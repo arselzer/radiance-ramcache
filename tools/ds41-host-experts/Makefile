@@ -68,7 +68,12 @@ $(O)/ds41_kv_packed_paths_check: ds41_kv_packed_paths_check.hip ds41_kv_codec_de
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_kv_packed_paths_check.hip -ldl
 kv-packed-paths-check: $(O)/ds41_kv_packed_paths_check
 
+# Independent reference-vs-optional-fast codec BYTE oracle. No performance measurement.
+$(O)/ds41_kv_fast_device_check: ds41_kv_fast_device_check.hip ds41_kv_fast_oracle.h $(TREE)/arch/common/rad_ds41_kv_codec.h $(TREE)/arch/common/rad_ds41_kv_fast.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $<
+kv-fast-check: $(O)/ds41_kv_fast_device_check
+
 clean:
 	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
 
-.PHONY: clean scan device-check mxfp4-check n128-check kv-codec-check router-eval
+.PHONY: clean scan device-check mxfp4-check n128-check kv-codec-check kv-packed-paths-check kv-fast-check router-eval

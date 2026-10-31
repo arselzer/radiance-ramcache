@@ -567,6 +567,7 @@ struct Model {
     /* Physical FP4-code/scale pages; the logical cache and every reader's arithmetic stay BF16.
      * Only native compressed/index producers are admitted. Window and F32 tails stay plain. */
     bool kv_packed = false;
+    bool kv_packed_fast = false; // independent default-off reader arithmetic implementation
     /* The indexer scores a step's rows in runs of at most `irows` rows into one [irows, cmax] score
      * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
@@ -2835,6 +2836,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (std::strcmp(e, "0") && std::strcmp(e, "1")) return RAD_E_INVAL;
         m.kv_packed = !std::strcmp(e, "1");
     }
+    if (const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST")) {
+        if (std::strcmp(e, "0") && std::strcmp(e, "1")) return RAD_E_INVAL;
+        m.kv_packed_fast = !std::strcmp(e, "1");
+    }
+    if (m.kv_packed_fast && !m.kv_packed) {
+        fprintf(stderr, "radiance: deepseek41: KV_PACKED_FAST=1 requires KV_PACKED=1\n");
+        return RAD_E_INVAL;
+    }
     if (m.kv_packed) {
         if (c.head_dim != 512 || c.idim != 128) return RAD_E_UNSUPPORTED;
         for (const auto r : c.ratio) if (r < 0 || r > 2) return RAD_E_UNSUPPORTED;
@@ -3006,9 +3015,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.layers.resize((size_t)c.n_layer);
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
     if (m.kv_packed && !m.probe)
-        fprintf(stderr, "radiance: deepseek41: KV_PACKED rank=%d zero=%d latent_format=1 row_bytes=288 "
+        fprintf(stderr, "radiance: deepseek41: KV_PACKED rank=%d zero=%d fast=%d latent_format=1 row_bytes=288 "
                         "groups=%zu index_format=2 row_bytes=68 groups=%zu; BF16 reader math, plain window/F32 tail\n",
-                        g.rank, (int)m.zero, m.comp.size(), m.index.size());
+                        g.rank, (int)m.zero, (int)m.kv_packed_fast, m.comp.size(), m.index.size());
     DS_TRY(kv_replicate(b, m));
     if (m.router_bf16 && g.rank == 0 && !m.probe)
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16: %d routers "

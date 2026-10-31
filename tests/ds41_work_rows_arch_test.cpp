@@ -55,6 +55,7 @@ const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_LCP",
                               "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8",
                               "RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16",
                               "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST",
                               "RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED",
                               "RADIANCE_EXPERIMENTAL_SCHED_TBO" };
 struct Env {
@@ -927,7 +928,7 @@ TEST(kv_packed_keeps_logical_bf16_geometry_and_pairs_each_capture_with_its_store
     Env e{ WINDOW_SWITCHES, { "RADIANCE_EXPERIMENTAL_DS41_LCP", "256" },
            { "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED", "1" } };
     auto d=declare(0,256,8);
-    REQUIRE_EQ(d->rc,RAD_OK); REQUIRE(d->m->kv_packed);
+    REQUIRE_EQ(d->rc,RAD_OK); REQUIRE(d->m->kv_packed); CHECK(!d->m->kv_packed_fast);
     REQUIRE(d->m->lat_pack); REQUIRE(d->m->ik_pack);
     for(const auto& kv:d->b.kv_groups) {
         CHECK(kv.d.dtype==RAD_BF16||kv.d.dtype==RAD_F32);
@@ -986,6 +987,29 @@ TEST(kv_packed_fused_refusal_keeps_original_chain_and_requires_captured_roundtri
         CHECK_EQ(b.op_of(L.k_q)->writes.back(),m.ik_pack);
         CHECK_EQ(b.op_of(L.l_q)->writes.back(),m.lat_pack);
     }
+}
+
+TEST(kv_packed_fast_is_independent_default_off_and_keeps_the_same_graph_and_issues) {
+    uint64_t graph = 0, issues = 0;
+    for (const char* flag : { "0", "1" }) {
+        Env e{ WINDOW_SWITCHES, { "RADIANCE_EXPERIMENTAL_DS41_LCP", "256" },
+               { "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED", "1" },
+               { "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST", flag } };
+        auto d=declare(0,256,8); REQUIRE_EQ(d->rc,RAD_OK);
+        CHECK_EQ(d->m->kv_packed_fast, flag[0]=='1');
+        auto k=step_of(d->b,{{1,41},{3,43}},{});
+        auto v=run_passes(d->b,deepseek41::step,{k.get()},0,4); REQUIRE(steps_ok(v));
+        if(flag[0]=='0'){graph=graph_hash(d->b);issues=issue_hash(d->b,v,{k.get()});}
+        else {CHECK_EQ(graph_hash(d->b),graph);CHECK_EQ(issue_hash(d->b,v,{k.get()}),issues);}
+    }
+    for (const char* flag : { "", "yes", "2" }) {
+        Env e{{"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","1"},
+              {"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST",flag}};
+        auto d=declare(0,16,1); CHECK_EQ(d->rc,RAD_E_INVAL);
+    }
+    Env e{{"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","0"},
+          {"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST","1"}};
+    auto d=declare(0,16,1); CHECK_EQ(d->rc,RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()

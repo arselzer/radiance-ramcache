@@ -25,6 +25,7 @@
  * blk.{n_layer}.. with `nextn_predict_layers`) runs on the block-drafter protocol: see struct Dsp. */
 #include <arch/rad_block_moe_fp8.h>
 #include <arch/rad_deepseek41_chat.h>
+#include <arch/rad_dflash_observe.h>
 #include "ds41_prefetch_plan.h"
 #include "ista_dialect.h"
 #include "../../core/sched/tbo.h"
@@ -543,6 +544,9 @@ struct Dsp {
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF set: the last stage's collapsed rows (`x`, the confidence
      * head's input) are declared persistent, so the engine can read them back after the query pass. */
     bool conf_x = false;
+    bool prob_capture = false;
+    rad_buf observations = 0;
+    rad_op observe = 0, observe_lo = 0;
 };
 
 struct Model {
@@ -1852,6 +1856,8 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
     d.rank = gi(meta, "dspark.markov_rank", 0);
     d.noise = gi(meta, "dspark.noise_token_id", -1);
     d.cand = gi(meta, "dspark.markov_top_k", 16);
+    const char* capture = std::getenv(rad_dflash_observe::kEnv);
+    d.prob_capture = capture && !std::strcmp(capture, "1");
     d.taps = gl(meta, "dspark.target_layers");
     std::sort(d.taps.begin(), d.taps.end());
     bool ok = !d.taps.empty() && d.noise >= 0 && d.noise < c.n_vocab && d.rank > 0 && d.rank % 32 == 0 &&
@@ -2167,6 +2173,12 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     }
     /* The proposal buffer (RadDrafterDecl::proposal), `block` tokens a sequence. */
     d.tokens = decl_b(b, nm.f("dspark_tokens"), RAD_I32, { g.max_seqs, d.block });
+    if (d.prob_capture) {
+        if (!rad_op_declared(b, "dflash_observe")) return RAD_E_UNSUPPORTED;
+        d.observations = decl_b(b, nm.f("%s", rad_dflash_observe::kBuffer), RAD_F32,
+                                { g.max_seqs, rad_dflash_observe::kWidth }, RAD_BUF_PERSIST);
+        if (!d.observations) return RAD_E_INVAL;
+    }
     if (!d.c || !d.cn || !d.ckv || !d.ckvn || !d.x || !d.h0 || !d.logits || !d.tokens) return RAD_E_INVAL;
 
     /* ---- weights */
@@ -2329,6 +2341,19 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                              RAD_INT("anchor_stride", d.block_lo), RAD_STR("dtype", "bf16") },
                            { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens })))
         return RAD_E_INVAL;
+
+    if (d.prob_capture) {
+        const auto observe = [&](int64_t block) {
+            return op(b, "dflash_observe",
+                      { RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", block), RAD_INT("top_k", R),
+                        RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab),
+                        RAD_INT("anchor_stride", block), RAD_STR("dtype", "bf16") },
+                      { d.mk1, d.mk2 }, { d.cand_, d.unary, d.tokens }, { d.observations });
+        };
+        d.observe = observe(d.block);
+        if (d.block_lo > 0) d.observe_lo = observe(d.block_lo);
+        if (!d.observe || (d.block_lo > 0 && !d.observe_lo)) return RAD_E_INVAL;
+    }
 
     m.dsp_f8_n = m.f8_n - f8_n0;
     m.dsp_f8_kept = m.f8_kept - f8_kept0;
@@ -3006,6 +3031,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     }
     RAD_ISSUE_N(x, lo ? d.select_lo : d.select, S, brows(d.cand_, N), brows(d.unary, N), RAD_NONE,
                 praw(batch->token_ids, RAD_I32, T), RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S));
+    if (d.observe)
+        RAD_ISSUE_N(x, lo ? d.observe_lo : d.observe, S, brows(d.cand_, N), brows(d.unary, N), RAD_NONE,
+                    praw(batch->token_ids, RAD_I32, T), RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S),
+                    brows(d.observations, S));
 }
 
 /* The ffn connection's mix, issued by the MoE block behind its routed gate_up (MoeFP8::Beside). */

@@ -704,10 +704,11 @@ EOF2
   # round, is not measured.
   local want got pat
   for pat in "Dc:DSpark confidence head: " "Dl:DSpark load-aware drafting: on" "Dx:DSpark context pass deferred (" \
-             "Dm:placement: 'dspark.markov_w" "Ds with NK:DSpark draft bank with up to "; do
+             "Dm:placement: 'dspark.markov_w" "Dpc:DSpark read-only proposal capture: on" \
+             "Ds with NK:DSpark draft bank with up to "; do
     want=${pat%%:*}; got=$(grep -cF "${pat#*:}" "$OUT/$name.server.log")
     local flag; case $want in Dc) flag=${ARM_DC:-};; Dl) flag=${ARM_DL:-};; Dx) flag=${ARM_DX:-};; Dm) flag=${ARM_DM:-};;
-                              "Ds with NK") flag=${ARM_SOLO:-};; esac
+                              Dpc) flag=${ARM_DPC:-};; "Ds with NK") flag=${ARM_SOLO:-};; esac
     if [[ -n "$flag" && "$got" == 0 ]]; then
       log "arm $name: $want, but the server log has no '${pat#*:}' line (a radiance or plugin without the switch?); not measured"
       stop_server; return 1
@@ -717,7 +718,7 @@ EOF2
       stop_server; return 1
     fi
   done
-  grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |placement: 'dspark.markov_w|DSpark draft bank with up to " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |DSpark read-only proposal capture: on|placement: 'dspark.markov_w|DSpark draft bank with up to " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Df (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): the plugin names, on each rank, the drafter's dense
   # weights it reads from E4M3 codes. A Df arm without such a line with N above 0, or another arm
   # with one, is not measured.
@@ -1348,7 +1349,11 @@ for a in $ARMS; do
 # Markov codebooks pinned in host memory with the embedding (..._DSPARK_CODEBOOK_RAM=1; needs Er): each
 # needs a Ds part (Dc / Dl / Dx not Ds0, Dc not with Dg) and a radiance (Dc, Dx: and a deepseek41
 # plugin) that has it; measured only with its startup line, and every other arm runs with it 0 and must
-# not have it; their shutdown report goes to window.log; H3 the third run home (RADIANCE_HOME_DIR3); Es
+# not have it; their shutdown report goes to window.log.
+# Dpc is read-only proposal probability/score/margin capture (DSPARK_PROB_CAPTURE), beside a drafting
+# Ds part only, never Ds0. It writes JSON events to the arm's server log; candidate_p is normalized
+# over the existing Markov-conditioned candidate set, not full vocabulary or target acceptance.
+# H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
 # from the use-order list up to N MiB an issue point, the read that crosses it cut
@@ -1476,7 +1481,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf="" dc="" dl="" dx="" dm="" ds="" nseq=""
+  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" ds="" nseq=""
   p1="" q1=() qm="" ql="" qg="" qe=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
@@ -1587,6 +1592,7 @@ for a in $ARMS; do
                  log "arm $a: $p: DlN takes 2-64; the arm is skipped"; skip=1
                fi ;;
       Dx)      dx=1 ;;                     # the drafter's context pass deferred while nothing drafts (DSPARK_CTX_DEFER)
+      Dpc)     dpc=1 ;;                    # read-only candidate-set probability/score/margin capture (DSPARK_PROB_CAPTURE)
       Dm)      dm=1 ;;                     # the drafter's Markov codebooks pinned with the embedding (DSPARK_CODEBOOK_RAM; needs Er)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
@@ -1864,10 +1870,14 @@ for a in $ARMS; do
   fi
   if [[ -n "$dc" && -n "$dg" ]]; then log "arm $a: Dc and Dg both decide the query pass; the arm is skipped"; skip=1; fi
   if [[ -n "$dm" && "-$a-" != *-Er-* ]]; then log "arm $a: Dm needs Er (the codebooks go where the embedding goes); the arm is skipped"; skip=1; fi
+  if [[ -n "$dpc" && ( -z "$ds" || "$ds" == Ds0 ) ]]; then
+    log "arm $a: Dpc needs a drafting Ds part (not Ds0); the arm is skipped"; skip=1
+  fi
   env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=${dc:-0} "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF_HEAD=${dc:+$DRAFT_CONF_HEAD}"
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=${dl:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=${dx:-0}
-        RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=${dm:-0})
-  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=${dm:-0}
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_PROB_CAPTURE=${dpc:-0})
+  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm ARM_DPC=$dpc
   # A drafting Ds part under --max-num-seqs above 1 (an NK part, or MAX_SEQS for the window): the
   # scheduler drafts for a sequence alone and says so at startup (arm() checks the line both ways).
   ARM_SOLO=
@@ -2102,4 +2112,12 @@ for a in $ARMS; do
   python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"
 done
 [[ " $ARMS" == *-Pc* ]] && python3 -I "$HERE/ab_requests.py" --ttft "$OUT" $ARMS | tee -a "$OUT/window.log"
+# The read-only capture must preserve the draft/acceptance counts of its otherwise identical arm.
+for a in $ARMS; do
+  [[ "-$a-" == *-Dpc-* ]] || continue
+  b=$(sed -E 's/-Dpc(-|$)/\1/' <<< "$a")
+  if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
+  log "draft stats: read-only capture $a against $b"
+  python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"
+done
 log "arms done"

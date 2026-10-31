@@ -525,9 +525,11 @@ bool read_only_by(const Program& prog, rad_weight w, const char* op);
  * experts. The kernel reads the same bytes in place over the link. Off by default. */
 inline constexpr char kDraftCodebookRamEnv[] = "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM";
 bool draft_codebook_ram();
+/* Require a real selector and allow only its optional read-only post-selection observer. */
+bool draft_codebook_readers(const Program& prog, rad_weight w);
 inline bool is_embedding_table(const Program& prog, rad_weight w) {
     return read_only_by(prog, w, "embed_lookup") ||
-           (draft_codebook_ram() && read_only_by(prog, w, "dflash_select"));
+           (draft_codebook_ram() && draft_codebook_readers(prog, w));
 }
 inline bool is_ngram_table(const Program& prog, rad_weight w) {
     return read_only_by(prog, w, "embed_lookup_q") || read_only_by(prog, w, "embed_lookup_planes");

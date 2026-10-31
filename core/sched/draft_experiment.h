@@ -7,6 +7,7 @@
 
 #include "draft_gate.h"
 #include "draft_conf.h"
+#include "draft_prob.h"
 
 namespace rad {
 inline constexpr char kDraftOriginEnv[] = "RADIANCE_EXPERIMENTAL_DS41_DRAFT_ORIGIN_STATS";
@@ -20,7 +21,8 @@ public:
                                    const char* gate = nullptr,
                                    const char* conf = nullptr,
                                    const char* load = nullptr,
-                                   const char* defer = nullptr) noexcept {
+                                   const char* defer = nullptr,
+                                   const char* prob = nullptr) noexcept {
         DraftExperiment x;
         const bool valid_cap = !verify_cap ||
             (verify_cap[0] >= '0' && verify_cap[0] <= '5' && verify_cap[1] == '\0');
@@ -41,6 +43,8 @@ public:
         if (!valid_conf || !valid_load || !valid_defer) x.valid_ = false;
         if (x.off_ && (x.conf_.on || x.load_from_ > 0 || x.ctx_defer_)) x.valid_ = false;
         if (x.conf_.on && x.gate_.on) x.valid_ = false;
+        if (!flag(prob) || (one(prob) && x.off_)) x.valid_ = false;
+        x.prob_ = one(prob);
         x.observe_ = one(stats) || x.off_ || x.cap_ >= 0;
         return x;
     }
@@ -53,6 +57,7 @@ public:
     const DraftConfCfg& conf() const noexcept { return conf_; } // the confidence controller; off by default
     int load_from() const noexcept { return load_from_; }       // load-aware drafting from N decoders; 0 off
     bool ctx_defer() const noexcept { return ctx_defer_; }      // the deferred context pass; off by default
+    bool prob_capture() const noexcept { return prob_; }      // read-only candidate-set signal
     bool scope_required() const noexcept { return off_ || cap_ >= 0; }
     int runtime_depth(int configured) const noexcept {
         return off_ ? 0 : cap_ >= 0 && configured > cap_ ? cap_ : configured;
@@ -67,6 +72,7 @@ private:
     DraftConfCfg conf_{};
     int load_from_ = 0;
     bool ctx_defer_ = false;
+    bool prob_ = false;
     static bool one(const char* x) noexcept { return x && std::strcmp(x,"1") == 0; }
     static bool flag(const char* x) noexcept {
         return !x || std::strcmp(x,"0") == 0 || std::strcmp(x,"1") == 0;

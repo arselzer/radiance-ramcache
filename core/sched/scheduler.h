@@ -102,6 +102,7 @@ struct SchedReq {
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF (draft_conf.h): the confidence controller's estimate and
      * counters. Kept through preemption; a new request starts it over. */
     DraftConfSeq dconf;
+    DraftProbPending dprob;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
@@ -520,6 +521,12 @@ public:
     int64_t              ctx_defer_cap() const { return dctx_.cap; }
     /* The DSpark bank under several sequences (draft_conf.h, "one sequence alone"). */
     bool                 draft_solo() const { return dsolo_; }
+    /* Read-only capture; publish AFTER set_draft and before this proposal's verify commits.
+     * anchor and tokens come from the same StepSlot readback as the installed proposal. */
+    void draft_prob_publish(uint64_t id, int64_t anchor, int32_t anchor_token,
+                            const int32_t* tokens, int n, const float* signal, bool published,
+                            int candidates);
+    DraftProbStats draft_prob_stats() const;
 
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
@@ -713,6 +720,13 @@ private:
     std::vector<ConfRec> dconf_recs_;
     int64_t              dconf_recs_n_ = 0;
     bool                 dconf_any_ = false;   /* any of the three on, or dsolo_ */
+    bool                 dprob_on_ = false;
+    uint64_t             dprob_epoch_ = 0;
+    DraftProbStats       dprob_stats_{};
+    void dprob_discard(SchedReq& s, const char* reason, bool cancelled = false);
+    void dprob_verify(SchedReq& s, const StepEntry& e, int64_t anchor, int accepted);
+    void dprob_record(uint64_t seq, const DraftProbPending& p, int depth, const char* event,
+                       const char* status, DraftProbOutcome outcome = {}, bool cancelled = false);
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */

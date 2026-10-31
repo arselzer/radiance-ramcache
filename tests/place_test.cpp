@@ -3558,6 +3558,25 @@ TEST(dspark_codebook_ram_pins_the_codebooks_with_the_embedding) {
     unsetenv(kDraftCodebookRamEnv);
 }
 
+TEST(dspark_codebook_observer_preserves_placement_but_needs_a_selector) {
+    setenv(kDraftCodebookRamEnv, "1", 1);
+    Fixture f;
+    const rad_weight w = f.weight("dspark.markov_w1.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("dflash_observe", { w }, false);
+    CHECK(!is_embedding_table(f.prog, w));
+    f.op("dflash_select", { w }, false);
+    CHECK(is_embedding_table(f.prog, w));
+    f.op("gemm", { w }, false);
+    CHECK(!is_embedding_table(f.prog, w));
+    Fixture other;
+    const rad_weight u = other.weight("unknown.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    other.op("dflash_select", { u }, false);
+    other.op("unknown_observer", { u }, false);
+    CHECK(!is_embedding_table(other.prog, u));
+    unsetenv(kDraftCodebookRamEnv);
+    CHECK(!is_embedding_table(f.prog, w));
+}
+
 /* The embedding gets its own room: the resolver sizes Config::embedding_host_mib on top of
  * --host-pool-mib, so a dense model with no pool still places the table, and the experts keep all
  * of --host-pool-mib after the table is pinned. */

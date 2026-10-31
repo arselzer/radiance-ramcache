@@ -31345,7 +31345,7 @@ static void device_phase(const Plugin& pl) {
      * asserts the chained path and that an anchor-pinned walk over the same data differs.
      *
      * Every value is a power of two times a quarter, so f32 accumulation is exact in any order. */
-    if (sel("dflash_select_bf16")) {
+    if (sel("dflash_select_bf16") || sel("dflash_observe_bf16")) {
         const RadKernelInfo* r = find(pl, "dflash_select_bf16");
         if (!r) ok("dflash_select_bf16", false, "row absent");
         else {
@@ -31454,6 +31454,47 @@ static void device_phase(const Plugin& pl) {
                     for (int64_t l = 0; l < steps; ++l)
                         if (bg[(size_t)(s * steps + l)] != want[s][l]) { bsame = false; break; }
                 ok("dflash_select_bf16 absent hp is a plane of ones (the bigram form)", bsame);
+                if (sel("dflash_observe_bf16")) {
+                    const RadKernelInfo* observer = find(pl, "dflash_observe_bf16");
+                    if (!observer) ok("dflash_observe_bf16", false, "row absent");
+                    else {
+                        /* Observe the selected bigram path, independently normalized over its
+                         * top-K set; this is not full-vocabulary or target-acceptance probability. */
+                        constexpr int fields = 5, width = 10;
+                        void* d_obs = dalloc((size_t)M * width * sizeof(float));
+                        if (!d_obs) ok("dflash_observe alloc", false, "hipMalloc failed");
+                        else {
+                            tb.push_back(T(d_obs, RAD_F32, { M, width }));
+                            run_case(observer, tb, ps);
+                            std::vector<float> obs((size_t)M * width);
+                            st_memcpy(obs.data(), d_obs, obs.size() * sizeof(float), hipMemcpyDeviceToHost);
+                            std::vector<int32_t> after(bg.size());
+                            st_memcpy(after.data(), d_out, after.size() * sizeof(int32_t), hipMemcpyDeviceToHost);
+                            bool exact = after == bg, signal = true;
+                            for (int64_t s = 0; s < M; ++s)
+                                for (int64_t l = 0; l < 2; ++l) {
+                                    const int64_t row = s * steps + l;
+                                    const int32_t pid = l ? want[s][l - 1] : anchor[s];
+                                    float scores[4], bv = -INFINITY, runner = -INFINITY;
+                                    int best = 0;
+                                    for (int c = 0; c < K; ++c) {
+                                        scores[c] = unf(row, c) + (float)R * pv(pid) * sv(cnd(row, c));
+                                        if (scores[c] > bv) { bv = scores[c]; best = c; }
+                                    }
+                                    float den = 0.f;
+                                    for (int c = 0; c < K; ++c) {
+                                        den += std::exp(scores[c] - bv);
+                                        if (c != best) runner = std::max(runner, scores[c]);
+                                    }
+                                    const float* y = obs.data() + s * width + l * fields;
+                                    signal = signal && std::fabs(y[0] - 1.f / den) <= 2e-6f && y[1] == bv &&
+                                             y[2] == bv - runner && y[3] == want[s][l] && y[4] == pid;
+                                }
+                            ok("dflash_observe_bf16 leaves selected IDs byte-identical", exact);
+                            ok("dflash_observe_bf16 reports conditioned candidate softmax and margin", signal);
+                        }
+                    }
+                }
             }
         }
     }

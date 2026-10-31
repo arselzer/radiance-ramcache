@@ -4203,8 +4203,9 @@ int Engine::start() {
         RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict; "
                 "%s absent, 0, 1 or T[,W[,R]] (T in (0, 64], W 1..64, R 1..4096), and not with compute OFF; "
                 "%s absent, 0, 1 or T[,R] (T in (0, 1), R 2..4096), not with %s; %s absent, 0, 1 or N (2..64); "
-                "%s absent, 0 or 1; none of the three with compute OFF", kDraftGateEnv, kDraftConfEnv,
-                kDraftGateEnv, kDraftLoadEnv, kDraftCtxDeferEnv);
+                "%s absent, 0 or 1; none of the three with compute OFF; %s absent, 0 or 1 and not "
+                "with compute OFF", kDraftGateEnv, kDraftConfEnv,
+                kDraftGateEnv, kDraftLoadEnv, kDraftCtxDeferEnv, rad_dflash_observe::kEnv);
         return RAD_E_INVAL;
     }
     std::vector<int> devs;

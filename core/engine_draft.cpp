@@ -123,6 +123,7 @@ int Engine::step_state_init() {
 
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF: the confidence head (engine_dconf.cpp). */
     RAD_TRY(dconf_init());
+    RAD_TRY(dprob_init());
 
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
@@ -142,6 +143,7 @@ void Engine::step_state_fini() {
     if (couple_draw_stage_) rad_dev_free(couple_draw_stage_, RAD_MEM_HOST_PINNED);
     if (couple_readback_) rad_dev_free(couple_readback_, RAD_MEM_HOST_PINNED);
     dconf_fini();
+    dprob_fini();
     couple_draw_stage_ = nullptr;
     couple_readback_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
@@ -625,6 +627,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
     /* The confidence head's input rows, behind the pass (engine_dconf.cpp). */
     RAD_TRY(dconf_issue(n, block));
+    RAD_TRY(dprob_issue(n));
     Rank& r0 = *ranks_[0];
     if (mtp_couple_) {
         /* Positions 1..steps of the drafting rows, on the stream of the slots below. */
@@ -688,10 +691,14 @@ int Engine::finish_block_drafter(const StepOut& so) {
         /* As in finish_serial_drafter: the step issued ahead only carries a request whose answer
          * is fixed (Scheduler::step_next_locked), so this agrees with the count it verifies. A
          * tree's parents come from the same slot, as ADV_BTAKE took them. */
-        if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) continue;
+        if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) {
+            dprob_finish(i, d, steps, false);
+            continue;
+        }
         const uint64_t seq = block_row_[(size_t)i].seq;
         const StepSlot& S = slots_host_[block_row_[(size_t)i].card];
         const int rc = sched_.set_draft(seq, d, steps, tree_ ? S.par : nullptr);
+        dprob_finish(i, d, steps, rc == RAD_OK);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, steps, rc == RAD_OK, block_row_[(size_t)i].card));
     }

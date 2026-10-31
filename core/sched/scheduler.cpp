@@ -184,6 +184,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     if (!kv || !pc) return RAD_E_INVAL;
     draft_experiment_ = experiment ? *experiment : DraftExperiment{};
     if (!draft_experiment_.valid()) return RAD_E_INVAL;
+    dprob_on_ = draft_experiment_.prob_capture();
+    dprob_epoch_ = 0;
+    dprob_stats_ = {};
     // The owning Engine is the authority for bank/Program/final-Plan scope. Standalone
     // Scheduler component tests explicitly inject this private option, never read getenv.
     m_.draft_origin = {};
@@ -954,6 +957,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 }
 
 void Scheduler::fini() {
+    if (dprob_on_)
+        for (auto& s : reqs_) if (s) dprob_discard(*s, "scheduler_fini");
     for (auto& s : reqs_)
         if (s && s->req && (s->running || s->pending_free)) kv_->free_sequence(s->req->id);
     builder_.fini();
@@ -1048,7 +1053,9 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     if (!reqs_[(size_t)slot]) reqs_[(size_t)slot] = std::make_unique<SchedReq>();
 
     SchedReq& s = *reqs_[(size_t)slot];
+    if (dprob_on_) dprob_discard(s, "slot_reused");
     s.req = std::move(r);
+    s.dprob = {};
     s.arrival = ++arrival_;
     s.arrived_us = mono_us();
     s.first_tok_us = 0;
@@ -1305,6 +1312,10 @@ void Scheduler::trim_prefix_cache(const Request* spare, int64_t spare_tokens) {
 
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
                               bool publish, int status, const char* why) {
+    /* An in-flight verification still gets paired at commit, including a cancelled request.
+     * Otherwise this pending proposal can never acquire a target outcome. */
+    if (dprob_on_ && s.entry < 0 && s.entry_next < 0)
+        dprob_discard(s, st == ReqState::Cancelled ? "cancelled" : "request_closed", st == ReqState::Cancelled);
     ++step_finished_;
     /* Publish before freeing: this is the only moment the whole prefix is both computed and still
      * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
@@ -1526,6 +1537,7 @@ void Scheduler::take_completed(std::vector<uint64_t>* out) {
 }
 
 void Scheduler::release_locked(SchedReq& s) {
+    if (dprob_on_) dprob_discard(s, "reaped");
     if (s.pending_free) { free_kv(s); s.pending_free = false; --n_deferred_; }
     if (s.reap_pending) { s.reap_pending = false; --n_deferred_; }
     by_id_.erase(s.req->id);
@@ -1600,7 +1612,10 @@ void Scheduler::shutdown(const char* reason, int status) {
     /* Nothing will commit again, so no entry of the last step still owns its slot. */
     step_open_ = false;
     next_open_ = false;
-    for (auto& up : reqs_) if (up) { up->entry = -1; up->entry_next = -1; }
+    for (auto& up : reqs_) if (up) {
+        if (dprob_on_) dprob_discard(*up, "shutdown");
+        up->entry = -1; up->entry_next = -1;
+    }
     block_.clear();
     serial_.clear();
     sweep_deferred();
@@ -2032,6 +2047,7 @@ void Scheduler::preempt_back() {
     int32_t slot = running_.back();
     SchedReq& s = *reqs_[(size_t)slot];
     Request& r = *s.req;
+    if (dprob_on_) dprob_discard(s, "preempted");
 
     /* Preemption by recompute: the blocks go back and the request restarts from zero. Its output
      * is the tail of its token sequence, so it simply re-prefills prompt ++ output. */
@@ -2797,6 +2813,7 @@ replan:
             /* Nor one decoding beside another under the bank's one-sequence rule (solo_hold). */
             else if (solo_hold) {
                 if (s.n_draft > 0) ++dconf_tot_.solo_dropped;
+                if (dprob_on_) dprob_discard(s, "concurrency");
                 s.n_draft = 0;
             }
             else if (s.n_draft == 0) {
@@ -3552,6 +3569,11 @@ int Scheduler::commit(StepResult& res) {
         const StepEntry& e = plan_.e[(size_t)i];
         SchedReq& s = *reqs_[(size_t)e.slot];
         Request& r = *s.req;
+        if (dprob_on_ && s.dprob.n > 0 && !e.is_prefill && e.produces_token) {
+            int a = res.n_accepted ? res.n_accepted[i] : 0;
+            a = std::max(0, std::min(a, e.n_spec));
+            dprob_verify(s, e, e.dev ? r.n_computed : (int64_t)e.ctx_len, a);
+        }
         if (r.state != ReqState::Running) {
             /* Cancelled between step and commit; its blocks were held until the device finished
              * with them. If the server also reaped it, the sweep at the end of this function

@@ -10021,6 +10021,61 @@ TEST(resume_grid_is_refused_where_partition_invariance_is_not_shown) {
     }
 }
 
+TEST(dspark_probability_capture_pairs_real_verification_and_cancelled_rows) {
+    for (int accepted : { 0, 1, 2 }) {
+        Fixture f; f.build(); f.cfg.n_spec = 2;
+        const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "1");
+        CHECK_OK(f.start(&x));
+        const uint64_t id = f.submit(4, 30);
+        REQUIRE(f.sch.step()); f.commit_plain(6);
+        const int64_t anchor = f.sch.find(id)->n_computed;
+        const int32_t proposal[] = { 7, 8 };
+        const float signal[10] = { .8f, 4, 2, 7, 6, .7f, 3, 1, 8, 7 };
+        CHECK_OK(f.sch.set_draft(id, proposal, 2));
+        f.sch.draft_prob_publish(id, anchor, 6, proposal, 2, signal, true, 16);
+        REQUIRE(f.sch.step()); REQUIRE_EQ(f.sch.plan().e[0].n_spec, 2);
+        CHECK_OK(f.commit(9, 0, [accepted](const StepEntry&) { return accepted; }));
+        const auto stats = f.sch.draft_prob_stats();
+        CHECK_EQ(stats.proposed, (uint64_t)2); CHECK_EQ(stats.resolved, (uint64_t)2);
+        CHECK_EQ(stats.verified, (uint64_t)2);
+        CHECK_EQ(stats.reached, (uint64_t)(accepted == 0 ? 1 : 2));
+        CHECK_EQ(stats.accepted, (uint64_t)accepted);
+        /* A second proposal cancelled while verification is in flight still pairs exactly once. */
+        CHECK_OK(f.sch.set_draft(id, proposal, 2));
+        f.sch.draft_prob_publish(id, f.sch.find(id)->n_computed, 9, proposal, 2, signal, true, 16);
+        REQUIRE(f.sch.step()); CHECK_OK(f.sch.cancel(id));
+        CHECK_OK(f.commit(10, 0, [](const StepEntry&) { return 1; }));
+        CHECK_EQ(f.sch.draft_prob_stats().resolved, (uint64_t)4);
+        CHECK_EQ(f.sch.draft_prob_stats().verified, (uint64_t)4);
+    }
+}
+
+TEST(dspark_probability_capture_resolves_caps_supersession_and_closed_sequences) {
+    Fixture f; f.build(); f.cfg.n_spec = 2;
+    const auto x = DraftExperiment::capture(nullptr, nullptr, "1", nullptr, nullptr, nullptr, nullptr, "1");
+    CHECK_OK(f.start(&x));
+    const uint64_t id = f.submit(4, 30);
+    REQUIRE(f.sch.step()); f.commit_plain(6);
+    const int32_t proposal[] = { 7, 8 };
+    const float signal[10] = { .8f, 4, 2, 7, 6, .7f, 3, 1, 8, 7 };
+    for (int pass = 0; pass < 2; ++pass) {
+        CHECK_OK(f.sch.set_draft(id, proposal, 2));
+        f.sch.draft_prob_publish(id, f.sch.find(id)->n_computed, 6, proposal, 2, signal, true, 16);
+    }
+    /* Both depth2 rows capped; first depth1 superseded. */
+    CHECK_EQ(f.sch.draft_prob_stats().proposed, (uint64_t)4);
+    CHECK_EQ(f.sch.draft_prob_stats().resolved, (uint64_t)3);
+    CHECK_OK(f.sch.cancel(id));
+    CHECK_EQ(f.sch.draft_prob_stats().resolved, (uint64_t)4);
+    CHECK_OK(f.sch.reap(id));
+    f.sch.draft_prob_publish(id, 4, 6, proposal, 2, signal, false, 16);
+    CHECK_EQ(f.sch.draft_prob_stats().resolved, (uint64_t)6);
+    /* Recycled slot and an unrelated ID never inherit pending observations. */
+    const uint64_t next = f.submit(4, 30);
+    CHECK_NE(next, id); REQUIRE(f.sch.step()); f.commit_plain();
+    CHECK_EQ(f.sch.draft_prob_stats().verified, (uint64_t)0);
+}
+
 /* ===== draft_conf.h: the confidence controller, load-aware drafting, the deferred context pass ===== */
 TEST(dspark_conf_parses_and_decides) {
     DraftConfCfg c;
@@ -10170,6 +10225,7 @@ struct ConfRun {
     std::vector<int> drafted, verified, ctx_rows, ctx_passes;
     std::vector<int32_t> ctx_pos, output;
     DraftConfStats stats;
+    DraftProbStats probability;
 };
 ConfRun conf_pipeline(const DraftExperiment& x, const std::vector<float>& p, bool with_hist,
                       int64_t short_by = 0) {
@@ -10223,6 +10279,11 @@ ConfRun conf_pipeline(const DraftExperiment& x, const std::vector<float>& p, boo
         if (n == 1) {
             CHECK_OK(f.sch.set_draft(id, generated, 5));
             f.sch.draft_conf_scored(id, p[(size_t)t], -1.0f);   /* finish_block_drafter's */
+            if (x.prob_capture()) {
+                const float obs[10] = { .8f, 4, 2, (float)generated[0], (float)slots[0].tok[0],
+                                        .7f, 3, 1, (float)generated[1], (float)generated[0] };
+                f.sch.draft_prob_publish(id, slots[0].ctx, slots[0].tok[0], generated, 5, obs, true, 16);
+            }
         }
         f.sch.step_finished();
         f.sch.promote_next();
@@ -10230,10 +10291,25 @@ ConfRun conf_pipeline(const DraftExperiment& x, const std::vector<float>& p, boo
     }
     out.output = f.sch.find(id)->output;
     out.stats = f.sch.metrics().draft_conf;
+    out.probability = f.sch.draft_prob_stats();
     f.sch.draft_conf_report();
     return out;
 }
 }  // namespace
+
+TEST(dspark_probability_capture_preserves_the_issue_ahead_pipeline) {
+    const auto off = DraftExperiment::capture(nullptr, nullptr, "1");
+    const auto on = DraftExperiment::capture(nullptr, nullptr, "1", nullptr, nullptr, nullptr, nullptr, "1");
+    const std::vector<float> p = { .9f, .1f, .8f, .2f };
+    const ConfRun a = conf_pipeline(off, p, false), b = conf_pipeline(on, p, false);
+    CHECK(a.output == b.output); CHECK(a.drafted == b.drafted); CHECK(a.verified == b.verified);
+    CHECK(a.ctx_rows == b.ctx_rows); CHECK(a.ctx_pos == b.ctx_pos);
+    CHECK_EQ(b.probability.proposed, (uint64_t)8);
+    CHECK_EQ(b.probability.verified, (uint64_t)3);
+    CHECK_EQ(b.probability.reached, (uint64_t)3);
+    CHECK_EQ(b.probability.accepted, (uint64_t)2);
+    CHECK_EQ(b.probability.resolved, (uint64_t)7); // last epoch pending until fixture fini
+}
 
 /* The controller on the pipeline: T 0.5, a probe every 3rd step of a closed run. */
 TEST(dspark_conf_closes_probes_and_reopens_on_the_issue_ahead_pipeline) {

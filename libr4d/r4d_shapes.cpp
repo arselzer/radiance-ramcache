@@ -2180,6 +2180,14 @@ extern "C" int r4d_shape_dflash_select(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+extern "C" int r4d_shape_dflash_observe(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+    if (operand < 7) return r4d_shape_dflash_select(p, n_p, operand, out);
+    if (operand != 7) return RAD_E_UNSUPPORTED;
+    *out = opd((uint32_t)RAD_F32, pi(p, n_p, "M"), 10);
+    return RAD_OK;
+}
+
 /* DeepSeek-V4.1's ops, in this unit for the helpers above. */
 #include "r4d_ds41_elem_shapes.inc"
 #include "r4d_ds41_sparse_shapes.inc"

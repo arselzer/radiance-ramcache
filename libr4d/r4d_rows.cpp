@@ -714,6 +714,12 @@ static const RadOperandSpec oDflashSelect[] = {
     { "succ",   RAD_OPD_WEIGHT, 0 },
     { "tokens", RAD_OPD_OUT,    0 },
 };
+/* A read-only post-selection instrument; the chosen path is INPUT, never selected here. */
+static const RadOperandSpec oDflashObserve[] = {
+    { "cand", RAD_OPD_IN, 0 }, { "unary", RAD_OPD_IN, 0 }, { "hp", RAD_OPD_IN, 1 },
+    { "anchor", RAD_OPD_IN, 0 }, { "pred", RAD_OPD_WEIGHT, 0 }, { "succ", RAD_OPD_WEIGHT, 0 },
+    { "tokens", RAD_OPD_IN, 0 }, { "observations", RAD_OPD_OUT, 0 },
+};
 /* dflash_tree: dflash_select's, plus the node count, the softmax temperature and the parents. */
 static const RadParamSpec pDflashTree[] = {
     { "M",       RAD_P_INT, RAD_REQUIRED },
@@ -3354,6 +3360,11 @@ static const RadOpSchema kSchemas[] = {
            "positions, and the greedy walk that turns a block of independent top-k sets into one "
            "path. Only the K edges leaving the previous pick are scored, because the walk is "
            "serial and the other K-1 rows of the score matrix are never read."),
+    SCHEMA("dflash_observe", pDflashSelect, oDflashObserve,
+           "Read-only scores of dflash_select's chosen path at depths 1/2. F32 [M,10], five "
+           "fields per depth: softmax share over the existing top-k candidates, selected Markov "
+           "score, margin over the best other candidate, selected token ID, predecessor ID. "
+           "Temperature 1; not a full-vocabulary or acceptance probability. Invalid signals are NaN."),
     SCHEMA("dflash_tree", pDflashTree, oDflashTree,
            "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: "
            "a taken node's children are the valid candidates at the next position, each with log "
@@ -4587,6 +4598,10 @@ static const RadConstraint cDflashConv[] = {
 static const RadConstraint cDflashSelect[] = {
     C_GE("steps", 1), C_GE("top_k", 1), C_LE("top_k", 32),
     C_DIV("rank", 32), C_LE("rank", 512), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cDflashObserve[] = {
+    C_GE("steps", 1), C_LE("steps", 63), C_GE("top_k", 1), C_LE("top_k", 32),
+    C_DIV("rank", 32), C_LE("rank", 512), C_LE("n_vocab", 16777216), C_IN("dtype", "bf16"),
 };
 /* dflash_tree's frontier (nodes x top_k children) and its node table live in LDS. */
 static const RadConstraint cDflashTree[] = {
@@ -9525,6 +9540,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cDflashSelect), NOTUNE,
   nullptr, nullptr, r4d_rad_dflash_select, nullptr, nullptr, nullptr,
   r4d_shape_dflash_select },
+
+{ "dflash_observe_bf16", "dflash_observe", "dflash",
+  "Read-only Markov-conditioned candidate-set softmax, score and margin AFTER unchanged selection",
+  "depths 1/2; top_k<=32, rank32..512; F32 [M,10] observations; no full-vocabulary probability",
+  "candidate/unary/codebooks/path read only, F32 observations out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDflashObserve), NOTUNE,
+  nullptr, nullptr, r4d_rad_dflash_observe, nullptr, nullptr, nullptr,
+  r4d_shape_dflash_observe },
 
 { "dflash_tree_bf16", "dflash_tree", "dflash",
   "DFlash2's candidate lattice grown best-first into a tree (rad_drafter_tree): the selector's "

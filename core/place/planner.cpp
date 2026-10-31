@@ -1124,6 +1124,17 @@ bool read_only_by(const Program& prog, rad_weight w, const char* op) {
     return read;
 }
 
+bool draft_codebook_readers(const Program& prog, rad_weight w) {
+    bool selector = false;
+    for (const OpInfo& o : prog.ops)
+        for (rad_weight ow : o.weights)
+            if (ow == w) {
+                if (o.op == "dflash_select") selector = true;
+                else if (o.op != "dflash_observe") return false;
+            }
+    return selector;
+}
+
 /* --embedding-placement ram: the token embedding goes to the pinned host pool before any strategy
  * runs. The host pool is mapped (Pools::configure), so at the DeviceZeroCopy site the lookup
  * kernel reads its M rows over the link in place, a few KiB a decode step, and the table's VRAM

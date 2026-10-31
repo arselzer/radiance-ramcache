@@ -637,6 +637,16 @@ private:
     int64_t   dconf_rows_ = 0;
     uint16_t* dconf_host_ = nullptr;
     int       dconf_n_ = 0, dconf_block_ = 0;
+    /* Optional read-only post-selection capture; persistent observation plane on rank 0 and
+     * its pinned readback, copied behind the same query pass as the StepSlots. No ABI fields. */
+    int dprob_init();
+    void dprob_fini();
+    int dprob_issue(int n);
+    void dprob_finish(int row, const int32_t* tokens, int n, bool published);
+    rad_buf dprob_buf_ = 0;
+    float* dprob_host_ = nullptr;
+    int64_t dprob_rows_ = 0;
+    int dprob_candidates_ = 0;
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */

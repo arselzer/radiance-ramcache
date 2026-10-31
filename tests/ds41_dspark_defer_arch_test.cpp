@@ -26,6 +26,7 @@ namespace {
 constexpr int kWorld = 4;
 
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER",
+                              rad_dflash_observe::kEnv,
                               "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF",
                               "RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK",
                               "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8",
@@ -162,6 +163,8 @@ TEST(ds41_dspark_controls_off_declare_and_issue_as_before) {
     REQUIRE(ds.on);
     CHECK(!ds.ctx_defer);
     CHECK(!ds.conf_x);
+    CHECK(!ds.prob_capture); CHECK(!ds.observe); CHECK(!ds.observations);
+    CHECK(find_b(d->b, rad_dflash_observe::kBuffer) == nullptr);
     const RecBuf* src = find_b(d->b, "dspark_src");
     const RecBuf* x = find_b(d->b, "dspark_collapsed");
     REQUIRE(src);
@@ -332,6 +335,39 @@ TEST(ds41_dspark_conf_keeps_the_collapsed_rows) {
     REQUIRE_EQ(e->rc, (int)RAD_OK);
     CHECK(!e->m->dsp.conf_x);
     CHECK(!e->m->dsp.ctx_defer);
+}
+
+TEST(ds41_dspark_proposal_capture_is_persistent_and_issued_after_unchanged_selection) {
+    for (int short_block : { 0, 3 }) {
+        Env env({ { rad_dflash_observe::kEnv, "1" },
+                  { "RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK", short_block ? "3" : "0" } });
+        auto d = declare(0, 4);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        const auto& ds = d->m->dsp;
+        const RecBuf* obs = find_b(d->b, rad_dflash_observe::kBuffer);
+        REQUIRE(obs);
+        CHECK_EQ(obs->d.kind, (int)RAD_BUF_PERSIST);
+        CHECK_EQ(obs->d.dtype, (uint32_t)RAD_F32);
+        CHECK_EQ(obs->d.shape[0], (int64_t)4);
+        CHECK_EQ(obs->d.shape[1], (int64_t)rad_dflash_observe::kWidth);
+        auto q = query_pass(d->b, 2, short_block ? 3 : 5, short_block ? 3 : 5);
+        auto runs = run_passes(d->b, deepseek41::step, { q.get() }, 0, kWorld);
+        REQUIRE(steps_ok(runs));
+        const rad_op select = short_block ? ds.select_lo : ds.select;
+        const rad_op observe = short_block ? ds.observe_lo : ds.observe;
+        const int sel = first_issue(*runs[0], select), cap = first_issue(*runs[0], observe);
+        REQUIRE(sel >= 0); REQUIRE(cap > sel);
+        const auto& before = runs[0]->issues[(size_t)sel].opd;
+        const auto& after = runs[0]->issues[(size_t)cap].opd;
+        REQUIRE_EQ(before.size(), (size_t)7); REQUIRE_EQ(after.size(), (size_t)8);
+        for (size_t i = 0; i < before.size(); ++i) {
+            CHECK_EQ(before[i].handle, after[i].handle);
+            CHECK_EQ(before[i].rows, after[i].rows);
+            CHECK_EQ(before[i].offset, after[i].offset);
+        }
+        CHECK_EQ(after[7].handle, ds.observations);
+        CHECK_EQ(after[7].rows, (int64_t)2);
+    }
 }
 
 RAD_TEST_MAIN()

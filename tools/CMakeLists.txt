@@ -44,6 +44,9 @@ rad_add_tool(rad-info     rad_info.cpp)
 rad_add_tool(ds41-bank-backup-check ds41_bank_backup_check.cpp)
 rad_add_tool(ds41-bank-packed-fill-check ds41_bank_packed_fill_check.cpp)
 
+# Explicit two-lock GPU window only; real VMem + allocator publication oracle.
+rad_add_tool(ds41-kv-backing-check ds41_kv_backing_check.cpp)
+
 # The tokeniser's independent reference encoder (tokref.h), which core/text's pre-tokeniser is
 # checked against. A library because tests/tokenizer_test uses it too; core/ does not link it.
 add_library(rad_tokref STATIC ${CMAKE_CURRENT_SOURCE_DIR}/tokref.cpp)

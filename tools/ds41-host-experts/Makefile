@@ -63,6 +63,11 @@ $(O)/ds41_kv_codec_device_check: ds41_kv_codec_device_check.hip $(TREE)/arch/com
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
 kv-codec-check: $(O)/ds41_kv_codec_device_check
 
+# Strict packed-cache code/scale + fused producer + all reader paths. GPU window only.
+$(O)/ds41_kv_packed_paths_check: ds41_kv_packed_paths_check.hip ds41_kv_codec_device_check.hip $(TREE)/arch/common/rad_ds41_kv_codec.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_kv_packed_paths_check.hip -ldl
+kv-packed-paths-check: $(O)/ds41_kv_packed_paths_check
+
 clean:
 	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
 

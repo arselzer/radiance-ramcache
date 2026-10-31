@@ -19,6 +19,10 @@ static const RadOperandSpec oDs41IndexScore[] = {
     { "bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
     { "score", RAD_OPD_OUT, 0 },
 };
+static const RadParamSpec pDs41IndexScoreKvPack[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"), P_INT("kv_format") };
+static const RadParamSpec pDs41AttnKvPack[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_INT("kv_format") };
 static const RadParamSpec pDs41IndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
 static const RadOperandSpec oDs41IndexCand[] = {
@@ -55,6 +59,11 @@ static const RadConstraint cDs41IndexTopk[] = {
 
 #elif defined(R4D_DS41_SCHEMAS)
 
+SCHEMA("index_score_kvpack", pDs41IndexScoreKvPack, oDs41IndexScore,
+       "Original index score arithmetic and dispatcher; reconstructed BF16 from packed original producer output."),
+SCHEMA("attn_sparse_sink_kvpack", pDs41AttnKvPack, oDs41AttnSparseSink,
+       "Original attention arithmetic and dispatcher; BF16 windows plus reconstructed BF16 compressed packed entries."),
+
 SCHEMA("attn_sparse_sink", pDs41AttnSparseSink, oDs41AttnSparseSink,
        "Latent attention (key = value, dim wide) with a per-head sink over the window cache's keys "
        "at [pos-window+1, pos] (the window table rebased at first = pos(last row of s) + 1 - "
@@ -78,6 +87,15 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
        "ascending order, then -1."),
 
 #elif defined(R4D_DS41_ROWS)
+
+{ "ds41_index_score_d128_kvpack", "index_score_kvpack", "attn", "BF16 reconstruction before original scalar/WMMA index score",
+  "dim128, kv_format2, selfcontained one-entry pages", "bf16 q/w, u8 cache, original other operands",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexScore), NOTUNE, nullptr, nullptr,
+  r4d_rad_ds41_index_score_kvpack, nullptr, nullptr, nullptr, r4d_shape_index_score },
+{ "ds41_attn_sparse_sink_d512_kvpack", "attn_sparse_sink_kvpack", "attn", "BF16 reconstruction before original scalar/WMMA attention",
+  "dim512, kv_format1, ordinary BF16 window", "u8 compressed cache, original other operands",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSink), NOTUNE, nullptr, nullptr,
+  r4d_rad_ds41_attn_sparse_sink_kvpack, nullptr, nullptr, nullptr, r4d_shape_attn_sparse_sink },
 
 { "ds41_attn_sparse_sink_d512_bf16", "attn_sparse_sink", "attn",
   "latent attention (key = value) over the window keys and the selected compressed entries, "

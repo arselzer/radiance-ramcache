@@ -48,6 +48,17 @@ static const RadConstraint cDs41QuantFp4[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("block", 1), C_IN("format", "fp4_e2m1"),
     C_IN("scale", "ue8m0 e4m3"), C_IN("dtype", "bf16"),
 };
+static const RadParamSpec pDs41QuantKvPack[] = { P_INT("M"), P_INT("n"), P_INT("block"),
+    P_STR("format"), P_STR("scale"), P_STR("dtype"), P_INT("kv_format") };
+static const RadOperandSpec oDs41QuantKvPack[] = {
+    { "x", RAD_OPD_INOUT, 0 }, { "original_codes_scales", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pDs41EntryKvPack[] = { P_INT("M"), P_INT("n"), P_INT("block_size"),
+    P_INT("kv_format"), P_STR("dtype") };
+static const RadOperandSpec oDs41EntryKvPack[] = {
+    { "actual_bf16", RAD_OPD_IN, 0 }, { "original_codes_scales", RAD_OPD_IN, 0 },
+    { "page", RAD_OPD_IN, 0 }, { "cache", RAD_OPD_INOUT, 0 },
+};
 
 static const RadParamSpec pDs41MhcMix[] = { P_INT("M"),          P_INT("n"),   P_INT("hc"),
                                             P_INT("iterations"), P_F64("eps"), P_F64("hc_eps"),
@@ -155,6 +166,24 @@ static const RadConstraint cDs41RopeRtFp8[] = {
 static const RadConstraint cDs41RopeRtFp4[] = {
     C_DS41_ROPE, C_IN("format", "fp4_e2m1"), C_IN("scale", "ue8m0 e4m3"),
 };
+static const RadParamSpec pDs41NormRopeKvPack[] = {
+    P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("n_head"), P_INT("head_dim"),
+    P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_INT("block"),
+    P_STR("format"), P_STR("scale"), P_STR("dtype"), P_F64O("wadd"), P_F64O("mult"), P_INT("kv_format"),
+};
+static const RadOperandSpec oDs41NormRopeKvPack[] = {
+    { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
+    { "cos_sin", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 },
+    { "original_codes_scales", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pDs41RopeKvPack[] = {
+    P_INT("M"), P_INT("n_head"), P_INT("head_dim"), P_INT("rot"), P_INT("off"), P_STR("mode"),
+    P_INT("inverse"), P_INT("block"), P_STR("format"), P_STR("scale"), P_STR("dtype"), P_INT("kv_format"),
+};
+static const RadOperandSpec oDs41RopeKvPack[] = {
+    { "x", RAD_OPD_INOUT, 0 }, { "cos_sin", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 },
+    { "original_codes_scales", RAD_OPD_OUT, 0 },
+};
 #undef C_DS41_ROPE
 
 static const RadParamSpec pDs41CollapseNorm[] = { P_INT("M"),     P_INT("n"),     P_INT("hc"),
@@ -179,6 +208,15 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
 };
 
 #elif defined(R4D_DS41_SCHEMAS)
+
+SCHEMA("quant_roundtrip_kvpack", pDs41QuantKvPack, oDs41QuantKvPack,
+       "Unchanged BF16 FP4 roundtrip plus ORIGINAL code/scale capture for DS41 packed entries; no reencoding."),
+SCHEMA("rmsnorm_rope_roundtrip_kvpack", pDs41NormRopeKvPack, oDs41NormRopeKvPack,
+       "Unchanged BF16 norm/rope/FP4 roundtrip plus original code/scale capture."),
+SCHEMA("rope_rows_roundtrip_kvpack", pDs41RopeKvPack, oDs41RopeKvPack,
+       "Unchanged BF16 rope/FP4 roundtrip plus original code/scale capture."),
+SCHEMA("entry_store_kvpack", pDs41EntryKvPack, oDs41EntryKvPack,
+       "Original codes/scales finalized against actual BF16 bits into one selfcontained packed page; literal pairs preserve exceptional bits."),
 
     SCHEMA("token_map", pDs41TokenMap, oDs41TokenMap,
            "mapped[m] = table[ids[m]], -1 for an id outside [0, n_vocab): ids through an id table."),
@@ -236,6 +274,23 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
            "step reads it. out must not alias h."),
 
 #elif defined(R4D_DS41_ROWS)
+
+{ "quant_roundtrip_fp4_kvpack", "quant_roundtrip_kvpack", "quant", "original FP4 capture with BF16 output retained",
+  "DS41 n512/group16/E4M3 or n128/group32/pow2", "bf16 x, u8 original capture", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41QuantFp4), NOTUNE, nullptr, nullptr, r4d_rad_quant_roundtrip_kvpack,
+  nullptr, nullptr, nullptr, r4d_shape_quant_roundtrip_kvpack },
+{ "rmsnorm_rope_roundtrip_fp4_kvpack", "rmsnorm_rope_roundtrip_kvpack", "norm", "same BF16 norm/rope/FP4 with original capture",
+  "DS41 index key", "bf16 x/y, f32 gain/cos_sin, i32 positions, u8 capture", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41NormRopeRtFp4), NOTUNE, nullptr, nullptr, r4d_rad_rmsnorm_rope_roundtrip_kvpack,
+  nullptr, nullptr, nullptr, r4d_shape_rmsnorm_rope_roundtrip_kvpack },
+{ "rope_rows_roundtrip_fp4_kvpack", "rope_rows_roundtrip_kvpack", "attn", "same BF16 rope/FP4 with original capture",
+  "DS41 compressed latent", "bf16 x, f32 cos_sin, i32 positions, u8 capture", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41RopeRtFp4), NOTUNE, nullptr, nullptr, r4d_rad_rope_rows_roundtrip_kvpack,
+  nullptr, nullptr, nullptr, r4d_shape_rope_rows_roundtrip_kvpack },
+{ "ds41_entry_store_kvpack", "entry_store_kvpack", "attn", "closed original producer domain into packed pages",
+  "DS41 n512/128, one entry/page, ratio1/2", "bf16 actual, u8 capture/cache, i32 page", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41EntryStore), NOTUNE, nullptr, nullptr, r4d_rad_entry_store_kvpack,
+  nullptr, nullptr, nullptr, r4d_shape_entry_store_kvpack },
 
 /* ---------------------------------- DeepSeek-V4.1's elem ops (r4d_ds41_elem.hip) -------------
  * R4D_PRIO_ONLY throughout: nothing else in this plugin implements them. */

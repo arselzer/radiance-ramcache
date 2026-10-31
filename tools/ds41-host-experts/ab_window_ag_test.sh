@@ -13,6 +13,7 @@ for fn in ag_rows_parse ag_rows_server_gate ag_rows_server_check ag_rows_receipt
   declare -F "$fn" >/dev/null || { bad "missing $fn"; exit 1; }
 done
 OUT=$T/out
+HERE=$T
 mkdir -p "$OUT"
 log() { echo "LOG $*" >>"$OUT/window.log"; }
 for p in Ag1 Ag64 Ag1024 Ag00064; do
@@ -44,6 +45,10 @@ line 1024 >"$OUT/on.server.log"
 # KLD follows the same actual-cap gate; all process operations and the corpus comparison are stubbed.
 lcp_check() { return 0; }
 ar_rows_server_check() { return 0; }
+n128_server_gate() { return 0; }
+vp_server_gate() { return 0; }
+qsp_gate() { return 0; }
+ARGS=()
 kill() { return 1; }
 wait() { return 0; }
 python3() { echo compared >>"$T/compares"; return 0; }

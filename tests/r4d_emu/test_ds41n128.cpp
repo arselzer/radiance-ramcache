@@ -289,17 +289,23 @@ int main(int argc, char** argv) {
     normal = r4d_rad_rmsnorm_rope_roundtrip;
     check = r4d_rad_rmsnorm_rope_roundtrip_n128_check;
 #endif
-    int failed = 0;
-    for (int m : { 1, 7, 8, 9, 16, 32, 33, 72, 73 }) {
-        Case c(m, 0); failed += compare(c); // THR1024/512/256 without the LCP pin
-    }
+    int failed = 0, cases = 0, max_m = 0;
+    auto positive = [&](int m, int profile) {
+        Case c(m, profile);
+        failed += compare(c);
+        ++cases;
+        max_m = std::max(max_m, m);
+    };
+    for (int m : { 1, 7, 8, 9, 16, 32, 33, 72, 73 })
+        positive(m, 0); // THR1024/512/256 without the LCP pin
 #ifdef DS41_N128_DEVICE
-    for (int m : { 255, 256, 1024, 2048 }) { Case c(m, 0); failed += compare(c); }
+    for (int m : { 255, 256, 1024, 2048, 4096 }) positive(m, 0);
 #endif
     for (int profile : { 1, 2, 3, 4, 5 })
-        for (int m : { 17, 33, 73 }) { Case c(m, profile); failed += compare(c); }
+        for (int m : { 17, 33, 73 }) positive(m, profile);
     failed += refusals();
     std::printf("%s: ds41 n128 wave norm matches unchanged fused norm, all output/guard bytes; "
-                "exceptional and rounding cases, eligibility refusals\n", failed ? "FAIL" : "PASS");
+                "exceptional and rounding cases, eligibility refusals; through M%d (%d positive cases)\n",
+                failed ? "FAIL" : "PASS", max_m, cases);
     return failed ? 1 : 0;
 }

@@ -35,7 +35,7 @@ COST_RE = re.compile(r"k=([012]) n=([0-9]+) cycle_ns=([0-9]+) wait_ns=([0-9]+) a
 HEX64 = re.compile(r"[0-9a-f]{64}")
 FORBIDDEN = ("experimental draft compute OFF:", "experimental draft verify cap:",
              "DSpark acceptance gate: on", "DSpark confidence head:",
-             "DSpark load-aware drafting: on", "DSpark draft bank with up to ")
+             "DSpark load-aware drafting: on", "DSpark draft bank with up to ", "DSpark prefix policy")
 
 
 def integer(value, low=0):
@@ -234,7 +234,7 @@ def extract(manifest_path):
         parts = run["arm"].split("-")
         require("Ds" in parts and "Db2" in parts and [p for p in parts if p.startswith("Dme")] == ["Dme"+str(run["k"])],
                 name+": arm must declare bare Ds, Db2 and one intended Dme")
-        require(not any(p in ("Dsa", "Dc", "Dl", "Dg") or re.fullmatch(r"Ds[0-9]+", p) or
+        require(not any(p in ("Dsa", "Dc", "Dl", "Dg") or p.startswith("Dpp") or re.fullmatch(r"Ds[0-9]+", p) or
                         re.fullmatch(r"(?:Dc|Dl|Dg)[0-9].*", p) for p in parts), name+": conflicting arm scope")
         require(("Dpc" in parts) == (not quiet), name+": Dpc/cost logging differs")
         requests = run.get("requests")

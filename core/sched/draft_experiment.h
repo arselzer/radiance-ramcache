@@ -8,6 +8,7 @@
 #include "draft_gate.h"
 #include "draft_conf.h"
 #include "draft_prob.h"
+#include "draft_policy.h"
 
 namespace rad {
 inline constexpr char kDraftOriginEnv[] = "RADIANCE_EXPERIMENTAL_DS41_DRAFT_ORIGIN_STATS";
@@ -23,7 +24,8 @@ public:
                                    const char* load = nullptr,
                                    const char* defer = nullptr,
                                    const char* prob = nullptr,
-                                   const char* early = nullptr) noexcept {
+                                   const char* early = nullptr,
+                                   const char* prefix_policy = nullptr) noexcept {
         DraftExperiment x;
         const bool valid_cap = !verify_cap ||
             (verify_cap[0] >= '0' && verify_cap[0] <= '5' && verify_cap[1] == '\0');
@@ -49,6 +51,9 @@ public:
         x.early_ = rad_dflash_observe::early_fixed(early);
         if (x.early_ < -1 || (x.early_ >= 0 && (x.off_ || x.cap_ >= 0 || x.gate_.on ||
                                                x.conf_.on || x.load_from_ > 0))) x.valid_ = false;
+        if (!DraftPrefixPolicy::parse(prefix_policy, &x.prefix_policy_) ||
+            (x.prefix_policy_.on && (x.off_ || x.cap_ >= 0 || x.gate_.on || x.conf_.on ||
+                                    x.load_from_ > 0 || x.early_ >= 0))) x.valid_ = false;
         x.observe_ = one(stats) || x.off_ || x.cap_ >= 0;
         return x;
     }
@@ -63,7 +68,9 @@ public:
     bool ctx_defer() const noexcept { return ctx_defer_; }      // the deferred context pass; off by default
     bool prob_capture() const noexcept { return prob_; }      // read-only candidate-set signal
     int early_verify() const noexcept { return early_; }      // fixed matched measurement, absent/off=-1
-    bool scope_required() const noexcept { return off_ || cap_ >= 0 || early_ >= 0; }
+    const DraftPrefixPolicy& prefix_policy() const noexcept { return prefix_policy_; }
+    bool early_boundary() const noexcept { return early_ >= 0 || prefix_policy_.on; }
+    bool scope_required() const noexcept { return off_ || cap_ >= 0 || early_boundary(); }
     int runtime_depth(int configured) const noexcept {
         if (off_) return 0;
         if (early_ >= 0 && configured > early_) return early_;
@@ -81,6 +88,7 @@ private:
     bool ctx_defer_ = false;
     bool prob_ = false;
     int early_ = -1;
+    DraftPrefixPolicy prefix_policy_{};
     static bool one(const char* x) noexcept { return x && std::strcmp(x,"1") == 0; }
     static bool flag(const char* x) noexcept {
         return !x || std::strcmp(x,"0") == 0 || std::strcmp(x,"1") == 0;

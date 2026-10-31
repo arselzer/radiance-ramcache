@@ -1,4 +1,4 @@
-/* Step 2A: read-only proposal observations, NOT a cost/depth policy. The optional architecture
+/* Read-only observations, fixed matched controls and a separately opt-in prefix policy. The architecture
  * op runs after unchanged selection. Copy behind it, retire after step_end_, and pair with the
  * same StepSlot's ID/position before the proposal's verification can commit. */
 #include "engine_priv.h"
@@ -9,8 +9,9 @@
 
 namespace rad {
 int Engine::dprob_init() {
-    if (!draft_experiment_.prob_capture() && draft_experiment_.early_verify() < 0) return RAD_OK;
-    const char* instrument = draft_experiment_.early_verify() >= 0
+    if (!draft_experiment_.prob_capture() && !draft_experiment_.early_boundary()) return RAD_OK;
+    const bool policy = draft_experiment_.prefix_policy().on;
+    const char* instrument = policy ? rad_dflash_observe::kPolicyEnv : draft_experiment_.early_verify() >= 0
                            ? rad_dflash_observe::kEarlyEnv : rad_dflash_observe::kEnv;
     if (!block_drafting() || tree_ || ranks_.empty() || !drafter_.name ||
         std::strcmp(drafter_.name, "dspark")) {
@@ -43,16 +44,25 @@ int Engine::dprob_init() {
     dprob_host_ = static_cast<float*>(rad_dev_alloc(
         dprob_rows_ * rad_dflash_observe::kWidth * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
     if (!dprob_host_) return RAD_E_NOMEM;
-    if (draft_experiment_.prob_capture())
+    if (draft_experiment_.prob_capture() && !policy)
         RAD_INFO("DSpark read-only proposal capture: on (%s); depths 1/2, candidate_p is softmax at "
              "temperature 1 over the existing %d Markov-conditioned candidates, NOT full-vocabulary "
              "or acceptance probability; score and margin logged; no proposal, verification or "
              "depth decision reads it", rad_dflash_observe::kEnv, dprob_candidates_);
-    if (draft_experiment_.early_verify() >= 0) {
+    if (policy && draft_experiment_.prob_capture())
+        RAD_INFO("DSpark read-only proposal capture: on (%s); policy action telemetry is separate; "
+                 "candidate_p is candidate-set share, never target acceptance probability",
+                 rad_dflash_observe::kEnv);
+    if (draft_experiment_.early_boundary()) {
         dmeasure_ = {};
         dmeasure_query_rows_ = (int)(short_from_ == 1 && drafter_short_ > 0 ? drafter_short_ : drafter_.block);
         if (dmeasure_query_rows_ < 2 || dmeasure_query_rows_ > 5) return RAD_E_UNSUPPORTED;
-        RAD_INFO("DSpark matched early verify: on k=%d (%s); query_rows=%d unchanged at every action, "
+        if (policy)
+            RAD_INFO("DSpark prefix policy: on config=%s (%s); query_rows=2 unchanged at every action, "
+                     "observer=1, wait=step_end before issue_ahead; candidate_p=candidate-set-share, "
+                     "invalid_numeric=full-prefix2; action/cycle logging=on, fixed_measurement=off",
+                     draft_experiment_.prefix_policy().spec, rad_dflash_observe::kPolicyEnv);
+        else RAD_INFO("DSpark matched early verify: on k=%d (%s); query_rows=%d unchanged at every action, "
                  "observer=1, wait=step_end before issue_ahead, logging=%s; fixed measurement, no probability policy",
                  draft_experiment_.early_verify(), rad_dflash_observe::kEarlyEnv, dmeasure_query_rows_,
                  draft_experiment_.prob_capture() ? "capture" : "quiet");
@@ -81,7 +91,7 @@ void Engine::dprob_finish(int row, const int32_t* tokens, int n, bool published)
     const StepSlot& s = slots_host_[b.card];
     sched_.draft_prob_publish(b.seq, s.ctx, s.tok[0], tokens, n,
                               dprob_host_ + (int64_t)row * rad_dflash_observe::kWidth,
-                              published, dprob_candidates_, draft_experiment_.early_verify() >= 0
+                              published, dprob_candidates_, draft_experiment_.early_boundary()
                                   ? dmeasure_.current.epoch : 0);
 }
 
@@ -96,10 +106,11 @@ int Engine::dmeasure_ready(const RadBatch* batch) {
     const uint64_t ready = rad_mono_ns();
     const Scheduler::BlockRow& row = block_row_[0];
     const StepSlot& slot = slots_host_[row.card];
+    const bool policy = draft_experiment_.prefix_policy().on;
+    const char* label = policy ? "DSpark prefix policy" : "DSpark matched early verify";
     bool previous_matches = false;
     if (!sched_.measure_block_binding(row, slot.ctx, slot.acc, dmeasure_.pending, &previous_matches)) {
-        RAD_ERR("DSpark matched early verify: sequence/slot/ctx binding failed for sequence %llu",
-                (unsigned long long)row.seq);
+        RAD_ERR("%s: sequence/slot/ctx binding failed for sequence %llu", label, (unsigned long long)row.seq);
         return RAD_E_STATE;
     }
     uint32_t invalid_depths = 0;
@@ -107,7 +118,7 @@ int Engine::dmeasure_ready(const RadBatch* batch) {
         const float* obs = dprob_host_ + j * rad_dflash_observe::kFields;
         const DraftMeasureSignal signal = draft_measure_signal(obs, slot.tok[j + 1], slot.tok[j]);
         if (signal == DraftMeasureSignal::PathMismatch) {
-            RAD_ERR("DSpark matched early verify: echoed observation/path IDs differ at depth %d", j + 1);
+            RAD_ERR("%s: echoed observation/path IDs differ at depth %d", label, j + 1);
             return RAD_E_STATE;
         }
         if (signal == DraftMeasureSignal::InvalidNumeric) invalid_depths |= 1u << j;
@@ -117,29 +128,46 @@ int Engine::dmeasure_ready(const RadBatch* batch) {
     frame.epoch = sched_.draft_prob_reserve_epoch();
     frame.ctx = slot.ctx; frame.anchor = slot.tok[0];
     frame.k = draft_experiment_.early_verify(); frame.query_rows = dmeasure_query_rows_;
+    bool fallback = false;
+    const float p1 = dprob_host_[rad_dflash_observe::kCandidateP];
+    const float p2 = dprob_host_[rad_dflash_observe::kFields + rad_dflash_observe::kCandidateP];
+    if (policy) frame.k = draft_experiment_.prefix_policy().select(p1, p2, invalid_depths, &fallback);
     frame.invalid_depths = invalid_depths;
     frame.ready_ns = ready; frame.wait_ns = ready - begin;
     std::copy(slot.tok + 1, slot.tok + 1 + block_steps_, frame.ids);
     const StepPlan& plan = sched_.plan();
     frame.pure_decode = plan.phase == RAD_PHASE_DECODE && plan.e.size() == 1 &&
                         !plan.e[0].is_prefill && !plan.e[0].ngram && plan.e[0].produces_token;
-    dmeasure_.ready(frame, previous_matches);
+    dmeasure_.ready(frame, previous_matches, policy);
+    if (policy) {
+        /* JSON stays valid for nonfinite observations; invalid_depths identifies the fallback.
+         * This action belongs to the complete Db2 query, not to a subsequently reused slot. */
+        const std::string p1_json = std::isfinite(p1) ? fmt("%.17g", (double)p1) : "null";
+        const std::string p2_json = std::isfinite(p2) ? fmt("%.17g", (double)p2) : "null";
+        RAD_INFO("DSpark prefix policy action: {\"seq\":%llu,\"epoch\":%llu,\"step\":%d,\"card\":%d,"
+                 "\"ctx\":%d,\"anchor\":%d,\"query_rows\":%d,\"ids\":[%d,%d],\"k\":%d,"
+                 "\"candidate_p\":[%s,%s],\"invalid_depths\":%u,\"fallback\":%s,\"wait_ns\":%llu,"
+                 "\"pure_decode\":%s}",
+                 (unsigned long long)frame.seq, (unsigned long long)frame.epoch, frame.step, frame.card,
+                 frame.ctx, frame.anchor, frame.query_rows, frame.ids[0], frame.ids[1], frame.k,
+                 p1_json.c_str(), p2_json.c_str(), (unsigned)invalid_depths, fallback ? "true" : "false",
+                 (unsigned long long)frame.wait_ns, frame.pure_decode ? "true" : "false");
+    }
     return RAD_OK;
 }
 
 int Engine::dmeasure_check(int row, const int32_t* tokens, int n) const {
-    if (draft_experiment_.early_verify() < 0) return RAD_OK;
+    if (!draft_experiment_.early_boundary()) return RAD_OK;
     const DraftMeasureFrame& frame = dmeasure_.current;
     const Scheduler::BlockRow& b = block_row_[(size_t)row];
     const StepSlot& s = slots_host_[b.card];
-    if (!frame.epoch || frame.seq != b.seq || frame.card != b.card || frame.ctx != s.ctx ||
-        frame.anchor != s.tok[0] || n != frame.query_rows ||
-        std::memcmp(frame.ids, tokens, (size_t)n * sizeof(int32_t))) return RAD_E_STATE;
+    if (!draft_measure_frame_matches(frame, b.seq, b.card, s.ctx, s.tok[0], tokens, n)) return RAD_E_STATE;
     return RAD_OK;
 }
 
 void Engine::dmeasure_finish(const StepOut& so) {
-    if (draft_experiment_.early_verify() < 0 || !dmeasure_.current.epoch) return;
+    if (!draft_experiment_.early_boundary() || !dmeasure_.current.epoch) return;
+    const bool policy = draft_experiment_.prefix_policy().on;
     const DraftMeasureFrame current = dmeasure_.current, previous = dmeasure_.closing;
     const bool closing = dmeasure_.close;
     const uint64_t cycle_ns = dmeasure_.closing_ns;
@@ -148,8 +176,18 @@ void Engine::dmeasure_finish(const StepOut& so) {
     const bool committed = sched_.committed_seq(current.seq, &output, &live);
     const bool published = sched_.measure_published(current, &output);
     const int accepted = so.accepted.empty() ? -1 : so.accepted[0];
-    const bool counted = dmeasure_.committed(committed && live, published, output, accepted);
-    if (draft_experiment_.prob_capture() && closing)
+    const bool counted = dmeasure_.committed(committed && live, published, output, accepted, policy);
+    if (policy)
+        RAD_INFO("DSpark prefix policy cycle: {\"seq\":%llu,\"epoch\":%llu,\"verify_step\":%d,"
+                 "\"next_epoch\":%llu,\"k\":%d,\"next_k\":%d,\"cycle_ns\":%llu,\"wait_ns\":%llu,"
+                 "\"cost_valid\":%s,\"live\":%s,\"published\":%s,\"accepted\":%d,\"output\":%llu,"
+                 "\"proposal_invalid_depths\":%u,\"next_invalid_depths\":%u}",
+                 (unsigned long long)current.seq, (unsigned long long)(closing ? previous.epoch : 0), current.step,
+                 (unsigned long long)current.epoch, closing ? previous.k : -1, current.k,
+                 (unsigned long long)(closing ? cycle_ns : 0), (unsigned long long)current.wait_ns,
+                 counted ? "true" : "false", committed && live ? "true" : "false", published ? "true" : "false",
+                 accepted, (unsigned long long)output, (unsigned)previous.invalid_depths, (unsigned)current.invalid_depths);
+    else if (draft_experiment_.prob_capture() && closing)
         RAD_INFO("DSpark matched early cycle: {\"seq\":%llu,\"epoch\":%llu,\"verify_step\":%d,"
                  "\"next_epoch\":%llu,\"k\":%d,\"cycle_ns\":%llu,\"wait_ns\":%llu,"
                  "\"steady\":%s,\"live\":%s,\"published\":%s,\"accepted\":%d,"
@@ -162,8 +200,20 @@ void Engine::dmeasure_finish(const StepOut& so) {
 }
 
 void Engine::dmeasure_report() const {
-    if (draft_experiment_.early_verify() < 0) return;
+    if (!draft_experiment_.early_boundary()) return;
     const DraftMeasureStats& s = dmeasure_.stats;
+    if (draft_experiment_.prefix_policy().on) {
+        RAD_INFO("DSpark prefix policy totals: queries=%llu query_rows=%llu observers=%llu waits=%llu "
+                 "wait_ns=%llu transition=%llu no_query=%llu end_cancel=%llu unpublished=%llu "
+                 "invalid_queries=%llu unclosed_epoch=%llu costs=[%llu,%llu,%llu]; "
+                 "on-policy action/cycle telemetry, never fixed TRAIN costs",
+                 (unsigned long long)s.queries, (unsigned long long)s.query_rows, (unsigned long long)s.queries,
+                 (unsigned long long)s.waits, (unsigned long long)s.wait_all_ns, (unsigned long long)s.transition,
+                 (unsigned long long)s.no_query, (unsigned long long)s.end_cancel, (unsigned long long)s.unpublished,
+                 (unsigned long long)s.invalid_queries, (unsigned long long)dmeasure_.pending.epoch,
+                 (unsigned long long)s.n[0], (unsigned long long)s.n[1], (unsigned long long)s.n[2]);
+        return;
+    }
     RAD_INFO("DSpark matched early totals: queries=%llu query_rows=%llu observers=%llu waits=%llu "
              "wait_ns=%llu transition=%llu no_query=%llu end_cancel=%llu unpublished=%llu "
              "invalid_queries=%llu invalid_cycles=%llu unclosed_epoch=%llu",

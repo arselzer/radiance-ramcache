@@ -637,8 +637,8 @@ private:
     int64_t   dconf_rows_ = 0;
     uint16_t* dconf_host_ = nullptr;
     int       dconf_n_ = 0, dconf_block_ = 0;
-    /* Optional read-only post-selection capture; persistent observation plane on rank 0 and
-     * its pinned readback, copied behind the same query pass as the StepSlots. No ABI fields. */
+    /* Optional post-selection observation plane on rank0, copied behind the same query pass as
+     * StepSlots. Fixed controls and the separate prefix policy share its early boundary. */
     int dprob_init();
     void dprob_fini();
     int dprob_issue(int n);

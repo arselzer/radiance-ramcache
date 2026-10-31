@@ -915,6 +915,11 @@ EOF2
     log "arm $name: Dme${ARM_DME}, but startup reports another fixed prefix; not measured"
     stop_server; return 1
   fi
+  if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --log "$OUT/$name.server.log" >>"$OUT/window.log" 2>&1; then
+    log "arm $name: DSpark policy startup/config guard failed; not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_DPP:-}" ]] && grep -F 'DSpark prefix policy: on config=' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |DSpark read-only proposal capture: on|DSpark matched early verify: on|placement: 'dspark.markov_w|DSpark draft bank with up to " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Df (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): the plugin names, on each rank, the drafter's dense
   # weights it reads from E4M3 codes. A Df arm without such a line with N above 0, or another arm
@@ -955,6 +960,11 @@ EOF2
     log "arm $name: teacher-forced along $lpref: exit $?"
   fi
   stop_server
+  if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --log "$OUT/$name.server.log" --complete >>"$OUT/window.log" 2>&1; then
+    log "arm $name: DSpark policy action/cycle/config guard failed; not measured"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
   local n128_why
   if ! n128_why=$(n128_server_gate "$OUT/$name.server.log" "${ARM_N128:-}" 4); then
     log "arm $name: $n128_why; not measured (results kept as $name.unmeasured.json)"
@@ -1838,6 +1848,10 @@ for a in $ARMS; do
 # max-num-seqs1 and no Dc/Dl/Dg. Every action runs the SAME configured query (Db2 stays two rows),
 # observer and step_end wait before issue_ahead; only the verified/published prefix changes. Quiet
 # by default; Dpc adds proposal/cycle JSON. All arms explicitly set off unless a Dme part is present.
+# Dpp is a separate default-off prefix policy, supplied ONLY by DSPARK_POLICY_CONFIG=v1:T1:T2
+# after TRAIN fitting. It requires bare Ds, Db2/from1, one sequence and no Dme/Dc/Dl/Dg. Every
+# query/observer/early wait stays identical to Dme0/1/2; invalid numeric signals use prefix2.
+# Its mandatory action/cycle logs are on-policy evidence and are refused by the quiet cost extractor.
 # H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
@@ -1966,7 +1980,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" ds="" nseq=""
+  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
@@ -2084,6 +2098,11 @@ for a in $ARMS; do
       Dme[0-2])                            # SAME query/observer/early wait, fixed verified prefix0/1/2 (measurement only)
                if [[ -n "$dme" ]]; then log "arm $a: duplicate Dme prefix; the arm is skipped"; skip=1; fi
                dme=${p#Dme} ;;
+      Dpp)     if [[ -n "$dpp" ]]; then log "arm $a: duplicate Dpp; the arm is skipped"; skip=1; fi
+               dpp=${DSPARK_POLICY_CONFIG:-}
+               if [[ -z "$dpp" ]] || ! python3 -I "$HERE/dspark_policy_gate.py" --config "$dpp" --arm Ds 2 1 0 >>"$OUT/window.log" 2>&1; then
+                 log "arm $a: Dpp requires explicit DSPARK_POLICY_CONFIG=v1:T1:T2; the arm is skipped"; skip=1
+               fi ;;
       Dm)      dm=1 ;;                     # the drafter's Markov codebooks pinned with the embedding (DSPARK_CODEBOOK_RAM; needs Er)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
@@ -2404,12 +2423,19 @@ for a in $ARMS; do
   if [[ -n "$dme" && ( "$ds" != Ds || -n "$dc$dl$dg" || "${nseq:-${MAX_SEQS:-1}}" != 1 ) ]]; then
     log "arm $a: Dme0/1/2 needs bare Ds, one sequence and no Dc/Dl/Dg (Db2/Dkt/Dv/Df retained); the arm is skipped"; skip=1
   fi
+  if [[ -n "$dpp" ]]; then
+    policy_conflicts=0; [[ -n "$dme$dc$dl$dg" ]] && policy_conflicts=1
+    if ! python3 -I "$HERE/dspark_policy_gate.py" --config "$dpp" --arm "${ds:-none}" "${db:-none}" "${nseq:-${MAX_SEQS:-1}}" "$policy_conflicts" >>"$OUT/window.log" 2>&1; then
+      log "arm $a: Dpp configuration/scope guard failed; the arm is skipped"; skip=1
+    fi
+  fi
   env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=${dc:-0} "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF_HEAD=${dc:+$DRAFT_CONF_HEAD}"
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=${dl:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=${dx:-0}
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=${dm:-0}
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_PROB_CAPTURE=${dpc:-0}
-        RADIANCE_EXPERIMENTAL_DS41_DSPARK_EARLY_VERIFY=${dme:-off})
-  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm ARM_DPC=$dpc ARM_DME=$dme
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_EARLY_VERIFY=${dme:-off}
+        "RADIANCE_EXPERIMENTAL_DS41_DSPARK_PREFIX_POLICY=${dpp:-off}")
+  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm ARM_DPC=$dpc ARM_DME=$dme ARM_DPP=$dpp
   # A drafting Ds part under --max-num-seqs above 1 (an NK part, or MAX_SEQS for the window): the
   # scheduler drafts for a sequence alone and says so at startup (arm() checks the line both ways).
   ARM_SOLO=

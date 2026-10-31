@@ -99,6 +99,6 @@ DraftProbStats Scheduler::draft_prob_stats() const {
 
 uint64_t Scheduler::draft_prob_reserve_epoch() {
     std::lock_guard<std::mutex> lk(mu_);
-    return dprob_on_ || draft_experiment_.early_verify() >= 0 ? ++dprob_epoch_ : 0;
+    return dprob_on_ || draft_experiment_.early_boundary() ? ++dprob_epoch_ : 0;
 }
 }

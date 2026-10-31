@@ -60,7 +60,8 @@ Engine::Engine(Config cfg)
                                                   std::getenv(kDraftLoadEnv),
                                                   std::getenv(kDraftCtxDeferEnv),
                                                   std::getenv(rad_dflash_observe::kEnv),
-                                                  std::getenv(rad_dflash_observe::kEarlyEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
+                                                  std::getenv(rad_dflash_observe::kEarlyEnv),
+                                                  std::getenv(rad_dflash_observe::kPolicyEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
@@ -987,7 +988,8 @@ int Engine::issue_ahead(const RadBatch** out, const StepOut& so) {
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
     for (int i = 0; i < block_rows_; ++i)
-        sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
+        sched_.expect_draft(block_row_[(size_t)i].seq,
+                           draft_experiment_.prefix_policy().on ? dmeasure_.current.k : block_steps_);
     /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: this step's ids first, when they can decide
      * whether a step follows (Scheduler::outcome_decides_next). Issued ahead regardless, the step
      * behind a reply's last token runs a pass for a finished request; and where issuing a pass
@@ -1358,9 +1360,9 @@ int Engine::step_loop() {
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
-        /* Default-off fixed measurement: the identical query/observer/slot readback completes
-         * before the next verify is planned, including fixed0 (which still queries). */
-        if (draft_experiment_.early_verify() >= 0) {
+        /* Default-off fixed measurement or prefix policy: the identical query/observer/slot
+         * readback completes before the next verify is planned, including k0 (still queries). */
+        if (draft_experiment_.early_boundary()) {
             st = dmeasure_ready(b);
             if (st < 0) return fail_loop(st);
         }

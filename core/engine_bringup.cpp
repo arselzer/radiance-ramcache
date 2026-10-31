@@ -4205,9 +4205,10 @@ int Engine::start() {
                 "%s absent, 0, 1 or T[,R] (T in (0, 1), R 2..4096), not with %s; %s absent, 0, 1 or N (2..64); "
                 "%s absent, 0 or 1; none of the three with compute OFF; %s absent, 0 or 1 and not "
                 "with compute OFF; %s absent/off or0|1|2, not with OFF, a verify cap, gate, confidence "
-                "or load controller", kDraftGateEnv, kDraftConfEnv,
+                "or load controller; %s absent/off/0 or v1:T1:T2 (finite thresholds in [0,1]), "
+                "not with fixed early measurement, OFF, cap, gate, confidence or load", kDraftGateEnv, kDraftConfEnv,
                 kDraftGateEnv, kDraftLoadEnv, kDraftCtxDeferEnv, rad_dflash_observe::kEnv,
-                rad_dflash_observe::kEarlyEnv);
+                rad_dflash_observe::kEarlyEnv, rad_dflash_observe::kPolicyEnv);
         return RAD_E_INVAL;
     }
     std::vector<int> devs;
@@ -4384,6 +4385,7 @@ int Engine::start() {
          * verified ones. */
         const bool short_ok = cfg_.draft_short_from == 0 || (cfg_.draft_short_from == 1 && drafter_short_ > 0);
         const bool early = draft_experiment_.early_verify() >= 0;
+        const bool policy = draft_experiment_.prefix_policy().on;
         /* Measurement holds the query shape fixed, independently of its verified prefix. In
          * particular Db2/from1 remains a two-row query for ALL k, including0; no cap-sized query.
          * Restrict this first instrument to one sequence and an unconditional full/short shape. */
@@ -4393,6 +4395,13 @@ int Engine::start() {
                     "draft-short-from0 (or auto), or1 with an existing2..4-row short block; "
                     "Db2 keeps its query, hot set and bank unchanged for fixed0/1/2",
                     rad_dflash_observe::kEarlyEnv);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (policy && !draft_prefix_policy_profile(cfg_.max_seqs, tree_, short_from_,
+                                                   drafter_.block, drafter_.depth, drafter_short_)) {
+            RAD_ERR("%s requires max-num-seqs1, the native chain5 drafter and Db2 with "
+                    "draft-short-from1; query, observer and early wait remain identical for all actions",
+                    rad_dflash_observe::kPolicyEnv);
             return RAD_E_UNSUPPORTED;
         }
         for (const auto& r : ranks_) {
@@ -4406,7 +4415,7 @@ int Engine::start() {
                 return RAD_E_UNSUPPORTED;
             }
         }
-        if (early) {
+        if (early || policy) {
             /* dprob_init logs the observer and actual fixed query shape after allocation. */
         } else if (draft_experiment_.compute_off())
             RAD_INFO("experimental draft compute OFF: configured depth5, Program, banks and pools "

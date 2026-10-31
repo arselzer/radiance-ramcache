@@ -117,6 +117,8 @@ class CostExtractionTest(unittest.TestCase):
                good.replace("invalid_queries=0", "invalid_queries=5"), good.replace("transition=1", "transition=4"),
                good.replace("mean_ms=2.000000", "mean_ms=2.100000"), good.replace("emitted=2", "emitted=3"),
                good+"\nexperimental draft verify cap: k=1", good+"\nDSpark matched early unknown: marker",
+               good+"\nDSpark prefix policy: on config=v1:0.25:0.75",
+               good+"\nDSpark prefix policy action: {}", good+"\nDSpark prefix policy cycle: {}",
                good+"\ndrafter 'dspark': sequence 1 proposes 7 8", good+"\nDSpark proposal capture: {}",
                good.replace("invalid_queries=0 invalid_cycles=0 ", "")]
         for text in bad:
@@ -129,6 +131,7 @@ class CostExtractionTest(unittest.TestCase):
             base = Path(tmp); good = fixture(base)
             for field, value in (("libraries", {}), ("config_sha256", "f"*64), ("logging", "capture"),
                                  ("log_level", "debug"), ("profile_id", "foreign"), ("arm", "all-Ds0-Db2-Dme0"),
+                                 ("arm", "all-Ds-Db2-Dme0-Dpp"),
                                  ("request_mapping_assertion", ""), ("provenance_assertion", "")):
                 bad = copy.deepcopy(good); bad["runs"][0][field] = value
                 with self.subTest(field=field), self.assertRaises(mod.Invalid):

@@ -1921,7 +1921,8 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
     d.cand = gi(meta, "dspark.markov_top_k", 16);
     const char* capture = std::getenv(rad_dflash_observe::kEnv);
     d.prob_capture = (capture && !std::strcmp(capture, "1")) ||
-                     rad_dflash_observe::early_fixed(std::getenv(rad_dflash_observe::kEarlyEnv)) >= 0;
+                     rad_dflash_observe::early_fixed(std::getenv(rad_dflash_observe::kEarlyEnv)) >= 0 ||
+                     rad_dflash_observe::policy_requested(std::getenv(rad_dflash_observe::kPolicyEnv));
     d.taps = gl(meta, "dspark.target_layers");
     std::sort(d.taps.begin(), d.taps.end());
     bool ok = !d.taps.empty() && d.noise >= 0 && d.noise < c.n_vocab && d.rank > 0 && d.rank % 32 == 0 &&

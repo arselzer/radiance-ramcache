@@ -28,6 +28,7 @@ constexpr int kWorld = 4;
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER",
                               rad_dflash_observe::kEnv,
                               rad_dflash_observe::kEarlyEnv,
+                              rad_dflash_observe::kPolicyEnv,
                               "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF",
                               "RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK",
                               "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8",
@@ -401,6 +402,28 @@ TEST(ds41_dspark_early_fixed_controls_observe_the_same_db2_query_even_at_zero) {
     REQUIRE_EQ(d->rc, (int)RAD_OK);
     CHECK(find_b(d->b, rad_dflash_observe::kBuffer) == nullptr);
     CHECK_EQ(d->m->dsp.observe, (rad_op)0); CHECK_EQ(d->m->dsp.observe_lo, (rad_op)0);
+}
+
+TEST(ds41_dspark_prefix_policy_uses_the_fixed_db2_observer_graph) {
+    Env env({ { rad_dflash_observe::kEnv, "0" },
+              { rad_dflash_observe::kPolicyEnv, "v1:0.25:0.75" },
+              { "RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK", "2" } });
+    auto d = declare(0); REQUIRE_EQ(d->rc, (int)RAD_OK);
+    const auto& ds = d->m->dsp;
+    REQUIRE(find_b(d->b, rad_dflash_observe::kBuffer));
+    auto q = query_pass(d->b, 1, 2, 2);
+    auto runs = run_passes(d->b, deepseek41::step, { q.get() }, 0, kWorld);
+    REQUIRE(steps_ok(runs));
+    const int sel = first_issue(*runs[0], ds.select_lo), cap = first_issue(*runs[0], ds.observe_lo);
+    REQUIRE(sel >= 0); REQUIRE(cap > sel);
+    const auto& before = runs[0]->issues[(size_t)sel].opd;
+    const auto& after = runs[0]->issues[(size_t)cap].opd;
+    REQUIRE_EQ(before.size(), (size_t)7); REQUIRE_EQ(after.size(), (size_t)8);
+    for (size_t j = 0; j < before.size(); ++j) {
+        CHECK_EQ(before[j].handle, after[j].handle); CHECK_EQ(before[j].rows, after[j].rows);
+        CHECK_EQ(before[j].offset, after[j].offset);
+    }
+    CHECK_EQ(after[7].handle, ds.observations); CHECK_EQ(after[7].rows, (int64_t)1);
 }
 
 RAD_TEST_MAIN()

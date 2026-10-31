@@ -27,6 +27,8 @@
 # Fn128 selects the default-off n128 fused index-key norm. It needs DEVICE_CHECKS=n128,
 # N128_CHECK_BIN (ds41_n128_device_check) and N128_CHECK_LIB, with the card oracle through M4096
 # passing on the arm's library SHA. Every normal rank must actually dispatch the fast kernel.
+# Qsp selects the default-off covering SwiGLU span beside P1; it needs the full/span wave oracle
+# and every rank must report actual reduced rows at exit. Every other arm explicitly disables it.
 #
 # Prefix caching (every other arm runs with --no-prefix-cache): Pc the prefix cache on, with
 # RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 (startup's checks after the load stop reserving the

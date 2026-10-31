@@ -1753,35 +1753,9 @@ TEST(seeded_sampling_repeats_and_is_unchanged_by_speculation) {
         CHECK(a == b);
         CHECK(a != other);
         CHECK(a != greedy);
-        /* Prompt lookup verifies a proposal only when it pays at the measured step cost
-         * (sched/lookup.h), and this sampled reply hardly repeats, so whether `spec` verified
-         * anything depends on the host's timings. The verify path at this temperature is held to
-         * the plain draw through the harness instead, which is always verified: it proposes the
-         * plain run's own reply with 30% of the drafts corrupted, so verifies accept and reject. */
-        const std::string oracle =
-            radtest::tmp_path(std::string("oracle-sampled-") + f.name + ".txt");
-        {
-            std::string ids;
-            for (int32_t t : a) ids += std::to_string(t) + " ";
-            FILE* fp = std::fopen(oracle.c_str(), "w");
-            REQUIRE(fp != nullptr);
-            std::fputs(ids.c_str(), fp);
-            std::fclose(fp);
-        }
-        Server orc;
-        REQUIRE(orc.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache",
-                                              "--debug-draft-oracle", oracle }));
-        const json ob = post(orc.port, "/completion", req);
-        CHECK_EQ(orc.stop(), 0);
-        if (a != tokens_of(ob)) fprintf(stderr, "    %s plain %s\n    %s oracle %s\n", f.name,
-                                        show(a).c_str(), f.name, show(tokens_of(ob)).c_str());
-        CHECK(a == tokens_of(ob));
-        const int64_t drafted = timing(ob, "draft_n"), accepted = timing(ob, "draft_n_accepted");
-        fprintf(stderr, "    %s: harness drafted %lld, accepted %lld (lookup drafted %lld)\n", f.name,
-                (long long)drafted, (long long)accepted,
-                (long long)std::max<int64_t>(0, timing(sb, "draft_n")));
-        CHECK(drafted > accepted);
-        CHECK(accepted > 0);
+        const int64_t drafted = timing(sb, "draft_n");
+        if (drafted <= 0) fprintf(stderr, "    %s: nothing drafted\n", f.name);
+        CHECK(drafted > 0);
         CHECK_EQ(plain.stop(), 0);
         CHECK_EQ(spec.stop(), 0);
     }

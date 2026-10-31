@@ -40,6 +40,7 @@
 #include "format/dspark_rad_banks.h"
 #include "place/vram_packed.h"
 #include "place/draft_vram.h"
+#include "place/draft_bank_lend.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
 
@@ -191,6 +192,16 @@ private:
     void draft_vram_credit(Rank& r, int layer, const int32_t* h, int64_t n);
     void draft_vram_drain(Rank& r, int before_step);
     void draft_vram_close();
+    draft_bank::Config draft_bank_config_{};
+    struct DraftBankLoan;
+    std::unique_ptr<DraftBankLoan> draft_bank_loan_;
+    int draft_bank_lend_open();
+    int draft_bank_lend_drain(bool startup, const char* action, uint64_t epoch);
+    int draft_bank_lend_transition(const draft_bank::Work&, draft_bank::Action, bool startup = false);
+    int draft_bank_lend_step(int step);
+    int draft_bank_lend_idle();
+    int draft_bank_lend_query_issued(int step, int64_t rows);
+    int draft_bank_lend_close();
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
@@ -525,6 +536,9 @@ private:
     void eors_report();
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
+    /* UNUSED physical-KV prerequisite. The callback changes backing under scheduler ownership
+     * after all issuers/readers drain, before admission. No runtime flag/caller enables it yet. */
+    int kv_quiescent_plan(const std::function<int()>& change, const RadBatch** out);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;
@@ -637,6 +651,22 @@ private:
     int64_t   dconf_rows_ = 0;
     uint16_t* dconf_host_ = nullptr;
     int       dconf_n_ = 0, dconf_block_ = 0;
+    /* Optional post-selection observation plane on rank0, copied behind the same query pass as
+     * StepSlots. Fixed controls and the separate prefix policy share its early boundary. */
+    int dprob_init();
+    void dprob_fini();
+    int dprob_issue(int n);
+    void dprob_finish(int row, const int32_t* tokens, int n, bool published);
+    rad_buf dprob_buf_ = 0;
+    float* dprob_host_ = nullptr;
+    int64_t dprob_rows_ = 0;
+    int dprob_candidates_ = 0;
+    int dmeasure_ready(const RadBatch* batch);
+    int dmeasure_check(int row, const int32_t* tokens, int n) const;
+    void dmeasure_finish(const StepOut& so);
+    void dmeasure_report() const;
+    DraftMeasure dmeasure_{};
+    int dmeasure_query_rows_ = 0;
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */

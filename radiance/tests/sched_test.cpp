@@ -6,6 +6,7 @@
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
 #include "place/ep_route_counts.h"
+#include "../tools/ds41-host-experts/ds41_p1.h"
 #include "sched/scheduler.h"
 #include "sched/draft_conf_head.h"
 #include "sched/advance_impl.h"
@@ -300,6 +301,50 @@ TEST(the_device_fakes_are_the_ones_linked) {
     CHECK(p != nullptr);
     CHECK(g_fake_device);
     rad_dev_free(p, RAD_MEM_DEVICE);
+}
+
+TEST(quiescent_planning_runs_before_prefix_adoption_or_page_allocation_and_refuses_without_mutation) {
+    Fixture f;
+    f.build(64, 8, 64, 4096, false, false);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.pc.seed(32);
+    const auto seeded = f.pc.seeded;
+    const auto refcounts = f.kv.refcnt;
+    const auto free = f.kv.freelist;
+    const uint64_t id = f.submit(80, 8);
+    REQUIRE(id != 0);
+    const RadBatch* batch = reinterpret_cast<const RadBatch*>(1);
+    int calls = 0;
+    CHECK_EQ(f.sch.step_quiescent([&] {
+        ++calls;
+        CHECK(f.kv.seqs.empty());
+        CHECK(f.kv.refcnt == refcounts);
+        CHECK_EQ(f.pc.lookups, 0ll);
+        return int(RAD_E_DEVICE); // e.g. a failed rank stream drain; do not attempt admission
+    }, &batch), RAD_E_DEVICE);
+    CHECK(batch == nullptr);
+    CHECK_EQ(calls, 1);
+    CHECK(f.kv.seqs.empty());
+    CHECK(f.kv.refcnt == refcounts && f.kv.freelist == free);
+    CHECK(f.pc.seeded == seeded);
+    CHECK_EQ(f.pc.lookups, 0ll);
+    CHECK(f.pc.restores.empty());
+    CHECK_EQ(f.sch.step_quiescent([&] {
+        ++calls;
+        CHECK(f.kv.seqs.empty());
+        CHECK_EQ(f.pc.lookups, 0ll);
+        return int(RAD_OK);
+    }, &batch), RAD_OK);
+    REQUIRE(batch);
+    CHECK_EQ(calls, 2);
+    CHECK(f.kv.has_sequence(id));
+    CHECK(f.pc.lookups > 0);
+    for (size_t i = 0; i < seeded.size(); ++i) {
+        const int32_t g = f.pc.groups[i];
+        const auto& table = f.kv.block_table(id, g);
+        REQUIRE(table.size() >= seeded[i].size());
+        CHECK(std::equal(seeded[i].begin(), seeded[i].end(), table.begin()));
+    }
 }
 
 /* ================================================================== geometry + chunking */
@@ -9114,10 +9159,10 @@ void lcp_fixture(Fixture& f, int64_t C, int64_t interval) {
 }  /* namespace */
 
 TEST(lcp_runs_a_lone_prompt_in_chunks_of_c) {
-    for (const int64_t C : { 256, 512, 1024, 2048 }) {
+    for (const int64_t C : { 256, 512, 1024, 2048, 4096 }) {
         LcpOn on(C, 1);
         Fixture f;
-        lcp_fixture(f, C, 2048);
+        lcp_fixture(f, C, std::max<int64_t>(2048, C));
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK_EQ(f.sch.lcp_rows(), C);
         CHECK_EQ(f.sch.geometry().quantum, 16);
@@ -9164,6 +9209,38 @@ TEST(lcp_runs_a_lone_prompt_in_chunks_of_c) {
         lcp_fixture(f, 1024, 2048);
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK_EQ(f.sch.lcp_rows(), (int64_t)0);
+    }
+}
+
+TEST(lcp4096_with_p1_requires_an_explicit_interval_and_preserves_the_chunk_grid) {
+    struct P1Env {
+        bool had; std::string old;
+        P1Env() {
+            const char* p = std::getenv(ds41p1::kEnv); had = p != nullptr; if (p) old = p;
+            setenv(ds41p1::kEnv, "1", 1);
+        }
+        ~P1Env() { if (had) setenv(ds41p1::kEnv, old.c_str(), 1); else unsetenv(ds41p1::kEnv); }
+    } p1;
+    for (int64_t I : { 2048, 4096, 8192 }) {
+        LcpOn on(4096, 1);
+        Fixture f;
+        lcp_fixture(f, 4096, I);
+        f.cfg.prefix_cache = true;
+        if (I == 2048) f.cfg.prefill_span = 2; // generic LCP permits this; P1 must still refuse I<C
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = f.start(); });
+        if (I == 2048) {
+            CHECK_EQ(rc, (int)RAD_E_INVAL);
+            CHECK(has(err, "checkpoint interval 2048 is below the chunk"));
+            continue;
+        }
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), (int64_t)4096);
+        CHECK_EQ(f.sch.geometry().grid, (int64_t)4096);
+        CHECK_EQ(f.sch.geometry().checkpoint_interval, I);
+        const Cut c = cut_from(f.sch, 0, 6817, 4096);
+        CHECK((c.ends == std::vector<int64_t>{ 4096, 6817 }));
+        CHECK((c.ckpts == (I == 4096 ? std::vector<int64_t>{ 4096 } : std::vector<int64_t>{})));
     }
 }
 
@@ -9762,8 +9839,8 @@ int resume_grid_start(Fixture& f, const char* grid, bool eors = true) {
 
 /* lcp_fixture's shape at the recommended chunk (2,048, the interval too) with the prefix cache on,
  * as the harness arms serve it (Pc). */
-void resume_fixture(Fixture& f) {
-    lcp_fixture(f, 2048, 2048);
+void resume_fixture(Fixture& f, int64_t C = 2048) {
+    lcp_fixture(f, C, C);
     f.cfg.prefix_cache = true;
 }
 
@@ -9857,32 +9934,35 @@ TEST(resume_grid_snapshots_the_reply_on_its_grid) {
  * boundary too), then the cold run's last chunk: every chunk end past its first is one the cold run
  * cuts, and so is every snapshot it writes. */
 TEST(resume_grid_hit_resumes_at_the_snapshot_then_cuts_the_cold_chunks) {
-    LcpOn on(2048, 1);
-    Fixture f;
-    resume_fixture(f);
-    REQUIRE_EQ(resume_grid_start(f, "16"), RAD_OK);
-    REQUIRE_EQ(f.sch.eors_grid(), (int64_t)16);
-    f.pc.seed(3040);
-    f.pc.lin = 3024;
-    f.pc.src = 5;
-    f.pc.eors_hit = true;
-    const uint64_t id = f.submit(5000, 4);
-    REQUIRE(id != 0);
-    REQUIRE(f.sch.step() != nullptr);
-    CHECK_EQ(f.sch.find(id)->n_computed, 3024);
-    const StepEntry& e = f.sch.plan().e[0];
-    CHECK_EQ(e.ckpt_restore, 5);
-    CHECK_EQ(e.ctx_len, 3024);
-    CHECK_EQ(e.n_tokens, 1072);                 /* [3024, 4096) */
-    CHECK_EQ((int64_t)e.ctx_len + e.ckpt_tok + 1, 4096ll);   /* the tail's snapshot, as cold */
-    const SchedMetrics m = f.sch.metrics();
-    CHECK_EQ(m.eors_hits, 1ll);
-    CHECK_EQ(m.eors_hit_tokens, 3024ll);
-    const Cut cold = cut_from(f.sch, 0, 5000, 2048), warm = cut_from(f.sch, 3024, 5000, 2048);
-    CHECK((cold.ends == std::vector<int64_t>{ 2048, 4096, 5000 }));
-    CHECK(warm.ends == ends_after(cold, 3024));
-    CHECK((warm.ckpts == std::vector<int64_t>{ 4096 }));
-    CHECK((cold.ckpts == std::vector<int64_t>{ 2048, 4096 }));
+    for (int64_t C : { 2048, 4096 }) {
+        LcpOn on(C, 1);
+        Fixture f;
+        resume_fixture(f, C);
+        REQUIRE_EQ(resume_grid_start(f, "16"), RAD_OK);
+        REQUIRE_EQ(f.sch.eors_grid(), (int64_t)16);
+        f.pc.seed(3040);
+        f.pc.lin = 3024;
+        f.pc.src = 5;
+        f.pc.eors_hit = true;
+        const uint64_t id = f.submit(5000, 4);
+        REQUIRE(id != 0);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(id)->n_computed, 3024);
+        const StepEntry& e = f.sch.plan().e[0];
+        CHECK_EQ(e.ckpt_restore, 5);
+        CHECK_EQ(e.ctx_len, 3024);
+        CHECK_EQ(e.n_tokens, 1072);                 /* [3024, 4096) */
+        CHECK_EQ((int64_t)e.ctx_len + e.ckpt_tok + 1, 4096ll);   /* the tail's snapshot, as cold */
+        const SchedMetrics m = f.sch.metrics();
+        CHECK_EQ(m.eors_hits, 1ll);
+        CHECK_EQ(m.eors_hit_tokens, 3024ll);
+        const Cut cold = cut_from(f.sch, 0, 5000, C), warm = cut_from(f.sch, 3024, 5000, C);
+        CHECK((cold.ends == (C == 2048 ? std::vector<int64_t>{ 2048, 4096, 5000 }
+                                      : std::vector<int64_t>{ 4096, 5000 })));
+        CHECK(warm.ends == ends_after(cold, 3024));
+        CHECK((warm.ckpts == std::vector<int64_t>{ 4096 }));
+        CHECK((cold.ckpts == (C == 2048 ? std::vector<int64_t>{ 2048, 4096 } : std::vector<int64_t>{ 4096 })));
+    }
 }
 
 /* What a resumed prefill issues for each row past its snapshot is what the cold run issues for it,
@@ -10019,6 +10099,61 @@ TEST(resume_grid_is_refused_where_partition_invariance_is_not_shown) {
         REQUIRE(f.sch.eors_on());
         CHECK_EQ(f.sch.eors_grid(), std::string(src) == "axis defaults" ? 16ll : 2048ll);
     }
+}
+
+TEST(dspark_probability_capture_pairs_real_verification_and_cancelled_rows) {
+    for (int accepted : { 0, 1, 2 }) {
+        Fixture f; f.build(); f.cfg.n_spec = 2;
+        const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "1");
+        CHECK_OK(f.start(&x));
+        const uint64_t id = f.submit(4, 30);
+        REQUIRE(f.sch.step()); f.commit_plain(6);
+        const int64_t anchor = f.sch.find(id)->n_computed;
+        const int32_t proposal[] = { 7, 8 };
+        const float signal[10] = { .8f, 4, 2, 7, 6, .7f, 3, 1, 8, 7 };
+        CHECK_OK(f.sch.set_draft(id, proposal, 2));
+        f.sch.draft_prob_publish(id, anchor, 6, proposal, 2, signal, true, 16);
+        REQUIRE(f.sch.step()); REQUIRE_EQ(f.sch.plan().e[0].n_spec, 2);
+        CHECK_OK(f.commit(9, 0, [accepted](const StepEntry&) { return accepted; }));
+        const auto stats = f.sch.draft_prob_stats();
+        CHECK_EQ(stats.proposed, (uint64_t)2); CHECK_EQ(stats.resolved, (uint64_t)2);
+        CHECK_EQ(stats.verified, (uint64_t)2);
+        CHECK_EQ(stats.reached, (uint64_t)(accepted == 0 ? 1 : 2));
+        CHECK_EQ(stats.accepted, (uint64_t)accepted);
+        /* A second proposal cancelled while verification is in flight still pairs exactly once. */
+        CHECK_OK(f.sch.set_draft(id, proposal, 2));
+        f.sch.draft_prob_publish(id, f.sch.find(id)->n_computed, 9, proposal, 2, signal, true, 16);
+        REQUIRE(f.sch.step()); CHECK_OK(f.sch.cancel(id));
+        CHECK_OK(f.commit(10, 0, [](const StepEntry&) { return 1; }));
+        CHECK_EQ(f.sch.draft_prob_stats().resolved, (uint64_t)4);
+        CHECK_EQ(f.sch.draft_prob_stats().verified, (uint64_t)4);
+    }
+}
+
+TEST(dspark_probability_capture_resolves_caps_supersession_and_closed_sequences) {
+    Fixture f; f.build(); f.cfg.n_spec = 2;
+    const auto x = DraftExperiment::capture(nullptr, nullptr, "1", nullptr, nullptr, nullptr, nullptr, "1");
+    CHECK_OK(f.start(&x));
+    const uint64_t id = f.submit(4, 30);
+    REQUIRE(f.sch.step()); f.commit_plain(6);
+    const int32_t proposal[] = { 7, 8 };
+    const float signal[10] = { .8f, 4, 2, 7, 6, .7f, 3, 1, 8, 7 };
+    for (int pass = 0; pass < 2; ++pass) {
+        CHECK_OK(f.sch.set_draft(id, proposal, 2));
+        f.sch.draft_prob_publish(id, f.sch.find(id)->n_computed, 6, proposal, 2, signal, true, 16);
+    }
+    /* Both depth2 rows capped; first depth1 superseded. */
+    CHECK_EQ(f.sch.draft_prob_stats().proposed, (uint64_t)4);
+    CHECK_EQ(f.sch.draft_prob_stats().resolved, (uint64_t)3);
+    CHECK_OK(f.sch.cancel(id));
+    CHECK_EQ(f.sch.draft_prob_stats().resolved, (uint64_t)4);
+    CHECK_OK(f.sch.reap(id));
+    f.sch.draft_prob_publish(id, 4, 6, proposal, 2, signal, false, 16);
+    CHECK_EQ(f.sch.draft_prob_stats().resolved, (uint64_t)6);
+    /* Recycled slot and an unrelated ID never inherit pending observations. */
+    const uint64_t next = f.submit(4, 30);
+    CHECK(next != id); REQUIRE(f.sch.step()); f.commit_plain();
+    CHECK_EQ(f.sch.draft_prob_stats().verified, (uint64_t)0);
 }
 
 /* ===== draft_conf.h: the confidence controller, load-aware drafting, the deferred context pass ===== */
@@ -10170,6 +10305,7 @@ struct ConfRun {
     std::vector<int> drafted, verified, ctx_rows, ctx_passes;
     std::vector<int32_t> ctx_pos, output;
     DraftConfStats stats;
+    DraftProbStats probability;
 };
 ConfRun conf_pipeline(const DraftExperiment& x, const std::vector<float>& p, bool with_hist,
                       int64_t short_by = 0) {
@@ -10223,6 +10359,11 @@ ConfRun conf_pipeline(const DraftExperiment& x, const std::vector<float>& p, boo
         if (n == 1) {
             CHECK_OK(f.sch.set_draft(id, generated, 5));
             f.sch.draft_conf_scored(id, p[(size_t)t], -1.0f);   /* finish_block_drafter's */
+            if (x.prob_capture()) {
+                const float obs[10] = { .8f, 4, 2, (float)generated[0], (float)slots[0].tok[0],
+                                        .7f, 3, 1, (float)generated[1], (float)generated[0] };
+                f.sch.draft_prob_publish(id, slots[0].ctx, slots[0].tok[0], generated, 5, obs, true, 16);
+            }
         }
         f.sch.step_finished();
         f.sch.promote_next();
@@ -10230,10 +10371,382 @@ ConfRun conf_pipeline(const DraftExperiment& x, const std::vector<float>& p, boo
     }
     out.output = f.sch.find(id)->output;
     out.stats = f.sch.metrics().draft_conf;
+    out.probability = f.sch.draft_prob_stats();
     f.sch.draft_conf_report();
     return out;
 }
 }  // namespace
+
+TEST(dspark_probability_capture_preserves_the_issue_ahead_pipeline) {
+    const auto off = DraftExperiment::capture(nullptr, nullptr, "1");
+    const auto on = DraftExperiment::capture(nullptr, nullptr, "1", nullptr, nullptr, nullptr, nullptr, "1");
+    const std::vector<float> p = { .9f, .1f, .8f, .2f };
+    const ConfRun a = conf_pipeline(off, p, false), b = conf_pipeline(on, p, false);
+    CHECK(a.output == b.output); CHECK(a.drafted == b.drafted); CHECK(a.verified == b.verified);
+    CHECK(a.ctx_rows == b.ctx_rows); CHECK(a.ctx_pos == b.ctx_pos);
+    CHECK_EQ(b.probability.proposed, (uint64_t)8);
+    CHECK_EQ(b.probability.verified, (uint64_t)3);
+    CHECK_EQ(b.probability.reached, (uint64_t)3);
+    CHECK_EQ(b.probability.accepted, (uint64_t)2);
+    CHECK_EQ(b.probability.resolved, (uint64_t)7); // last epoch pending until fixture fini
+}
+
+TEST(dspark_matched_early_controls_parse_and_preserve_configured_query_depth) {
+    const auto early = [](const char* value, const char* cap = nullptr, const char* off = nullptr) {
+        return DraftExperiment::capture(nullptr, off, cap, nullptr, nullptr, nullptr, nullptr, nullptr, value);
+    };
+    for (const char* value : { (const char*)nullptr, "off" }) {
+        const auto x = early(value);
+        CHECK(x.valid()); CHECK_EQ(x.early_verify(), -1); CHECK_EQ(x.runtime_depth(5), 5);
+        CHECK(!x.scope_required());
+    }
+    for (int k = 0; k <= 2; ++k) {
+        const std::string value = std::to_string(k);
+        const auto x = early(value.c_str());
+        CHECK(x.valid()); CHECK_EQ(x.early_verify(), k); CHECK_EQ(x.runtime_depth(5), k);
+        CHECK_EQ(x.runtime_depth(2), k); CHECK_EQ(x.runtime_depth(0), 0);
+        CHECK(!x.compute_off()); CHECK(x.head_enabled(true)); CHECK(x.scope_required());
+        CHECK(!x.prob_capture()); // quiet observer is independent of JSON capture
+        CHECK(!early(value.c_str(), "1").valid());
+        CHECK(!early(value.c_str(), nullptr, "1").valid());
+        CHECK(!DraftExperiment::capture(nullptr, nullptr, nullptr, "1", nullptr, nullptr, nullptr, nullptr, value.c_str()).valid());
+        CHECK(!DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, "1", nullptr, nullptr, nullptr, value.c_str()).valid());
+        CHECK(!DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, "1", nullptr, nullptr, value.c_str()).valid());
+        CHECK(DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "1", "1", value.c_str()).valid());
+    }
+    for (const char* bad : { "", "3", "-1", "00", "1x", "OFF", "on" }) CHECK(!early(bad).valid());
+    CHECK(draft_measure_profile(0, 5, 5, 0));
+    CHECK(draft_measure_profile(1, 5, 5, 2)); // the measured Db2 profile
+    CHECK(draft_measure_profile(1, 5, 5, 4));
+    CHECK(!draft_measure_profile(2, 5, 5, 2)); // load-changing query shape
+    CHECK(!draft_measure_profile(1, 5, 5, 1)); // no depth2 observation
+    CHECK(!draft_measure_profile(1, 5, 5, 0));
+    CHECK(!draft_measure_profile(0, 6, 5, 0));
+    CHECK(!draft_measure_profile(0, 5, 4, 0));
+}
+
+TEST(dspark_matched_early_meter_excludes_transitions_caps_end_and_cancel) {
+    for (int k = 0; k <= 2; ++k) {
+        DraftMeasure m;
+        DraftMeasureFrame a;
+        a.seq = 1; a.epoch = 1; a.card = 0; a.k = k; a.query_rows = 2;
+        a.ready_ns = 100; a.wait_ns = 9; a.pure_decode = false;
+        m.ready(a, false); CHECK(!m.committed(true, true, 1, 0)); // prompt transition
+        a.epoch++; a.ready_ns += 100; a.pure_decode = true;
+        m.ready(a, true); CHECK(!m.committed(true, true, 2, 0)); // first decode excluded
+        a.epoch++; a.ready_ns += 100; a.wait_ns = 11;
+        m.ready(a, true); CHECK(m.committed(true, true, (uint64_t)(3 + k), k));
+        CHECK_EQ(m.stats.n[k], (uint64_t)1); CHECK_EQ(m.stats.ns[k], (uint64_t)100);
+        CHECK_EQ(m.stats.wait_ns[k], (uint64_t)11); CHECK_EQ(m.stats.accepted[k], (uint64_t)k);
+        CHECK_EQ(m.stats.emitted[k], (uint64_t)(1 + k));
+        /* The full query ran for0 too: all three boundaries have one observer and one wait. */
+        CHECK_EQ(m.stats.queries, (uint64_t)3); CHECK_EQ(m.stats.query_rows, (uint64_t)6);
+        CHECK_EQ(m.stats.waits, (uint64_t)3);
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, false); CHECK(!m.committed(true, true, 10, 0)); // wrong prefix / context cap
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, true); CHECK(!m.committed(false, false, 10, 0)); // EOS/budget/cancel at commit
+        CHECK_EQ(m.stats.end_cancel, (uint64_t)1);
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, false); CHECK(!m.committed(true, true, 11, 0));
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, true); CHECK(!m.committed(true, false, 12, 0)); // cancelled after commit
+        CHECK_EQ(m.stats.unpublished, (uint64_t)1);
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, false); CHECK(!m.committed(true, true, 20, 0));
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, true); CHECK(!m.committed(true, true, 20, 0)); // truncated emission
+        m.no_query(); CHECK_EQ(m.stats.no_query, (uint64_t)1);
+        CHECK_EQ(m.pending.epoch, (uint64_t)0); CHECK_EQ(m.stats.n[k], (uint64_t)1);
+        CHECK_EQ(m.stats.transition, (uint64_t)3);
+    }
+    DraftMeasure m;
+    DraftMeasureFrame a; a.seq = 1; a.card = 0; a.k = 1; a.query_rows = 2;
+    a.epoch = 1; a.ready_ns = 100; a.pure_decode = true;
+    m.ready(a, false); CHECK(!m.committed(true, true, 1, 0));
+    a.seq = 2; a.epoch = 2; a.ready_ns = 200;
+    m.ready(a, true); CHECK(!m.committed(true, true, 2, 0)); // recycled card, different request
+    CHECK_EQ(m.stats.transition, (uint64_t)1); CHECK_EQ(m.stats.n[1], (uint64_t)0);
+}
+
+TEST(dspark_matched_early_invalid_numeric_signals_preserve_ids_and_fixed_prefixes) {
+    const float good[5] = { .8f, 2, 1, 7, 6 };
+    CHECK(draft_measure_signal(good, 7, 6) == DraftMeasureSignal::Valid);
+    for (int field = 0; field < 3; ++field) {
+        float bad[5]; std::copy(good, good + 5, bad); bad[field] = NAN;
+        CHECK(draft_measure_signal(bad, 7, 6) == DraftMeasureSignal::InvalidNumeric);
+        /* Numerical invalidity does not excuse a stale/missing echo. Present depths always
+         * write both IDs; the -1/-1 sentinel belongs only to an absent depth. */
+        CHECK(draft_measure_signal(bad, 8, 6) == DraftMeasureSignal::PathMismatch);
+        bad[3] = bad[4] = -1;
+        CHECK(draft_measure_signal(bad, 7, 6) == DraftMeasureSignal::PathMismatch);
+    }
+    for (float p : { -1.f, 2.f, INFINITY, -INFINITY }) {
+        float bad[5]; std::copy(good, good + 5, bad); bad[0] = p;
+        CHECK(draft_measure_signal(bad, 7, 6) == DraftMeasureSignal::InvalidNumeric);
+    }
+    float edge[5]; std::copy(good, good + 5, edge); edge[2] = INFINITY;
+    CHECK(draft_measure_signal(edge, 7, 6) == DraftMeasureSignal::Valid); // singleton margin
+    edge[2] = -1;
+    CHECK(draft_measure_signal(edge, 7, 6) == DraftMeasureSignal::InvalidNumeric);
+    edge[2] = 1; edge[1] = INFINITY;
+    CHECK(draft_measure_signal(edge, 7, 6) == DraftMeasureSignal::InvalidNumeric);
+    for (int k = 0; k <= 2; ++k) {
+        const std::string value = std::to_string(k);
+        const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                nullptr, "1", value.c_str());
+        Fixture f; f.build(); f.cfg.max_seqs = 1;
+        dspark_group(f, 4096, false, false);
+        CHECK_OK(f.start(&x));
+        const auto id = f.submit(4, 30);
+        REQUIRE(f.sch.step()); f.commit_plain(6);
+        const int32_t tokens[] = { 7, 8 };
+        const float invalid[10] = { NAN, NAN, NAN, 7, 6, NAN, NAN, NAN, 8, 7 };
+        CHECK_OK(f.sch.set_draft(id, tokens, 2));
+        f.sch.draft_prob_publish(id, f.sch.find(id)->n_computed, 6, tokens, 2, invalid, true, 16);
+        REQUIRE(f.sch.step()); CHECK_EQ(f.sch.plan().e[0].n_spec, k);
+        CHECK_OK(f.commit(9));
+        CHECK(f.sch.find(id)->output == std::vector<int32_t>({ 6, 9 }));
+        CHECK_EQ(f.sch.draft_prob_stats().verified, (uint64_t)k);
+        CHECK_EQ(x.runtime_depth(2), k); CHECK(!x.compute_off());
+        DraftMeasure m;
+        DraftMeasureFrame frame; frame.seq = id; frame.card = 0; frame.k = k;
+        frame.query_rows = 2; frame.pure_decode = true; frame.epoch = 1; frame.ready_ns = 100;
+        m.ready(frame, false); CHECK(!m.committed(true, true, 0, 0));
+        frame.epoch++; frame.ready_ns += 100; frame.invalid_depths = 3;
+        m.ready(frame, true); CHECK(!m.committed(true, true, (uint64_t)(1 + k), k));
+        CHECK_EQ(m.pending.epoch, (uint64_t)2); // invalid scores do not suppress publication
+        frame.epoch++; frame.ready_ns += 100; frame.invalid_depths = 0;
+        m.ready(frame, true); CHECK(!m.committed(true, true, (uint64_t)(2 * (1 + k)), k));
+        frame.epoch++; frame.ready_ns += 100;
+        m.ready(frame, true); CHECK(m.committed(true, true, (uint64_t)(3 * (1 + k)), k));
+        CHECK_EQ(m.stats.queries, (uint64_t)4); CHECK_EQ(m.stats.waits, (uint64_t)4);
+        CHECK_EQ(m.stats.invalid_queries, (uint64_t)1); CHECK_EQ(m.stats.invalid_cycles, (uint64_t)2);
+        CHECK_EQ(m.stats.n[k], (uint64_t)1); CHECK_EQ(m.stats.ns[k], (uint64_t)100);
+    }
+}
+
+TEST(dspark_matched_early_normal_planning_keeps_the_cap_and_drops_context_end_queries) {
+    for (int k = 0; k <= 2; ++k) {
+        const std::string value = std::to_string(k);
+        const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                nullptr, nullptr, value.c_str());
+        Fixture f; f.build(); f.cfg.max_seqs = 1;
+        dspark_group(f, 4096, false, false);
+        CHECK_OK(f.start(&x));
+        const auto id = f.submit(40, 30);
+        REQUIRE(f.sch.step()); f.commit_plain(6); // deliberately no issue_ahead
+        const int32_t tokens[] = { 7, 8 };
+        CHECK_OK(f.sch.set_draft(id, tokens, 2));
+        REQUIRE(f.sch.step()); CHECK_EQ(f.sch.plan().e[0].n_spec, k);
+        for (int j = 0; j < k; ++j) CHECK_EQ(f.sch.plan().e[0].draft[j], tokens[j]);
+    }
+    const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                            nullptr, nullptr, "0");
+    Fixture f; f.build(4096, 64, 512, 42); f.cfg.max_seqs = 1;
+    dspark_group(f, 4096, false, false);
+    CHECK_OK(f.start(&x));
+    const auto id = f.submit(40, 0);
+    REQUIRE(f.sch.step()); f.commit_plain(6);
+    REQUIRE(f.sch.step()); // one plain token would fit, a complete Db2 query would not
+    Scheduler::BlockRow row[1];
+    CHECK_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 0);
+    CHECK(f.sch.block_query(3) == nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 0);
+    CHECK(f.sch.find(id) != nullptr);
+}
+
+/* Mirrors mark_step_end -> early sync -> expect_draft/step_next -> commit -> set_draft, with
+ * Db2's two generated tokens at pitch5 for ALL controls. No observer/timing fake decides a token. */
+TEST(dspark_matched_early_db2_keeps_query_and_ahead_publication_prefix_consistent) {
+    for (int k = 0; k <= 2; ++k) {
+        for (int tail : { 0, 1, 2 }) { // continuing, EOS/budget end, cancellation after early read
+            const std::string value = std::to_string(k);
+            const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                    nullptr, "1", value.c_str());
+            Fixture f; f.build(); f.cfg.max_seqs = 1; f.cfg.draft_short_from = 1;
+            dspark_group(f, 4096, false, false);
+            CHECK_OK(f.start(&x));
+            auto r = f.request(40, 0); r->speculation_fixed = true;
+            const auto id = f.add(std::move(r));
+            const RadBatch* b = f.sch.step(); REQUIRE(b);
+            std::vector<StepSlot> slots(1);
+            DraftMeasure meter;
+            DraftMeasureFrame previous;
+            for (int t = 0; t < 6; ++t) {
+                const StepEntry entry = f.sch.plan().e[0];
+                REQUIRE_EQ(entry.n_spec, t ? k : 0);
+                const int accepted = t ? (t - 1) % (k + 1) : 0;
+                std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+                for (int j = 0; j <= entry.n_spec; ++j)
+                    sampled[(size_t)(entry.dev_out + j)] = j < accepted ? ahead_draft(id, t, j) : ahead_tok(id, t);
+                AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+                accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+                Scheduler::BlockRow row[1];
+                REQUIRE_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 1);
+                REQUIRE(f.sch.block_context(t + 1));
+                const RadBatch* query = f.sch.block_query(t + 1); REQUIRE(query);
+                CHECK_EQ(query->n_tok, 2); CHECK_EQ(query->n_out, 2);
+                AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK; q.st = slots.data(); adv_row(q, 0);
+                int32_t generated[5] = { ahead_draft(id, t + 1, 0), ahead_draft(id, t + 1, 1), -7, -7, -7 };
+                AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 2;
+                take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+                const StepSlot& slot = slots[(size_t)entry.card];
+                bool matches = false;
+                REQUIRE(f.sch.measure_block_binding(row[0], slot.ctx, slot.acc, previous, &matches));
+                CHECK_EQ(matches, t > 0);
+                auto wrong = row[0]; wrong.seq++;
+                CHECK(!f.sch.measure_block_binding(wrong, slot.ctx, slot.acc, previous, &matches));
+                CHECK(!f.sch.measure_block_binding(row[0], slot.ctx + 1, slot.acc, previous, &matches));
+                REQUIRE(f.sch.measure_block_binding(row[0], slot.ctx, slot.acc, previous, &matches));
+                DraftMeasureFrame frame;
+                frame.seq = id; frame.epoch = f.sch.draft_prob_reserve_epoch(); frame.card = entry.card;
+                frame.step = b->step; frame.ctx = slot.ctx; frame.anchor = slot.tok[0];
+                frame.k = k; frame.query_rows = 2; frame.ids[0] = generated[0]; frame.ids[1] = generated[1];
+                frame.ready_ns = (uint64_t)(100 + t * 100); frame.wait_ns = 10;
+                frame.pure_decode = !entry.is_prefill;
+                meter.ready(frame, matches);
+                if (t == 5 && tail == 2) CHECK_OK(f.sch.cancel(id));
+                f.sch.expect_draft(id, 2); // runtime cap, while generated/query count stays2
+                const RadBatch* next = f.sch.step_next();
+                if (tail != 2 || t != 5) {
+                    REQUIRE(next); CHECK_EQ(next->n_spec, k); CHECK_EQ(next->n_tok, 1 + k);
+                    AdvanceArgs tr = f.sch.advance_args(0); tr.mode = ADV_TRUNK; tr.st = slots.data(); adv_row(tr, 0);
+                    for (int j = 0; j < k; ++j) CHECK_EQ(next->token_ids[1 + j], generated[j]);
+                } else CHECK(next == nullptr);
+                CHECK_OK(f.commit(ahead_tok(id, t), t == 5 && tail == 1,
+                                  [accepted](const StepEntry&) { return accepted; }));
+                f.sch.block_end();
+                const int rc = f.sch.set_draft(id, generated, 2);
+                const float obs[10] = { .8f, 4, 2, (float)generated[0], (float)slot.tok[0],
+                                        .7f, 3, 1, (float)generated[1], (float)generated[0] };
+                f.sch.draft_prob_publish(id, frame.ctx, frame.anchor, generated, 2, obs, rc == RAD_OK, 16, frame.epoch);
+                uint64_t output = 0; bool live = false;
+                REQUIRE(f.sch.committed_seq(id, &output, &live));
+                const bool published = f.sch.measure_published(frame, &output);
+                if (t == 5 && tail) CHECK(!published);
+                else {
+                    REQUIRE_EQ(rc, (int)RAD_OK); CHECK(published);
+                    auto wrong_frame = frame; wrong_frame.seq++;
+                    CHECK(!f.sch.measure_published(wrong_frame, &output));
+                    wrong_frame = frame; wrong_frame.ctx++;
+                    CHECK(!f.sch.measure_published(wrong_frame, &output));
+                    if (k) {
+                        wrong_frame = frame; wrong_frame.ids[0]++;
+                        CHECK(!f.sch.measure_published(wrong_frame, &output));
+                        wrong_frame = frame; wrong_frame.k = k - 1;
+                        CHECK(!f.sch.measure_published(wrong_frame, &output));
+                    }
+                }
+                meter.committed(live, published, output, accepted);
+                previous = meter.pending;
+                f.sch.step_finished();
+                if (next) { f.sch.promote_next(); b = next; }
+            }
+            CHECK_EQ(meter.stats.queries, (uint64_t)6); CHECK_EQ(meter.stats.query_rows, (uint64_t)12);
+            CHECK_EQ(meter.stats.waits, (uint64_t)6);
+            CHECK_EQ(meter.stats.n[k], (uint64_t)(tail ? 3 : 4));
+            CHECK_EQ(meter.stats.ns[k], (uint64_t)(tail ? 300 : 400));
+            if (tail) CHECK_EQ(meter.stats.end_cancel, (uint64_t)1);
+            CHECK_EQ(f.sch.draft_prob_stats().proposed, (uint64_t)12);
+        }
+    }
+}
+
+/* Policy decisions carry the query epoch through ahead planning and exact-count publication.
+ * The two-row query/context pass is still issued at k0. Changing k is not a context reset. */
+TEST(dspark_prefix_policy_db2_actions_preserve_query_context_and_publication_binding) {
+    for (const char* defer : { "0", "1" }) for (int tail : { 0, 1, 2 }) {
+        const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                defer, nullptr, nullptr, "v1:0.25:0.75");
+        REQUIRE(x.valid());
+        Fixture f; f.build(); f.cfg.max_seqs = 1; f.cfg.draft_short_from = 1;
+        dspark_group(f, 4096, defer[0] == '1', false); REQUIRE_EQ(f.start(&x), (int)RAD_OK);
+        auto r = f.request(40, 0); r->speculation_fixed = true;
+        const auto id = f.add(std::move(r));
+        const RadBatch* b = f.sch.step(); REQUIRE(b);
+        std::vector<StepSlot> slots(1);
+        DraftMeasure meter;
+        int previous_k = 0;
+        for (int t = 0; t < 6; ++t) {
+            const StepEntry entry = f.sch.plan().e[0]; CHECK_EQ(entry.n_spec, previous_k);
+            const int accepted = t ? (t - 1) % (previous_k + 1) : 0;
+            std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+            for (int j = 0; j <= entry.n_spec; ++j)
+                sampled[(size_t)(entry.dev_out + j)] = j < accepted ? ahead_draft(id, t, j) : ahead_tok(id, t);
+            AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+            accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+            Scheduler::BlockRow row[1];
+            REQUIRE_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 1);
+            REQUIRE(f.sch.block_context(t + 1));
+            const RadBatch* query = f.sch.block_query(t + 1); REQUIRE(query);
+            CHECK_EQ(query->n_tok, 2); CHECK_EQ(query->n_out, 2);
+            AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK; q.st = slots.data(); adv_row(q, 0);
+            int32_t generated[5] = { ahead_draft(id, t + 1, 0), ahead_draft(id, t + 1, 1), -7, -7, -7 };
+            AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 2;
+            take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+            const StepSlot& slot = slots[(size_t)entry.card];
+            bool matches = false;
+            REQUIRE(f.sch.measure_block_binding(row[0], slot.ctx, slot.acc, meter.pending, &matches));
+            CHECK_EQ(matches, t > 0);
+            const unsigned invalid = t == 3 ? 2u : 0u;
+            const int k = x.prefix_policy().select(t % 3 == 0 ? .125f : .5f,
+                                                   t % 3 == 1 ? .5f : .875f, invalid);
+            DraftMeasureFrame frame;
+            frame.seq = id; frame.epoch = f.sch.draft_prob_reserve_epoch(); frame.card = entry.card;
+            frame.step = b->step; frame.ctx = slot.ctx; frame.anchor = slot.tok[0];
+            frame.k = k; frame.query_rows = 2; frame.ids[0] = generated[0]; frame.ids[1] = generated[1];
+            frame.invalid_depths = invalid; frame.ready_ns = (uint64_t)(100 + t * 100);
+            frame.wait_ns = 10; frame.pure_decode = !entry.is_prefill;
+            REQUIRE(draft_measure_frame_matches(frame, id, entry.card, slot.ctx, slot.tok[0], generated, 2));
+            meter.ready(frame, matches, true);
+            if (t == 5 && tail == 2) CHECK_OK(f.sch.cancel(id));
+            f.sch.expect_draft(id, k);
+            const RadBatch* next = f.sch.step_next();
+            if (t != 5 || tail != 2) {
+                REQUIRE(next); CHECK_EQ(next->n_spec, k); CHECK_EQ(next->n_tok, 1 + k);
+                AdvanceArgs tr = f.sch.advance_args(0); tr.mode = ADV_TRUNK; tr.st = slots.data(); adv_row(tr, 0);
+                for (int j = 0; j < k; ++j) CHECK_EQ(next->token_ids[1 + j], generated[j]);
+            } else CHECK(next == nullptr);
+            CHECK_OK(f.commit(ahead_tok(id, t), t == 5 && tail == 1,
+                              [accepted](const StepEntry&) { return accepted; }));
+            f.sch.block_end();
+            if (t != 5 || !tail) CHECK_EQ(f.sch.set_draft(id, generated, (k + 1) % 3), (int)RAD_E_STATE);
+            const int rc = f.sch.set_draft(id, generated, k);
+            uint64_t output = 0; bool live = false;
+            REQUIRE(f.sch.committed_seq(id, &output, &live));
+            const bool published = f.sch.measure_published(frame, &output);
+            if (t == 5 && tail) CHECK(!published);
+            else {
+                CHECK_EQ(rc, (int)RAD_OK); CHECK(published);
+                auto stale = frame; ++stale.ctx; CHECK(!f.sch.measure_published(stale, &output));
+                stale = frame; ++stale.seq; CHECK(!f.sch.measure_published(stale, &output));
+                stale = frame; stale.k = (k + 1) % 3; CHECK(!f.sch.measure_published(stale, &output));
+            }
+            meter.committed(live, published, output, accepted, true);
+            f.sch.step_finished();
+            if (next) { f.sch.promote_next(); b = next; }
+            previous_k = k;
+        }
+        CHECK_EQ(meter.stats.queries, (uint64_t)6); CHECK_EQ(meter.stats.query_rows, (uint64_t)12);
+        CHECK_EQ(meter.stats.waits, (uint64_t)6); CHECK_EQ(meter.stats.invalid_queries, (uint64_t)1);
+        CHECK_EQ(meter.stats.n[0] + meter.stats.n[1] + meter.stats.n[2], (uint64_t)(tail ? 3 : 4));
+        if (tail) CHECK_EQ(meter.stats.end_cancel, (uint64_t)1);
+    }
+}
+
+TEST(dspark_prefix_policy_context_limit_keeps_the_full_db2_query_requirement) {
+    const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                            nullptr, nullptr, nullptr, "v1:0.25:0.75");
+    Fixture f; f.build(4096, 64, 512, 42); f.cfg.max_seqs = 1; f.cfg.draft_short_from = 1;
+    dspark_group(f, 4096, false, false); CHECK_OK(f.start(&x));
+    const auto id = f.submit(40, 0);
+    REQUIRE(f.sch.step()); f.commit_plain(6);
+    REQUIRE(f.sch.step());
+    Scheduler::BlockRow row[1];
+    CHECK_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 0);
+    CHECK(f.sch.block_query(3) == nullptr); CHECK(f.sch.find(id) != nullptr);
+}
 
 /* The controller on the pipeline: T 0.5, a probe every 3rd step of a closed run. */
 TEST(dspark_conf_closes_probes_and_reopens_on_the_issue_ahead_pipeline) {
@@ -10494,6 +11007,71 @@ TEST(dspark_bank_drafts_for_a_sequence_alone_and_catches_it_up_when_alone_again)
         }
         r.f.sch.draft_conf_report();
     }
+}
+
+/* The production seam is before commit: same actual block_begin epoch/step and existing solo
+ * decision, while cancellation/admission are owned by the scheduler callback. No GPU issue. */
+TEST(dspark_bank_backing_frame_binds_concurrency_cancellation_and_resume_before_commit) {
+    BankRun r;r.start(4,true,false,32);
+    const uint64_t a=r.f.submit(40,400);
+    (void)r.step();(void)r.step(); // anchor past prompt, with its existing host driver
+    CHECK_OK(r.f.sch.enable_draft_bank_observation());
+    CHECK_EQ(r.f.sch.enable_draft_bank_observation(),RAD_E_STATE);
+    const uint64_t b=r.f.submit(60,400);
+    const RadBatch* batch=r.f.sch.step();REQUIRE(batch!=nullptr);
+    const int step=batch->step;
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(r.f.sch.block_begin(5,5,129,128799,rows,4,/*on_card=*/true),0);
+    rad::draft_bank::Work original{};int calls=0;
+    CHECK_OK(r.f.sch.with_draft_bank_frame(step,[&](const rad::draft_bank::Work&w){original=w;++calls;return RAD_OK;}));
+    CHECK_EQ(calls,1);CHECK(original.lendable());CHECK_EQ(original.query_seq,(uint64_t)0);
+    CHECK_EQ(original.step,step);CHECK(original.epoch>0);
+    CHECK_EQ(r.f.sch.with_draft_bank_frame(step+1,[&](const rad::draft_bank::Work&){++calls;return RAD_OK;}),RAD_E_STATE);
+    CHECK_EQ(calls,1);
+    CHECK_EQ(r.f.sch.with_draft_bank_idle([]{return RAD_OK;}),RAD_E_STATE);
+    CHECK_OK(r.f.sch.cancel(b)); // old frame may only lose work; never reassigns a new request's bank work
+    CHECK_OK(r.f.sch.with_draft_bank_frame(step,[&](const rad::draft_bank::Work&w){
+        CHECK_EQ(w.epoch,original.epoch);CHECK(w.lendable());return RAD_OK;}));
+    CHECK(r.f.sch.block_context(step)==nullptr);CHECK(r.f.sch.block_query(step)==nullptr);
+    r.f.sch.block_end();
+    CHECK_EQ(r.f.sch.with_draft_bank_frame(step,[](const rad::draft_bank::Work&){return RAD_OK;}),RAD_E_STATE);
+    CHECK_OK(r.f.commit(712));r.f.sch.step_finished();
+    batch=r.f.sch.step();REQUIRE(batch!=nullptr);
+    const int next=batch->step;
+    CHECK_EQ(r.f.sch.block_begin(5,5,129,128799,rows,4,/*on_card=*/true),1);
+    CHECK_OK(r.f.sch.with_draft_bank_frame(next,[&](const rad::draft_bank::Work&w){
+        CHECK(w.epoch>original.epoch);CHECK(!w.solo_held);CHECK(!w.lendable());
+        CHECK(w.context_rows>0);CHECK_EQ(w.query_rows,5);CHECK_EQ(w.query_seq,a);return RAD_OK;}));
+    r.f.sch.block_end();CHECK_OK(r.f.commit(713));r.f.sch.step_finished();
+}
+
+TEST(dspark_bank_backing_observation_refuses_without_explicit_deferred_context_and_solo) {
+    for(int c=0;c<2;++c){BankRun r;r.start(c?1:4,c!=0,false,32);
+        CHECK_EQ(r.f.sch.enable_draft_bank_observation(),RAD_E_STATE);}
+    BankRun r;r.start(4,true,false,32);
+    CHECK_OK(r.f.sch.enable_draft_bank_observation());
+    int invoked=0;
+    CHECK_EQ(r.f.sch.with_draft_bank_frame(0,[&](const rad::draft_bank::Work&){++invoked;return RAD_OK;}),RAD_E_STATE);
+    CHECK_EQ(invoked,0);CHECK_OK(r.f.sch.with_draft_bank_idle([&]{++invoked;return RAD_OK;}));CHECK_EQ(invoked,1);
+}
+
+TEST(dspark_bank_backing_transaction_refuses_after_issue_ahead_was_planned) {
+    BankRun r;r.start(4,true,false,32);
+    const uint64_t id=r.f.submit(40,400);(void)r.step();(void)r.step();
+    /* Like Engine's initialized sampler: step_next refuses an undecided grammar
+     * backend before it opens any future frame. This test needs an actual one. */
+    r.f.sch.find(id)->speculation_fixed=true;
+    CHECK_OK(r.f.sch.enable_draft_bank_observation());
+    const RadBatch* b=r.f.sch.step();REQUIRE(b!=nullptr);const int step=b->step;
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(r.f.sch.block_begin(5,5,129,128799,rows,4,true),1);
+    CHECK_OK(r.f.sch.with_draft_bank_frame(step,[](const rad::draft_bank::Work&){return RAD_OK;}));
+    /* Normal planning may now hold future reads: the backing callback must fail,
+     * even though no device action was executed in this host fixture. */
+    REQUIRE(r.f.sch.step_next()!=nullptr);
+    int calls=0;
+    CHECK_EQ(r.f.sch.with_draft_bank_frame(step,[&](const rad::draft_bank::Work&){++calls;return RAD_OK;}),RAD_E_STATE);
+    CHECK_EQ(calls,0);
 }
 
 /* Past the window: after 140 steps of two sequences, the survivor's owed positions reach below the

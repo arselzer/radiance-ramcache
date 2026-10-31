@@ -104,6 +104,9 @@ public:
     /* Waits until everything this rank enqueued has landed. Used before a block is given back on a
      * failure path, where a late in-flight copy would overwrite its next owner's writes. */
     void quiesce();
+    /* Checked form for physical-memory maintenance. The existing best-effort callers retain
+     * quiesce(); a backing change must propagate a failed device selection or stream drain. */
+    int quiesce_checked();
 
     /* ---------------- restore ----------------
      *

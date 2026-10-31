@@ -1,0 +1,163 @@
+{
+  "window": "ab-20261031T182505Z",
+  "candidate": {
+    "engine_commit": "35cab28d38667ea408cac5e74f8f9604fd2a0796",
+    "source_commit": "b79bac8ed1e47e7e2fa2429ecf13e586469266b8",
+    "engine_sha256": "dd0d1e3bc9f20330df96dd84c9627cfc8d8c83d2186e808b74c0df0561ff470e",
+    "runtime_build_receipt_sha256": "330e733a9cf3b9498f5aba11db514d452f7da9e6bb710064d6e7309a0b1d0443",
+    "source_only_files_since_build": [
+      "tools/ds41-host-experts/ds41_bank_lend_probe.py"
+    ],
+    "libraries": {
+      "kernels/libr4d.so": "b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10",
+      "kernels/libavx.so": "764ea8ccf1f0b5bdeb2e1484decb55c3dc824b2ceca76a123a69b6e4585a2655",
+      "kernels/libref.so": "334a712aff27a53ce0fd222a56024f4684dedcd1f65372fc6458ec0c2e237b19",
+      "architectures/deepseek41.so": "9399b90de377c060fa77abba5b76ba1857fb0016ce9731384693d8117d272ee0",
+      "quantizers/libquant.so": "4bf4ab40e8aa2cbe74d859a34e70c181d262f213dfc99fae3e1b4dc539296ee7"
+    },
+    "arms": [
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1024-Lm4096-Kld",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ag1024-Lm4096-Kld",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1280-Ag1024-Lm4096-Kld",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-Kh-Lm8192-Ulong8k",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1280-Ag1024-Cs-Kh-Lm8192-Ulong8k",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1280-Ag1024-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-L1024-Pf-N8-C8-Pmr8",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1280-Ag1024-Cs-L1024-Pf-N8-C8-Pmr8"
+    ],
+    "mode": "collective",
+    "reused_card_window": "ab-20261031T144623Z",
+    "reused_card_libr4d_sha256": "b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10",
+    "immutable_receipts": {
+      "devcheck-lcp-lcp.log": "3d272f745d0468bfcbf975aaf827a6e4907e0030d764735f46a90a2a898eba5a",
+      "devcheck-lcp-sweep.log": "8aa90ae8a2256a70a42d518ade349745db93e5462ede6ae7bb57d2fb1c466144",
+      "devcheck-lcp-sweep0.log": "7421cefe0687ea3bbb7316fa0273bb762cc61c706390fe47345b09426294f0a0",
+      "devcheck-bal.log": "626d74a7d530f47bac9b74bbeb14709484140aed2cdfcf615a2830d1517b678a",
+      "devcheck-p1.log": "46b6c490b7037d203bb8ad22bdb662ec9281a94eb96d2236e51063073e5968d8",
+      "n128-off.log": "46e2d0433f960aa1a4514411c8399fe6d1c92c416db77fde7241aa419b41d8fa",
+      "n128-on.log": "df7b6e29cd7cac26bf34e4bae4568677f75b92876af6b9c9441a6ef945215e4a",
+      "n128-lcp.log": "492b39f5951a1fcaa8948e631d40f9e74ee646c6a48020dbfeaae187db94cafd"
+    },
+    "isolation": "Each new switch has its own long KLD arm.4K first model gate keeps Rb,Vp,N128 off. No optimization adopted by preparation."
+  },
+  "kld_positions_equal_each": 3397,
+  "kld_candidate_arms": [
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1024-Lm4096-Kld",
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ag1024-Lm4096-Kld",
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1280-Ag1024-Lm4096-Kld"
+  ],
+  "groups": {
+    "long8k": [
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-Kh-Lm8192-Ulong8k",
+        "requests_equal": 1,
+        "canonical_hashes_equal": 1,
+        "mean_stream_total_tok_s": 20.766470894266654,
+        "weighted_decode_tok_s": 20.766470894266654,
+        "summed_ttft_s": 17.676131525000002,
+        "ttft_by_prompt_s": {
+          "long-gpl3-7k": 17.676131525000002
+        }
+      },
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1280-Ag1024-Cs-Kh-Lm8192-Ulong8k",
+        "requests_equal": 1,
+        "canonical_hashes_equal": 1,
+        "mean_stream_total_tok_s": 20.790538770517653,
+        "weighted_decode_tok_s": 20.790538770517653,
+        "summed_ttft_s": 16.961889567,
+        "ttft_by_prompt_s": {
+          "long-gpl3-7k": 16.961889567
+        }
+      }
+    ],
+    "harness": [
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness",
+        "requests_equal": 13,
+        "canonical_hashes_equal": 13,
+        "mean_stream_total_tok_s": 25.527798454100758,
+        "weighted_decode_tok_s": 25.813550873212805,
+        "summed_ttft_s": 73.84126492,
+        "ttft_by_prompt_s": {
+          "hxA-1": 15.11058751,
+          "hxB-1": 9.391441295999998,
+          "hxA-2": 4.070377752,
+          "hxB-2": 3.430597859,
+          "hxA-3": 3.872211368,
+          "hxB-3": 4.1471228700000005,
+          "hxA-4": 6.858927916,
+          "hxB-4": 7.818286998,
+          "hxA-5": 3.443401422,
+          "hxB-5": 8.527848829999998,
+          "hxA-6": 6.344283431,
+          "hxB-6": 0.510293074,
+          "hxA-7": 0.315884594
+        }
+      },
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1280-Ag1024-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness",
+        "requests_equal": 13,
+        "canonical_hashes_equal": 13,
+        "mean_stream_total_tok_s": 25.76568129410596,
+        "weighted_decode_tok_s": 26.063546018066173,
+        "summed_ttft_s": 72.797019472,
+        "ttft_by_prompt_s": {
+          "hxA-1": 14.609795705999998,
+          "hxB-1": 8.978515202,
+          "hxA-2": 4.111777483,
+          "hxB-2": 3.4316648339999998,
+          "hxA-3": 3.882264892,
+          "hxB-3": 4.152162120999999,
+          "hxA-4": 6.834728857999999,
+          "hxB-4": 7.817912167999999,
+          "hxA-5": 3.419300907,
+          "hxB-5": 8.463790273,
+          "hxA-6": 6.287213677,
+          "hxB-6": 0.494830453,
+          "hxA-7": 0.313062898
+        }
+      }
+    ],
+    "heldout": [
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-L1024-Pf-N8-C8-Pmr8",
+        "requests_equal": 8,
+        "canonical_hashes_equal": 0,
+        "mean_stream_total_tok_s": 41.80426919207966,
+        "weighted_decode_tok_s": 5.110650785240954,
+        "summed_ttft_s": 25.152478278,
+        "ttft_by_prompt_s": {
+          "heldout-01": 2.2030535319999998,
+          "heldout-02": 4.81717077,
+          "heldout-03": 3.525548857,
+          "heldout-04": 2.878764024,
+          "heldout-05": 5.312685961000001,
+          "heldout-06": 4.084926376,
+          "heldout-07": 0.838408914,
+          "heldout-08": 1.491919844
+        }
+      },
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1280-Ag1024-Cs-L1024-Pf-N8-C8-Pmr8",
+        "requests_equal": 8,
+        "canonical_hashes_equal": 0,
+        "mean_stream_total_tok_s": 41.32949654331074,
+        "weighted_decode_tok_s": 5.137064289184314,
+        "summed_ttft_s": 24.464002764,
+        "ttft_by_prompt_s": {
+          "heldout-01": 5.29881828,
+          "heldout-02": 2.152700377,
+          "heldout-03": 0.894896994,
+          "heldout-04": 4.618003109,
+          "heldout-05": 1.406939424,
+          "heldout-06": 3.351862341,
+          "heldout-07": 3.9429860039999998,
+          "heldout-08": 2.797796235
+        }
+      }
+    ]
+  }
+}

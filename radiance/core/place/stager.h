@@ -547,6 +547,11 @@ public:
      * slots (..._P1_LEND) with the arena's, and every pass at the full plan takes them all back. < 0
      * with *why when no slot fits or no unit is left to lend (the engine refuses to start). */
     bool p1_lend_arena_asked() const { return p1_ && p1_arena_asked_; }
+    bool draft_bank_lend_conflict() const { return p1_lend_asked_ || p1_arena_asked_ || (p1_ && p1_->lending()); }
+    /* Idle P1 is supported; ring/arena lenders require a combined proof and are refused. */
+    int quiesce_for_draft_bank();
+    void track_draft_bank_residents() { bank_track_ = true; }
+    uint64_t draft_bank_selected_units() const { return bank_selected_; }
     int  p1_lend_arena(char* lo, int64_t bytes, int64_t rows, std::function<bool()> full, std::string* why);
     //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
     int shutdown_head_cache();
@@ -662,6 +667,8 @@ private:
     int  p1_state_ = 0;
     int64_t p1_min_rows_ = ds41p1::kDefMinRows;   /* ..._P1_MIN_ROWS as lcp_init read it */
     bool    p1_lend_asked_ = false;               /* ..._P1_LEND or ..._P1_LEND_ARENA > 0 as lcp_init read it */
+    bool bank_track_ = false;
+    uint64_t bank_selected_ = 0; // real selected file-tier units skipped because bank loan is resident
     /* The rows the CPU path takes under P1: every layer pass below the threshold (ds41p1::cpu_rows). */
     int64_t p1_cpu_rows() const { return ds41p1::cpu_rows(ep_rows_, p1_min_rows_); }
     /* hx_init's ..._MISSES bound: every pass's rows (ep_rows_), but under P1 without the lent ring only the
@@ -1214,6 +1221,10 @@ private:
 public:
     /* Waits for the background relayouts of missed units; before the mover drains its cache. */
     void drain_host_inserts();
+    /* Initial physical-KV mode has no P1 or head/draft passes. Assert the rank CPU issuer ended
+     * its FileStager pass (end_pass already joined CPU expert/miss jobs), then drain RAM-cache
+     * insert helpers. Never calls Scheduler or waits for its ownership mutex. */
+    int quiesce_for_backing();
 private:
     int  finish(int32_t b, RadStream s);
     struct HeadOps;

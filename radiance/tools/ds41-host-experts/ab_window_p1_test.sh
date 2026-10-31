@@ -9,7 +9,10 @@
 #      stated off; the adopted arm itself states P1 off; P1 at the default threshold with M16, Ql12 on
 #      B6's ring, Qh without Ql and Ql without P1 are skipped; Qm17 with M16 is launched; P1 at Lc2048 with
 #      Qe64 and M2048 is launched with the lent arena on, Qh beside Qe alone too; Qe at M1024 beside Lc2048
-#      and Qe without P1 are skipped.
+#      and Qe without P1 are skipped; Lc4096 with explicit Pci4096 works cold or cached, while
+#      a missing/short interval, another prefix-only part without Pc, or Lc4112 are refused;
+#   3. balanced-kernel receipts state their actual requested-height coverage; an M2048 balance
+#      oracle cannot authorize Mb+Lc4096 even when the independent LCP oracle covered 4096.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -57,6 +60,62 @@ expect 1 "P1 without Qe on a server that lends the arena"             p1arena 10
 expect 0 "P1 with Ql10 and Qe64, both lines"                          p1both 1024 1 320 10 64
 expect 1 "P1 with Qe64 alone on a server that lends the ring too"     p1both 1024 1 320 "" 64
 
+# Qsp's startup and useful-work gates, independent of ordinary P1 startup admission.
+eval "$(sed -n '/^qsp_gate() {/,/^}/p' "$W")"
+declare -F qsp_gate >/dev/null || { echo "FAIL no qsp_gate in $W"; exit 1; }
+: > "$T/qsp-good.log"
+for rank in 0 1 2 3; do
+  echo "ds41 p1: rank $rank's wave SwiGLU spans on (test)" >> "$T/qsp-good.log"
+  echo "ds41 p1 stats, rank $rank: test; wave SwiGLU spans 12, rows 20 of 200, full-replay fallbacks 0" >> "$T/qsp-good.log"
+done
+sed '/rank 3/d' "$T/qsp-good.log" > "$T/qsp-missing.log"
+sed 's/spans 12/spans 0/' "$T/qsp-good.log" > "$T/qsp-idle.log"
+sed 's/rows 20 of 200/rows 200 of 200/' "$T/qsp-good.log" > "$T/qsp-full.log"
+: > "$T/qsp-off.log"
+qexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qsp_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+qexpect 0 'Qsp every-rank startup' "$T/qsp-good.log" 1 start
+qexpect 0 'Qsp every-rank work reduction' "$T/qsp-good.log" 1 exit
+qexpect 1 'Qsp missing rank' "$T/qsp-missing.log" 1 start
+qexpect 1 'Qsp enabled without actual waves' "$T/qsp-idle.log" 1 exit
+qexpect 1 'Qsp no reduced work' "$T/qsp-full.log" 1 exit
+qexpect 1 'Qsp unrequested activation' "$T/qsp-good.log" '' start
+qexpect 0 'Qsp explicitly off' "$T/qsp-off.log" '' exit
+
+# ---- the balance receipt: an old generic PASS is not requested-height evidence
+eval "$(sed -n '/^bal_receipt_bound() {/,/^}/p' "$W")"
+declare -F bal_receipt_bound >/dev/null || { echo "FAIL no bal_receipt_bound in $W"; exit 1; }
+receipt() {   # want status, description, requested C, expected maximum, receipt line(s)
+  local want=$1 what=$2 requested=$3 maximum=$4 got rc
+  printf '%s\n' "$5" > "$T/bal.log"
+  got=$(bal_receipt_bound "$T/bal.log" "$requested"); rc=$?
+  if [[ $rc == "$want" && ( $rc != 0 || $got == "$maximum" ) ]]; then ok "$what"
+  else bad "$what: status $rc/max '$got', wanted $want/'$maximum'"; fi
+}
+receipt 0 'the 2048 receipt keeps its actual bound' 2048 2048 \
+  'bal: byte coverage max_M=2048 requested_C=2048 heights=1,6,16,17,64,256,512,1024,2048'
+receipt 0 'the 3072 boundary has an actual receipt' 3072 3072 \
+  'bal: byte coverage max_M=3072 requested_C=3072 heights=1,6,16,17,64,256,512,1024,2048,3072'
+receipt 0 'an intermediate requested C is actually present' 4000 4000 \
+  'bal: byte coverage max_M=4000 requested_C=4000 heights=1,6,16,17,64,256,512,1024,2048,3072,4000'
+receipt 0 'the 4096 receipt covers its upper boundary' 4096 4096 \
+  'bal: byte coverage max_M=4096 requested_C=4096 heights=1,6,16,17,64,256,512,1024,2048,3072,4096'
+receipt 1 'a generic legacy PASS has no actual bound' 4096 '' \
+  "PASS: bal: the balanced gemv and twin give the plain kernel's bytes at 1..4096 tokens"
+receipt 1 'a short maximum cannot certify the requested C' 4096 '' \
+  'bal: byte coverage max_M=2048 requested_C=4096 heights=1,6,16,17,64,256,512,1024,2048'
+receipt 1 'a claimed bound missing from the tested list refuses' 4096 '' \
+  'bal: byte coverage max_M=4096 requested_C=4096 heights=1,6,16,17,64,256,512,1024,2048,3072'
+receipt 1 'a receipt for another C refuses' 3072 '' \
+  'bal: byte coverage max_M=4096 requested_C=4096 heights=1,6,16,17,64,256,512,1024,2048,3072,4096'
+receipt 1 'duplicate tested heights refuse' 4096 '' \
+  'bal: byte coverage max_M=4096 requested_C=4096 heights=1,6,16,17,64,256,512,1024,2048,2048,3072,4096'
+receipt 1 'a trailing empty tested height refuses' 4096 '' \
+  'bal: byte coverage max_M=4096 requested_C=4096 heights=1,6,16,17,64,256,512,1024,2048,3072,4096,'
+
 # ---- 2. the arm loop, stubbed
 H=$T/home
 mkdir -p "$H/kernels"
@@ -78,8 +137,16 @@ BIG=$pre-M2048-$mid-B6-$post2k-P1-Qe64-Cs-Mb1-Lm4096
 BIGG=$pre-M2048-$mid-B6-$post2k-P1-Qe64-Qh3000-Cs-Mb1-Lm4096
 BIGM=$pre-M1024-$mid-B6-$post2k-P1-Qe64-Cs-Mb1-Lm4096
 ENOP=$pre-M1024-$mid-B1-$post-Qe64-Cs-Mb1-Lm4096
-ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP"
-out=$(
+post4k=${post%-Lc1024}-Lc4096
+COLD4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pci4096-Cs-Mb1-Lm8192
+PC4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pc-Pci4096-Cs-Mb1-Lm8192
+NOINT4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Cs-Mb1-Lm8192
+LOWINT4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pci2048-Cs-Mb1-Lm8192
+NOPC4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pci4096-Pce-Cs-Mb1-Lm8192
+OVER4K=$pre-M4112-$mid-B6-${post%-Lc1024}-Lc4112-P1-Qe64-Pci8192-Cs-Mb1-Lm8192
+ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP $COLD4K $PC4K $NOINT4K $LOWINT4K $NOPC4K $OVER4K"
+run_loop() {   # actual balance-oracle bound; every model action remains stubbed
+ (
   set +u
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
@@ -90,8 +157,8 @@ out=$(
   unset RADIANCE_TUNE
   SUM=$(sha256sum "$H/kernels/libr4d.so" | cut -d' ' -f1); LIB=$H/kernels/libr4d.so
   TALL_OK=1 TALL_WHY=test TALL_SUM=$SUM TALL_LIB=$LIB DK_OK=1 DK_WHY=test DK_SUM=$SUM DK_LIB=$LIB
-  RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=2048
-  BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
+  RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=4096
+  BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=$1 P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
   OUT=$T/out; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
@@ -99,6 +166,8 @@ out=$(
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"
 ) 2>&1
+}
+out=$(run_loop 4096)
 echo "$out" > "$T/loop.txt"
 section() { awk -v a="ARM $1" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt"; }
 # The last value an arm states for a variable (later entries win in the arm's environment).
@@ -151,14 +220,32 @@ for a in "$BIG" "$BIGG"; do
   [[ "$sec" == *"--max-num-batched-tokens 2048"* ]] && ok "$n: chunks of 2048" || bad "$n: no --max-num-batched-tokens 2048"
 done
 has "P1+Lc2048+Qe64+Qh3000" "$(section "$BIGG")" RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS 3000
-for a in "$SHORTM" "$OVERL" "$GNOL" "$LNOP" "$BIGM" "$ENOP"; do
+for a in "$COLD4K" "$PC4K"; do
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "4K arm $a was not launched"; continue; fi
+  has "LCP4096" "$sec" RADIANCE_EXPERIMENTAL_DS41_LCP 4096
+  has "LCP4096" "$sec" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES 4096
+  has "LCP4096" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA 64
+  [[ "$sec" == *"--checkpoint-interval 4096"* ]] && ok "LCP4096: explicit interval 4096" || bad "LCP4096: missing interval 4096"
+done
+for a in "$SHORTM" "$OVERL" "$GNOL" "$LNOP" "$BIGM" "$ENOP" "$NOINT4K" "$LOWINT4K" "$NOPC4K" "$OVER4K"; do
   if [[ -n "$(section "$a")" ]]; then bad "arm $a was launched"
   elif grep -q "LOG: arm $a: .*skipped" "$T/loop.txt"; then ok "skipped: $(grep -m1 "LOG: arm $a: " "$T/loop.txt" | sed "s|LOG: arm $a: ||")"
   else bad "arm $a neither launched nor skipped"; fi
 done
-for a in "$REF" "$NEW" "$NEWG" "$Q17" "$BIG" "$BIGG"; do
+for a in "$REF" "$NEW" "$NEWG" "$Q17" "$BIG" "$BIGG" "$COLD4K" "$PC4K"; do
   if grep -q "LOG: arm $a: .*\(skipped\|refused\)" "$T/loop.txt"; then bad "arm $a: $(grep -m1 "LOG: arm $a: " "$T/loop.txt")"; fi
 done
+
+short_out=$(run_loop 2048)
+for a in "$COLD4K" "$PC4K"; do
+  if grep -qxF "ARM $a" <<< "$short_out"; then bad "Mb+Lc4096 launched after only the balance M2048 oracle"
+  elif grep -qF "arm $a: Mb refused: its row bound 4096 exceeds the balance oracle's actual M2048" <<< "$short_out"; then
+    ok 'Mb+Lc4096 refused above BAL_MAX_M despite the independent LCP4096 receipt'
+  else bad "no actual-bound refusal for arm $a"; fi
+done
+grep -qxF "ARM $BIG" <<< "$short_out" && ok 'Mb+Lc2048 still runs on its M2048 balance receipt' ||
+  bad 'the shorter balance receipt incorrectly stopped Mb+Lc2048'
 
 (( fail )) && { echo "ab_window_p1_test: FAILED (loop output in $T/loop.txt, removed on exit)"; exit 1; }
 echo "ab_window_p1_test: all checks passed"

@@ -1,0 +1,42 @@
+PASS: n128 M1 profile0 every byte, guards and dispatch (rc0/0/0, first difference 533)
+PASS: n128 M7 profile0 every byte, guards and dispatch (rc0/0/0, first difference 1343)
+PASS: n128 M8 profile0 every byte, guards and dispatch (rc0/0/0, first difference 1478)
+PASS: n128 M9 profile0 every byte, guards and dispatch (rc0/0/0, first difference 1613)
+PASS: n128 M16 profile0 every byte, guards and dispatch (rc0/0/0, first difference 2558)
+PASS: n128 M32 profile0 every byte, guards and dispatch (rc0/0/0, first difference 4718)
+PASS: n128 M33 profile0 every byte, guards and dispatch (rc0/0/0, first difference 4853)
+PASS: n128 M72 profile0 every byte, guards and dispatch (rc0/0/0, first difference 10118)
+PASS: n128 M73 profile0 every byte, guards and dispatch (rc0/0/0, first difference 10253)
+PASS: n128 M255 profile0 every byte, guards and dispatch (rc0/0/0, first difference 34823)
+PASS: n128 M256 profile0 every byte, guards and dispatch (rc0/0/0, first difference 34958)
+PASS: n128 M1024 profile0 every byte, guards and dispatch (rc0/0/0, first difference 138638)
+PASS: n128 M2048 profile0 every byte, guards and dispatch (rc0/0/0, first difference 276878)
+PASS: n128 M4096 profile0 every byte, guards and dispatch (rc0/0/0, first difference 553358)
+PASS: n128 M17 profile1 every byte, guards and dispatch (rc0/0/0, first difference 2693)
+PASS: n128 M33 profile1 every byte, guards and dispatch (rc0/0/0, first difference 4853)
+PASS: n128 M73 profile1 every byte, guards and dispatch (rc0/0/0, first difference 10253)
+PASS: n128 M17 profile2 every byte, guards and dispatch (rc0/0/0, first difference 2693)
+PASS: n128 M33 profile2 every byte, guards and dispatch (rc0/0/0, first difference 4853)
+PASS: n128 M73 profile2 every byte, guards and dispatch (rc0/0/0, first difference 10253)
+PASS: n128 M17 profile3 every byte, guards and dispatch (rc0/0/0, first difference 2693)
+PASS: n128 M33 profile3 every byte, guards and dispatch (rc0/0/0, first difference 4853)
+PASS: n128 M73 profile3 every byte, guards and dispatch (rc0/0/0, first difference 10253)
+PASS: n128 M17 profile4 every byte, guards and dispatch (rc0/0/0, first difference 2693)
+PASS: n128 M33 profile4 every byte, guards and dispatch (rc0/0/0, first difference 4853)
+PASS: n128 M73 profile4 every byte, guards and dispatch (rc0/0/0, first difference 10253)
+PASS: n128 M17 profile5 every byte, guards and dispatch (rc0/0/0, first difference 2693)
+PASS: n128 M33 profile5 every byte, guards and dispatch (rc0/0/0, first difference 4853)
+PASS: n128 M73 profile5 every byte, guards and dispatch (rc0/0/0, first difference 10253)
+PASS: n128 eligibility near-miss0 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 eligibility near-miss1 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 eligibility near-miss2 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 eligibility near-miss3 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 eligibility near-miss4 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 eligibility near-miss5 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 eligibility near-miss6 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 eligibility near-miss7 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 eligibility near-miss8 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 eligibility near-miss9 refused before writing; unchanged fallback, rc-18/0/0
+PASS: n128 invalid checker form refused, rc-12
+PASS: ds41 n128 wave norm matches unchanged fused norm, all output/guard bytes; exceptional and rounding cases, eligibility refusals; through M4096 (29 positive cases)
+n128 on exit 0

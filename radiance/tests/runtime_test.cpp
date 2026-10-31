@@ -2194,6 +2194,48 @@ TEST(an_aborted_rank_barrier_releases_its_waiters_and_every_later_arrival) {
     CHECK(true);
 }
 
+TEST(the_paired_rank_barrier_distinguishes_parked_cpu_issuers_from_active_or_aborted) {
+    rad::RankBarrier b(2);
+    std::atomic<bool> may_join{false};
+    CHECK(b.parked_for_scheduler());
+    std::thread rank([&] {
+        b.arrive_and_wait(); // release
+        while (!may_join.load(std::memory_order_acquire)) std::this_thread::yield();
+        b.arrive_and_wait(); // CPU issuer joined, GPU may still have queued work
+        b.arrive_and_wait(); // next release remains parked until abort
+    });
+    b.arrive_and_wait();
+    CHECK(!b.parked_for_scheduler());
+    may_join.store(true, std::memory_order_release);
+    b.arrive_and_wait();
+    CHECK(b.parked_for_scheduler());
+    b.abort();
+    CHECK(!b.parked_for_scheduler());
+    rank.join();
+}
+
+TEST(backing_quiescence_drains_both_compute_lanes_without_destroying_the_context) {
+    if (!rad::device_is_host()) SKIP("queued byte/drain fixture requires the host device backend");
+    Fixture f;
+    REQUIRE_EQ(f.start(), RAD_OK);
+    uint8_t* bytes = static_cast<uint8_t*>(rad_dev_alloc(128, RAD_MEM_DEVICE));
+    REQUIRE(bytes);
+    CHECK_OK(rad_memset_async(bytes, 0x5A, 64, f.ctx.stream()));
+    CHECK_OK(f.ctx.set_lane(1));
+    CHECK_OK(rad_memset_async(bytes + 64, 0xC3, 64, f.ctx.cur_stream()));
+    CHECK_OK(f.ctx.quiesce_for_backing());
+    int wrong = 0;
+    for (int i = 0; i < 128; ++i) wrong += bytes[i] != (i < 64 ? 0x5A : 0xC3);
+    CHECK_EQ(wrong, 0);
+    CHECK_OK(f.ctx.set_lane(0));
+    CHECK_OK(rad_memset_async(bytes, 0x71, 128, f.ctx.stream()));
+    CHECK_OK(f.ctx.quiesce_for_backing());
+    wrong = 0;
+    for (int i = 0; i < 128; ++i) wrong += bytes[i] != 0x71;
+    CHECK_EQ(wrong, 0);
+    rad_dev_free(bytes, RAD_MEM_DEVICE);
+}
+
 /* No rank leaves round r before every rank has arrived at it, and none reaches round r + 2 while
  * another is still in r: a fast rank re-entering at once waits on the next generation. */
 TEST(no_rank_passes_a_barrier_round_before_every_rank_reached_it) {

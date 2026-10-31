@@ -1,0 +1,342 @@
+{
+  "schema": "ds41-proposal-metadata-v1",
+  "assertion": "Fresh server perarm, concurrency1, seq1..N in receipt order; no hidden generation probes. Existing proposal-ID logs and response prompt/counts will be checked. Same chat prompt shared across Ds1/Ds2 stays one split group.",
+  "requests": [
+    {
+      "run": "code2",
+      "seq": 1,
+      "family": "code",
+      "prompt_key": "code-01",
+      "split_group": "code-01"
+    },
+    {
+      "run": "code2",
+      "seq": 2,
+      "family": "code",
+      "prompt_key": "code-02",
+      "split_group": "code-02"
+    },
+    {
+      "run": "code2",
+      "seq": 3,
+      "family": "code",
+      "prompt_key": "code-03",
+      "split_group": "code-03"
+    },
+    {
+      "run": "code2",
+      "seq": 4,
+      "family": "code",
+      "prompt_key": "code-04",
+      "split_group": "code-04"
+    },
+    {
+      "run": "code2",
+      "seq": 5,
+      "family": "code",
+      "prompt_key": "code-05",
+      "split_group": "code-05"
+    },
+    {
+      "run": "code2",
+      "seq": 6,
+      "family": "code",
+      "prompt_key": "code-06",
+      "split_group": "code-06"
+    },
+    {
+      "run": "code2",
+      "seq": 7,
+      "family": "code",
+      "prompt_key": "code-07",
+      "split_group": "code-07"
+    },
+    {
+      "run": "code2",
+      "seq": 8,
+      "family": "code",
+      "prompt_key": "code-08",
+      "split_group": "code-08"
+    },
+    {
+      "run": "code2",
+      "seq": 9,
+      "family": "code",
+      "prompt_key": "code-09",
+      "split_group": "code-09"
+    },
+    {
+      "run": "code2",
+      "seq": 10,
+      "family": "code",
+      "prompt_key": "code-10",
+      "split_group": "code-10"
+    },
+    {
+      "run": "code2",
+      "seq": 11,
+      "family": "code",
+      "prompt_key": "code-11",
+      "split_group": "code-11"
+    },
+    {
+      "run": "code2",
+      "seq": 12,
+      "family": "code",
+      "prompt_key": "code-12",
+      "split_group": "code-12"
+    },
+    {
+      "run": "code2",
+      "seq": 13,
+      "family": "code",
+      "prompt_key": "code-13",
+      "split_group": "code-13"
+    },
+    {
+      "run": "code2",
+      "seq": 14,
+      "family": "code",
+      "prompt_key": "code-14",
+      "split_group": "code-14"
+    },
+    {
+      "run": "code2",
+      "seq": 15,
+      "family": "code",
+      "prompt_key": "code-15",
+      "split_group": "code-15"
+    },
+    {
+      "run": "code2",
+      "seq": 16,
+      "family": "code",
+      "prompt_key": "code-16",
+      "split_group": "code-16"
+    },
+    {
+      "run": "chat2",
+      "seq": 1,
+      "family": "chat",
+      "prompt_key": "chat-01",
+      "split_group": "chat-01"
+    },
+    {
+      "run": "chat2",
+      "seq": 2,
+      "family": "chat",
+      "prompt_key": "chat-02",
+      "split_group": "chat-02"
+    },
+    {
+      "run": "chat2",
+      "seq": 3,
+      "family": "chat",
+      "prompt_key": "chat-03",
+      "split_group": "chat-03"
+    },
+    {
+      "run": "chat2",
+      "seq": 4,
+      "family": "chat",
+      "prompt_key": "chat-04",
+      "split_group": "chat-04"
+    },
+    {
+      "run": "chat2",
+      "seq": 5,
+      "family": "chat",
+      "prompt_key": "chat-05",
+      "split_group": "chat-05"
+    },
+    {
+      "run": "chat2",
+      "seq": 6,
+      "family": "chat",
+      "prompt_key": "chat-06",
+      "split_group": "chat-06"
+    },
+    {
+      "run": "chat2",
+      "seq": 7,
+      "family": "chat",
+      "prompt_key": "chat-07",
+      "split_group": "chat-07"
+    },
+    {
+      "run": "chat2",
+      "seq": 8,
+      "family": "chat",
+      "prompt_key": "chat-08",
+      "split_group": "chat-08"
+    },
+    {
+      "run": "chat2",
+      "seq": 9,
+      "family": "chat",
+      "prompt_key": "chat-09",
+      "split_group": "chat-09"
+    },
+    {
+      "run": "chat2",
+      "seq": 10,
+      "family": "chat",
+      "prompt_key": "chat-10",
+      "split_group": "chat-10"
+    },
+    {
+      "run": "chat2",
+      "seq": 11,
+      "family": "chat",
+      "prompt_key": "chat-11",
+      "split_group": "chat-11"
+    },
+    {
+      "run": "chat2",
+      "seq": 12,
+      "family": "chat",
+      "prompt_key": "chat-12",
+      "split_group": "chat-12"
+    },
+    {
+      "run": "chat2",
+      "seq": 13,
+      "family": "chat",
+      "prompt_key": "chat-13",
+      "split_group": "chat-13"
+    },
+    {
+      "run": "chat2",
+      "seq": 14,
+      "family": "chat",
+      "prompt_key": "chat-14",
+      "split_group": "chat-14"
+    },
+    {
+      "run": "chat2",
+      "seq": 15,
+      "family": "chat",
+      "prompt_key": "chat-15",
+      "split_group": "chat-15"
+    },
+    {
+      "run": "chat2",
+      "seq": 16,
+      "family": "chat",
+      "prompt_key": "chat-16",
+      "split_group": "chat-16"
+    },
+    {
+      "run": "chat1",
+      "seq": 1,
+      "family": "chat",
+      "prompt_key": "chat-01",
+      "split_group": "chat-01"
+    },
+    {
+      "run": "chat1",
+      "seq": 2,
+      "family": "chat",
+      "prompt_key": "chat-02",
+      "split_group": "chat-02"
+    },
+    {
+      "run": "chat1",
+      "seq": 3,
+      "family": "chat",
+      "prompt_key": "chat-03",
+      "split_group": "chat-03"
+    },
+    {
+      "run": "chat1",
+      "seq": 4,
+      "family": "chat",
+      "prompt_key": "chat-04",
+      "split_group": "chat-04"
+    },
+    {
+      "run": "chat1",
+      "seq": 5,
+      "family": "chat",
+      "prompt_key": "chat-05",
+      "split_group": "chat-05"
+    },
+    {
+      "run": "chat1",
+      "seq": 6,
+      "family": "chat",
+      "prompt_key": "chat-06",
+      "split_group": "chat-06"
+    },
+    {
+      "run": "chat1",
+      "seq": 7,
+      "family": "chat",
+      "prompt_key": "chat-07",
+      "split_group": "chat-07"
+    },
+    {
+      "run": "chat1",
+      "seq": 8,
+      "family": "chat",
+      "prompt_key": "chat-08",
+      "split_group": "chat-08"
+    },
+    {
+      "run": "chat1",
+      "seq": 9,
+      "family": "chat",
+      "prompt_key": "chat-09",
+      "split_group": "chat-09"
+    },
+    {
+      "run": "chat1",
+      "seq": 10,
+      "family": "chat",
+      "prompt_key": "chat-10",
+      "split_group": "chat-10"
+    },
+    {
+      "run": "chat1",
+      "seq": 11,
+      "family": "chat",
+      "prompt_key": "chat-11",
+      "split_group": "chat-11"
+    },
+    {
+      "run": "chat1",
+      "seq": 12,
+      "family": "chat",
+      "prompt_key": "chat-12",
+      "split_group": "chat-12"
+    },
+    {
+      "run": "chat1",
+      "seq": 13,
+      "family": "chat",
+      "prompt_key": "chat-13",
+      "split_group": "chat-13"
+    },
+    {
+      "run": "chat1",
+      "seq": 14,
+      "family": "chat",
+      "prompt_key": "chat-14",
+      "split_group": "chat-14"
+    },
+    {
+      "run": "chat1",
+      "seq": 15,
+      "family": "chat",
+      "prompt_key": "chat-15",
+      "split_group": "chat-15"
+    },
+    {
+      "run": "chat1",
+      "seq": 16,
+      "family": "chat",
+      "prompt_key": "chat-16",
+      "split_group": "chat-16"
+    }
+  ]
+}

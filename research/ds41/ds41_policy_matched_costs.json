@@ -1,0 +1,1199 @@
+{
+  "extraction": {
+    "authority_assertion": "Actual serving build3fe07391 is recorded separately from later fixture/harness source2167bd20; runtime-provenance.json retains the complete allowed diff. Operator retained the source/build snapshot and coherent plugin hashes,10 complete arms, original Db2 hotsets and192GiB profile. Existing verbose binding audit passed; no model warmup generation.",
+    "authority_boundary": "Log checks establish instrumentation evidence, not operator-supplied deployment/config/request authority.",
+    "cost_scope": "quiet_train_groups_only",
+    "family_profiles": {
+      "chat": {
+        "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+          "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+        },
+        "id": "chat-original-db2"
+      },
+      "code": {
+        "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+          "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+        },
+        "id": "code-original-db2"
+      }
+    },
+    "fit_performed": false,
+    "frozen_split": {
+      "heldout_fraction": 0.25,
+      "metadata": "/home/as/ds41-claude-build/work/autonomous-20261031/dpc/metadata-frozen.json",
+      "seed": "ds41-prob-v1",
+      "sha256": "ad5a012102e4ef5a8be614308e9e14acbc4f85e748494131b015a6b3415b1cb1"
+    },
+    "manifest": "/home/as/ds41-claude-build/work/autonomous-20261031/dme-quiet/manifest.json",
+    "manifest_sha256": "92e1cc7a295ca1275f0128842d9721df055b25103d036441135c47c52f6ae6f8",
+    "profile": {
+      "common_config_sha256": "3c3b5d07df55c37de9f8345cbcab9dcd0c15b6b76f7b1083e4e8828ca1be9fb8",
+      "engine_commit": "3fe07391956274d0529b95d553a234f5e2032cf7",
+      "hardware": "256GB DDR4-2666;4xRX9070XT16GB;192GiB expert cache;startup ledgers retained",
+      "id": "ab-20261031T154102Z-common",
+      "libraries": {
+        "deepseek41.so": "c97db6d93528374937cc3a494d0a79eaca70c07dd6d6a36d5b0dce097b29b974",
+        "libavx.so": "764ea8ccf1f0b5bdeb2e1484decb55c3dc824b2ceca76a123a69b6e4585a2655",
+        "libquant.so": "4bf4ab40e8aa2cbe74d859a34e70c181d262f213dfc99fae3e1b4dc539296ee7",
+        "libr4d.so": "b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10",
+        "libref.so": "334a712aff27a53ce0fd222a56024f4684dedcd1f65372fc6458ec0c2e237b19"
+      },
+      "source_provenance": {
+        "path": "/home/as/ds41-claude-build/work/autonomous-20261031/dme-quiet/runtime-provenance.json",
+        "reviewed_source_commit": "2167bd2047fc65f45cff5e59fe2c31e662a2aa6d",
+        "sha256": "d60b0880bd66f4bcba7fb6a5d5b2c660e72fb6b51608ab202942b6291ecac98f"
+      }
+    },
+    "runs": [
+      {
+        "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256",
+        "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+        "costs": {
+          "0": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          },
+          "1": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          },
+          "2": {
+            "accepted": 1941,
+            "cycle_ns": 104606022988,
+            "emitted": 3162,
+            "n": 1221,
+            "wait_ns": 2894270772
+          }
+        },
+        "cycle_audit": null,
+        "family": "code",
+        "family_profile_id": "code-original-db2",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+          "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+        },
+        "k": 2,
+        "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.server.log",
+        "log_level": "info",
+        "log_sha256": "7a0fd1f56683a39252f5673755cc4b28c66a4cf3a2c945981ec00681e2811ef3",
+        "logging": "quiet",
+        "profile_id": "ab-20261031T154102Z-common",
+        "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+        "request_inventory": [
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 2,
+            "prompt_key": "code-02",
+            "seq": 1,
+            "split": "train",
+            "split_group": "code-02"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 4,
+            "prompt_key": "code-04",
+            "seq": 2,
+            "split": "train",
+            "split_group": "code-04"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 5,
+            "prompt_key": "code-05",
+            "seq": 3,
+            "split": "train",
+            "split_group": "code-05"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 6,
+            "prompt_key": "code-06",
+            "seq": 4,
+            "split": "train",
+            "split_group": "code-06"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 7,
+            "prompt_key": "code-07",
+            "seq": 5,
+            "split": "train",
+            "split_group": "code-07"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 8,
+            "prompt_key": "code-08",
+            "seq": 6,
+            "split": "train",
+            "split_group": "code-08"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 9,
+            "prompt_key": "code-09",
+            "seq": 7,
+            "split": "train",
+            "split_group": "code-09"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 10,
+            "prompt_key": "code-10",
+            "seq": 8,
+            "split": "train",
+            "split_group": "code-10"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 11,
+            "prompt_key": "code-11",
+            "seq": 9,
+            "split": "train",
+            "split_group": "code-11"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 12,
+            "prompt_key": "code-12",
+            "seq": 10,
+            "split": "train",
+            "split_group": "code-12"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 14,
+            "prompt_key": "code-14",
+            "seq": 11,
+            "split": "train",
+            "split_group": "code-14"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 15,
+            "prompt_key": "code-15",
+            "seq": 12,
+            "split": "train",
+            "split_group": "code-15"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 16,
+            "prompt_key": "code-16",
+            "seq": 13,
+            "split": "train",
+            "split_group": "code-16"
+          }
+        ],
+        "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+        "requests": 13,
+        "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.json",
+        "results_sha256": "a9b31627a989c881aef0c73f0edd6f2f28a8ed64412fc2fbdaf21771a2a92f5d",
+        "run": "code-C2",
+        "scope": "cost_train",
+        "split_groups": [
+          "code-02",
+          "code-04",
+          "code-05",
+          "code-06",
+          "code-07",
+          "code-08",
+          "code-09",
+          "code-10",
+          "code-11",
+          "code-12",
+          "code-14",
+          "code-15",
+          "code-16"
+        ],
+        "totals": {
+          "end_cancel": 13,
+          "invalid_cycles": 0,
+          "invalid_queries": 0,
+          "no_query": 0,
+          "observers": 1260,
+          "queries": 1260,
+          "query_rows": 2520,
+          "transition": 13,
+          "unclosed_epoch": 0,
+          "unpublished": 0,
+          "wait_ns": 2985881080,
+          "waits": 1260
+        }
+      },
+      {
+        "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256",
+        "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+        "costs": {
+          "0": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          },
+          "1": {
+            "accepted": 1494,
+            "cycle_ns": 107862227171,
+            "emitted": 3175,
+            "n": 1681,
+            "wait_ns": 3988758060
+          },
+          "2": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          }
+        },
+        "cycle_audit": null,
+        "family": "code",
+        "family_profile_id": "code-original-db2",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+          "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+        },
+        "k": 1,
+        "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.server.log",
+        "log_level": "info",
+        "log_sha256": "9cd82d53dc05f68d48ab06b5432da58046eede615d9848b656b6a9d968baa5c5",
+        "logging": "quiet",
+        "profile_id": "ab-20261031T154102Z-common",
+        "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+        "request_inventory": [
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 2,
+            "prompt_key": "code-02",
+            "seq": 1,
+            "split": "train",
+            "split_group": "code-02"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 4,
+            "prompt_key": "code-04",
+            "seq": 2,
+            "split": "train",
+            "split_group": "code-04"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 5,
+            "prompt_key": "code-05",
+            "seq": 3,
+            "split": "train",
+            "split_group": "code-05"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 6,
+            "prompt_key": "code-06",
+            "seq": 4,
+            "split": "train",
+            "split_group": "code-06"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 7,
+            "prompt_key": "code-07",
+            "seq": 5,
+            "split": "train",
+            "split_group": "code-07"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 8,
+            "prompt_key": "code-08",
+            "seq": 6,
+            "split": "train",
+            "split_group": "code-08"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 9,
+            "prompt_key": "code-09",
+            "seq": 7,
+            "split": "train",
+            "split_group": "code-09"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 10,
+            "prompt_key": "code-10",
+            "seq": 8,
+            "split": "train",
+            "split_group": "code-10"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 11,
+            "prompt_key": "code-11",
+            "seq": 9,
+            "split": "train",
+            "split_group": "code-11"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 12,
+            "prompt_key": "code-12",
+            "seq": 10,
+            "split": "train",
+            "split_group": "code-12"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 14,
+            "prompt_key": "code-14",
+            "seq": 11,
+            "split": "train",
+            "split_group": "code-14"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 15,
+            "prompt_key": "code-15",
+            "seq": 12,
+            "split": "train",
+            "split_group": "code-15"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 16,
+            "prompt_key": "code-16",
+            "seq": 13,
+            "split": "train",
+            "split_group": "code-16"
+          }
+        ],
+        "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+        "requests": 13,
+        "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.json",
+        "results_sha256": "503385eabbecca46b0ce8e5aaeb788c9503629648ec2b41fbd9f0639dd7a63cd",
+        "run": "code-C1",
+        "scope": "cost_train",
+        "split_groups": [
+          "code-02",
+          "code-04",
+          "code-05",
+          "code-06",
+          "code-07",
+          "code-08",
+          "code-09",
+          "code-10",
+          "code-11",
+          "code-12",
+          "code-14",
+          "code-15",
+          "code-16"
+        ],
+        "totals": {
+          "end_cancel": 13,
+          "invalid_cycles": 0,
+          "invalid_queries": 0,
+          "no_query": 0,
+          "observers": 1720,
+          "queries": 1720,
+          "query_rows": 3440,
+          "transition": 13,
+          "unclosed_epoch": 0,
+          "unpublished": 0,
+          "wait_ns": 4080568974,
+          "waits": 1720
+        }
+      },
+      {
+        "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256",
+        "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+        "costs": {
+          "0": {
+            "accepted": 0,
+            "cycle_ns": 132190319659,
+            "emitted": 3188,
+            "n": 3188,
+            "wait_ns": 7226724064
+          },
+          "1": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          },
+          "2": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          }
+        },
+        "cycle_audit": null,
+        "family": "code",
+        "family_profile_id": "code-original-db2",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+          "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+        },
+        "k": 0,
+        "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.server.log",
+        "log_level": "info",
+        "log_sha256": "5d74da85438145a4c8d711abcbcd57e499c768dff014e7c21b8360da7ca524fa",
+        "logging": "quiet",
+        "profile_id": "ab-20261031T154102Z-common",
+        "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+        "request_inventory": [
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 2,
+            "prompt_key": "code-02",
+            "seq": 1,
+            "split": "train",
+            "split_group": "code-02"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 4,
+            "prompt_key": "code-04",
+            "seq": 2,
+            "split": "train",
+            "split_group": "code-04"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 5,
+            "prompt_key": "code-05",
+            "seq": 3,
+            "split": "train",
+            "split_group": "code-05"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 6,
+            "prompt_key": "code-06",
+            "seq": 4,
+            "split": "train",
+            "split_group": "code-06"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 7,
+            "prompt_key": "code-07",
+            "seq": 5,
+            "split": "train",
+            "split_group": "code-07"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 8,
+            "prompt_key": "code-08",
+            "seq": 6,
+            "split": "train",
+            "split_group": "code-08"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 9,
+            "prompt_key": "code-09",
+            "seq": 7,
+            "split": "train",
+            "split_group": "code-09"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 10,
+            "prompt_key": "code-10",
+            "seq": 8,
+            "split": "train",
+            "split_group": "code-10"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 11,
+            "prompt_key": "code-11",
+            "seq": 9,
+            "split": "train",
+            "split_group": "code-11"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 12,
+            "prompt_key": "code-12",
+            "seq": 10,
+            "split": "train",
+            "split_group": "code-12"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 14,
+            "prompt_key": "code-14",
+            "seq": 11,
+            "split": "train",
+            "split_group": "code-14"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 15,
+            "prompt_key": "code-15",
+            "seq": 12,
+            "split": "train",
+            "split_group": "code-15"
+          },
+          {
+            "frozen_run": "code2",
+            "frozen_seq": 16,
+            "prompt_key": "code-16",
+            "seq": 13,
+            "split": "train",
+            "split_group": "code-16"
+          }
+        ],
+        "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+        "requests": 13,
+        "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.json",
+        "results_sha256": "771fdcfe3cbd4b220db62e61a9d7746748f10dd8aace3ab5395abe2d6f3df5f9",
+        "run": "code-C0",
+        "scope": "cost_train",
+        "split_groups": [
+          "code-02",
+          "code-04",
+          "code-05",
+          "code-06",
+          "code-07",
+          "code-08",
+          "code-09",
+          "code-10",
+          "code-11",
+          "code-12",
+          "code-14",
+          "code-15",
+          "code-16"
+        ],
+        "totals": {
+          "end_cancel": 13,
+          "invalid_cycles": 0,
+          "invalid_queries": 0,
+          "no_query": 0,
+          "observers": 3227,
+          "queries": 3227,
+          "query_rows": 6454,
+          "transition": 13,
+          "unclosed_epoch": 0,
+          "unpublished": 0,
+          "wait_ns": 7317918987,
+          "waits": 3227
+        }
+      },
+      {
+        "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost",
+        "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+        "costs": {
+          "0": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          },
+          "1": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          },
+          "2": {
+            "accepted": 312,
+            "cycle_ns": 28197115882,
+            "emitted": 627,
+            "n": 315,
+            "wait_ns": 752702636
+          }
+        },
+        "cycle_audit": null,
+        "family": "chat",
+        "family_profile_id": "chat-original-db2",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+          "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+        },
+        "k": 2,
+        "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.server.log",
+        "log_level": "info",
+        "log_sha256": "ec2404a800782dffa7defc871aedd0d450af9aa05663c23e947291c58727999e",
+        "logging": "quiet",
+        "profile_id": "ab-20261031T154102Z-common",
+        "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+        "request_inventory": [
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 2,
+            "prompt_key": "chat-02",
+            "seq": 1,
+            "split": "train",
+            "split_group": "chat-02"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 3,
+            "prompt_key": "chat-03",
+            "seq": 2,
+            "split": "train",
+            "split_group": "chat-03"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 5,
+            "prompt_key": "chat-05",
+            "seq": 3,
+            "split": "train",
+            "split_group": "chat-05"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 6,
+            "prompt_key": "chat-06",
+            "seq": 4,
+            "split": "train",
+            "split_group": "chat-06"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 7,
+            "prompt_key": "chat-07",
+            "seq": 5,
+            "split": "train",
+            "split_group": "chat-07"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 8,
+            "prompt_key": "chat-08",
+            "seq": 6,
+            "split": "train",
+            "split_group": "chat-08"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 9,
+            "prompt_key": "chat-09",
+            "seq": 7,
+            "split": "train",
+            "split_group": "chat-09"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 10,
+            "prompt_key": "chat-10",
+            "seq": 8,
+            "split": "train",
+            "split_group": "chat-10"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 12,
+            "prompt_key": "chat-12",
+            "seq": 9,
+            "split": "train",
+            "split_group": "chat-12"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 14,
+            "prompt_key": "chat-14",
+            "seq": 10,
+            "split": "train",
+            "split_group": "chat-14"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 15,
+            "prompt_key": "chat-15",
+            "seq": 11,
+            "split": "train",
+            "split_group": "chat-15"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 16,
+            "prompt_key": "chat-16",
+            "seq": 12,
+            "split": "train",
+            "split_group": "chat-16"
+          }
+        ],
+        "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+        "requests": 12,
+        "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.json",
+        "results_sha256": "f913c4fd0ecc611be891892c34f1ee75f57d9e0a0d404a2862953d3da3a779de",
+        "run": "chat-C2",
+        "scope": "cost_train",
+        "split_groups": [
+          "chat-02",
+          "chat-03",
+          "chat-05",
+          "chat-06",
+          "chat-07",
+          "chat-08",
+          "chat-09",
+          "chat-10",
+          "chat-12",
+          "chat-14",
+          "chat-15",
+          "chat-16"
+        ],
+        "totals": {
+          "end_cancel": 12,
+          "invalid_cycles": 0,
+          "invalid_queries": 0,
+          "no_query": 0,
+          "observers": 351,
+          "queries": 351,
+          "query_rows": 702,
+          "transition": 12,
+          "unclosed_epoch": 0,
+          "unpublished": 0,
+          "wait_ns": 838324174,
+          "waits": 351
+        }
+      },
+      {
+        "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost",
+        "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+        "costs": {
+          "0": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          },
+          "1": {
+            "accepted": 255,
+            "cycle_ns": 25465309197,
+            "emitted": 636,
+            "n": 381,
+            "wait_ns": 921733016
+          },
+          "2": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          }
+        },
+        "cycle_audit": null,
+        "family": "chat",
+        "family_profile_id": "chat-original-db2",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+          "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+        },
+        "k": 1,
+        "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.server.log",
+        "log_level": "info",
+        "log_sha256": "f75061f9677388b31d14a2f93845e828ad7dc7d09175f6269e81d8f8b4a1d7dc",
+        "logging": "quiet",
+        "profile_id": "ab-20261031T154102Z-common",
+        "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+        "request_inventory": [
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 2,
+            "prompt_key": "chat-02",
+            "seq": 1,
+            "split": "train",
+            "split_group": "chat-02"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 3,
+            "prompt_key": "chat-03",
+            "seq": 2,
+            "split": "train",
+            "split_group": "chat-03"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 5,
+            "prompt_key": "chat-05",
+            "seq": 3,
+            "split": "train",
+            "split_group": "chat-05"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 6,
+            "prompt_key": "chat-06",
+            "seq": 4,
+            "split": "train",
+            "split_group": "chat-06"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 7,
+            "prompt_key": "chat-07",
+            "seq": 5,
+            "split": "train",
+            "split_group": "chat-07"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 8,
+            "prompt_key": "chat-08",
+            "seq": 6,
+            "split": "train",
+            "split_group": "chat-08"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 9,
+            "prompt_key": "chat-09",
+            "seq": 7,
+            "split": "train",
+            "split_group": "chat-09"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 10,
+            "prompt_key": "chat-10",
+            "seq": 8,
+            "split": "train",
+            "split_group": "chat-10"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 12,
+            "prompt_key": "chat-12",
+            "seq": 9,
+            "split": "train",
+            "split_group": "chat-12"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 14,
+            "prompt_key": "chat-14",
+            "seq": 10,
+            "split": "train",
+            "split_group": "chat-14"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 15,
+            "prompt_key": "chat-15",
+            "seq": 11,
+            "split": "train",
+            "split_group": "chat-15"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 16,
+            "prompt_key": "chat-16",
+            "seq": 12,
+            "split": "train",
+            "split_group": "chat-16"
+          }
+        ],
+        "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+        "requests": 12,
+        "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.json",
+        "results_sha256": "5e78fd3788561d1091b02433502cf155fc8baa206434085cedfd23ed4fb32fd2",
+        "run": "chat-C1",
+        "scope": "cost_train",
+        "split_groups": [
+          "chat-02",
+          "chat-03",
+          "chat-05",
+          "chat-06",
+          "chat-07",
+          "chat-08",
+          "chat-09",
+          "chat-10",
+          "chat-12",
+          "chat-14",
+          "chat-15",
+          "chat-16"
+        ],
+        "totals": {
+          "end_cancel": 12,
+          "invalid_cycles": 0,
+          "invalid_queries": 0,
+          "no_query": 0,
+          "observers": 417,
+          "queries": 417,
+          "query_rows": 834,
+          "transition": 12,
+          "unclosed_epoch": 0,
+          "unpublished": 0,
+          "wait_ns": 1006589871,
+          "waits": 417
+        }
+      },
+      {
+        "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost",
+        "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+        "costs": {
+          "0": {
+            "accepted": 0,
+            "cycle_ns": 27974041188,
+            "emitted": 650,
+            "n": 650,
+            "wait_ns": 1493194799
+          },
+          "1": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          },
+          "2": {
+            "accepted": 0,
+            "cycle_ns": 0,
+            "emitted": 0,
+            "n": 0,
+            "wait_ns": 0
+          }
+        },
+        "cycle_audit": null,
+        "family": "chat",
+        "family_profile_id": "chat-original-db2",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+          "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+        },
+        "k": 0,
+        "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.server.log",
+        "log_level": "info",
+        "log_sha256": "3e8ab6fa593fdb8308ac6e6606d2939a773dc86dda331d04b4d6f544f87ef10d",
+        "logging": "quiet",
+        "profile_id": "ab-20261031T154102Z-common",
+        "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+        "request_inventory": [
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 2,
+            "prompt_key": "chat-02",
+            "seq": 1,
+            "split": "train",
+            "split_group": "chat-02"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 3,
+            "prompt_key": "chat-03",
+            "seq": 2,
+            "split": "train",
+            "split_group": "chat-03"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 5,
+            "prompt_key": "chat-05",
+            "seq": 3,
+            "split": "train",
+            "split_group": "chat-05"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 6,
+            "prompt_key": "chat-06",
+            "seq": 4,
+            "split": "train",
+            "split_group": "chat-06"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 7,
+            "prompt_key": "chat-07",
+            "seq": 5,
+            "split": "train",
+            "split_group": "chat-07"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 8,
+            "prompt_key": "chat-08",
+            "seq": 6,
+            "split": "train",
+            "split_group": "chat-08"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 9,
+            "prompt_key": "chat-09",
+            "seq": 7,
+            "split": "train",
+            "split_group": "chat-09"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 10,
+            "prompt_key": "chat-10",
+            "seq": 8,
+            "split": "train",
+            "split_group": "chat-10"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 12,
+            "prompt_key": "chat-12",
+            "seq": 9,
+            "split": "train",
+            "split_group": "chat-12"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 14,
+            "prompt_key": "chat-14",
+            "seq": 10,
+            "split": "train",
+            "split_group": "chat-14"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 15,
+            "prompt_key": "chat-15",
+            "seq": 11,
+            "split": "train",
+            "split_group": "chat-15"
+          },
+          {
+            "frozen_run": "chat2",
+            "frozen_seq": 16,
+            "prompt_key": "chat-16",
+            "seq": 12,
+            "split": "train",
+            "split_group": "chat-16"
+          }
+        ],
+        "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+        "requests": 12,
+        "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.json",
+        "results_sha256": "740ff2211f24f9ce211bc4f87e5e4ca74f898e31d7fe8a278b86c35fd8d2b0a0",
+        "run": "chat-C0",
+        "scope": "cost_train",
+        "split_groups": [
+          "chat-02",
+          "chat-03",
+          "chat-05",
+          "chat-06",
+          "chat-07",
+          "chat-08",
+          "chat-09",
+          "chat-10",
+          "chat-12",
+          "chat-14",
+          "chat-15",
+          "chat-16"
+        ],
+        "totals": {
+          "end_cancel": 12,
+          "invalid_cycles": 0,
+          "invalid_queries": 0,
+          "no_query": 0,
+          "observers": 686,
+          "queries": 686,
+          "query_rows": 1372,
+          "transition": 12,
+          "unclosed_epoch": 0,
+          "unpublished": 0,
+          "wait_ns": 1576397468,
+          "waits": 686
+        }
+      }
+    ],
+    "schema": "ds41-matched-cost-extraction-v1"
+  },
+  "families": {
+    "chat": {
+      "c0_ms": 43.03698644307692,
+      "c1_ms": 66.83808188188976,
+      "c2_ms": 89.51465359365078,
+      "measurements": {
+        "0": {
+          "cycle_ns": 27974041188,
+          "n": 650,
+          "runs": [
+            "chat-C0"
+          ]
+        },
+        "1": {
+          "cycle_ns": 25465309197,
+          "n": 381,
+          "runs": [
+            "chat-C1"
+          ]
+        },
+        "2": {
+          "cycle_ns": 28197115882,
+          "n": 315,
+          "runs": [
+            "chat-C2"
+          ]
+        }
+      },
+      "profile": {
+        "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+          "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+        },
+        "id": "chat-original-db2"
+      },
+      "source": "C0=chat-C0; C1=chat-C1; C2=chat-C2"
+    },
+    "code": {
+      "c0_ms": 41.46496852540778,
+      "c1_ms": 64.16551289173111,
+      "c2_ms": 85.67241849959049,
+      "measurements": {
+        "0": {
+          "cycle_ns": 132190319659,
+          "n": 3188,
+          "runs": [
+            "code-C0"
+          ]
+        },
+        "1": {
+          "cycle_ns": 107862227171,
+          "n": 1681,
+          "runs": [
+            "code-C1"
+          ]
+        },
+        "2": {
+          "cycle_ns": 104606022988,
+          "n": 1221,
+          "runs": [
+            "code-C2"
+          ]
+        }
+      },
+      "profile": {
+        "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+        "hotset": {
+          "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+          "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+        },
+        "id": "code-original-db2"
+      },
+      "source": "C0=code-C0; C1=code-C1; C2=code-C2"
+    }
+  },
+  "measurement_profile": "ab-20261031T154102Z;native Db2 observer+early wait;quiet TRAIN only;no fitting",
+  "same_drafter_observer_wait": true,
+  "schema": "ds41-proposal-costs-v1"
+}

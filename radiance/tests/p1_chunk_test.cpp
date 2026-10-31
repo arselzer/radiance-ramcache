@@ -46,7 +46,7 @@ struct Fixture {
         prog.buffers.push_back(b);
     }
     /* A paged group, and with `linear` a gated-delta-net group (quantum 64, an interval). */
-    int start(bool linear, int64_t max_tok = 2048) {
+    int start(bool linear, int64_t max_tok = 2048, int64_t interval = 2048) {
         g_ki = RadKernelInfo{};
         g_ki.name = "gdn_fake";
         g_ki.op = "gdn_chunked";
@@ -90,7 +90,7 @@ struct Fixture {
         cfg.max_tok = max_tok;
         cfg.max_seqs = 1;
         cfg.max_ctx = 24576;
-        cfg.checkpoint_interval = 2048;
+        cfg.checkpoint_interval = interval;
         cfg.prefix_cache = true;
         cfg.prefix_exact = false;
         cfg.n_spec = 0;
@@ -200,6 +200,33 @@ TEST(p1_plan_chunk_keeps_the_interval_snapshots_and_the_tail_with_a_linear_group
         }
     }
     CHECK(true);
+}
+
+TEST(p1_plan_chunk4096_keeps_end_alignment_checkpoint_intervals_and_tail_snapshots) {
+    for (bool linear : { false, true }) {
+        Fixture f;
+        REQUIRE_EQ(f.start(linear, 4096, 4096), RAD_OK);
+        const int64_t g = f.sch.p1_grid();
+        f.sch.set_p1_end_align(true, 4096);
+        for (int64_t P : { 17, 3086, 4095, 4096, 4097, 6817, 8191, 8192, 8193, 16385, 20000 }) {
+            const Chunks c = cut(f.sch, P, 4096);
+            int64_t at = 0, deepest = -1;
+            REQUIRE(!c.n.empty());
+            for (size_t i = 0; i < c.n.size(); ++i) {
+                CHECK(c.n[i] > 0 && c.n[i] <= 4096);
+                at += c.n[i];
+                if (i + 1 < c.n.size()) CHECK_EQ(at % g, (int64_t)0);
+                if (c.ckpt[i] >= 0) { CHECK_EQ(c.ckpt[i], at); deepest = c.ckpt[i]; }
+            }
+            CHECK_EQ(at, P);
+            f.sch.set_p1_end_align(false, 4096);
+            const Chunks cold = cut(f.sch, P, 4096);
+            f.sch.set_p1_end_align(true, 4096);
+            int64_t cold_tail = -1;
+            for (int64_t cp : cold.ckpt) cold_tail = std::max(cold_tail, cp);
+            if (cold_tail > 0 && cold_tail % 4096 != 0) CHECK_EQ(deepest, cold_tail);
+        }
+    }
 }
 
 RAD_TEST_MAIN()

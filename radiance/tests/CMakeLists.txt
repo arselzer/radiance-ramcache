@@ -26,10 +26,10 @@
 # Phase 1's lent arena) on it: the real declare's graph at fewer rows, and the arena levels' sizes.
 # ds41_work_rows_arch_test is deepseek41's compressor tail at the rows a step needs (work_rows) on it:
 # the bound, the same bytes at either bound on host forms of the ops, and the recorded passes' key.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test mapped_slab_pregrow_test ds41_prefetch_arch_test
+set(RAD_TESTS_NO_CORE kv_growth_test arch_test glm5next_test nemotron35_test mapped_slab_pregrow_test draft_policy_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
                       ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test
-                      ds41_shape_probe_arch_test ds41_work_rows_arch_test)
+                      ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test ds41_ag_rows_arch_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -524,10 +524,23 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 add_test(NAME ab_window_vp_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_vp_test.sh)
 set_tests_properties(ab_window_vp_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+add_test(NAME ab_window_n128_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_n128_test.sh)
+set_tests_properties(ab_window_n128_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 # ab_window.sh's P1 parts (P1, QmN, QlK, QhMS): the server-log gate on synthetic logs and the arm loop with
 # every action stubbed. No card, no server, no model.
 add_test(NAME ab_window_p1_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_p1_test.sh)
 set_tests_properties(ab_window_p1_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+add_test(NAME ab_window_ar_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_ar_test.sh)
+set_tests_properties(ab_window_ar_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+
+add_test(NAME ab_window_ag_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_ag_test.sh)
+set_tests_properties(ab_window_ag_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+add_test(NAME ab_window_shared_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_shared_test.sh)
+set_tests_properties(ab_window_shared_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 
 # ================================================================== libr4d's kernels, on the host
@@ -575,12 +588,13 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip
                 ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16f8_nt_m64.hip
                 ${R4D_DIR}/r4d_gemm_bf16_nt_tiled.hip
-                ${R4D_DIR}/r4d_ds41_mxfp4.hip ${R4D_DIR}/r4d_ds41_elem.hip)
+                ${R4D_DIR}/r4d_ds41_mxfp4.hip ${R4D_DIR}/r4d_ds41_elem.hip
+                ${R4D_DIR}/r4d_dflash_select_bf16.hip)
 # The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below, and the bf16
 # skinny GEMM's (r4d_cfg_gemm) for it and its bf16f8 twin, whose outputs test_bf16f8 compares.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 bf16f8 ds41vp ds41mx ds41tall ds41mask ds41bal)
+                  dsa m2xfp4 bf16f8 ds41vp ds41mx ds41tall ds41mask ds41bal dprob ds41n128)
 # ds41mask holds the DSpark draft router (router_scored_topk, r4d_ds41_elem.hip) under
 # RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM's mask (core/place/draft_vram.h, built with the engine's own
 # helpers): never a masked expert, the best three kept ones, their weights renormalised.
@@ -635,7 +649,9 @@ else()
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_bf16f8.cpp
                 ${R4D_EMU}/test_ds41vp.cpp ${R4D_EMU}/test_ds41mx.cpp ${R4D_EMU}/test_ds41tall.cpp
-                ${R4D_EMU}/test_ds41mask.cpp ${R4D_EMU}/test_ds41bal.cpp ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_ds41mask.cpp ${R4D_EMU}/test_ds41bal.cpp ${R4D_EMU}/test_dprob.cpp
+                ${R4D_EMU}/test_ds41n128.cpp
+                ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -687,7 +703,7 @@ else()
 endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 bf16f8
-            ds41vp ds41mx ds41tall ds41mask ds41bal)
+            ds41vp ds41mx ds41tall ds41mask ds41bal dprob ds41n128)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # ds41tall again with RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1 beside LCP: the balanced twin and gemv rows
@@ -703,6 +719,18 @@ if(R4D_EMU_BUILT)
   add_test(NAME r4d_emu_ds41tall_lcp COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41tall)
   set_tests_properties(r4d_emu_ds41tall_lcp PROPERTIES ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_LCP=1024"
                        LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # The n128 checker forces both forms per case. These also verify the default-off public
+  # dispatcher and its opt-in branch, once with the original THR table, once under LCP's pin.
+  set_tests_properties(r4d_emu_ds41n128 PROPERTIES
+                       ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_N128=0;RADIANCE_EXPERIMENTAL_DS41_LCP=0;RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0")
+  add_test(NAME r4d_emu_ds41n128_on COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41n128)
+  set_tests_properties(r4d_emu_ds41n128_on PROPERTIES
+                       ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_N128=1;RADIANCE_EXPERIMENTAL_DS41_LCP=0;RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0"
+                       LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME r4d_emu_ds41n128_lcp COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41n128)
+  set_tests_properties(r4d_emu_ds41n128_lcp PROPERTIES
+                       ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_N128=1;RADIANCE_EXPERIMENTAL_DS41_LCP=2048"
+                       LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.
   foreach(k 0 1 2)
@@ -715,7 +743,7 @@ if(R4D_EMU_BUILT)
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
                        r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_bf16f8 r4d_emu_ds41vp r4d_emu_ds41vp_tail r4d_emu_ds41mx
-                       r4d_emu_ds41tall r4d_emu_ds41mask r4d_emu_ds41bal
+                       r4d_emu_ds41tall r4d_emu_ds41mask r4d_emu_ds41bal r4d_emu_dprob r4d_emu_ds41n128
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
@@ -1091,6 +1119,20 @@ add_test(NAME vendor_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/vendor_sums.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(vendor_sums PROPERTIES LABELS "fast;unit" TIMEOUT 120)
 # ---- P1 (S)
+add_executable(ds41_lcp_contract ${CMAKE_CURRENT_SOURCE_DIR}/ds41_lcp_contract.cpp)
+set_target_properties(ds41_lcp_contract PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+foreach(c 0 2048 3072 4096 4097 4112)
+  set(ds41_lcp_expected_core ${c})
+  set(ds41_lcp_expected_plugin ${c})
+  if(c GREATER 4096)
+    set(ds41_lcp_expected_core -1)
+    set(ds41_lcp_expected_plugin 0)
+  endif()
+  add_test(NAME ds41_lcp_contract_${c} COMMAND ds41_lcp_contract ${ds41_lcp_expected_core} ${ds41_lcp_expected_plugin})
+  set_tests_properties(ds41_lcp_contract_${c} PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+    ENVIRONMENT "ROCR_VISIBLE_DEVICES=99;RADIANCE_EXPERIMENTAL_DS41_LCP=${c};RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0;RADIANCE_EXPERIMENTAL_DS41_P1=0")
+endforeach()
+
 # Prefill Phase 1's stager and end-aligned chunks (core/place/card_expert_stager.h, core/sched/p1_chunk.h):
 # p1_stager_test (the scheduling on a simulated card, the ring stress, the tunables, the admission) and
 # p1_chunk_test (Scheduler::plan_chunk's end alignment on the scheduler fakes), registered by the glob

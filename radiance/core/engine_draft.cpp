@@ -123,6 +123,7 @@ int Engine::step_state_init() {
 
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF: the confidence head (engine_dconf.cpp). */
     RAD_TRY(dconf_init());
+    RAD_TRY(dprob_init());
 
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
@@ -142,6 +143,7 @@ void Engine::step_state_fini() {
     if (couple_draw_stage_) rad_dev_free(couple_draw_stage_, RAD_MEM_HOST_PINNED);
     if (couple_readback_) rad_dev_free(couple_readback_, RAD_MEM_HOST_PINNED);
     dconf_fini();
+    dprob_fini();
     couple_draw_stage_ = nullptr;
     couple_readback_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
@@ -600,6 +602,9 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     const int head = tree_ ? block - 1 : steps;
     const int n = sched_.block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
+    /* Same frame, under Scheduler ownership, before ANY bank context/query and issue-ahead.
+     * Restoring at this seam is mandatory even when the depth/head later declines a query. */
+    if (draft_bank_loan_) RAD_TRY(draft_bank_lend_step(step));
 
     /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). */
     if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(block_row_.data(), n));
@@ -622,9 +627,11 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     if (!qb) return RAD_OK;
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
+    if (draft_bank_loan_) RAD_TRY(draft_bank_lend_query_issued(step, qb->n_tok));
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
     /* The confidence head's input rows, behind the pass (engine_dconf.cpp). */
     RAD_TRY(dconf_issue(n, block));
+    RAD_TRY(dprob_issue(n));
     Rank& r0 = *ranks_[0];
     if (mtp_couple_) {
         /* Positions 1..steps of the drafting rows, on the stream of the slots below. */
@@ -679,6 +686,7 @@ int Engine::finish_block_drafter(const StepOut& so) {
     const bool show = (int)log_level() >= (int)Log::Debug;
     for (int i = 0; i < block_rows_; ++i) {
         const int32_t* d = &draft_out_[(size_t)i * (size_t)steps];
+        if (draft_experiment_.early_boundary()) RAD_TRY(dmeasure_check(i, d, steps));
         if (show) {
             std::string t;
             for (int j = 0; j < steps; ++j) t += fmt(" %d", (int)d[j]);
@@ -688,15 +696,24 @@ int Engine::finish_block_drafter(const StepOut& so) {
         /* As in finish_serial_drafter: the step issued ahead only carries a request whose answer
          * is fixed (Scheduler::step_next_locked), so this agrees with the count it verifies. A
          * tree's parents come from the same slot, as ADV_BTAKE took them. */
-        if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) continue;
+        if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) {
+            dprob_finish(i, d, steps, false);
+            continue;
+        }
         const uint64_t seq = block_row_[(size_t)i].seq;
         const StepSlot& S = slots_host_[block_row_[(size_t)i].card];
-        const int rc = sched_.set_draft(seq, d, steps, tree_ ? S.par : nullptr);
+        const int published_steps = draft_experiment_.prefix_policy().on ? dmeasure_.current.k : steps;
+        const int rc = sched_.set_draft(seq, d, published_steps, tree_ ? S.par : nullptr);
+        /* A terminal/cancelled request can have disappeared at commit. Other policy publication
+         * failures must stop rather than leave an ahead verifier bound to unpublished tokens. */
+        if (draft_experiment_.prefix_policy().on && rc < 0 && rc != RAD_E_NOTFOUND) return rc;
+        dprob_finish(i, d, steps, rc == RAD_OK);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, steps, rc == RAD_OK, block_row_[(size_t)i].card));
     }
     /* The confidence head's p for each drafting row (engine_dconf.cpp). */
     dconf_finish();
+    if (draft_experiment_.early_boundary()) dmeasure_finish(so);
     return RAD_OK;
 }
 

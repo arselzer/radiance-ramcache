@@ -1,0 +1,7 @@
+ar_rows sha256 b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10
+  ok    ds41_ar_rows_exact cap 1024, ts_min 0
+  ok    ds41_ar_rows_exact cap 1024, ts_min 32768
+  ok    ds41_ar_rows_exact cap 64, ts_min 0
+  ok    ds41_ar_rows_exact cap 64, ts_min 32768
+ar_rows exit 0
+ar_rows finished sha256 b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10

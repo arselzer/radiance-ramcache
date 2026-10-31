@@ -20443,6 +20443,148 @@ static void f32bf16_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
     a32.n_p = a16.n_p = 4;
 }
 
+/* Rb beside ds41's large-chunk prefill: compare every output byte with the current f32 row at
+ * the served heights, without the billions of host FMAs a full tall host oracle would require.
+ * The first, middle and last rows still have an independent host oracle. The 96-column case is
+ * TP4 rank 3's view of the whole 384-column router weight, after the real relayout hook has
+ * checked and converted the entire plane. No form sweep or timing loop is needed: above 16 rows
+ * the serving path uses the rule, not ROUTER_BF16_FORM's decode override. */
+static void ds41_f32bf16_tall_case(const Plugin& pl, int64_t M, int64_t N) {
+    const auto* rf = find(pl, "gemm_nt_f32_bf16");
+    const auto* rh = find(pl, "gemm_nt_f32bf16_bf16");
+    if (!rf || !rh || !rh->layout || !rh->relayout) {
+        ok("ds41 f32bf16 tall", false, "row or relayout hooks absent");
+        return;
+    }
+    constexpr int64_t K = 5120;
+    const int64_t whole_n = N == 96 ? 384 : N, first_col = N == 96 ? 288 : 0;
+    const int64_t xp = K + 5, yp = N + 3;
+    const size_t ybytes = (size_t)M * (size_t)yp * 4 + 256;
+    std::vector<uint16_t> x((size_t)(M * xp), 0x7fc1), halves((size_t)(whole_n * K));
+    std::vector<float> w((size_t)(whole_n * K));
+    for (int64_t row = 0; row < M; ++row)
+        for (int64_t k = 0; k < K; ++k)
+            x[(size_t)(row * xp + k)] = row == 0 ? 0 : h_to_bf16(
+                (float)((int)(st_mix32((uint32_t)(row * K + k)) % 2001) - 1000) / 1000);
+    for (size_t i = 0; i < w.size(); ++i) {
+        halves[i] = i % 1021 == 0 ? 0x8000 : h_to_bf16(
+            (float)((int)(st_mix32((uint32_t)i + 0x51ed27u) % 2001) - 1000) / 8000);
+        w[i] = h_bf16(halves[i]);
+    }
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16") };
+    const RadEncoding enc = rad_enc_plain(RAD_F32);
+    const int selected = 0;
+    const RadTensor source = T(w.data(), RAD_F32, { whole_n, K });
+    RadLayout layout{};
+    int rc = rh->layout(ps.data(), (int)ps.size(), 1, &enc, &selected, &source, 1, &layout);
+    std::vector<uint16_t> stored(halves.size(), 0xa5a5);
+    if (rc == RAD_OK && layout.dtype == RAD_BF16 && layout.bytes == (int64_t)stored.size() * 2)
+        rc = rh->relayout(ps.data(), (int)ps.size(), 1, &enc, &selected, &source, 1,
+                          stored.data(), (int64_t)stored.size() * 2);
+    else if (rc == RAD_OK)
+        rc = RAD_E_SHAPE;
+    if (rc != RAD_OK || stored != halves) {
+        ok("ds41 f32bf16 tall", false, fmt("whole-plane relayout rc=%d", rc));
+        return;
+    }
+    if (M == 2048 || M == 4096) {
+        /* Exercise this loaded plugin's rejection, not just the separately linked host test.
+         * For N=96 corrupt the first source row, outside rank 3's final 96-row TP slice. */
+        const size_t bad_at = N == 96 ? (size_t)K - 1 : w.size() - 1;
+        uint32_t original;
+        std::memcpy(&original, &w[bad_at], 4);
+        const uint32_t bad = original | (N == 96 ? 0x0001u : N == 384 ? 0x8000u : 0xffffu);
+        std::memcpy(&w[bad_at], &bad, 4);
+        std::vector<uint16_t> rejected(stored.size());
+        const int reject = rh->relayout(ps.data(), (int)ps.size(), 1, &enc, &selected, &source, 1,
+                                         rejected.data(), (int64_t)rejected.size() * 2);
+        std::memcpy(&w[bad_at], &original, 4);
+        ok(fmt("ds41 f32bf16 tall N=%lld M=%lld source[%zu]: whole-plane nonzero low half refused",
+               (long long)N, (long long)M, bad_at).c_str(), reject == RAD_E_DTYPE, fmt("rc=%d", reject));
+        if (reject != RAD_E_DTYPE) return;
+    }
+    void* dx = dalloc(x.size() * 2);
+    void* dw32 = dalloc(w.size() * 4);
+    void* dw16 = dalloc(stored.size() * 2);
+    void* dy = dalloc(ybytes);
+    if (!dx || !dw32 || !dw16 || !dy) {
+        ok("ds41 f32bf16 tall", false, "allocation failed");
+        return;
+    }
+    st_memcpy(dx, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(dw32, w.data(), w.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(dw16, stored.data(), stored.size() * 2, hipMemcpyHostToDevice);
+    std::vector<RadTensor> t32 = {
+        T(dx, RAD_BF16, { M, K }),
+        T((float*)dw32 + first_col * K, RAD_F32, { N, K }),
+        T((uint8_t*)dy + 128, RAD_F32, { M, N }),
+    };
+    auto t16 = t32;
+    t16[1] = T((uint16_t*)dw16 + first_col * K, RAD_BF16, { N, K });
+    t32[0].stride[0] = t16[0].stride[0] = xp;
+    t32[2].stride[0] = t16[2].stride[0] = yp;
+    RadArgs a32{};
+    a32.t = t32.data(); a32.n_t = 3; a32.p = ps.data(); a32.n_p = (int)ps.size();
+    a32.world_size = 1;
+    RadArgs a16 = a32;
+    a16.t = t16.data();
+    const std::vector<uint8_t> fill(ybytes, 0xa5);
+    auto run = [&](const RadKernelInfo* row, RadArgs* a, std::vector<uint8_t>* got) {
+        st_memcpy(dy, fill.data(), fill.size(), hipMemcpyHostToDevice);
+        int r = row->launch(a, nullptr);
+        if (r == RAD_OK && st_stream_sync(nullptr) != hipSuccess) r = RAD_E_DEVICE;
+        got->assign(ybytes, 0);
+        if (r == RAD_OK) st_memcpy(got->data(), dy, ybytes, hipMemcpyDeviceToHost);
+        return r;
+    };
+    std::vector<uint8_t> f32, bf16;
+    const int r32 = run(rf, &a32, &f32), r16 = run(rh, &a16, &bf16);
+    bool guards = true, host = true;
+    if (r32 == RAD_OK && r16 == RAD_OK) {
+        for (size_t i = 0; i < ybytes; ++i) {
+            const bool output = i >= 128 && i < ybytes - 128 &&
+                                (i - 128) % ((size_t)yp * 4) < (size_t)N * 4;
+            if (!output) guards = guards && f32[i] == 0xa5 && bf16[i] == 0xa5;
+        }
+        for (int64_t row : { int64_t(0), M / 2, M - 1 })
+            for (int64_t c = 0; c < N; ++c) {
+                float lane[32];
+                for (int l = 0; l < 32; ++l) {
+                    float sum = 0;
+                    for (int64_t k = l; k < K; k += 32)
+                        sum = std::fmaf(h_bf16(x[(size_t)(row * xp + k)]),
+                                         w[(size_t)((first_col + c) * K + k)], sum);
+                    lane[l] = sum;
+                }
+                for (int mask = 16; mask; mask >>= 1) {
+                    float next[32];
+                    for (int l = 0; l < 32; ++l) next[l] = lane[l] + lane[l ^ mask];
+                    std::memcpy(lane, next, sizeof lane);
+                }
+                const size_t off = 128 + (size_t)(row * yp + c) * 4;
+                host = host && std::memcmp(f32.data() + off, &lane[0], 4) == 0 &&
+                               std::memcmp(bf16.data() + off, &lane[0], 4) == 0;
+            }
+    }
+    const bool same = r32 == RAD_OK && r16 == RAD_OK && f32 == bf16 && guards && host;
+    ok(fmt("ds41 f32bf16 tall M=%lld N=%lld K=5120 weight_col=%lld: every output byte, "
+           "sampled host rows and guards", (long long)M, (long long)N, (long long)first_col).c_str(),
+       same, same ? "" : fmt("rc %d/%d, guards=%d, host=%d", r32, r16, guards, host));
+}
+
+static void ds41_f32bf16_tall(const Plugin& pl) {
+    const int before = g_fail;
+    for (int64_t M : { 256, 1024, 2048, 4096 })
+        for (int64_t N : { 96, 384, 1024 }) {
+            dfree_all();
+            ds41_f32bf16_tall_case(pl, M, N);
+        }
+    dfree_all();
+    if (g_fail == before)
+        std::printf("PASS: ds41 f32bf16 tall: 12 served shapes through M4096, every output byte equals f32; "
+                    "sampled host rows and guards match; 6 nonzero-low-half loads refused\n");
+}
+
 /* gemm_fp8a8_f32scale's dense form at the shape (a decode form or a row tile, by the rule)
  * compared byte for byte with the legacy 16x64 tile, which an activation pitch off 16 bytes takes;
  * the output keeps a filled pitch, so an overrun or a missed row shows. Timed, it also prints its
@@ -27406,6 +27548,148 @@ static bool ar_pattern_check(const RadKernelInfo* row, const std::vector<int>& d
     return true;
 }
 
+/* DS41's architecture-side row slices use these unchanged launchers on smaller messages. Hold
+ * the whole output, guard regions and exceptional-value payloads to an unsliced launch, across
+ * both message-size boundaries and sequence wrap. No tolerance or NaN-equivalence comparison. */
+using ArSeedSeq = int (*)(void*, unsigned int, unsigned int);
+struct ArRowsRank {
+    const RadKernelInfo *one = nullptr, *two = nullptr;
+    ArSeedSeq seed = nullptr;
+    StBarrier* barrier = nullptr;
+    std::vector<ArRowsRank>* all = nullptr;
+    int rank = 0, dev = 0, cap = 1024, ts_min = 32768;
+    unsigned int handshake = 0, parity = 0;
+    void *whole = nullptr, *sliced = nullptr;
+    int rc = RAD_OK, setup_rc = RAD_E_STATE;
+    size_t bad = 0, fold_bad = 0;
+};
+static uint16_t ar_rows_value(int rank, int64_t i) {
+    switch (i % 257) {
+    case 0: return 0;
+    case 1: return 0x8000;
+    case 2: return rank == 0 ? 0x7F80 : 0x3F80;
+    case 3: return rank == 1 ? 0xFF80 : 0x3F80;
+    case 4: return (uint16_t)(0x7F81 + rank);   /* distinct signaling NaN payloads */
+    case 5: return (uint16_t)(0x7FC1 + rank);
+    case 6: return (uint16_t)(rank + 1);         /* subnormal */
+    default: return h_to_bf16(ar_rough_value(rank, i));
+    }
+}
+static void ar_rows_worker(ArRowsRank* t) {
+    constexpr int64_t D = 5120, C = 2048, guard = 16, most = C * D, total = most + 2 * guard;
+    hipStream_t stream = nullptr;
+    void *a = nullptr, *b = nullptr, *ao = nullptr, *bo = nullptr;
+    t->rc = st_set_device(t->dev) == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    if (t->rc == RAD_OK && hipStreamCreate(&stream) != hipSuccess) t->rc = RAD_E_DEVICE;
+    const RadParam whole[] = { PI("world_size", 4), PI("numel", most), PS("dtype", "bf16"), PI("exact", 1) };
+    const RadParam part[] = { PI("world_size", 4), PI("numel", (int64_t)t->cap * D),
+                              PS("dtype", "bf16"), PI("exact", 1) };
+    if (t->rc == RAD_OK) t->rc = t->two->init(whole, 4, t->rank, 4, &t->whole);
+    if (t->rc == RAD_OK) t->rc = t->two->init(part, 4, t->rank, 4, &t->sliced);
+    if (t->rc == RAD_OK && (hipMalloc(&a, total * 2) != hipSuccess || hipMalloc(&b, total * 2) != hipSuccess ||
+                            hipMalloc(&ao, total * 2) != hipSuccess || hipMalloc(&bo, total * 2) != hipSuccess))
+        t->rc = RAD_E_NOMEM;
+    if (t->rc == RAD_OK) t->rc = t->seed(t->whole, t->handshake, t->parity);
+    if (t->rc == RAD_OK) t->rc = t->seed(t->sliced, t->handshake, t->parity);
+    t->setup_rc = t->rc;
+    t->barrier->wait();   /* nobody launches while a peer is still allocating or seeding flags */
+    bool ready = true;
+    for (const auto& r : *t->all) ready = ready && r.setup_rc == RAD_OK;
+    if (ready) {
+        const int sizes[] = { 2048, 1, 6, 7, 102, 103, 1024, 1025, 1023, 17, 2048 };
+        std::vector<uint16_t> input(total, 0x5AA5), output(total, 0xA55A), gold(total), got(total);
+        auto launch = [&](void* in, void* out, int64_t off, int64_t n, void* inst, int blocks) {
+            RadTensor ts[2] = { T((uint16_t*)in + guard + off, RAD_BF16, { n }),
+                               T((uint16_t*)out + guard + off, RAD_BF16, { n }) };
+            const RadParam ps[] = { PI("world_size", 4), PI("numel", n), PS("dtype", "bf16"), PI("exact", 1),
+                                    PI("nblocks", blocks), PI("nthreads", 256), PI("ts_min", t->ts_min) };
+            RadArgs args{};
+            args.t = ts; args.n_t = out == in ? 1 : 2; args.p = ps; args.n_p = 7;
+            args.instance = inst; args.rank = t->rank; args.world_size = 4;
+            const RadKernelInfo* row = n <= 524288 ? t->one : t->two;
+            return row->launch(&args, stream);
+        };
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); ++k) {
+            const int64_t n = (int64_t)sizes[k] * D;
+            std::fill(input.begin(), input.end(), 0x5AA5);
+            for (int64_t i = 0; i < n; ++i) input[(size_t)guard + i] = ar_rows_value(t->rank, i);
+            st_memcpy(a, input.data(), total * 2, hipMemcpyHostToDevice);
+            st_memcpy(b, input.data(), total * 2, hipMemcpyHostToDevice);
+            const bool oop = k % 2 != 0;
+            void *ya = oop ? ao : a, *yb = oop ? bo : b;
+            if (oop) {
+                st_memcpy(ao, output.data(), total * 2, hipMemcpyHostToDevice);
+                st_memcpy(bo, output.data(), total * 2, hipMemcpyHostToDevice);
+            }
+            const int blocks = 2 << (k % 4);   /* blocks can disappear and return across tails */
+            int rc = launch(a, ya, 0, n, t->whole, blocks);
+            for (int64_t off = 0; off < n && rc >= 0; off += (int64_t)t->cap * D) {
+                const int64_t count = std::min((int64_t)t->cap * D, n - off);
+                rc = launch(b, yb, off, count, t->sliced, blocks);
+            }
+            st_stream_sync(stream);
+            if (rc < 0) t->rc = rc;
+            st_memcpy(gold.data(), ya, total * 2, hipMemcpyDeviceToHost);
+            st_memcpy(got.data(), yb, total * 2, hipMemcpyDeviceToHost);
+            for (int64_t i = 0; i < total; ++i) {
+                t->bad += gold[(size_t)i] != got[(size_t)i];
+                if (i < guard || i >= guard + n)
+                    t->bad += got[(size_t)i] != (oop ? output[(size_t)i] : input[(size_t)i]);
+            }
+            /* The byte comparison above covers every value, including NaN payloads. Also sample
+             * the finite reference fold, whose exponent spread detects a changed rank order. */
+            for (int64_t i = 0; i < n; i += 127) {
+                if (i % 257 < 7) continue;
+                volatile float acc = 0.0f;
+                for (int rank = 0; rank < 4; ++rank) acc = acc + h_bf16(ar_rows_value(rank, i));
+                t->fold_bad += got[(size_t)guard + i] != h_to_bf16(acc);
+            }
+            if (oop) {
+                st_memcpy(got.data(), a, total * 2, hipMemcpyDeviceToHost);
+                t->bad += got != input;
+                st_memcpy(got.data(), b, total * 2, hipMemcpyDeviceToHost);
+                t->bad += got != input;
+            }
+        }
+    }
+    for (void* p : { a, b, ao, bo }) if (p) st_free(p);
+    if (stream) hip_ck(hipStreamDestroy(stream), "hipStreamDestroy", __LINE__);
+}
+static void ds41_ar_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
+    const char* name = "ds41_ar_rows_exact";
+    if (devs.size() < 4 || !ar_peer_path_ok(devs, 4)) { skip(name, "needs four P2P cards"); return; }
+    const RadKernelInfo *one = find(pl, "ar_oneshot_4rank_exact"), *two = find(pl, "ar_twoshot_4rank_exact");
+    const auto seed = (ArSeedSeq)dlsym(pl.h, "r4d_ar_test_seed_seq");
+    if (!one || !two || !seed) { ok(name, false, "missing exact rows or test seed hook"); return; }
+    for (int cap : { 1024, 64 }) for (int ts_min : { 0, 32768 }) {
+        std::vector<ArRowsRank> ranks(4);
+        StBarrier barrier(4);
+        std::vector<std::thread> threads;
+        for (int rank = 0; rank < 4; ++rank) {
+            auto& r = ranks[(size_t)rank];
+            r.one = one; r.two = two; r.seed = seed; r.barrier = &barrier; r.all = &ranks;
+            r.rank = rank; r.dev = devs[(size_t)rank]; r.cap = cap; r.ts_min = ts_min;
+            r.handshake = cap == 1024 ? 0x7FFFFFFEu : 0xFFFFFFFEu;
+            r.parity = cap == 1024 ? 0 : 1;
+            threads.emplace_back(ar_rows_worker, &r);
+        }
+        for (auto& t : threads) t.join();
+        size_t bad = 0, folds = 0;
+        bool up = true;
+        for (const auto& r : ranks) { bad += r.bad; folds += r.fold_bad; up = up && r.rc == RAD_OK; }
+        ok((std::string(name) + " cap " + std::to_string(cap) + ", ts_min " + std::to_string(ts_min)).c_str(),
+           up && !bad && !folds, std::to_string(bad) + " byte/guard/source differences, " +
+           std::to_string(folds) + " finite-fold samples differ (thresholds, tails, in/out of place, wrap)");
+        for (const auto& r : ranks) {
+            if (r.whole) two->fini(r.whole);
+            if (r.sliced) two->fini(r.sliced);
+        }
+    }
+}
+
+#include "r4d_ds41_ag_rows_check.h"
+#include "r4d_ds41_ar_ag_shared_check.h"
+
 static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name,
                             int world) {
     const RadKernelInfo* row = find(pl, name);
@@ -31204,7 +31488,7 @@ static void device_phase(const Plugin& pl) {
      * asserts the chained path and that an anchor-pinned walk over the same data differs.
      *
      * Every value is a power of two times a quarter, so f32 accumulation is exact in any order. */
-    if (sel("dflash_select_bf16")) {
+    if (sel("dflash_select_bf16") || sel("dflash_observe_bf16")) {
         const RadKernelInfo* r = find(pl, "dflash_select_bf16");
         if (!r) ok("dflash_select_bf16", false, "row absent");
         else {
@@ -31313,6 +31597,47 @@ static void device_phase(const Plugin& pl) {
                     for (int64_t l = 0; l < steps; ++l)
                         if (bg[(size_t)(s * steps + l)] != want[s][l]) { bsame = false; break; }
                 ok("dflash_select_bf16 absent hp is a plane of ones (the bigram form)", bsame);
+                if (sel("dflash_observe_bf16")) {
+                    const RadKernelInfo* observer = find(pl, "dflash_observe_bf16");
+                    if (!observer) ok("dflash_observe_bf16", false, "row absent");
+                    else {
+                        /* Observe the selected bigram path, independently normalized over its
+                         * top-K set; this is not full-vocabulary or target-acceptance probability. */
+                        constexpr int fields = 5, width = 10;
+                        void* d_obs = dalloc((size_t)M * width * sizeof(float));
+                        if (!d_obs) ok("dflash_observe alloc", false, "hipMalloc failed");
+                        else {
+                            tb.push_back(T(d_obs, RAD_F32, { M, width }));
+                            run_case(observer, tb, ps);
+                            std::vector<float> obs((size_t)M * width);
+                            st_memcpy(obs.data(), d_obs, obs.size() * sizeof(float), hipMemcpyDeviceToHost);
+                            std::vector<int32_t> after(bg.size());
+                            st_memcpy(after.data(), d_out, after.size() * sizeof(int32_t), hipMemcpyDeviceToHost);
+                            bool exact = after == bg, signal = true;
+                            for (int64_t s = 0; s < M; ++s)
+                                for (int64_t l = 0; l < 2; ++l) {
+                                    const int64_t row = s * steps + l;
+                                    const int32_t pid = l ? want[s][l - 1] : anchor[s];
+                                    float scores[4], bv = -INFINITY, runner = -INFINITY;
+                                    int best = 0;
+                                    for (int c = 0; c < K; ++c) {
+                                        scores[c] = unf(row, c) + (float)R * pv(pid) * sv(cnd(row, c));
+                                        if (scores[c] > bv) { bv = scores[c]; best = c; }
+                                    }
+                                    float den = 0.f;
+                                    for (int c = 0; c < K; ++c) {
+                                        den += std::exp(scores[c] - bv);
+                                        if (c != best) runner = std::max(runner, scores[c]);
+                                    }
+                                    const float* y = obs.data() + s * width + l * fields;
+                                    signal = signal && std::fabs(y[0] - 1.f / den) <= 2e-6f && y[1] == bv &&
+                                             y[2] == bv - runner && y[3] == want[s][l] && y[4] == pid;
+                                }
+                            ok("dflash_observe_bf16 leaves selected IDs byte-identical", exact);
+                            ok("dflash_observe_bf16 reports conditioned candidate softmax and margin", signal);
+                        }
+                    }
+                }
             }
         }
     }
@@ -32236,7 +32561,11 @@ static void device_phase(const Plugin& pl) {
         for (int64_t cols : { 4, 36, 96 }) f32bf16_forms(pl, 3, cols, 4096, 0, false);
         f32bf16_forms(pl, 7, 31, 129, 0, false);
         f32bf16_forms(pl, 70, 13, 130, 0, false);
+        ds41_f32bf16_tall(pl);
     }
+    /* The compact tall gate alone, for a window whose unchanged decode/form checks are already
+     * pinned to this same libr4d hash. The row's ordinary smoke case above also runs this gate. */
+    if (g_case && sel("ds41_f32bf16_tall")) ds41_f32bf16_tall(pl);
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);
         dsa_score_check(pl, 7, 257);
@@ -32718,6 +33047,10 @@ static void device_phase(const Plugin& pl) {
         for (const auto& nk : kNK) bf16_band_edge(pl, nk[0], nk[1]);
     }
 
+    if (sel("ds41_ar_rows_exact")) ds41_ar_rows_exact(pl, devs);
+    if (sel("ds41_ag_rows_exact")) ds41_ag_rows_exact(pl, devs);
+    if (sel("ds41_ar_ag_shared_exact")) ds41_ar_ag_shared_exact(pl, devs);
+
     /* Every collective has a host twin (r4d_rows.cpp): the same kernel with its mailbox in pinned
      * host memory. A case is the pair's, so the twin is held to exactly the original's checks. */
     /* The 2-rank pair keeps its own harness: its flag layout and its block ceiling are not the
@@ -32894,6 +33227,8 @@ static void usage(void) {
                 "       r4d_selftest <plugin.so> --real <file> <woff> <soff> <N> <K>\n"
                 "  no --case: the catalogue, the static checks, then one child process per row\n"
                 "  --case:    that row's smoke test alone, in this process -- the reproducer\n"
+                "             ds41_f32bf16_tall runs only the twelve tall router/compressor byte\n"
+                "             comparisons and six load refusals, without a timing/form sweep.\n"
                 "  --real:    the block-scaled fp8 matvec against a REAL checkpoint weight, at the\n"
                 "             given byte offsets in a safetensors file, compared with a host\n"
                 "             reference over the same bytes. An offset is 8 + <header length, a\n"

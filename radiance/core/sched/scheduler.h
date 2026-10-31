@@ -14,11 +14,14 @@
 #pragma once
 #include "batch.h"
 #include "draft.h"
+#include "draft_measure.h"
 #include "lookup.h"
 #include "metrics.h"
 #include "ngram.h"
+#include "place/draft_bank_lend.h"
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -102,6 +105,7 @@ struct SchedReq {
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF (draft_conf.h): the confidence controller's estimate and
      * counters. Kept through preemption; a new request starts it over. */
     DraftConfSeq dconf;
+    DraftProbPending dprob;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
@@ -360,6 +364,11 @@ public:
     /* ---------------------------------------------------------- the step path */
     /* One decision, one batch. Null when there is nothing to run, which is not an error. */
     const RadBatch* step();
+    /* Physical-memory maintenance seam: hold the SAME ownership lock across the drain/change
+     * callback and ALL admission/prefix/COW planning. Failure runs no planning or batch uploads.
+     * Callback must not call any public Scheduler method (the mutex is not recursive). No engine
+     * mode installs this yet; ordinary step() remains unchanged. */
+    int step_quiescent(const std::function<int()>& before_plan, const RadBatch** out);
 
     /* ---------------------------------------------------- the next step, before this one commits
      *
@@ -483,6 +492,10 @@ public:
      * in the order block_query() emits them. */
     int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
                     bool on_card = false);
+    /* Fixed early measurement only: actual device ctx and consumed prefix, under mu_. */
+    bool measure_block_binding(const BlockRow& row, int32_t ctx, int accepted,
+                                const DraftMeasureFrame& previous, bool* previous_matches) const;
+    bool measure_published(const DraftMeasureFrame& row, uint64_t* output) const;
     /* How many running sequences the step just run decoded (produced a token for), the load a
      * block drafter's block length is chosen by. Read before block_begin(). */
     int decoded_seqs() const;
@@ -520,6 +533,18 @@ public:
     int64_t              ctx_defer_cap() const { return dctx_.cap; }
     /* The DSpark bank under several sequences (draft_conf.h, "one sequence alone"). */
     bool                 draft_solo() const { return dsolo_; }
+    /* Private Engine backing-reuse transaction. Holds admission/cancellation out until the
+     * caller restores the complete cohort. The callback must not reenter Scheduler. */
+    int with_draft_bank_frame(int step, const std::function<int(const draft_bank::Work&)>&);
+    int with_draft_bank_idle(const std::function<int()>&);
+    int enable_draft_bank_observation(); // once, before rank threads start
+    /* Read-only capture; publish AFTER set_draft and before this proposal's verify commits.
+     * anchor and tokens come from the same StepSlot readback as the installed proposal. */
+    void draft_prob_publish(uint64_t id, int64_t anchor, int32_t anchor_token,
+                            const int32_t* tokens, int n, const float* signal, bool published,
+                            int candidates, uint64_t reserved_epoch = 0);
+    uint64_t draft_prob_reserve_epoch(); // early boundary/capture share one identity, quiet too
+    DraftProbStats draft_prob_stats() const;
 
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
@@ -713,6 +738,13 @@ private:
     std::vector<ConfRec> dconf_recs_;
     int64_t              dconf_recs_n_ = 0;
     bool                 dconf_any_ = false;   /* any of the three on, or dsolo_ */
+    bool                 dprob_on_ = false;
+    uint64_t             dprob_epoch_ = 0;
+    DraftProbStats       dprob_stats_{};
+    void dprob_discard(SchedReq& s, const char* reason, bool cancelled = false);
+    void dprob_verify(SchedReq& s, const StepEntry& e, int64_t anchor, int accepted);
+    void dprob_record(uint64_t seq, const DraftProbPending& p, int depth, const char* event,
+                       const char* status, DraftProbOutcome outcome = {}, bool cancelled = false);
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */
@@ -905,6 +937,11 @@ private:
      * under the deferral the row whose owed positions the next pass continues. */
     int32_t            block_ctx_passes_ = 0;
     size_t             block_ctx_at_ = 0;
+    int                bank_frame_step_ = -1;
+    uint64_t           bank_frame_epoch_ = 0;
+    bool               bank_frame_solo_ = false;
+    bool               bank_observe_ = false;
+    bool               bank_frame_open_ = false;
     /* `block` - 1 copies of the drafter's mask token, which a query entry's `draft` points at:
      * token_at() walks prompt ++ output ++ draft, so the mask positions come from the accessor
      * every other pass uses. */
@@ -1003,6 +1040,7 @@ private:
 
     /* arrival; mu_ held */
     int  add_locked(std::unique_ptr<Request> r);
+    const RadBatch* step_locked();
 
     /* ordering */
     bool ahead_of(int32_t a, int32_t b) const;

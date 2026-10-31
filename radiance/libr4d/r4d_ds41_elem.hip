@@ -23,9 +23,12 @@
 #include "r4d_launch.h"
 #include "r4d_plugin.h"
 
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 
@@ -1657,6 +1660,65 @@ __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     }
 }
 
+/* The index key alone: n=128, one head, GPT-J rot64/off64, FP4/UE8M0 blocks of 32,
+ * f32 gains. Eight independent waves own eight rows; there is no cross-wave storage or barrier.
+ * Do NOT fold the four columns a lane holds before the butterfly: the old workgroup gives each
+ * 32-column chunk its own butterfly, then adds the chunks from 0 in order. Its LDS contains lane 0
+ * of each chunk, so broadcast that lane even though finite sums agree across the wave: NaNs with
+ * different payloads need not. Also retain the old width's trailing zero-wave additions.
+ * Each norm narrows with f32_to_bf16, each rope pair with ds_bf16, and each 32-column quantization
+ * group uses the existing helpers. The dispatcher below is default off and checks every premise. */
+__global__ __launch_bounds__(256) void norm_rope_rt_n128_kernel(
+    const uint16_t* __restrict__ x, uint32_t x_ld, const float* __restrict__ w,
+    uint16_t* __restrict__ y, uint32_t y_ld, float eps, float wadd, float mult,
+    uint32_t M, FzRope r, uint32_t sum_waves) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t m = blockIdx.x * 8u + threadIdx.x / kFzWave;
+    if (m >= M) return;
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    float v[4], g[4], ss = 0.0f;
+#pragma unroll
+    for (uint32_t c = 0; c < 4; ++c) {
+        const uint32_t i = lane + c * kFzWave;
+        v[c] = bf16_to_f32(xr[i]);
+        g[c] = w[i];
+        float q = 0.0f;
+        q += v[c] * v[c];
+        q = r4d_wave_sum(q);
+        ss += __shfl(q, 0, 32);
+    }
+#pragma unroll 1
+    for (uint32_t c = 4; c < sum_waves; ++c) ss += 0.0f;
+    const float s = rsqrtf(ss / 128.0f + eps);
+    uint16_t h[4];
+#pragma unroll
+    for (uint32_t c = 0; c < 4; ++c)
+        h[c] = f32_to_bf16(v[c] * s * (g[c] + wadd) * mult);
+
+    const long p = r.pos[(long)m * r.ps];
+    if (p >= 0 && p < r.tab_rows) {
+#pragma unroll
+        for (uint32_t c = 2; c < 4; ++c) {
+            const uint32_t partner = __shfl_xor((uint32_t)h[c], 1, 32);
+            const float va = ds_bf((lane & 1u) ? (uint16_t)partner : h[c]);
+            const float vb = ds_bf((lane & 1u) ? h[c] : (uint16_t)partner);
+            const uint32_t i = ((c - 2u) * kFzWave + lane) / 2u;
+            const float co = r.cs[p * r.cp + (long)i * r.cst];
+            const float sn = r.sign * r.cs[p * r.cp + (long)(r.half + i) * r.cst];
+            h[c] = ds_bf16((lane & 1u) ? va * sn + vb * co : va * co - vb * sn);
+        }
+    }
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+#pragma unroll
+    for (uint32_t c = 0; c < 4; ++c) {
+        const float z = ds_bf(h[c]);
+        float a = fabsf(z);
+        a = a == a ? a : 0.0f;
+        const float amax = r4d_xor_max<32>(a);
+        yr[lane + c * kFzWave] = ds_bf16(roundtrip(z, block_scale(amax, kFp4, kUe8m0), kFp4));
+    }
+}
+
 /* rope_rows_roundtrip, in place: quant_group_kernel's grid (a thread a column, rows over grid.y);
  * a rotated column takes its gptj partner (the other lane of its even/odd pair, the same wave)
  * by a shuffle, forms its half of rope_rows' pair and rounds it as rope_rows stores it. */
@@ -1911,7 +1973,7 @@ int fz_rope_args(const RadArgs* a, const RadTensor& x, const RadTensor& cs, cons
 constexpr long kFzMaxN = 16384;
 
 /* x [M, n] (rows as rmsnorm reads them), w, y [M, n], cos_sin, positions. */
-int norm_rope_rt_body(const RadArgs* a, RadStream stream) {
+int norm_rope_rt_body(const RadArgs* a, RadStream stream, int n128 = -1) {
     if (!a || a->n_t < 5) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &w = a->t[1], &y = a->t[2], &cs = a->t[3], &pos = a->t[4];
     if (!x.data || !w.data || !y.data || !cs.data || !pos.data) return R4D_NO(RAD_E_INVAL);
@@ -1935,6 +1997,37 @@ int norm_rope_rt_body(const RadArgs* a, RadStream stream) {
     const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
     const float mult = (float)r4d_getf(a, "mult", 1.0);
     const int thr = r4d_act_threads((int)M, (int)n);
+    const bool short_key = n == 128 && w.dtype == RAD_F32 && r.hd == 128 && r.half == 32 &&
+                           r.off == 64 && r.pairs == 32 && r.gptj && r.sign == 1.0f &&
+                           block == 32 && fmt == kFp4 && sc == kUe8m0;
+    /* Strictly default off, read once. Forced 0/1 is only the checker export below; a forced 1
+     * outside this exact site refuses rather than silently checking the old kernel twice. */
+    static const bool short_key_on = [] {
+        const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_N128");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    if (n128 == 1 && !short_key) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (short_key && (n128 == 1 || (n128 < 0 && short_key_on))) {
+        const int launch = R4D_EMIT(stream, norm_rope_rt_n128_kernel,
+                         dim3(r4d_cliff_rows(((uint32_t)M + 7u) / 8u, 1, 8)), dim3(256), 0,
+                         (const uint16_t*)x.data, (uint32_t)x_ld, (const float*)w.data,
+                         (uint16_t*)y.data, (uint32_t)y.stride[0], eps, wadd, mult, (uint32_t)M,
+                         r, (uint32_t)thr / kFzWave);
+        /* Proof for a model arm, only after its normal dispatcher queued the fast kernel.
+         * Forced checker calls cannot produce it. After each rank's first use only a relaxed load
+         * remains; disabled, ineligible and failed launches never touch this state or perform I/O. */
+        if (n128 < 0 && launch == RAD_OK && a->rank >= 0 && a->rank < a->world_size && a->rank < 64) {
+            static std::atomic<uint64_t> reported{0};
+            const uint64_t bit = uint64_t(1) << (unsigned)a->rank;
+            if (!(reported.load(std::memory_order_relaxed) & bit) &&
+                !(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+                std::fprintf(stderr, "[r4d] ds41 n128 active: normal dispatch rank=%d world=%d n=128 M=%lld old_thr=%d\n",
+                             a->rank, a->world_size, M, thr);
+                std::fflush(stderr);
+            }
+        }
+        return launch;
+    }
     const uint32_t lds = (uint32_t)(n * sizeof(uint16_t));
 #define FZ_NRQ(WF, T)                                                                             \
     R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \
@@ -2125,6 +2218,12 @@ extern "C" int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream s) {
     return norm_rope_rt_body(a, s);
+}
+/* Oracle: 0 the unchanged workgroup kernel, 1 the narrow wave form (unsupported elsewhere).
+ * No row registers this entry, and it never changes the process-wide default. */
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip_n128_check(const RadArgs* a, RadStream s, int form) {
+    if (form != 0 && form != 1) return RAD_E_INVAL;
+    return norm_rope_rt_body(a, s, form);
 }
 extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s) {
     return rope_rt_body(a, s);

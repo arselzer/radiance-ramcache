@@ -1,0 +1,10 @@
+[2026-10-31T18:07:30Z] waiting for 30 s of QFN idleness
+[2026-10-31T18:07:58Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-31T18:08:06Z] run: python3 /home/as/ds41-claude-build/work/autonomous-20261031/bank-lend/run.py /home/as/ds41-claude-build/work/autonomous-20261031/bank-lend/manifest-retry1.json /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T180730Z
+[2026-10-31T18:23:37Z] cmd exit 0
+DSBANKLEND_WINDOW_INNER_PASS roles=6
+[2026-10-31T18:23:37Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-31T18:24:28Z] QFN up after 50s; completion: {"id":"cmpl-973410be7b182d974087977c","object":"text_completion","created":1793471067,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-31T18:23:37.7845185Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

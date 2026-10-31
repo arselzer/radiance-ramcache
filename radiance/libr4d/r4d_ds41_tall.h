@@ -21,15 +21,16 @@
  * reads the limit off the bands it resolved (FileStager::tall_init) rather than assuming it: 48, the
  * CPU path's limit (core/place/ep_route_counts.h) and the sparse ops' scalar band.
  *
- * Large-chunk prefill, RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (C a multiple of 16 in 64 .. 2048): the
+ * Large-chunk prefill, RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (C a multiple of 16 in 64 .. 4096): the
  * same pins at every height, with the twin's bound raised to kR4dDs41LcpMax. Every other ds41 kernel
  * that picks a form by the pass height keeps a row's bits by construction at any height (the
  * attention's head groups, the indexer's head split, mhc_mix's split, the f32 router's tile forms,
  * moe_scatter's launches, the exact all-reduce's one- and two-shot), and the gemm_nt tiled row is
  * byte-identical to the skinny one by contract; the core admits those pairs by name and refuses any
  * other op that resolves two kernels (FileStager::lcp_init), and ds41_mxfp4_device_check `lcp` holds
- * each to its rows launched alone and 16 at a time up to 2048 rows. A valid C turns EXACT_TALL's pins
- * on here whatever EXACT_TALL says (the core refuses EXACT_TALL other than 1 or unset beside it).
+ * each to its rows launched alone and 16 at a time up to the requested chunk. A valid C turns
+ * EXACT_TALL's pins on here whatever EXACT_TALL says (the core refuses EXACT_TALL other than 1 or
+ * unset beside it).
  *
  * Read once, the first time a launcher or the row table asks. Anything but "1" (EXACT_TALL), or a C
  * outside the range (LCP), is off here; the core refuses such values (core/place/ep_route_counts.h). */
@@ -40,10 +41,10 @@
  * without the norms' pin). */
 constexpr int kR4dDs41TallRows = 48;
 /* Under LCP: the largest chunk the switch takes, which is the twin's bound, and the smallest. */
-constexpr int kR4dDs41LcpMax = 2048;
+constexpr int kR4dDs41LcpMax = 4096;
 constexpr int kR4dDs41LcpMin = 64;
 
-/* RADIANCE_EXPERIMENTAL_DS41_LCP: C, or 0 (unset, or not a multiple of 16 in [64, 2048]). */
+/* RADIANCE_EXPERIMENTAL_DS41_LCP: C, or 0 (unset, or not a multiple of 16 in [64, 4096]). */
 inline int r4d_ds41_lcp() {
     static const int c = [] {
         const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP");

@@ -1,0 +1,7 @@
+ag_rows sha256 b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10
+  ok    ds41_ag_rows_exact cap 1024, tight
+  ok    ds41_ag_rows_exact cap 1024, pitched
+  ok    ds41_ag_rows_exact cap 64, tight
+  ok    ds41_ag_rows_exact cap 64, pitched
+ag_rows exit 0
+ag_rows finished sha256 b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10

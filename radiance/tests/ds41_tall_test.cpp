@@ -20,6 +20,7 @@
 #include "device/device.h"
 #include "place/ep_route_counts.h"
 #include "place/stager.h"
+#include "../libr4d/r4d_ds41_tall.h"
 
 #include <algorithm>
 #include <cstring>
@@ -104,6 +105,8 @@ struct EpCountsHostProbe {
 }  // namespace rad
 
 using namespace rad;
+static_assert(kEpRouteLcpMax == kR4dDs41LcpMax && kEpRouteLcpMax == 4096,
+              "core admission and libr4d's pinned/twin reach must extend together");
 
 namespace {
 
@@ -169,13 +172,14 @@ std::vector<int32_t> counts_of(int64_t rows) {
 /* Kernel rows by name, for the bands of a resolved op to point at; the twin as libr4d declares it
  * (its bound on M: 32, or 48). */
 enum { kGemv, kTall32, kTall48, kTiled, kQGemv, kQTiled, kM16, kM64, kTiledNt, kNorm,
-       kTall2048, kBfTiled, kAr1, kAr2, kAr2Lane, kAr2Of3, kNorm2, kRows };
+       kTall2048, kBfTiled, kAr1, kAr2, kAr2Lane, kAr2Of3, kNorm2, kTall4096, kRows };
 struct Rows {
     RadKernelInfo info[kRows] = {};
     KernelRow row[kRows];
     const RadConstraint le32[2] = { { "M", RAD_C_GE, 1, nullptr }, { "M", RAD_C_LE, 32, nullptr } };
     const RadConstraint le48[2] = { { "M", RAD_C_GE, 1, nullptr }, { "M", RAD_C_LE, 48, nullptr } };
     const RadConstraint le2048[2] = { { "M", RAD_C_GE, 1, nullptr }, { "M", RAD_C_LE, 2048, nullptr } };
+    const RadConstraint le4096[2] = { { "M", RAD_C_GE, 1, nullptr }, { "M", RAD_C_LE, 4096, nullptr } };
     Rows() {
         const char* names[kRows] = { "moe_gemm_ggml_mxfp4_gemv", "moe_gemm_ggml_mxfp4_gemv_tall",
                                      "moe_gemm_ggml_mxfp4_gemv_tall", "moe_gemm_ggml_mxfp4_tiled",
@@ -183,7 +187,8 @@ struct Rows {
                                      "gemm_bf16_nt_m16", "gemm_bf16_nt_m64", "gemm_nt_ggml_mxfp4_tiled",
                                      "rmsnorm_bf16", "moe_gemm_ggml_mxfp4_gemv_tall", "gemm_bf16_nt_tiled",
                                      "ar_oneshot_4rank_exact", "ar_twoshot_4rank_exact",
-                                     "ar_twoshot_4rank_exact_lane", "ar_twoshot_3rank_exact", "rmsnorm_chain_bf16" };
+                                     "ar_twoshot_4rank_exact_lane", "ar_twoshot_3rank_exact", "rmsnorm_chain_bf16",
+                                     "moe_gemm_ggml_mxfp4_gemv_tall" };
         for (int i = 0; i < kRows; ++i) {
             info[i].name = names[i];
             row[i].info = &info[i];
@@ -195,6 +200,8 @@ struct Rows {
         info[kTall48].n_constraints = 2;
         info[kTall2048].constraints = le2048;
         info[kTall2048].n_constraints = 2;
+        info[kTall4096].constraints = le4096;
+        info[kTall4096].n_constraints = 2;
     }
 };
 
@@ -533,6 +540,16 @@ TEST(lcp_raises_the_counts_contract_to_the_chunk) {
         Lcp on(2048);
         CHECK_EQ(ep_route_max_rows(), (int64_t)2048);
     }
+    for (int64_t C : { 3072, 4096 }) {
+        Lcp on(C);
+        auto c = counts_of(C);
+        int64_t total = -1;
+        CHECK_EQ(ep_route_max_rows(), C);
+        CHECK(ep_route_current(witness(prog, stream, C), prog, stream, 3, 12, C));
+        CHECK(ep_route_counts_valid(witness(prog, stream, C), c.data(), 96, &total));
+        CHECK_EQ(total, 2 * C);
+        CHECK(!ep_route_current(witness(prog, stream, C + 1), prog, stream, 3, 12, C + 1));
+    }
     {
         Lcp bad(-1);   /* a value outside the range: no limit raised, refused at init */
         CHECK_EQ(ds41_lcp_rows(), (int64_t)0);
@@ -563,17 +580,17 @@ void lcp_program(Program& p, const Rows& r, int64_t C, int twin = kTall2048) {
 
 TEST(lcp_init_admits_chunks_on_the_proven_kernels) {
     Rows r;
-    for (int64_t C : { 64, 256, 1024, 2048 }) {
+    for (int64_t C : { 64, 256, 1024, 2048, 3072, 4096 }) {
         Lcp on(C);
         Env xt("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL", nullptr);
         FileStager fs;
         Program p;
-        lcp_program(p, r, C);
+        lcp_program(p, r, C, C > 2048 ? kTall4096 : kTall2048);
         CHECK_OK(EpCountsHostProbe::tall_init(fs, p));
         CHECK_EQ(EpCountsHostProbe::ep_rows(fs), C);
         CHECK_EQ(EpCountsHostProbe::lcp(fs), C);
         CHECK_EQ(EpCountsHostProbe::sorted_max(fs), 6 * C);
-        CHECK_EQ(EpCountsHostProbe::lcp_reach(fs), (int64_t)2048);
+        CHECK_EQ(EpCountsHostProbe::lcp_reach(fs), C > 2048 ? (int64_t)4096 : (int64_t)2048);
         const std::string& pairs = EpCountsHostProbe::lcp_pairs(fs);
         CHECK(has(pairs, "gemm_nt bf16"));
         if (C > 64) CHECK(has(pairs, "gemm_bf16_nt_tiled"));
@@ -591,6 +608,19 @@ TEST(lcp_init_admits_chunks_on_the_proven_kernels) {
         CHECK_EQ(EpCountsHostProbe::ep_rows(fs), (int64_t)1024);
         CHECK(has(EpCountsHostProbe::lcp_pairs(fs), "ar_twoshot_4rank_exact_lane"));
     }
+}
+
+TEST(lcp4096_refuses_a_plugin_that_only_proved_2048_rows) {
+    Lcp on(4096);
+    Env xt("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL", nullptr);
+    Rows r;
+    Program p;
+    lcp_program(p, r, 4096, kTall2048);
+    FileStager fs;
+    std::string err;
+    CHECK_EQ(init_of(fs, p, &err), (int)RAD_E_INVAL);
+    CHECK(has(err, "reaches 2048 tokens, short of the chunk"));
+    CHECK_EQ(EpCountsHostProbe::lcp(fs), (int64_t)0);
 }
 
 TEST(lcp_init_refuses_what_was_not_proven_at_the_chunk) {
@@ -699,11 +729,11 @@ TEST(lcp_init_refuses_what_was_not_proven_at_the_chunk) {
 TEST(an_lcp_chunk_reads_only_its_routed_experts) {
     Rows r;
     Env xt("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL", nullptr);
-    for (int64_t C : { 256, 1024 }) {
+    for (int64_t C : { 256, 1024, 4096 }) {
         Lcp on(C);
         FileStager fs;
         Program p;
-        lcp_program(p, r, C);
+        lcp_program(p, r, C, C > 2048 ? kTall4096 : kTall2048);
         CHECK_OK(EpCountsHostProbe::tall_init(fs, p));
         REQUIRE(EpCountsHostProbe::tables(fs, C));
         EpCountsHostProbe::set_capped(fs, true);
@@ -730,14 +760,14 @@ TEST(an_lcp_chunk_reads_only_its_routed_experts) {
  * they belong. */
 TEST(an_lcp_chunk_cuts_its_jobs_from_the_chunk_sized_tables) {
     Env xt("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL", nullptr);
-    for (int64_t C : { 256, 1024 })
+    for (int64_t C : { 256, 1024, 4096 })
         for (int64_t T : { (int64_t)17, (int64_t)100, C }) {
             Lcp on(C);
             FileStager fs;
             {
                 Rows r;
                 Program p;
-                lcp_program(p, r, C);
+                lcp_program(p, r, C, C > 2048 ? kTall4096 : kTall2048);
                 CHECK_OK(EpCountsHostProbe::tall_init(fs, p));
             }
             REQUIRE(EpCountsHostProbe::tables(fs, T));

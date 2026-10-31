@@ -1,0 +1,15 @@
+[2026-10-31T17:56:24Z] waiting for 30 s of QFN idleness
+[2026-10-31T17:56:52Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-31T17:57:00Z] run: python3 /home/as/ds41-claude-build/work/autonomous-20261031/bank-lend/run.py /home/as/ds41-claude-build/work/autonomous-20261031/bank-lend/manifest.json /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T175623Z
+[2026-10-31T17:59:39Z] cmd exit 1
+    require(client.returncode == 0, 'mixed client failed; see '+str(out/(name+'.client.log')))
+    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/as/ds41-claude-build/work/autonomous-20261031/bank-lend/run.py", line 22, in require
+    if not ok: raise RuntimeError(text)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: mixed client failed; see /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T175623Z/196608-no-bank.client.log
+[2026-10-31T17:59:39Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-31T18:00:29Z] QFN up after 50s; completion: {"id":"cmpl-6ac6ec05b1554512a1848c0f","object":"text_completion","created":1793469629,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-31T17:59:39.079767484Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

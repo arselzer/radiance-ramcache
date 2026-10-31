@@ -39,6 +39,7 @@ namespace {
 constexpr int kWorld = 4;
 
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_P1",
+                              deepseek41::kIndexCompactEnv,
                               "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA",
                               "RADIANCE_EXPERIMENTAL_DS41_LCP",
                               "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL",
@@ -342,6 +343,95 @@ TEST(the_sizing_declare_keeps_the_real_index_runs_at_a_long_context) {
     if (!why.empty()) std::fprintf(stderr, "  %s\n", why.c_str());
 }
 
+TEST(compact_index_score_metadata_keeps_32k_and_bounds_512k_1m_without_allocating_them) {
+    Env e{ WINDOW_SWITCHES };
+    for (int64_t ctx : { int64_t(32768), int64_t(524288), int64_t(1048576) }) {
+        unsetenv(deepseek41::kIndexCompactEnv);
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
+        auto base = declare(0, 2048, false, ctx); REQUIRE_EQ(base->rc, RAD_OK);
+        const int64_t old_rows = base->m->irows, old_parts = base->m->iparts;
+        setenv(deepseek41::kIndexCompactEnv, "1", 1);
+        auto compact = declare(0, 2048, false, ctx); REQUIRE_EQ(compact->rc, RAD_OK);
+        REQUIRE(compact->m->index_compact);
+        const int64_t rows = compact->m->irows;
+        const RecBuf* plane = find_b(compact->b, "index_score"); REQUIRE(plane);
+        CHECK_EQ(plane->d.shape[0], rows); CHECK_EQ(plane->d.shape[1], ctx + 1);
+        CHECK_EQ(rows, ctx == 32768 ? old_rows : ctx == 524288 ? int64_t(127) : int64_t(64));
+        CHECK_EQ(compact->m->iparts, (int64_t(2048) + rows - 1) / rows);
+        if (ctx == 32768) {
+            CHECK_EQ(compact->m->iparts, old_parts);
+            CHECK(differs(base->b, compact->b).empty());
+            CHECK(differs(compact->b, base->b).empty());
+        }
+        /* Both large tables still exist at their ORIGINAL full-context extents. */
+        for (const char* name : { "rope_window", "rope_compressed" }) {
+            const RecBuf* rope = find_b(compact->b, name); REQUIRE(rope);
+            CHECK_EQ(rope->d.shape[0], ctx); CHECK_EQ(rope->d.shape[1], int64_t(64));
+        }
+    }
+}
+
+TEST(compact_index_score_requires_lcp_and_sizing_levels_keep_the_real_run_graph) {
+    Env e{ WINDOW_SWITCHES };
+    setenv(deepseek41::kIndexCompactEnv, "1", 1);
+    for (const char* lcp : { (const char*)nullptr, "0", "48", "2049", "4097", "bad" }) {
+        if (lcp) setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", lcp, 1);
+        else unsetenv("RADIANCE_EXPERIMENTAL_DS41_LCP");
+        setenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL", "1", 1);
+        auto d = declare(0, 2048, false, 1 << 20); REQUIRE_EQ(d->rc, RAD_OK);
+        CHECK(!d->m->index_compact); CHECK_EQ(d->m->irows, int64_t(256));
+    }
+    setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
+    auto real = declare(0, 2048, false, 1 << 20); REQUIRE_EQ(real->rc, RAD_OK);
+    CHECK_EQ(real->m->irows, int64_t(64)); CHECK_EQ(real->m->iparts, int64_t(32));
+    for (int64_t rows : { int64_t(32), int64_t(64), int64_t(256) }) {
+        auto probe = declare(0, rows, true, 1 << 20); REQUIRE_EQ(probe->rc, RAD_OK);
+        CHECK(differs(real->b, probe->b).empty());
+        const RecBuf* plane = find_b(probe->b, "index_score"); REQUIRE(plane);
+        CHECK_EQ(plane->d.shape[0], std::min(rows, int64_t(64)));
+        CHECK(probe->err.empty());
+    }
+    setenv(deepseek41::kIndexCompactEnv, "2", 1);
+    CHECK_EQ(declare(0, 2048, false, 1 << 20)->rc, RAD_E_INVAL);
+}
+
+TEST(compact_index_score_recorded_runs_keep_full_inputs_causal_offsets_and_tail_extents) {
+    Env e{ WINDOW_SWITCHES };
+    setenv(deepseek41::kIndexCompactEnv, "1", 1);
+    setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
+    unsetenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP");
+    for (int64_t ctx : { int64_t(32768), int64_t(524288), int64_t(1048576) }) {
+        auto d = declare(0, 2048, false, ctx); REQUIRE_EQ(d->rc, RAD_OK);
+        const auto* m = d->m;
+        for (int T : { 49, 65, 129, 259 }) {
+            auto batch = kit(d->b, {}, {T}, 16);
+            RadCtx c; c.b = &d->b; c.batch = &batch->b; c.rank = 0; c.world = kWorld;
+            deepseek41::step(&c, &batch->b); CHECK(c.step_fail.empty());
+            const int64_t n = (T + m->irows - 1) / m->irows, R = (T + n - 1) / n;
+            int64_t scores = 0, topks = 0;
+            const auto& L = m->layers[2];
+            for (const RecIssue& issue : c.issues) {
+                if (std::find(L.i_runs.begin(), L.i_runs.end(), issue.op) != L.i_runs.end()) {
+                    REQUIRE_EQ(issue.opd.size(), size_t(7));
+                    REQUIRE((size_t)scores < L.i_runs.size());
+                    CHECK_EQ(issue.op, L.i_runs[(size_t)scores]); CHECK_EQ(issue.opd[0].rows, int64_t(T));
+                    CHECK_EQ(issue.opd[6].rows, R); ++scores;
+                }
+                if (issue.op == L.i_topk) {
+                    REQUIRE_EQ(issue.opd.size(), size_t(4));
+                    const int64_t rows = std::min(R, int64_t(T) - topks * R);
+                    CHECK_EQ(issue.opd[0].rows, rows); CHECK_EQ(issue.opd[2].rows, rows);
+                    CHECK(issue.opd[2].raw == (void*)(batch->b.positions + topks * R));
+                    CHECK_EQ(issue.opd[3].rows, rows); CHECK_EQ(issue.opd[3].offset, topks * R * m->c.itopk);
+                    ++topks;
+                }
+            }
+            CHECK_EQ(scores, n); CHECK_EQ(topks, n);
+            CHECK(overruns(d->b, d->b, batch->b, 0, nullptr).empty());
+        }
+    }
+}
+
 TEST(a_step_of_the_levels_rows_stays_inside_its_buffers) {
     Env e{ WINDOW_SWITCHES };
     for (int rank = 0; rank < kWorld; ++rank) {
@@ -412,6 +502,40 @@ TEST(beside_lcp_a_level_sizes_the_compressors_work_rows_for_itself) {
     std::fprintf(stderr, "  T 2048: the 256-row level ends at %.1f MiB, %.1f beside LCP\n", level_at[0] / 1048576.0,
                  level_at[1] / 1048576.0);
     CHECK(level_at[1] < level_at[0]);
+}
+
+TEST(lcp4096_keeps_the_small_arena_level_and_full_step_bounds) {
+    Env e{ WINDOW_SWITCHES };
+    setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "4096", 1);
+    for (int rank = 0; rank < kWorld; ++rank) {
+        auto real = declare(rank, 4096, false);
+        auto probe = declare(rank, 256, true);
+        REQUIRE_EQ(real->rc, RAD_OK);
+        REQUIRE_EQ(probe->rc, RAD_OK);
+        CHECK(real->m->work_fit);
+        CHECK(differs(real->b, probe->b).empty());
+        const RecBuf* pg = find_b(probe->b, "comp_page");
+        REQUIRE(pg != nullptr);
+        CHECK_EQ(pg->d.shape[0], (int64_t)257);
+        for (const std::vector<int>& rows : { std::vector<int>{ 1 }, std::vector<int>{ 256 } }) {
+            auto small = kit(real->b, {}, rows, 4095);
+            std::string fail;
+            CHECK(overruns(real->b, probe->b, small->b, rank, &fail).empty());
+            CHECK(fail.empty());
+        }
+        auto large = kit(real->b, {}, { 4096 }, 1024);
+        CHECK(!overruns(real->b, probe->b, large->b, rank, nullptr).empty());
+        CHECK(overruns(real->b, real->b, large->b, rank, nullptr).empty());
+        if (rank == 0) {
+            int64_t full = 0, level = 0;
+            arena(real->b, probe->b, &full, &level);
+            const int64_t room = full - level - (1 << 20);
+            CHECK(room / ds41p1::kSlotBytes >= ds41p1::kMaxLend);
+            std::fprintf(stderr, "  LCP4096 arena %.1f MiB, level256 %.1f MiB, %lld physical slots; "
+                                 "lending cap remains %d\n", full / 1048576.0, level / 1048576.0,
+                         (long long)(room / ds41p1::kSlotBytes), ds41p1::kMaxLend);
+        }
+    }
 }
 
 TEST(the_256_row_level_ends_far_below_the_full_plan) {

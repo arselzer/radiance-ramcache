@@ -802,6 +802,99 @@ TEST(index_score_runs_are_the_unsplit_rows) {
     CHECK_EQ(run("index_score", c), RAD_E_SHAPE);
 }
 
+/* SOURCE oracle for compact index row runs: actual reference launches, original row_part,
+ * causal positions, two sequences and paged holes; selection finishes before plane reuse.
+ * This proves host composition, not the card's scalar pin or long-context serving. */
+TEST(index_score_compact_runs_preserve_causal_candidates_and_topk_composition) {
+    constexpr int64_t H = 2, D = 128, C = 71, block = 8, K = 9;
+    const int64_t KW = ((C + block - 1) / block + 31) / 32, pitch = C + 5;
+    for (int64_t M : { int64_t(49), int64_t(65), int64_t(127), int64_t(129), int64_t(259) })
+    for (int64_t ratio : { int64_t(1), int64_t(2) }) {
+        const int64_t split = M / 2, nblk = (C + 3) / 4, cbs = 4 * ratio;
+        T q(RAD_BF16, {M, H * D + 8}), w(RAD_BF16, {M, H + 4});
+        q.t.shape[1] = H * D; w.t.shape[1] = H;
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t h = 0; h < H; ++h) {
+                w.set(m * (H + 4) + h, h ? .5f : 1.f);
+                for (int64_t d = 0; d < D; ++d)
+                    q.set(m * (H * D + 8) + h * D + d,
+                          m % 17 == 0 ? NAN : m % 11 == 0 ? 0.f : float((m + d + h) % 7 - 3) * .125f);
+            }
+        }
+        T kc(RAD_BF16, {nblk, 1, cbs, D / ratio});
+        for (int64_t i = 0; i < nblk * 4 * D; ++i) kc.set(i, float(i % 5 - 2) * .25f);
+        T bt(RAD_I32, {2, nblk});
+        for (int64_t s = 0; s < 2; ++s) for (int64_t j = 0; j < nblk; ++j)
+            st_int(RAD_I32, bt.t.data, s * nblk + j,
+                   j == 3 ? -1 : j == 7 ? nblk + 1 : (j + s * 3) % nblk);
+        T pos(RAD_I32, {M});
+        for (int64_t m = 0; m < M; ++m)
+            st_int(RAD_I32, pos.t.data, m, ((m < split ? m : m - split) + 1) * ratio - 1);
+        T cu(RAD_I32, {3}); cu.n({0, split, M});
+        auto pitched = [](uint32_t dt, int64_t rows, int64_t columns, int64_t extra) {
+            T t(dt, {rows, columns + extra}); t.t.shape[1] = columns;
+            std::fill(t.mem.begin(), t.mem.end(), uint8_t(0xa5)); return t;
+        };
+        auto view = [](const T& owner, int64_t at, int64_t rows) {
+            T t(owner.t.dtype, {1}); t.t = owner.t; t.t.shape[0] = rows;
+            t.t.data = (uint8_t*)owner.t.data + at * owner.t.stride[0] * 4; return t;
+        };
+        auto score = [&](T& out, int64_t rows, int64_t part) {
+            A a; a.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(out).i("M", rows).i("heads", H).i("dim", D)
+                .i("ratio", ratio).i("width", C).d("wscale", .125).s("dtype", "bf16");
+            if (part >= 0) a.i("row_part", part);
+            return run("index_score", a);
+        };
+        auto candidates = [&](T& sc, T& positions, T& keep, int64_t rows) {
+            A a; a.t(sc).t(positions).t(keep).i("M", rows).i("width", C).i("block", block)
+                .i("topk_blocks", 2).i("ratio", ratio);
+            return run("index_candidates", a);
+        };
+        auto topk = [&](T& sc, T* keep, T& positions, T& sel, int64_t rows) {
+            A a; a.t(sc); if (keep) a.t(*keep); else a.tnull();
+            a.t(positions).t(sel).i("M", rows).i("width", C).i("topk", K).i("ratio", ratio).i("block", block);
+            return run("index_topk", a);
+        };
+        T whole = pitched(RAD_F32, M, C, 5), whole_keep = pitched(RAD_I32, M, KW, 1);
+        REQUIRE_EQ(score(whole, M, -1), RAD_OK);
+        REQUIRE_EQ(candidates(whole, pos, whole_keep, M), RAD_OK);
+        for (bool masked : { false, true }) {
+            T whole_sel = pitched(RAD_I32, M, K, 3);
+            REQUIRE_EQ(topk(whole, masked ? &whole_keep : nullptr, pos, whole_sel, M), RAD_OK);
+            for (int64_t floor : { int64_t(256), int64_t(127), int64_t(64) }) {
+                const int64_t n = (M + floor - 1) / floor, R = (M + n - 1) / n;
+                T assembled = pitched(RAD_F32, M, C, 5), keep = pitched(RAD_I32, M, KW, 1);
+                T sel = pitched(RAD_I32, M, K, 3);
+                for (int64_t p = 0; p * R < M; ++p) {
+                    const int64_t at = p * R, rows = std::min(R, M - at);
+                    T plane = pitched(RAD_F32, R, C, 5);
+                    REQUIRE_EQ(score(plane, R, p), RAD_OK);
+                    for (int64_t i = 0; i < R; ++i) {
+                        for (int64_t j = 0; j < C; ++j) {
+                            const float got = plane.at(i * pitch + j);
+                            if (i < rows) {
+                                const float want = whole.at((at + i) * pitch + j);
+                                CHECK(!std::memcmp(&got, &want, 4));
+                                std::memcpy(assembled.mem.data() + ((at + i) * pitch + j) * 4,
+                                            plane.mem.data() + (i * pitch + j) * 4, 4);
+                            } else CHECK(std::isinf(got) && got < 0);
+                        }
+                        for (int64_t j = C * 4; j < pitch * 4; ++j)
+                            CHECK_EQ(plane.mem[(size_t)(i * pitch * 4 + j)], uint8_t(0xa5));
+                    }
+                    for (size_t j = (size_t)(R * pitch * 4); j < plane.mem.size(); ++j)
+                        CHECK_EQ(plane.mem[j], uint8_t(0xa5));
+                    T sc = view(plane, 0, rows), positions = view(pos, at, rows);
+                    T kept = view(keep, at, rows), selected = view(sel, at, rows);
+                    REQUIRE_EQ(candidates(sc, positions, kept, rows), RAD_OK);
+                    REQUIRE_EQ(topk(sc, masked ? &kept : nullptr, positions, selected, rows), RAD_OK);
+                }
+                CHECK(assembled.mem == whole.mem); CHECK(keep.mem == whole_keep.mem); CHECK(sel.mem == whole_sel.mem);
+            }
+        }
+    }
+}
+
 /* entry_store writes whole blocks at their pages and skips a negative page. */
 TEST(entry_store_writes_one_entry_a_block) {
     T x(RAD_F32, {3, 4}); x.f({1, 2, 3, 4,  5, 6, 7, 8,  9, 10, 11, 12});

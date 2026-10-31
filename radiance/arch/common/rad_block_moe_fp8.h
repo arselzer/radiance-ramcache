@@ -522,9 +522,21 @@ struct MoeFP8 {
     /* `beside` false: the collective runs on its own (a pass that owns it), so it takes the
      * size-chosen block count and not the overlap cap, which only pays beside other work. */
     void issue_ar(RadCtx* c, int64_t r0, int64_t rows, bool beside = true) const {
-        RAD_ISSUE_N(c, beside && op_ar_ov ? op_ar_ov : op_ar, rows * g.n_embd,
-                    brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE);
+        const rad_op ar = beside && op_ar_ov ? op_ar_ov : op_ar;
+        if (ar_rows <= 0 || rows <= ar_rows) {
+            RAD_ISSUE_N(c, ar, rows * g.n_embd, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE);
+            return;
+        }
+        for (int64_t at = 0; at < rows;) {
+            const int64_t n = std::min(ar_rows, rows - at);
+            RAD_ISSUE_N(c, ar, n * g.n_embd, brow_slice(w.h.x, r0 + at, n, g.n_embd), RAD_NONE);
+            at += n;
+        }
     }
+    /* Set by DeepSeek41 before declare for its default-off exact AR row slices. Zero leaves every
+     * other architecture's declaration and issue unchanged. Each slice is a normal collective on
+     * the same stream, with the existing sequence/parity protocol, never a partial reduction. */
+    int64_t ar_rows = 0;
     /* Set before declare: the `overlap` issue_ar's collective is declared at, 0 for none. */
     int    ar_overlap = 0;
     rad_op op_ar_ov = 0;
@@ -682,6 +694,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     /* The expert slice must lie inside the model, or tokens routed past it are silently dropped. */
     if (c.expert_base < 0 || c.expert_base + c.n_expert > c.n_expert_all) return RAD_E_INVAL;
     if (c.rows <= 0) c.rows = g.max_tok;
+    if (ar_rows > 0 && (g.world != 4 || !g.wire_exact || std::strcmp(g.dtype, "bf16") ||
+                        g.n_embd % 64 || c.shared_fp32_combine || ar_in != kArNone || ar_out_))
+        return RAD_E_UNSUPPORTED;
     /* A rank whose slice of the shared arm is empty (see Config) declares no arm, and the
      * all-reduce carries the others' share. */
     const bool split_shared = src.shared_mlp_gate || src.shared_mlp_up || src.shared_mlp_down;
@@ -1624,10 +1639,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
 
     if (g.world > 1) {
+        const int64_t ar_bound = ar_rows > 0 ? std::min(ar_rows, g.max_tok) : g.max_tok;
         const auto all_reduce = [&](const char* dtype, rad_buf buffer) {
             return rw(b, RAD_OP(b, "all_reduce",
                          RAD_PARAMS(RAD_INT("world_size", g.world),
-                                    RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                    RAD_RANGE("numel", g.n_embd, ar_bound * g.n_embd),
                                     RAD_STR("dtype", dtype), RAD_INT("exact", g.wire_exact),
                                     RAD_INT("min_bytes", g.wire_min_bytes)),
                          RAD_NOWEIGHTS),
@@ -1647,7 +1663,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     if (g.world > 1 && ar_overlap > 0)
         op_ar_ov = rw(b, RAD_OP(b, "all_reduce",
                           RAD_PARAMS(RAD_INT("world_size", g.world),
-                                     RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                     RAD_RANGE("numel", g.n_embd,
+                                               (ar_rows > 0 ? std::min(ar_rows, g.max_tok) : g.max_tok) * g.n_embd),
                                      RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
                                      RAD_INT("min_bytes", g.wire_min_bytes),
                                      RAD_INT("overlap", ar_overlap)),

@@ -1,0 +1,53 @@
+[
+  {
+    "name": "backup",
+    "argv": [
+      "/home/as/ds41-claude-build/aql-sync/bin/ds41-bank-backup-check",
+      "--inside-guarded-window",
+      "--hot-n",
+      "24",
+      "--backup-mib",
+      "8192"
+    ],
+    "sha256": "dec71d4a5b29fdf1ed99826d52b925f3b84bd87767466c03c3eacd906768b4ec",
+    "exit": 0,
+    "passed": true,
+    "required": true
+  },
+  {
+    "name": "draft",
+    "argv": [
+      "/usr/bin/bash",
+      "/home/as/ds41-claude-build/work/autonomous-20261031/bank-lend/legacy-checks.sh",
+      "draft"
+    ],
+    "sha256": "1fec42b800e9ead5ee885d3bcb70756b693bf10d88d1cbc7fdb5c36bfeaa2ee8",
+    "exit": 0,
+    "passed": true,
+    "required": true
+  },
+  {
+    "name": "rb",
+    "argv": [
+      "/usr/bin/bash",
+      "/home/as/ds41-claude-build/work/autonomous-20261031/bank-lend/legacy-checks.sh",
+      "rb"
+    ],
+    "sha256": "5f2114b0cd3173475c00f3e81588ecae7618326b564a14d2fbea9743bee424e1",
+    "exit": 0,
+    "passed": true,
+    "required": true
+  },
+  {
+    "name": "vp",
+    "argv": [
+      "/usr/bin/bash",
+      "/home/as/ds41-claude-build/work/autonomous-20261031/bank-lend/legacy-checks.sh",
+      "vp"
+    ],
+    "sha256": "c1d7b156ee8bb63c2a93ceae12ee96a156a5d81f4a474a83a3f9e7cab3ffc8c6",
+    "exit": 0,
+    "passed": true,
+    "required": true
+  }
+]

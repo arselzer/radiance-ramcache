@@ -1,0 +1,9 @@
+  ok    dflash_select_bf16
+  ok    dflash_select_bf16 walks the chained path
+  ok    dflash_select_bf16 case can tell a chained walk from an anchor-pinned one
+  ok    dflash_select_bf16
+  ok    dflash_select_bf16 absent hp is a plane of ones (the bigram form)
+  ok    dflash_observe_bf16
+  ok    dflash_observe_bf16 leaves selected IDs byte-identical
+  ok    dflash_observe_bf16 reports conditioned candidate softmax and margin
+observer check exit 0

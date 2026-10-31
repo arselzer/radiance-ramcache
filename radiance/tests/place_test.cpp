@@ -17,6 +17,7 @@
 #include "place/planner.h"
 #include "place/vram_packed.h"
 #include "../tools/ds41-host-experts/ds41_host_experts.h"
+#include "../tools/ds41-host-experts/ds41_p1.h"
 #include "place/expert_profile_map.h"
 #include "place/native_decode_profile.h"
 #include "format/radfile.h"
@@ -3557,6 +3558,25 @@ TEST(dspark_codebook_ram_pins_the_codebooks_with_the_embedding) {
     unsetenv(kDraftCodebookRamEnv);
 }
 
+TEST(dspark_codebook_observer_preserves_placement_but_needs_a_selector) {
+    setenv(kDraftCodebookRamEnv, "1", 1);
+    Fixture f;
+    const rad_weight w = f.weight("dspark.markov_w1.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("dflash_observe", { w }, false);
+    CHECK(!is_embedding_table(f.prog, w));
+    f.op("dflash_select", { w }, false);
+    CHECK(is_embedding_table(f.prog, w));
+    f.op("gemm", { w }, false);
+    CHECK(!is_embedding_table(f.prog, w));
+    Fixture other;
+    const rad_weight u = other.weight("unknown.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    other.op("dflash_select", { u }, false);
+    other.op("unknown_observer", { u }, false);
+    CHECK(!is_embedding_table(other.prog, u));
+    unsetenv(kDraftCodebookRamEnv);
+    CHECK(!is_embedding_table(f.prog, w));
+}
+
 /* The embedding gets its own room: the resolver sizes Config::embedding_host_mib on top of
  * --host-pool-mib, so a dense model with no pool still places the table, and the experts keep all
  * of --host-pool-mib after the table is pinned. */
@@ -5640,7 +5660,23 @@ const RadKernelInfo g_mx_gemv_info = { "moe_gemm_ggml_mxfp4_gemv", "moe_gemm_ggm
 const RadKernelInfo g_mx_tiled_info = { "moe_gemm_ggml_mxfp4_tiled", "moe_gemm_ggml", "moe", "", "", "",
                                         RAD_DOMAIN_DEVICE, 57, nullptr, 0, nullptr, 0,
                                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
-KernelRow g_vp_row, g_mx_gemv_row, g_mx_tiled_row;
+const RadKernelInfo g_mx_p1_info = { ds41p1::kTwinRow, "moe_gemm_ggml", "moe", "", "", "",
+                                    RAD_DOMAIN_DEVICE, 57, nullptr, 0, nullptr, 0,
+                                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+const RadKernelInfo g_mx_lcp_info = { ds41p1::kLcpTwinRow, "moe_gemm_ggml", "moe", "", "", "",
+                                     RAD_DOMAIN_DEVICE, 57, nullptr, 0, nullptr, 0,
+                                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+KernelRow g_vp_row, g_mx_gemv_row, g_mx_tiled_row, g_mx_p1_row, g_mx_lcp_row;
+const RadOperandSpec g_vp_table_opds[] = {
+    { "a", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WTAB, 0 }, { "sorted", RAD_OPD_IN, 0 },
+    { "offsets", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+const RadOperandSpec g_vp_stacked_opds[] = {
+    { "a", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "sorted", RAD_OPD_IN, 0 },
+    { "offsets", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+const RadOpSchema g_vp_table_schema = { "moe_gemm_ggml", nullptr, 0, g_vp_table_opds, 5, "table fixture" };
+const RadOpSchema g_vp_stacked_schema = { "moe_gemm_ggml", nullptr, 0, g_vp_stacked_opds, 5, "stacked fixture" };
 
 constexpr int kVpN[2] = { 64, 32 }, kVpK[2] = { 1024, 512 };   /* gate_up, down */
 
@@ -5658,6 +5694,8 @@ struct VpModel {
         g_vp_row.info = &g_vp_info;
         g_mx_gemv_row.info = &g_mx_gemv_info;
         g_mx_tiled_row.info = &g_mx_tiled_info;
+        g_mx_p1_row.info = &g_mx_p1_info;
+        g_mx_lcp_row.info = &g_mx_lcp_info;
         f.prog.meta.n_layers = trunk;
         RadEncoding enc{};
         rad_enc_copy_str(enc.scheme, "affine");
@@ -5738,6 +5776,16 @@ struct VpModel {
             hi = 1 << 20;
         }
         f.prog.ops.push_back(o);
+    }
+    void p1_op(int l, int s, int64_t rows = 2048) {
+        op(l, s, { &g_vp_row, &g_mx_p1_row });
+        OpInfo& o = f.prog.ops.back();
+        o.ranged_key = "M";
+        o.range_lo = 1;
+        o.range_hi = rows;
+        o.schema = &g_vp_table_schema;
+        o.bands.back().hi = rows;
+        o.bands.back().span = fmt("M in (16, %lld]", (long long)rows);
     }
 };
 
@@ -5855,6 +5903,136 @@ TEST(vram_pack_eligible_refuses_a_table_any_other_row_or_position_reads) {
     vram_pack_eligible(empty.prog, m.file, cfg, &t, &why);
     CHECK_EQ(t.size(), (size_t)1);
     CHECK(why.find("no moe_gemm_ggml op reads a weight table") != std::string::npos);
+}
+
+TEST(vram_pack_eligible_accepts_packed_aware_p1_bands_at_the_same_sizes_as_decode) {
+    VpModel m(1, 3, 1, "vp_p1_eligible.rad");
+    REQUIRE(m.ok);
+    m.op(0, 0, { &g_vp_row });
+    m.op(0, 1, { &g_vp_row });
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> decode, p1;
+    std::string why;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &decode, &why);
+    CHECK(why.empty());
+    REQUIRE(decode.size() == 7);
+    for (size_t w = 1; w < decode.size(); ++w) REQUIRE(decode[w].bytes > 0);
+
+    /* Same weight bytes and raw-round budgets with the exact high-band P1 reader. The final
+     * case also splits both proven ranges into more bands; every reader remains packed-aware. */
+    for (int64_t rows : { int64_t(17), int64_t(64), int64_t(2048), int64_t(ds41p1::kTwinMaxRows) }) {
+        m.f.prog.ops.clear();
+        m.p1_op(0, 0, rows);
+        m.p1_op(0, 1, rows);
+        if (rows == ds41p1::kTwinMaxRows) {
+            for (OpInfo& o : m.f.prog.ops) {
+                Band low = o.bands.front(), high = o.bands.back();
+                low.hi = 8;
+                high.hi = 1024;
+                o.bands = { low, o.bands.front(), high, o.bands.back() };
+            }
+        }
+        vram_pack_eligible(m.f.prog, m.file, cfg, &p1, &why);
+        CHECK(why.empty());
+        REQUIRE(p1.size() == decode.size());
+        for (size_t w = 1; w < p1.size(); ++w) {
+            CHECK_EQ(p1[w].bytes, decode[w].bytes);
+            CHECK_EQ(p1[w].cap, decode[w].cap);
+            CHECK_EQ(p1[w].N, decode[w].N);
+            CHECK_EQ(p1[w].K, decode[w].K);
+            CHECK_EQ(p1[w].scales_off, decode[w].scales_off);
+            CHECK_EQ(p1[w].scales_bytes, decode[w].scales_bytes);
+        }
+    }
+}
+
+TEST(vram_pack_p1_eligibility_refuses_unproven_bands_and_stacked_weights) {
+    VpModel m(1, 2, 1, "vp_p1_refuse.rad");
+    REQUIRE(m.ok);
+    m.p1_op(0, 0);
+    m.p1_op(0, 1);
+    const std::vector<OpInfo> good = m.f.prog.ops;
+    const KernelRow no_info{};
+    struct BadReader {
+        const char* name;
+        std::function<void(OpInfo&)> change;
+    };
+    const std::vector<BadReader> cases = {
+        { "ordinary LCP twin", [](OpInfo& o) { o.bands[1].dom[RAD_DOMAIN_DEVICE].row = &g_mx_lcp_row; } },
+        { "tiled high band", [](OpInfo& o) { o.bands[1].dom[RAD_DOMAIN_DEVICE].row = &g_mx_tiled_row; } },
+        { "plain low band", [](OpInfo& o) { o.bands[0].dom[RAD_DOMAIN_DEVICE].row = &g_mx_gemv_row; } },
+        { "missing device reader", [](OpInfo& o) { o.bands[1].dom[RAD_DOMAIN_DEVICE].row = nullptr; } },
+        { "missing reader metadata", [&](OpInfo& o) { o.bands[1].dom[RAD_DOMAIN_DEVICE].row = &no_info; } },
+        { "extra block reader", [](OpInfo& o) {
+            Band extra = o.bands.back();
+            o.bands.back().hi = 1024;
+            extra.dom[RAD_DOMAIN_DEVICE].row = &g_mx_gemv_row;
+            o.bands.push_back(extra);
+        } },
+        { "stacked weight", [](OpInfo& o) { o.schema = &g_vp_stacked_schema; } },
+        { "missing table schema", [](OpInfo& o) { o.schema = nullptr; } },
+        { "different ranged axis", [](OpInfo& o) { o.ranged_key = "N"; } },
+        { "range misses decode row", [](OpInfo& o) { o.range_lo = 2; } },
+        { "P1 above its bound", [](OpInfo& o) {
+            o.range_hi = o.bands[1].hi = ds41p1::kTwinMaxRows + 1;
+        } },
+        { "decode band above 16", [](OpInfo& o) { o.bands[0].hi = 17; } },
+        { "P1 band starts below 17", [](OpInfo& o) { o.bands[0].hi = 15; } },
+        { "no low band", [](OpInfo& o) { o.bands.erase(o.bands.begin()); } },
+        { "incomplete high coverage", [](OpInfo& o) { --o.bands[1].hi; } },
+        { "overlapping bounds", [](OpInfo& o) { o.bands[1].hi = 16; } },
+        { "no bands", [](OpInfo& o) { o.bands.clear(); } },
+    };
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> t;
+    std::string why;
+    for (const BadReader& bad : cases) {
+        m.f.prog.ops = good;
+        bad.change(m.f.prog.ops[0]);
+        vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+        REQUIRE(t.size() == m.f.prog.weights.size());
+        for (int e = 0; e < 2; ++e) {
+            if (t[m.at(0, e, 0)].bytes) std::printf("  accepted %s\n", bad.name);
+            CHECK_EQ(t[m.at(0, e, 0)].bytes, int64_t(0));
+            CHECK(t[m.at(0, e, 1)].bytes > 0);   /* the independent down table is still eligible */
+        }
+        CHECK(why.find("1 routed moe_gemm_ggml op(s) have a band") != std::string::npos);
+    }
+}
+
+TEST(vram_pack_p1_tables_keep_other_readers_positions_and_draft_weights_block) {
+    VpModel m(2, 4, 1, "vp_p1_shared.rad");
+    REQUIRE(m.ok);
+    for (int l = 0; l < 2; ++l) {
+        m.p1_op(l, 0);
+        m.p1_op(l, 1);
+    }
+    /* P1 does not override an additional block-form reader, the operand's table position,
+     * file_id (even for a trunk-shaped bank weight), or the trunk layer bound. */
+    m.f.op("gemm", { m.at(0, 0, 0) }, false);
+    m.f.prog.ops[0].weight_opd[1] = 2;
+    m.f.prog.weights[m.at(0, 2, 0)].file_id = 1;
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> t;
+    std::string why;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    REQUIRE(t.size() == m.f.prog.weights.size());
+    for (int e = 0; e < 4; ++e) {
+        CHECK_EQ(t[m.at(0, e, 0)].bytes > 0, e == 3);
+        CHECK(t[m.at(0, e, 1)].bytes > 0);
+        CHECK_EQ(t[m.at(1, e, 0)].bytes, int64_t(0));
+        CHECK_EQ(t[m.at(1, e, 1)].bytes, int64_t(0));
+    }
+    CHECK(why.find("DSpark bank's") != std::string::npos);
 }
 
 TEST(the_scan_reads_a_weights_scales_and_the_query_keeps_one_over_its_room_block) {
@@ -6309,6 +6487,37 @@ TEST(dspark_bank_vram_with_packed_trunk_residents_keeps_the_hot_set_block_and_fi
             CHECK_EQ(rep.trunk_packed, (int64_t)2 * r1);
             CHECK_EQ(rep.bank_vram, (int64_t)2 * 72);
             CHECK(p.totals.bytes[int(Tier::VRAM)] + p.slab_overhead + p.file_stage_vram <= p.vram_budget);
+        }
+    }
+}
+
+TEST(lcp4096_small_host_budgets_preserve_the_file_tier_and_the_planners_budget) {
+    /* The cache holds only two/four of 16 synthetic units. Changing the pass bound cannot
+     * promote the missing working set into unbudgeted RAM or require that it all be resident. */
+    FileBufferUnitsEnv units("1");
+    const int64_t reserve = 4 * (MiB + MiB / 2) + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES;
+    for (int extra_mib : { 3, 6 }) {
+        Fixture f;
+        build_moe_layers(f, 2, 8, MiB, MiB / 2);
+        Config c = base_config();
+        c.placement = "expert_tiered";
+        c.vram_weights_mib = 12;
+        c.host_pool_mib = (reserve + extra_mib * MiB) / MiB;
+        c.weights_disk_tier = true;
+        std::string baseline;
+        for (int64_t T : { 16, 4096 }) {
+            f.prog.ctx.max_tok = c.max_tok = T;
+            PlannerInput in{ &f.prog, &c, 0, 1, nullptr, 0 };
+            Plan p;
+            REQUIRE_EQ(Planner(in).plan(&p), RAD_OK);
+            CHECK(p.fits());
+            CHECK(count_tier(f.prog, p, Tier::SSD) > 0);
+            CHECK(p.totals.bytes[(int)Tier::HostPinned] <= p.host_budget);
+            CHECK(p.host_budget + p.file_stage_reserve <= c.host_pool_mib * MiB);
+            CHECK(p.totals.bytes[(int)Tier::VRAM] + p.slab_overhead + p.file_stage_vram <= p.vram_budget);
+            const std::string got = digest(f.prog, p);
+            if (T == 16) baseline = got;
+            else CHECK_EQ(got, baseline);
         }
     }
 }

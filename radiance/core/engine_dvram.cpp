@@ -31,6 +31,12 @@
 namespace rad {
 
 int Engine::draft_vram_open() {
+    if (draft_bank::Config::parse(std::getenv(draft_bank::kLendEnv),
+            std::getenv(draft_bank::kBackupEnv), std::getenv(draft_bank::kGraceEnv),
+            std::getenv(draft_bank::kCooldownEnv), &draft_bank_config_) < 0) {
+        RAD_ERR("DSBANKLEND invalid flag/budget/hysteresis: explicit flag=1 and positive BACKUP_MIB required");
+        return RAD_E_INVAL;
+    }
     int n = 0;
     const char* v = std::getenv(kDraftVramEnv);
     const char* file = std::getenv(kDraftHotsetEnv);
@@ -41,6 +47,10 @@ int Engine::draft_vram_open() {
         return RAD_E_INVAL;
     }
     if (n == 0) {
+        if (draft_bank_config_.on) {
+            RAD_ERR("DSBANKLEND requires an explicit native DRAFT_VRAM hot bank");
+            return RAD_E_UNSUPPORTED;
+        }
         if (file && *file) {
             RAD_ERR("%s=%s is set but %s is 0 or unset: the hot set would not be used", kDraftHotsetEnv,
                     file, kDraftVramEnv);

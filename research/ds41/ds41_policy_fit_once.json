@@ -1,0 +1,3366 @@
+{
+  "calibration": [
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.6576197724933469
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.3,
+      "lo": 0.2,
+      "mean_candidate_p": 0.2852450905,
+      "n": 2,
+      "split": "heldout",
+      "split_groups": 2
+    },
+    {
+      "acceptance_rate": 0.14285714285714285,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.02567962434474355,
+        0.5131278292743189
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.36226711957142854,
+      "n": 7,
+      "split": "heldout",
+      "split_groups": 4
+    },
+    {
+      "acceptance_rate": 0.2857142857142857,
+      "accepted": 2,
+      "binomial_wilson95_descriptive": [
+        0.08221892400405678,
+        0.6410655481673808
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.45235363928571426,
+      "n": 7,
+      "split": "heldout",
+      "split_groups": 5
+    },
+    {
+      "acceptance_rate": 0.2222222222222222,
+      "accepted": 2,
+      "binomial_wilson95_descriptive": [
+        0.06322510711784671,
+        0.5474110308930111
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5446872048888889,
+      "n": 9,
+      "split": "heldout",
+      "split_groups": 5
+    },
+    {
+      "acceptance_rate": 0.3333333333333333,
+      "accepted": 3,
+      "binomial_wilson95_descriptive": [
+        0.1205838183869109,
+        0.6457978644196036
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.6548276212222223,
+      "n": 9,
+      "split": "heldout",
+      "split_groups": 6
+    },
+    {
+      "acceptance_rate": 0.6,
+      "accepted": 12,
+      "binomial_wilson95_descriptive": [
+        0.3865815007622531,
+        0.781193467627183
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.75994108625,
+      "n": 20,
+      "split": "heldout",
+      "split_groups": 7
+    },
+    {
+      "acceptance_rate": 0.5833333333333334,
+      "accepted": 14,
+      "binomial_wilson95_descriptive": [
+        0.3883466586522876,
+        0.7553239739018824
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8551565557499999,
+      "n": 24,
+      "split": "heldout",
+      "split_groups": 7
+    },
+    {
+      "acceptance_rate": 0.9005847953216374,
+      "accepted": 308,
+      "binomial_wilson95_descriptive": [
+        0.8642875174812542,
+        0.9279830244437345
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.9916912308801169,
+      "n": 342,
+      "split": "heldout",
+      "split_groups": 7
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.4898908364545973
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.3,
+      "lo": 0.2,
+      "mean_candidate_p": 0.2874255255,
+      "n": 4,
+      "split": "train",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.058823529411764705,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.010460400984997592,
+        0.26982030637575405
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.3553813746470588,
+      "n": 17,
+      "split": "train",
+      "split_groups": 11
+    },
+    {
+      "acceptance_rate": 0.3170731707317073,
+      "accepted": 13,
+      "binomial_wilson95_descriptive": [
+        0.19564613898988575,
+        0.4698419964434429
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.44786645363414634,
+      "n": 41,
+      "split": "train",
+      "split_groups": 16
+    },
+    {
+      "acceptance_rate": 0.36507936507936506,
+      "accepted": 23,
+      "binomial_wilson95_descriptive": [
+        0.25715392865036535,
+        0.4885129029847216
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5507747293650794,
+      "n": 63,
+      "split": "train",
+      "split_groups": 19
+    },
+    {
+      "acceptance_rate": 0.390625,
+      "accepted": 25,
+      "binomial_wilson95_descriptive": [
+        0.2805556918824008,
+        0.5130808211972754
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.65333625771875,
+      "n": 64,
+      "split": "train",
+      "split_groups": 21
+    },
+    {
+      "acceptance_rate": 0.4025974025974026,
+      "accepted": 31,
+      "binomial_wilson95_descriptive": [
+        0.3002201729682805,
+        0.5142314683205054
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.7535016319610389,
+      "n": 77,
+      "split": "train",
+      "split_groups": 22
+    },
+    {
+      "acceptance_rate": 0.5714285714285714,
+      "accepted": 52,
+      "binomial_wilson95_descriptive": [
+        0.46889749285370325,
+        0.6681733637278853
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8518485269560438,
+      "n": 91,
+      "split": "train",
+      "split_groups": 22
+    },
+    {
+      "acceptance_rate": 0.9389747762408462,
+      "accepted": 1154,
+      "binomial_wilson95_descriptive": [
+        0.9241749881026099,
+        0.9510389271011704
+      ],
+      "depth": 1,
+      "family": "all",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.9924154778413344,
+      "n": 1229,
+      "split": "train",
+      "split_groups": 25
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.7934506856227626
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.380484909,
+      "n": 1,
+      "split": "heldout",
+      "split_groups": 1
+    },
+    {
+      "acceptance_rate": 0.07692307692307693,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.013710421242556586,
+        0.3331395092109959
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.4573719043076923,
+      "n": 13,
+      "split": "heldout",
+      "split_groups": 6
+    },
+    {
+      "acceptance_rate": 0.23076923076923078,
+      "accepted": 3,
+      "binomial_wilson95_descriptive": [
+        0.08179528718498569,
+        0.5025637594672749
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5583682243076923,
+      "n": 13,
+      "split": "heldout",
+      "split_groups": 7
+    },
+    {
+      "acceptance_rate": 0.5,
+      "accepted": 7,
+      "binomial_wilson95_descriptive": [
+        0.26799202452413634,
+        0.7320079754758637
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.6318565734285714,
+      "n": 14,
+      "split": "heldout",
+      "split_groups": 6
+    },
+    {
+      "acceptance_rate": 0.25,
+      "accepted": 3,
+      "binomial_wilson95_descriptive": [
+        0.08894166839405471,
+        0.5323053349335657
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.7521211106666666,
+      "n": 12,
+      "split": "heldout",
+      "split_groups": 5
+    },
+    {
+      "acceptance_rate": 0.29411764705882354,
+      "accepted": 5,
+      "binomial_wilson95_descriptive": [
+        0.1327998961029523,
+        0.5313311006653985
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8525541494705883,
+      "n": 17,
+      "split": "heldout",
+      "split_groups": 6
+    },
+    {
+      "acceptance_rate": 0.8933823529411765,
+      "accepted": 243,
+      "binomial_wilson95_descriptive": [
+        0.8510732888466412,
+        0.9247346731432458
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.9905979164411766,
+      "n": 272,
+      "split": "heldout",
+      "split_groups": 7
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        5.551115123125783e-17,
+        0.35433043506668743
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.3,
+      "lo": 0.2,
+      "mean_candidate_p": 0.26385373514285715,
+      "n": 7,
+      "split": "train",
+      "split_groups": 7
+    },
+    {
+      "acceptance_rate": 0.25,
+      "accepted": 4,
+      "binomial_wilson95_descriptive": [
+        0.10182067491213048,
+        0.49498316535508774
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.3394304831875,
+      "n": 16,
+      "split": "train",
+      "split_groups": 11
+    },
+    {
+      "acceptance_rate": 0.12121212121212122,
+      "accepted": 4,
+      "binomial_wilson95_descriptive": [
+        0.04816161309413558,
+        0.2732550517107523
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.453985189030303,
+      "n": 33,
+      "split": "train",
+      "split_groups": 19
+    },
+    {
+      "acceptance_rate": 0.25,
+      "accepted": 12,
+      "binomial_wilson95_descriptive": [
+        0.1492063367379791,
+        0.3878437280950796
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5520823784166667,
+      "n": 48,
+      "split": "train",
+      "split_groups": 17
+    },
+    {
+      "acceptance_rate": 0.35294117647058826,
+      "accepted": 18,
+      "binomial_wilson95_descriptive": [
+        0.23634488451520852,
+        0.49013941545494777
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.6450929465882353,
+      "n": 51,
+      "split": "train",
+      "split_groups": 17
+    },
+    {
+      "acceptance_rate": 0.3404255319148936,
+      "accepted": 16,
+      "binomial_wilson95_descriptive": [
+        0.2216744384377161,
+        0.48329075438058056
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.7496730406170212,
+      "n": 47,
+      "split": "train",
+      "split_groups": 19
+    },
+    {
+      "acceptance_rate": 0.4742268041237113,
+      "accepted": 46,
+      "binomial_wilson95_descriptive": [
+        0.3777449221838968,
+        0.5726722965030077
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8530653155876289,
+      "n": 97,
+      "split": "train",
+      "split_groups": 23
+    },
+    {
+      "acceptance_rate": 0.913,
+      "accepted": 913,
+      "binomial_wilson95_descriptive": [
+        0.8939135189433066,
+        0.928925578547625
+      ],
+      "depth": 2,
+      "family": "all",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.992323459642,
+      "n": 1000,
+      "split": "train",
+      "split_groups": 25
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.7934506856227626
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.3,
+      "lo": 0.2,
+      "mean_candidate_p": 0.290928572,
+      "n": 1,
+      "split": "heldout",
+      "split_groups": 1
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.4898908364545973
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.37518743425,
+      "n": 4,
+      "split": "heldout",
+      "split_groups": 2
+    },
+    {
+      "acceptance_rate": 0.25,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.04558726080970055,
+        0.6993581574175981
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.44814093425,
+      "n": 4,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.6576197724933469
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5465176105,
+      "n": 2,
+      "split": "heldout",
+      "split_groups": 2
+    },
+    {
+      "acceptance_rate": 0.25,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.04558726080970055,
+        0.6993581574175981
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.656774506,
+      "n": 4,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.5,
+      "accepted": 6,
+      "binomial_wilson95_descriptive": [
+        0.2537815976337061,
+        0.7462184023662939
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.7622111639166667,
+      "n": 12,
+      "split": "heldout",
+      "split_groups": 4
+    },
+    {
+      "acceptance_rate": 0.4,
+      "accepted": 4,
+      "binomial_wilson95_descriptive": [
+        0.16818032970623614,
+        0.6873262302663417
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8501862823999999,
+      "n": 10,
+      "split": "heldout",
+      "split_groups": 4
+    },
+    {
+      "acceptance_rate": 0.7311827956989247,
+      "accepted": 68,
+      "binomial_wilson95_descriptive": [
+        0.6332377843443057,
+        0.8107869187491933
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.9854256350752687,
+      "n": 93,
+      "split": "heldout",
+      "split_groups": 4
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.6576197724933469
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.3,
+      "lo": 0.2,
+      "mean_candidate_p": 0.2863248585,
+      "n": 2,
+      "split": "train",
+      "split_groups": 1
+    },
+    {
+      "acceptance_rate": 0.1,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.017876213095072896,
+        0.4041500267952385
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.3480038552,
+      "n": 10,
+      "split": "train",
+      "split_groups": 5
+    },
+    {
+      "acceptance_rate": 0.21052631578947367,
+      "accepted": 4,
+      "binomial_wilson95_descriptive": [
+        0.08507676632916253,
+        0.43334278443814167
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.4473462842105263,
+      "n": 19,
+      "split": "train",
+      "split_groups": 5
+    },
+    {
+      "acceptance_rate": 0.17647058823529413,
+      "accepted": 3,
+      "binomial_wilson95_descriptive": [
+        0.06191126637620997,
+        0.41029458568834126
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5630630779411765,
+      "n": 17,
+      "split": "train",
+      "split_groups": 6
+    },
+    {
+      "acceptance_rate": 0.17647058823529413,
+      "accepted": 3,
+      "binomial_wilson95_descriptive": [
+        0.06191126637620997,
+        0.41029458568834126
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.660797894,
+      "n": 17,
+      "split": "train",
+      "split_groups": 9
+    },
+    {
+      "acceptance_rate": 0.25806451612903225,
+      "accepted": 8,
+      "binomial_wilson95_descriptive": [
+        0.13701705906393744,
+        0.43246135809433794
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.7429857368709677,
+      "n": 31,
+      "split": "train",
+      "split_groups": 11
+    },
+    {
+      "acceptance_rate": 0.3888888888888889,
+      "accepted": 7,
+      "binomial_wilson95_descriptive": [
+        0.2030524657216362,
+        0.613809583977621
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8554974430555555,
+      "n": 18,
+      "split": "train",
+      "split_groups": 9
+    },
+    {
+      "acceptance_rate": 0.8533333333333334,
+      "accepted": 192,
+      "binomial_wilson95_descriptive": [
+        0.8011840171986669,
+        0.8936201534240281
+      ],
+      "depth": 1,
+      "family": "chat",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.99067132632,
+      "n": 225,
+      "split": "train",
+      "split_groups": 12
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.7934506856227626
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.380484909,
+      "n": 1,
+      "split": "heldout",
+      "split_groups": 1
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        5.551115123125783e-17,
+        0.35433043506668743
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.4449989284285714,
+      "n": 7,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.14285714285714285,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.02567962434474355,
+        0.5131278292743189
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5490003567142857,
+      "n": 7,
+      "split": "heldout",
+      "split_groups": 4
+    },
+    {
+      "acceptance_rate": 0.4,
+      "accepted": 2,
+      "binomial_wilson95_descriptive": [
+        0.11762077423264783,
+        0.769275718723987
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.6264094948000001,
+      "n": 5,
+      "split": "heldout",
+      "split_groups": 4
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        5.551115123125783e-17,
+        0.5614970317550454
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.7296964326666666,
+      "n": 3,
+      "split": "heldout",
+      "split_groups": 2
+    },
+    {
+      "acceptance_rate": 0.14285714285714285,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.02567962434474355,
+        0.5131278292743189
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.844369982,
+      "n": 7,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.82,
+      "accepted": 41,
+      "binomial_wilson95_descriptive": [
+        0.6920394632569922,
+        0.9022980732976582
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.9836410582,
+      "n": 50,
+      "split": "heldout",
+      "split_groups": 4
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.43448246478317476
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.3,
+      "lo": 0.2,
+      "mean_candidate_p": 0.2582449704,
+      "n": 5,
+      "split": "train",
+      "split_groups": 5
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.4898908364545973
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.33064039825,
+      "n": 4,
+      "split": "train",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.22809537235419838
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.4483731023076923,
+      "n": 13,
+      "split": "train",
+      "split_groups": 8
+    },
+    {
+      "acceptance_rate": 0.08333333333333333,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.014865094404917095,
+        0.35387991114111694
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5591425349166667,
+      "n": 12,
+      "split": "train",
+      "split_groups": 6
+    },
+    {
+      "acceptance_rate": 0.14285714285714285,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.02567962434474355,
+        0.5131278292743189
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.6435752511428571,
+      "n": 7,
+      "split": "train",
+      "split_groups": 6
+    },
+    {
+      "acceptance_rate": 0.16666666666666666,
+      "accepted": 2,
+      "binomial_wilson95_descriptive": [
+        0.04696514218385378,
+        0.4480308622529734
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.7466098467500001,
+      "n": 12,
+      "split": "train",
+      "split_groups": 7
+    },
+    {
+      "acceptance_rate": 0.2608695652173913,
+      "accepted": 6,
+      "binomial_wilson95_descriptive": [
+        0.12548616044986347,
+        0.4647000483742537
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8548842720434782,
+      "n": 23,
+      "split": "train",
+      "split_groups": 10
+    },
+    {
+      "acceptance_rate": 0.7676056338028169,
+      "accepted": 109,
+      "binomial_wilson95_descriptive": [
+        0.6916482930088332,
+        0.8294655289081483
+      ],
+      "depth": 2,
+      "family": "chat",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.990108066887324,
+      "n": 142,
+      "split": "train",
+      "split_groups": 12
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.7934506856227626
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.3,
+      "lo": 0.2,
+      "mean_candidate_p": 0.279561609,
+      "n": 1,
+      "split": "heldout",
+      "split_groups": 1
+    },
+    {
+      "acceptance_rate": 0.3333333333333333,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.06149194472039621,
+        0.7923403991979522
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.3450400333333333,
+      "n": 3,
+      "split": "heldout",
+      "split_groups": 2
+    },
+    {
+      "acceptance_rate": 0.3333333333333333,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.06149194472039621,
+        0.7923403991979522
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.4579705793333333,
+      "n": 3,
+      "split": "heldout",
+      "split_groups": 2
+    },
+    {
+      "acceptance_rate": 0.2857142857142857,
+      "accepted": 2,
+      "binomial_wilson95_descriptive": [
+        0.08221892400405678,
+        0.6410655481673808
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5441642318571429,
+      "n": 7,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.4,
+      "accepted": 2,
+      "binomial_wilson95_descriptive": [
+        0.11762077423264783,
+        0.769275718723987
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.6532701134,
+      "n": 5,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.75,
+      "accepted": 6,
+      "binomial_wilson95_descriptive": [
+        0.40927543031016883,
+        0.9285207872478909
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.75653596975,
+      "n": 8,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.7142857142857143,
+      "accepted": 10,
+      "binomial_wilson95_descriptive": [
+        0.4535091567010681,
+        0.8827862135542308
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8587067509999999,
+      "n": 14,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.963855421686747,
+      "accepted": 240,
+      "binomial_wilson95_descriptive": [
+        0.9327462519914472,
+        0.9808697391416236
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.9940313931686747,
+      "n": 249,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.6576197724933469
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.3,
+      "lo": 0.2,
+      "mean_candidate_p": 0.2885261925,
+      "n": 2,
+      "split": "train",
+      "split_groups": 2
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        5.551115123125783e-17,
+        0.35433043506668743
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.3659206881428571,
+      "n": 7,
+      "split": "train",
+      "split_groups": 6
+    },
+    {
+      "acceptance_rate": 0.4090909090909091,
+      "accepted": 9,
+      "binomial_wilson95_descriptive": [
+        0.2325581619647187,
+        0.6126518152368488
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.4483156908636364,
+      "n": 22,
+      "split": "train",
+      "split_groups": 11
+    },
+    {
+      "acceptance_rate": 0.43478260869565216,
+      "accepted": 20,
+      "binomial_wilson95_descriptive": [
+        0.3020926277801995,
+        0.5775256630570501
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5462333831521738,
+      "n": 46,
+      "split": "train",
+      "split_groups": 13
+    },
+    {
+      "acceptance_rate": 0.46808510638297873,
+      "accepted": 22,
+      "binomial_wilson95_descriptive": [
+        0.3333168707656074,
+        0.607676167798052
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.6506373679999999,
+      "n": 47,
+      "split": "train",
+      "split_groups": 12
+    },
+    {
+      "acceptance_rate": 0.5,
+      "accepted": 23,
+      "binomial_wilson95_descriptive": [
+        0.3611893708270325,
+        0.6388106291729675
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.760588430826087,
+      "n": 46,
+      "split": "train",
+      "split_groups": 11
+    },
+    {
+      "acceptance_rate": 0.6164383561643836,
+      "accepted": 45,
+      "binomial_wilson95_descriptive": [
+        0.501740834746836,
+        0.7194939031264869
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.850948794219178,
+      "n": 73,
+      "split": "train",
+      "split_groups": 13
+    },
+    {
+      "acceptance_rate": 0.9581673306772909,
+      "accepted": 962,
+      "binomial_wilson95_descriptive": [
+        0.9439378961619891,
+        0.9689040909859894
+      ],
+      "depth": 1,
+      "family": "code",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.9928063484511952,
+      "n": 1004,
+      "split": "train",
+      "split_groups": 13
+    },
+    {
+      "acceptance_rate": 0.16666666666666666,
+      "accepted": 1,
+      "binomial_wilson95_descriptive": [
+        0.030053369748306635,
+        0.5635028221864702
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.47180704283333336,
+      "n": 6,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.3333333333333333,
+      "accepted": 2,
+      "binomial_wilson95_descriptive": [
+        0.09677141110578041,
+        0.700006684861608
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5692974031666667,
+      "n": 6,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.5555555555555556,
+      "accepted": 5,
+      "binomial_wilson95_descriptive": [
+        0.26665129349549305,
+        0.8112214789023355
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.6348827282222222,
+      "n": 9,
+      "split": "heldout",
+      "split_groups": 2
+    },
+    {
+      "acceptance_rate": 0.3333333333333333,
+      "accepted": 3,
+      "binomial_wilson95_descriptive": [
+        0.1205838183869109,
+        0.6457978644196036
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.7595960033333333,
+      "n": 9,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.4,
+      "accepted": 4,
+      "binomial_wilson95_descriptive": [
+        0.16818032970623614,
+        0.6873262302663417
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8582830667,
+      "n": 10,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.9099099099099099,
+      "accepted": 202,
+      "binomial_wilson95_descriptive": [
+        0.8649513287881189,
+        0.94092373485331
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.9921647764054055,
+      "n": 222,
+      "split": "heldout",
+      "split_groups": 3
+    },
+    {
+      "acceptance_rate": 0.0,
+      "accepted": 0,
+      "binomial_wilson95_descriptive": [
+        0,
+        0.6576197724933469
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.3,
+      "lo": 0.2,
+      "mean_candidate_p": 0.277875647,
+      "n": 2,
+      "split": "train",
+      "split_groups": 2
+    },
+    {
+      "acceptance_rate": 0.3333333333333333,
+      "accepted": 4,
+      "binomial_wilson95_descriptive": [
+        0.13812009109121315,
+        0.6093779111272004
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.4,
+      "lo": 0.3,
+      "mean_candidate_p": 0.34236051149999996,
+      "n": 12,
+      "split": "train",
+      "split_groups": 8
+    },
+    {
+      "acceptance_rate": 0.2,
+      "accepted": 4,
+      "binomial_wilson95_descriptive": [
+        0.08065766257979806,
+        0.41601743225189364
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.5,
+      "lo": 0.4,
+      "mean_candidate_p": 0.4576330454,
+      "n": 20,
+      "split": "train",
+      "split_groups": 11
+    },
+    {
+      "acceptance_rate": 0.3055555555555556,
+      "accepted": 11,
+      "binomial_wilson95_descriptive": [
+        0.1800445159482992,
+        0.4685627285051034
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.6,
+      "lo": 0.5,
+      "mean_candidate_p": 0.5497289929166667,
+      "n": 36,
+      "split": "train",
+      "split_groups": 11
+    },
+    {
+      "acceptance_rate": 0.38636363636363635,
+      "accepted": 17,
+      "binomial_wilson95_descriptive": [
+        0.2572120275052556,
+        0.5337642460762172
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.7,
+      "lo": 0.6,
+      "mean_candidate_p": 0.6453343981363636,
+      "n": 44,
+      "split": "train",
+      "split_groups": 11
+    },
+    {
+      "acceptance_rate": 0.4,
+      "accepted": 14,
+      "binomial_wilson95_descriptive": [
+        0.2555072885938059,
+        0.5642729098710749
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.8,
+      "lo": 0.7,
+      "mean_candidate_p": 0.7507232785142857,
+      "n": 35,
+      "split": "train",
+      "split_groups": 12
+    },
+    {
+      "acceptance_rate": 0.5405405405405406,
+      "accepted": 40,
+      "binomial_wilson95_descriptive": [
+        0.4278134568803063,
+        0.649266290736203
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 0.9,
+      "lo": 0.8,
+      "mean_candidate_p": 0.8524999642567568,
+      "n": 74,
+      "split": "train",
+      "split_groups": 13
+    },
+    {
+      "acceptance_rate": 0.9370629370629371,
+      "accepted": 804,
+      "binomial_wilson95_descriptive": [
+        0.9187848901656733,
+        0.951444770201637
+      ],
+      "depth": 2,
+      "family": "code",
+      "hi": 1.0,
+      "lo": 0.9,
+      "mean_candidate_p": 0.9926901097249416,
+      "n": 858,
+      "split": "train",
+      "split_groups": 13
+    }
+  ],
+  "candidates": [
+    {
+      "family": "all",
+      "family_fit_is_diagnostic": false,
+      "fixed_reference_chosen_on_train": 2,
+      "heldout": {
+        "actions": {
+          "0": 87,
+          "1": 104,
+          "2": 215
+        },
+        "epochs": 406,
+        "modeled_ms": 29021.004165253908,
+        "tokens": 897,
+        "tokens_per_ms": 0.030908647919011524
+      },
+      "heldout_conditional_depth2_trials": 332,
+      "heldout_epochs": 406,
+      "heldout_fixed": [
+        {
+          "actions": {
+            "0": 406
+          },
+          "epochs": 406,
+          "modeled_ms": 17026.5634072713,
+          "tokens": 406,
+          "tokens_per_ms": 0.023845093709668693
+        },
+        {
+          "actions": {
+            "1": 406
+          },
+          "epochs": 406,
+          "modeled_ms": 26377.251650842438,
+          "tokens": 738,
+          "tokens_per_ms": 0.02797865409819638
+        },
+        {
+          "actions": {
+            "2": 406
+          },
+          "epochs": 406,
+          "modeled_ms": 35251.754592309204,
+          "tokens": 993,
+          "tokens_per_ms": 0.028168810644581096
+        }
+      ],
+      "heldout_group_bootstrap95": [
+        0.04260064179105205,
+        0.18151459846721396
+      ],
+      "heldout_groups": 7,
+      "heldout_one_decision_gain_vs_train_selected_fixed": 0.09726492570098966,
+      "status": "candidate_for_on_policy_window",
+      "thresholds": [
+        0.937915564,
+        0.97501117
+      ],
+      "train": {
+        "actions": {
+          "0": 398,
+          "1": 331,
+          "2": 807
+        },
+        "epochs": 1536,
+        "modeled_ms": 107722.61900849054,
+        "tokens": 3364,
+        "tokens_per_ms": 0.031228353255455612
+      },
+      "train_conditional_depth2_trials": 1262,
+      "train_epochs": 1536,
+      "train_fixed": [
+        {
+          "actions": {
+            "0": 1536
+          },
+          "epochs": 1536,
+          "modeled_ms": 64185.37729909051,
+          "tokens": 1536,
+          "tokens_per_ms": 0.023930684287210145
+        },
+        {
+          "actions": {
+            "1": 1536
+          },
+          "epochs": 1536,
+          "modeled_ms": 99400.08703359881,
+          "tokens": 2798,
+          "tokens_per_ms": 0.028148868713306373
+        },
+        {
+          "actions": {
+            "2": 1536
+          },
+          "epochs": 1536,
+          "modeled_ms": 132803.1388699973,
+          "tokens": 3789,
+          "tokens_per_ms": 0.028530952146463204
+        }
+      ],
+      "train_groups": 25,
+      "train_threshold_grid": [
+        [
+          0.0,
+          0.284145385,
+          0.465813279,
+          0.566216528,
+          0.649983108,
+          0.721902847,
+          0.789838254,
+          0.850141406,
+          0.903879344,
+          0.937915564,
+          0.96579206,
+          0.982364416,
+          0.992489338,
+          0.996132016,
+          0.998358786,
+          0.999224663,
+          0.999666929,
+          0.999877691,
+          0.999951482,
+          0.999981403,
+          0.999993563,
+          1,
+          2.0
+        ],
+        [
+          0.0,
+          0.200498864,
+          0.420648217,
+          0.523592591,
+          0.597964287,
+          0.669896185,
+          0.760374963,
+          0.829205453,
+          0.872073472,
+          0.922002852,
+          0.954315305,
+          0.97501117,
+          0.98678571,
+          0.993392885,
+          0.996556044,
+          0.998765826,
+          0.999490738,
+          0.999780238,
+          0.999917746,
+          0.999973416,
+          0.999991298,
+          1,
+          2.0
+        ]
+      ]
+    },
+    {
+      "family": "chat",
+      "family_fit_is_diagnostic": true,
+      "fixed_reference_chosen_on_train": 1,
+      "heldout": {
+        "actions": {
+          "0": 62,
+          "1": 42,
+          "2": 18
+        },
+        "epochs": 122,
+        "modeled_ms": 7086.756363195844,
+        "tokens": 188,
+        "tokens_per_ms": 0.026528356608441314
+      },
+      "heldout_conditional_depth2_trials": 75,
+      "heldout_epochs": 122,
+      "heldout_fixed": [
+        {
+          "actions": {
+            "0": 122
+          },
+          "epochs": 122,
+          "modeled_ms": 5250.512346055376,
+          "tokens": 122,
+          "tokens_per_ms": 0.023235827660067612
+        },
+        {
+          "actions": {
+            "1": 122
+          },
+          "epochs": 122,
+          "modeled_ms": 8154.245989590537,
+          "tokens": 197,
+          "tokens_per_ms": 0.02415919267722414
+        },
+        {
+          "actions": {
+            "2": 122
+          },
+          "epochs": 122,
+          "modeled_ms": 10920.787738425408,
+          "tokens": 238,
+          "tokens_per_ms": 0.02179329968685167
+        }
+      ],
+      "heldout_group_bootstrap95": [
+        0.037191935607286064,
+        0.20434168977396316
+      ],
+      "heldout_groups": 4,
+      "heldout_one_decision_gain_vs_train_selected_fixed": 0.09806469789243755,
+      "status": "candidate_for_on_policy_window",
+      "thresholds": [
+        0.990988195,
+        0.999827385
+      ],
+      "train": {
+        "actions": {
+          "0": 147,
+          "1": 112,
+          "2": 56
+        },
+        "epochs": 315,
+        "modeled_ms": 18825.12277914846,
+        "tokens": 522,
+        "tokens_per_ms": 0.027728902813754307
+      },
+      "train_conditional_depth2_trials": 201,
+      "train_epochs": 315,
+      "train_fixed": [
+        {
+          "actions": {
+            "0": 315
+          },
+          "epochs": 315,
+          "modeled_ms": 13556.650729569308,
+          "tokens": 315,
+          "tokens_per_ms": 0.023235827660067442
+        },
+        {
+          "actions": {
+            "1": 315
+          },
+          "epochs": 315,
+          "modeled_ms": 21053.995792795355,
+          "tokens": 516,
+          "tokens_per_ms": 0.02450841185104513
+        },
+        {
+          "actions": {
+            "2": 315
+          },
+          "epochs": 315,
+          "modeled_ms": 28197.115882000053,
+          "tokens": 627,
+          "tokens_per_ms": 0.02223631674331106
+        }
+      ],
+      "train_groups": 12,
+      "train_threshold_grid": [
+        [
+          0.0,
+          0.285586178,
+          0.410080284,
+          0.472407401,
+          0.577875435,
+          0.650060356,
+          0.708216667,
+          0.759958625,
+          0.816841066,
+          0.883111596,
+          0.949267209,
+          0.973781765,
+          0.990988195,
+          0.994667172,
+          0.998750448,
+          0.999504209,
+          0.999708354,
+          0.999926686,
+          0.999965429,
+          0.999988914,
+          0.999997258,
+          1,
+          2.0
+        ],
+        [
+          0.0,
+          0.200498864,
+          0.329750478,
+          0.430350453,
+          0.491737038,
+          0.536979795,
+          0.59559381,
+          0.663106084,
+          0.726694465,
+          0.80027163,
+          0.848573744,
+          0.891193092,
+          0.944324374,
+          0.976331174,
+          0.991126716,
+          0.994485676,
+          0.997403681,
+          0.999490738,
+          0.999827385,
+          0.999972343,
+          0.999993205,
+          1,
+          2.0
+        ]
+      ]
+    },
+    {
+      "family": "code",
+      "family_fit_is_diagnostic": true,
+      "fixed_reference_chosen_on_train": 2,
+      "heldout": {
+        "actions": {
+          "0": 42,
+          "1": 35,
+          "2": 207
+        },
+        "epochs": 284,
+        "modeled_ms": 21721.512258693005,
+        "tokens": 704,
+        "tokens_per_ms": 0.0324102664499456
+      },
+      "heldout_conditional_depth2_trials": 257,
+      "heldout_epochs": 284,
+      "heldout_fixed": [
+        {
+          "actions": {
+            "0": 284
+          },
+          "epochs": 284,
+          "modeled_ms": 11776.051061215849,
+          "tokens": 284,
+          "tokens_per_ms": 0.024116743254905492
+        },
+        {
+          "actions": {
+            "1": 284
+          },
+          "epochs": 284,
+          "modeled_ms": 18223.005661251686,
+          "tokens": 541,
+          "tokens_per_ms": 0.029687748006924575
+        },
+        {
+          "actions": {
+            "2": 284
+          },
+          "epochs": 284,
+          "modeled_ms": 24330.96685388378,
+          "tokens": 755,
+          "tokens_per_ms": 0.03103041504819956
+        }
+      ],
+      "heldout_group_bootstrap95": [
+        0.02041083791225118,
+        0.05831179657018137
+      ],
+      "heldout_groups": 3,
+      "heldout_one_decision_gain_vs_train_selected_fixed": 0.044467706912805216,
+      "status": "candidate_for_on_policy_window",
+      "thresholds": [
+        0.93028152,
+        0.872849584
+      ],
+      "train": {
+        "actions": {
+          "0": 265,
+          "1": 159,
+          "2": 797
+        },
+        "epochs": 1221,
+        "modeled_ms": 89471.45075319096,
+        "tokens": 2879,
+        "tokens_per_ms": 0.032177862052799246
+      },
+      "train_conditional_depth2_trials": 1061,
+      "train_epochs": 1221,
+      "train_fixed": [
+        {
+          "actions": {
+            "0": 1221
+          },
+          "epochs": 1221,
+          "modeled_ms": 50628.72656952161,
+          "tokens": 1221,
+          "tokens_per_ms": 0.024116743254906186
+        },
+        {
+          "actions": {
+            "1": 1221
+          },
+          "epochs": 1221,
+          "modeled_ms": 78346.09124080531,
+          "tokens": 2282,
+          "tokens_per_ms": 0.029127171041450205
+        },
+        {
+          "actions": {
+            "2": 1221
+          },
+          "epochs": 1221,
+          "modeled_ms": 104606.02298799723,
+          "tokens": 3162,
+          "tokens_per_ms": 0.030227704960763265
+        }
+      ],
+      "train_groups": 13,
+      "train_threshold_grid": [
+        [
+          0.0,
+          0.284145385,
+          0.51552999,
+          0.600755274,
+          0.686711967,
+          0.780343533,
+          0.836817265,
+          0.888826251,
+          0.93028152,
+          0.956612229,
+          0.976403296,
+          0.989718914,
+          0.994738519,
+          0.997430623,
+          0.998656631,
+          0.999482512,
+          0.999797404,
+          0.999918461,
+          0.999964118,
+          0.999986649,
+          0.999994993,
+          1,
+          2.0
+        ],
+        [
+          0.0,
+          0.236870408,
+          0.482498735,
+          0.581831515,
+          0.655900478,
+          0.744346857,
+          0.826683044,
+          0.872849584,
+          0.923517048,
+          0.955147624,
+          0.972656846,
+          0.985645473,
+          0.992688835,
+          0.996172607,
+          0.998440802,
+          0.999361217,
+          0.9997316,
+          0.999888182,
+          0.999951839,
+          0.999983668,
+          0.999993324,
+          1,
+          2.0
+        ]
+      ]
+    }
+  ],
+  "cost_profile": {
+    "extraction": {
+      "authority_assertion": "Actual serving build3fe07391 is recorded separately from later fixture/harness source2167bd20; runtime-provenance.json retains the complete allowed diff. Operator retained the source/build snapshot and coherent plugin hashes,10 complete arms, original Db2 hotsets and192GiB profile. Existing verbose binding audit passed; no model warmup generation.",
+      "authority_boundary": "Log checks establish instrumentation evidence, not operator-supplied deployment/config/request authority.",
+      "cost_scope": "quiet_train_groups_only",
+      "family_profiles": {
+        "chat": {
+          "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+            "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+          },
+          "id": "chat-original-db2"
+        },
+        "code": {
+          "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+            "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+          },
+          "id": "code-original-db2"
+        }
+      },
+      "fit_performed": false,
+      "frozen_split": {
+        "heldout_fraction": 0.25,
+        "metadata": "/home/as/ds41-claude-build/work/autonomous-20261031/dpc/metadata-frozen.json",
+        "seed": "ds41-prob-v1",
+        "sha256": "ad5a012102e4ef5a8be614308e9e14acbc4f85e748494131b015a6b3415b1cb1"
+      },
+      "manifest": "/home/as/ds41-claude-build/work/autonomous-20261031/dme-quiet/manifest.json",
+      "manifest_sha256": "92e1cc7a295ca1275f0128842d9721df055b25103d036441135c47c52f6ae6f8",
+      "profile": {
+        "common_config_sha256": "3c3b5d07df55c37de9f8345cbcab9dcd0c15b6b76f7b1083e4e8828ca1be9fb8",
+        "engine_commit": "3fe07391956274d0529b95d553a234f5e2032cf7",
+        "hardware": "256GB DDR4-2666;4xRX9070XT16GB;192GiB expert cache;startup ledgers retained",
+        "id": "ab-20261031T154102Z-common",
+        "libraries": {
+          "deepseek41.so": "c97db6d93528374937cc3a494d0a79eaca70c07dd6d6a36d5b0dce097b29b974",
+          "libavx.so": "764ea8ccf1f0b5bdeb2e1484decb55c3dc824b2ceca76a123a69b6e4585a2655",
+          "libquant.so": "4bf4ab40e8aa2cbe74d859a34e70c181d262f213dfc99fae3e1b4dc539296ee7",
+          "libr4d.so": "b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10",
+          "libref.so": "334a712aff27a53ce0fd222a56024f4684dedcd1f65372fc6458ec0c2e237b19"
+        },
+        "source_provenance": {
+          "path": "/home/as/ds41-claude-build/work/autonomous-20261031/dme-quiet/runtime-provenance.json",
+          "reviewed_source_commit": "2167bd2047fc65f45cff5e59fe2c31e662a2aa6d",
+          "sha256": "d60b0880bd66f4bcba7fb6a5d5b2c660e72fb6b51608ab202942b6291ecac98f"
+        }
+      },
+      "runs": [
+        {
+          "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256",
+          "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+          "costs": {
+            "0": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            },
+            "1": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            },
+            "2": {
+              "accepted": 1941,
+              "cycle_ns": 104606022988,
+              "emitted": 3162,
+              "n": 1221,
+              "wait_ns": 2894270772
+            }
+          },
+          "cycle_audit": null,
+          "family": "code",
+          "family_profile_id": "code-original-db2",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+            "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+          },
+          "k": 2,
+          "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.server.log",
+          "log_level": "info",
+          "log_sha256": "7a0fd1f56683a39252f5673755cc4b28c66a4cf3a2c945981ec00681e2811ef3",
+          "logging": "quiet",
+          "profile_id": "ab-20261031T154102Z-common",
+          "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+          "request_inventory": [
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 2,
+              "prompt_key": "code-02",
+              "seq": 1,
+              "split": "train",
+              "split_group": "code-02"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 4,
+              "prompt_key": "code-04",
+              "seq": 2,
+              "split": "train",
+              "split_group": "code-04"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 5,
+              "prompt_key": "code-05",
+              "seq": 3,
+              "split": "train",
+              "split_group": "code-05"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 6,
+              "prompt_key": "code-06",
+              "seq": 4,
+              "split": "train",
+              "split_group": "code-06"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 7,
+              "prompt_key": "code-07",
+              "seq": 5,
+              "split": "train",
+              "split_group": "code-07"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 8,
+              "prompt_key": "code-08",
+              "seq": 6,
+              "split": "train",
+              "split_group": "code-08"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 9,
+              "prompt_key": "code-09",
+              "seq": 7,
+              "split": "train",
+              "split_group": "code-09"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 10,
+              "prompt_key": "code-10",
+              "seq": 8,
+              "split": "train",
+              "split_group": "code-10"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 11,
+              "prompt_key": "code-11",
+              "seq": 9,
+              "split": "train",
+              "split_group": "code-11"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 12,
+              "prompt_key": "code-12",
+              "seq": 10,
+              "split": "train",
+              "split_group": "code-12"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 14,
+              "prompt_key": "code-14",
+              "seq": 11,
+              "split": "train",
+              "split_group": "code-14"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 15,
+              "prompt_key": "code-15",
+              "seq": 12,
+              "split": "train",
+              "split_group": "code-15"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 16,
+              "prompt_key": "code-16",
+              "seq": 13,
+              "split": "train",
+              "split_group": "code-16"
+            }
+          ],
+          "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+          "requests": 13,
+          "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.json",
+          "results_sha256": "a9b31627a989c881aef0c73f0edd6f2f28a8ed64412fc2fbdaf21771a2a92f5d",
+          "run": "code-C2",
+          "scope": "cost_train",
+          "split_groups": [
+            "code-02",
+            "code-04",
+            "code-05",
+            "code-06",
+            "code-07",
+            "code-08",
+            "code-09",
+            "code-10",
+            "code-11",
+            "code-12",
+            "code-14",
+            "code-15",
+            "code-16"
+          ],
+          "totals": {
+            "end_cancel": 13,
+            "invalid_cycles": 0,
+            "invalid_queries": 0,
+            "no_query": 0,
+            "observers": 1260,
+            "queries": 1260,
+            "query_rows": 2520,
+            "transition": 13,
+            "unclosed_epoch": 0,
+            "unpublished": 0,
+            "wait_ns": 2985881080,
+            "waits": 1260
+          }
+        },
+        {
+          "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256",
+          "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+          "costs": {
+            "0": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            },
+            "1": {
+              "accepted": 1494,
+              "cycle_ns": 107862227171,
+              "emitted": 3175,
+              "n": 1681,
+              "wait_ns": 3988758060
+            },
+            "2": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            }
+          },
+          "cycle_audit": null,
+          "family": "code",
+          "family_profile_id": "code-original-db2",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+            "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+          },
+          "k": 1,
+          "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.server.log",
+          "log_level": "info",
+          "log_sha256": "9cd82d53dc05f68d48ab06b5432da58046eede615d9848b656b6a9d968baa5c5",
+          "logging": "quiet",
+          "profile_id": "ab-20261031T154102Z-common",
+          "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+          "request_inventory": [
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 2,
+              "prompt_key": "code-02",
+              "seq": 1,
+              "split": "train",
+              "split_group": "code-02"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 4,
+              "prompt_key": "code-04",
+              "seq": 2,
+              "split": "train",
+              "split_group": "code-04"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 5,
+              "prompt_key": "code-05",
+              "seq": 3,
+              "split": "train",
+              "split_group": "code-05"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 6,
+              "prompt_key": "code-06",
+              "seq": 4,
+              "split": "train",
+              "split_group": "code-06"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 7,
+              "prompt_key": "code-07",
+              "seq": 5,
+              "split": "train",
+              "split_group": "code-07"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 8,
+              "prompt_key": "code-08",
+              "seq": 6,
+              "split": "train",
+              "split_group": "code-08"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 9,
+              "prompt_key": "code-09",
+              "seq": 7,
+              "split": "train",
+              "split_group": "code-09"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 10,
+              "prompt_key": "code-10",
+              "seq": 8,
+              "split": "train",
+              "split_group": "code-10"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 11,
+              "prompt_key": "code-11",
+              "seq": 9,
+              "split": "train",
+              "split_group": "code-11"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 12,
+              "prompt_key": "code-12",
+              "seq": 10,
+              "split": "train",
+              "split_group": "code-12"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 14,
+              "prompt_key": "code-14",
+              "seq": 11,
+              "split": "train",
+              "split_group": "code-14"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 15,
+              "prompt_key": "code-15",
+              "seq": 12,
+              "split": "train",
+              "split_group": "code-15"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 16,
+              "prompt_key": "code-16",
+              "seq": 13,
+              "split": "train",
+              "split_group": "code-16"
+            }
+          ],
+          "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+          "requests": 13,
+          "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.json",
+          "results_sha256": "503385eabbecca46b0ce8e5aaeb788c9503629648ec2b41fbd9f0639dd7a63cd",
+          "run": "code-C1",
+          "scope": "cost_train",
+          "split_groups": [
+            "code-02",
+            "code-04",
+            "code-05",
+            "code-06",
+            "code-07",
+            "code-08",
+            "code-09",
+            "code-10",
+            "code-11",
+            "code-12",
+            "code-14",
+            "code-15",
+            "code-16"
+          ],
+          "totals": {
+            "end_cancel": 13,
+            "invalid_cycles": 0,
+            "invalid_queries": 0,
+            "no_query": 0,
+            "observers": 1720,
+            "queries": 1720,
+            "query_rows": 3440,
+            "transition": 13,
+            "unclosed_epoch": 0,
+            "unpublished": 0,
+            "wait_ns": 4080568974,
+            "waits": 1720
+          }
+        },
+        {
+          "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256",
+          "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+          "costs": {
+            "0": {
+              "accepted": 0,
+              "cycle_ns": 132190319659,
+              "emitted": 3188,
+              "n": 3188,
+              "wait_ns": 7226724064
+            },
+            "1": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            },
+            "2": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            }
+          },
+          "cycle_audit": null,
+          "family": "code",
+          "family_profile_id": "code-original-db2",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+            "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+          },
+          "k": 0,
+          "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.server.log",
+          "log_level": "info",
+          "log_sha256": "5d74da85438145a4c8d711abcbcd57e499c768dff014e7c21b8360da7ca524fa",
+          "logging": "quiet",
+          "profile_id": "ab-20261031T154102Z-common",
+          "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+          "request_inventory": [
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 2,
+              "prompt_key": "code-02",
+              "seq": 1,
+              "split": "train",
+              "split_group": "code-02"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 4,
+              "prompt_key": "code-04",
+              "seq": 2,
+              "split": "train",
+              "split_group": "code-04"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 5,
+              "prompt_key": "code-05",
+              "seq": 3,
+              "split": "train",
+              "split_group": "code-05"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 6,
+              "prompt_key": "code-06",
+              "seq": 4,
+              "split": "train",
+              "split_group": "code-06"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 7,
+              "prompt_key": "code-07",
+              "seq": 5,
+              "split": "train",
+              "split_group": "code-07"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 8,
+              "prompt_key": "code-08",
+              "seq": 6,
+              "split": "train",
+              "split_group": "code-08"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 9,
+              "prompt_key": "code-09",
+              "seq": 7,
+              "split": "train",
+              "split_group": "code-09"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 10,
+              "prompt_key": "code-10",
+              "seq": 8,
+              "split": "train",
+              "split_group": "code-10"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 11,
+              "prompt_key": "code-11",
+              "seq": 9,
+              "split": "train",
+              "split_group": "code-11"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 12,
+              "prompt_key": "code-12",
+              "seq": 10,
+              "split": "train",
+              "split_group": "code-12"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 14,
+              "prompt_key": "code-14",
+              "seq": 11,
+              "split": "train",
+              "split_group": "code-14"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 15,
+              "prompt_key": "code-15",
+              "seq": 12,
+              "split": "train",
+              "split_group": "code-15"
+            },
+            {
+              "frozen_run": "code2",
+              "frozen_seq": 16,
+              "prompt_key": "code-16",
+              "seq": 13,
+              "split": "train",
+              "split_group": "code-16"
+            }
+          ],
+          "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+          "requests": 13,
+          "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucodecost256.json",
+          "results_sha256": "771fdcfe3cbd4b220db62e61a9d7746748f10dd8aace3ab5395abe2d6f3df5f9",
+          "run": "code-C0",
+          "scope": "cost_train",
+          "split_groups": [
+            "code-02",
+            "code-04",
+            "code-05",
+            "code-06",
+            "code-07",
+            "code-08",
+            "code-09",
+            "code-10",
+            "code-11",
+            "code-12",
+            "code-14",
+            "code-15",
+            "code-16"
+          ],
+          "totals": {
+            "end_cancel": 13,
+            "invalid_cycles": 0,
+            "invalid_queries": 0,
+            "no_query": 0,
+            "observers": 3227,
+            "queries": 3227,
+            "query_rows": 6454,
+            "transition": 13,
+            "unclosed_epoch": 0,
+            "unpublished": 0,
+            "wait_ns": 7317918987,
+            "waits": 3227
+          }
+        },
+        {
+          "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost",
+          "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+          "costs": {
+            "0": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            },
+            "1": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            },
+            "2": {
+              "accepted": 312,
+              "cycle_ns": 28197115882,
+              "emitted": 627,
+              "n": 315,
+              "wait_ns": 752702636
+            }
+          },
+          "cycle_audit": null,
+          "family": "chat",
+          "family_profile_id": "chat-original-db2",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+            "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+          },
+          "k": 2,
+          "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.server.log",
+          "log_level": "info",
+          "log_sha256": "ec2404a800782dffa7defc871aedd0d450af9aa05663c23e947291c58727999e",
+          "logging": "quiet",
+          "profile_id": "ab-20261031T154102Z-common",
+          "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+          "request_inventory": [
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 2,
+              "prompt_key": "chat-02",
+              "seq": 1,
+              "split": "train",
+              "split_group": "chat-02"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 3,
+              "prompt_key": "chat-03",
+              "seq": 2,
+              "split": "train",
+              "split_group": "chat-03"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 5,
+              "prompt_key": "chat-05",
+              "seq": 3,
+              "split": "train",
+              "split_group": "chat-05"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 6,
+              "prompt_key": "chat-06",
+              "seq": 4,
+              "split": "train",
+              "split_group": "chat-06"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 7,
+              "prompt_key": "chat-07",
+              "seq": 5,
+              "split": "train",
+              "split_group": "chat-07"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 8,
+              "prompt_key": "chat-08",
+              "seq": 6,
+              "split": "train",
+              "split_group": "chat-08"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 9,
+              "prompt_key": "chat-09",
+              "seq": 7,
+              "split": "train",
+              "split_group": "chat-09"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 10,
+              "prompt_key": "chat-10",
+              "seq": 8,
+              "split": "train",
+              "split_group": "chat-10"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 12,
+              "prompt_key": "chat-12",
+              "seq": 9,
+              "split": "train",
+              "split_group": "chat-12"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 14,
+              "prompt_key": "chat-14",
+              "seq": 10,
+              "split": "train",
+              "split_group": "chat-14"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 15,
+              "prompt_key": "chat-15",
+              "seq": 11,
+              "split": "train",
+              "split_group": "chat-15"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 16,
+              "prompt_key": "chat-16",
+              "seq": 12,
+              "split": "train",
+              "split_group": "chat-16"
+            }
+          ],
+          "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+          "requests": 12,
+          "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme2-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.json",
+          "results_sha256": "f913c4fd0ecc611be891892c34f1ee75f57d9e0a0d404a2862953d3da3a779de",
+          "run": "chat-C2",
+          "scope": "cost_train",
+          "split_groups": [
+            "chat-02",
+            "chat-03",
+            "chat-05",
+            "chat-06",
+            "chat-07",
+            "chat-08",
+            "chat-09",
+            "chat-10",
+            "chat-12",
+            "chat-14",
+            "chat-15",
+            "chat-16"
+          ],
+          "totals": {
+            "end_cancel": 12,
+            "invalid_cycles": 0,
+            "invalid_queries": 0,
+            "no_query": 0,
+            "observers": 351,
+            "queries": 351,
+            "query_rows": 702,
+            "transition": 12,
+            "unclosed_epoch": 0,
+            "unpublished": 0,
+            "wait_ns": 838324174,
+            "waits": 351
+          }
+        },
+        {
+          "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost",
+          "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+          "costs": {
+            "0": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            },
+            "1": {
+              "accepted": 255,
+              "cycle_ns": 25465309197,
+              "emitted": 636,
+              "n": 381,
+              "wait_ns": 921733016
+            },
+            "2": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            }
+          },
+          "cycle_audit": null,
+          "family": "chat",
+          "family_profile_id": "chat-original-db2",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+            "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+          },
+          "k": 1,
+          "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.server.log",
+          "log_level": "info",
+          "log_sha256": "f75061f9677388b31d14a2f93845e828ad7dc7d09175f6269e81d8f8b4a1d7dc",
+          "logging": "quiet",
+          "profile_id": "ab-20261031T154102Z-common",
+          "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+          "request_inventory": [
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 2,
+              "prompt_key": "chat-02",
+              "seq": 1,
+              "split": "train",
+              "split_group": "chat-02"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 3,
+              "prompt_key": "chat-03",
+              "seq": 2,
+              "split": "train",
+              "split_group": "chat-03"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 5,
+              "prompt_key": "chat-05",
+              "seq": 3,
+              "split": "train",
+              "split_group": "chat-05"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 6,
+              "prompt_key": "chat-06",
+              "seq": 4,
+              "split": "train",
+              "split_group": "chat-06"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 7,
+              "prompt_key": "chat-07",
+              "seq": 5,
+              "split": "train",
+              "split_group": "chat-07"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 8,
+              "prompt_key": "chat-08",
+              "seq": 6,
+              "split": "train",
+              "split_group": "chat-08"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 9,
+              "prompt_key": "chat-09",
+              "seq": 7,
+              "split": "train",
+              "split_group": "chat-09"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 10,
+              "prompt_key": "chat-10",
+              "seq": 8,
+              "split": "train",
+              "split_group": "chat-10"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 12,
+              "prompt_key": "chat-12",
+              "seq": 9,
+              "split": "train",
+              "split_group": "chat-12"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 14,
+              "prompt_key": "chat-14",
+              "seq": 10,
+              "split": "train",
+              "split_group": "chat-14"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 15,
+              "prompt_key": "chat-15",
+              "seq": 11,
+              "split": "train",
+              "split_group": "chat-15"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 16,
+              "prompt_key": "chat-16",
+              "seq": 12,
+              "split": "train",
+              "split_group": "chat-16"
+            }
+          ],
+          "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+          "requests": 12,
+          "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.json",
+          "results_sha256": "5e78fd3788561d1091b02433502cf155fc8baa206434085cedfd23ed4fb32fd2",
+          "run": "chat-C1",
+          "scope": "cost_train",
+          "split_groups": [
+            "chat-02",
+            "chat-03",
+            "chat-05",
+            "chat-06",
+            "chat-07",
+            "chat-08",
+            "chat-09",
+            "chat-10",
+            "chat-12",
+            "chat-14",
+            "chat-15",
+            "chat-16"
+          ],
+          "totals": {
+            "end_cancel": 12,
+            "invalid_cycles": 0,
+            "invalid_queries": 0,
+            "no_query": 0,
+            "observers": 417,
+            "queries": 417,
+            "query_rows": 834,
+            "transition": 12,
+            "unclosed_epoch": 0,
+            "unpublished": 0,
+            "wait_ns": 1006589871,
+            "waits": 417
+          }
+        },
+        {
+          "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost",
+          "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+          "costs": {
+            "0": {
+              "accepted": 0,
+              "cycle_ns": 27974041188,
+              "emitted": 650,
+              "n": 650,
+              "wait_ns": 1493194799
+            },
+            "1": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            },
+            "2": {
+              "accepted": 0,
+              "cycle_ns": 0,
+              "emitted": 0,
+              "n": 0,
+              "wait_ns": 0
+            }
+          },
+          "cycle_audit": null,
+          "family": "chat",
+          "family_profile_id": "chat-original-db2",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+            "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+          },
+          "k": 0,
+          "log": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.server.log",
+          "log_level": "info",
+          "log_sha256": "3e8ab6fa593fdb8308ac6e6606d2939a773dc86dda331d04b4d6f544f87ef10d",
+          "logging": "quiet",
+          "profile_id": "ab-20261031T154102Z-common",
+          "provenance_assertion": "Exact retained launch/source/home cohort; shared query/observer/wait profile and family original Db2 hotset checked.",
+          "request_inventory": [
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 2,
+              "prompt_key": "chat-02",
+              "seq": 1,
+              "split": "train",
+              "split_group": "chat-02"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 3,
+              "prompt_key": "chat-03",
+              "seq": 2,
+              "split": "train",
+              "split_group": "chat-03"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 5,
+              "prompt_key": "chat-05",
+              "seq": 3,
+              "split": "train",
+              "split_group": "chat-05"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 6,
+              "prompt_key": "chat-06",
+              "seq": 4,
+              "split": "train",
+              "split_group": "chat-06"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 7,
+              "prompt_key": "chat-07",
+              "seq": 5,
+              "split": "train",
+              "split_group": "chat-07"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 8,
+              "prompt_key": "chat-08",
+              "seq": 6,
+              "split": "train",
+              "split_group": "chat-08"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 9,
+              "prompt_key": "chat-09",
+              "seq": 7,
+              "split": "train",
+              "split_group": "chat-09"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 10,
+              "prompt_key": "chat-10",
+              "seq": 8,
+              "split": "train",
+              "split_group": "chat-10"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 12,
+              "prompt_key": "chat-12",
+              "seq": 9,
+              "split": "train",
+              "split_group": "chat-12"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 14,
+              "prompt_key": "chat-14",
+              "seq": 10,
+              "split": "train",
+              "split_group": "chat-14"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 15,
+              "prompt_key": "chat-15",
+              "seq": 11,
+              "split": "train",
+              "split_group": "chat-15"
+            },
+            {
+              "frozen_run": "chat2",
+              "frozen_seq": 16,
+              "prompt_key": "chat-16",
+              "seq": 12,
+              "split": "train",
+              "split_group": "chat-16"
+            }
+          ],
+          "request_mapping_assertion": "Fresh server per arm, concurrency1;seq1..N in immutable TRAIN receipt order; no hidden generation or warmup requests.",
+          "requests": 12,
+          "results": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T154102Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dme0-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchatcost.json",
+          "results_sha256": "740ff2211f24f9ce211bc4f87e5e4ca74f898e31d7fe8a278b86c35fd8d2b0a0",
+          "run": "chat-C0",
+          "scope": "cost_train",
+          "split_groups": [
+            "chat-02",
+            "chat-03",
+            "chat-05",
+            "chat-06",
+            "chat-07",
+            "chat-08",
+            "chat-09",
+            "chat-10",
+            "chat-12",
+            "chat-14",
+            "chat-15",
+            "chat-16"
+          ],
+          "totals": {
+            "end_cancel": 12,
+            "invalid_cycles": 0,
+            "invalid_queries": 0,
+            "no_query": 0,
+            "observers": 686,
+            "queries": 686,
+            "query_rows": 1372,
+            "transition": 12,
+            "unclosed_epoch": 0,
+            "unpublished": 0,
+            "wait_ns": 1576397468,
+            "waits": 686
+          }
+        }
+      ],
+      "schema": "ds41-matched-cost-extraction-v1"
+    },
+    "families": {
+      "chat": {
+        "c0_ms": 43.03698644307692,
+        "c1_ms": 66.83808188188976,
+        "c2_ms": 89.51465359365078,
+        "measurements": {
+          "0": {
+            "cycle_ns": 27974041188,
+            "n": 650,
+            "runs": [
+              "chat-C0"
+            ]
+          },
+          "1": {
+            "cycle_ns": 25465309197,
+            "n": 381,
+            "runs": [
+              "chat-C1"
+            ]
+          },
+          "2": {
+            "cycle_ns": 28197115882,
+            "n": 315,
+            "runs": [
+              "chat-C2"
+            ]
+          }
+        },
+        "profile": {
+          "config_sha256": "b5751fa93bf3c59efe4775f01bd975145bbf6b861be66fd9762025e4295ab18f",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-heldout-db2.json",
+            "sha256": "a769dc70eeab020679b1253a8efaeb3d34f7490a66aab2dafcb65dfca6352255"
+          },
+          "id": "chat-original-db2"
+        },
+        "source": "C0=chat-C0; C1=chat-C1; C2=chat-C2"
+      },
+      "code": {
+        "c0_ms": 41.46496852540778,
+        "c1_ms": 64.16551289173111,
+        "c2_ms": 85.67241849959049,
+        "measurements": {
+          "0": {
+            "cycle_ns": 132190319659,
+            "n": 3188,
+            "runs": [
+              "code-C0"
+            ]
+          },
+          "1": {
+            "cycle_ns": 107862227171,
+            "n": 1681,
+            "runs": [
+              "code-C1"
+            ]
+          },
+          "2": {
+            "cycle_ns": 104606022988,
+            "n": 1221,
+            "runs": [
+              "code-C2"
+            ]
+          }
+        },
+        "profile": {
+          "config_sha256": "ab0e5e54f33f756f88be08ee501fc64d8e376e7077dc2d95dde65b3a4b9c0007",
+          "hotset": {
+            "path": "/home/as/ds41-claude-build/work/hotsets/hot-both-db2.json",
+            "sha256": "bfd42436774b0044f836d1617b9add896b7882e5aec314a90c9b5a30535c974d"
+          },
+          "id": "code-original-db2"
+        },
+        "source": "C0=code-C0; C1=code-C1; C2=code-C2"
+      }
+    },
+    "measurement_profile": "ab-20261031T154102Z;native Db2 observer+early wait;quiet TRAIN only;no fitting",
+    "same_drafter_observer_wait": true,
+    "schema": "ds41-proposal-costs-v1"
+  },
+  "counts": {
+    "cancelled_outcomes": 0,
+    "invalid_signals": 0,
+    "outcome:accepted": 2916,
+    "outcome:rejected": 731,
+    "outcome:request_closed": 64,
+    "outcome:unreached": 365,
+    "proposals": 4076
+  },
+  "dispositions": [
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 427,
+        "status:accepted": 342,
+        "status:rejected": 78,
+        "status:request_closed": 7
+      },
+      "depth": 1,
+      "family": "all",
+      "split": "heldout"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 1611,
+        "status:accepted": 1299,
+        "status:rejected": 287,
+        "status:request_closed": 25
+      },
+      "depth": 1,
+      "family": "all",
+      "split": "train"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 427,
+        "status:accepted": 262,
+        "status:rejected": 80,
+        "status:request_closed": 7,
+        "status:unreached": 78
+      },
+      "depth": 2,
+      "family": "all",
+      "split": "heldout"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 1611,
+        "status:accepted": 1013,
+        "status:rejected": 286,
+        "status:request_closed": 25,
+        "status:unreached": 287
+      },
+      "depth": 2,
+      "family": "all",
+      "split": "train"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 134,
+        "status:accepted": 80,
+        "status:rejected": 50,
+        "status:request_closed": 4
+      },
+      "depth": 1,
+      "family": "chat",
+      "split": "heldout"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 351,
+        "status:accepted": 218,
+        "status:rejected": 121,
+        "status:request_closed": 12
+      },
+      "depth": 1,
+      "family": "chat",
+      "split": "train"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 134,
+        "status:accepted": 45,
+        "status:rejected": 35,
+        "status:request_closed": 4,
+        "status:unreached": 50
+      },
+      "depth": 2,
+      "family": "chat",
+      "split": "heldout"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 351,
+        "status:accepted": 119,
+        "status:rejected": 99,
+        "status:request_closed": 12,
+        "status:unreached": 121
+      },
+      "depth": 2,
+      "family": "chat",
+      "split": "train"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 293,
+        "status:accepted": 262,
+        "status:rejected": 28,
+        "status:request_closed": 3
+      },
+      "depth": 1,
+      "family": "code",
+      "split": "heldout"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 1260,
+        "status:accepted": 1081,
+        "status:rejected": 166,
+        "status:request_closed": 13
+      },
+      "depth": 1,
+      "family": "code",
+      "split": "train"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 293,
+        "status:accepted": 217,
+        "status:rejected": 45,
+        "status:request_closed": 3,
+        "status:unreached": 28
+      },
+      "depth": 2,
+      "family": "code",
+      "split": "heldout"
+    },
+    {
+      "counts": {
+        "cancelled_outcomes": 0,
+        "invalid_signals": 0,
+        "proposals": 1260,
+        "status:accepted": 894,
+        "status:rejected": 187,
+        "status:request_closed": 13,
+        "status:unreached": 166
+      },
+      "depth": 2,
+      "family": "code",
+      "split": "train"
+    }
+  ],
+  "incomplete_proposals": 0,
+  "limitations": [
+    "Smaller verify depths change future query anchors; this is not a full on-policy simulation.",
+    "Conditional depth2 calibration excludes unreached/discarded/cancelled trials.",
+    "Thresholds and the fixed-depth reference are chosen only on train groups.",
+    "Historical0.49/0.70 acceptance break-evens are not candidate_p thresholds."
+  ],
+  "one_decision_replay_only": true,
+  "replay_exclusions": {
+    "not_fixed_depth2_verified": 32,
+    "request_boundary_epochs": 64
+  },
+  "schema": "ds41-proposal-analysis-v1",
+  "split": {
+    "group_field": "split_group (defaults to prompt_key)",
+    "groups": {
+      "heldout": [
+        "chat-01",
+        "chat-04",
+        "chat-11",
+        "chat-13",
+        "code-01",
+        "code-03",
+        "code-13"
+      ],
+      "train": [
+        "chat-02",
+        "chat-03",
+        "chat-05",
+        "chat-06",
+        "chat-07",
+        "chat-08",
+        "chat-09",
+        "chat-10",
+        "chat-12",
+        "chat-14",
+        "chat-15",
+        "chat-16",
+        "code-02",
+        "code-04",
+        "code-05",
+        "code-06",
+        "code-07",
+        "code-08",
+        "code-09",
+        "code-10",
+        "code-11",
+        "code-12",
+        "code-14",
+        "code-15",
+        "code-16"
+      ]
+    },
+    "heldout_fraction": 0.25,
+    "seed": "ds41-prob-v1"
+  },
+  "validation": "passed"
+}

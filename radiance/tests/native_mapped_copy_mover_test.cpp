@@ -1423,6 +1423,8 @@ void EpCountsHostProbe::side_store_holds_what_the_packed_cache_refuses(){
     fs.mover_=t.mover.get();fs.plan_=&plan;fs.hx_pool_=pool;fs.hx_policy_=FileStager::kHxAll;fs.hx_miss_rows_=1;
     fs.hx_units_.reset(new Mover::HostUnit[FileStager::kHxUnits]);
     StagedLayer L;L.layer=layer;L.units={fits,held};fs.layers_={L};
+    /* hx_choose is called directly here: simulate the decode pass-begin read-ahead admission. */
+    fs.hx_ra_pass_=true;
     fs.hx_ra_=&r;fs.hx_ra_li_.assign(size_t(layer+1),-1);fs.hx_ra_li_[size_t(layer)]=0;
     std::array<int32_t,96> uo;uo.fill(-1);uo[size_t(e_held)]=held;uo[size_t(e_fits)]=fits;fs.hx_unit_of_={uo};
     fs.hx_ra_ok_.assign(plan.units.size(),0);fs.hx_ra_ok_[size_t(held)]=fs.hx_ra_ok_[size_t(fits)]=1;

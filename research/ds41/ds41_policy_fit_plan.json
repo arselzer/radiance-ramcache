@@ -1,0 +1,18 @@
+{
+  "action": "Single TRAIN threshold search; global production candidate only; family results diagnostics",
+  "traces": [
+    "--trace",
+    "code2=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T130014Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds2-Dkt-Db2-Dv24-Pmr-Df-Vp-Dpc-Ucode256.server.log",
+    "--trace",
+    "chat2=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T130014Z/all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds2-Dkt-Db2-Dv24-Pmr-Df-Vp-Dpc-Uchat.server.log"
+  ],
+  "metadata": "/home/as/ds41-claude-build/work/autonomous-20261031/dpc/metadata-frozen.json",
+  "metadata_sha256": "ad5a012102e4ef5a8be614308e9e14acbc4f85e748494131b015a6b3415b1cb1",
+  "costs": "/home/as/ds41-claude-build/work/autonomous-20261031/dme-quiet/matched-costs.json",
+  "costs_sha256": "f4c4d714bfb5923a811b3625d34f5083aaff45c521c20463d0c1588538e749fb",
+  "seed": "ds41-prob-v1",
+  "heldout_fraction": 0.25,
+  "grid_points": 21,
+  "bootstrap": 200,
+  "excluded": "Db1/verify-depth1 capture is not mixed into this Db2 policy replay. No iterative heldout selection."
+}

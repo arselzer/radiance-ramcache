@@ -529,9 +529,13 @@ int TierExec::wait_copy() {
 /* ------------------------------------------------------------------ restore */
 
 void TierExec::quiesce() {
-    if (!enabled_ || !stream_) return;
-    if (rad_dev_set(device_) < 0) return;
-    (void)rad_stream_sync(stream_);
+    (void)quiesce_checked();
+}
+
+int TierExec::quiesce_checked() {
+    if (!enabled_ || !stream_) return RAD_OK;
+    const int rc = rad_dev_set(device_);
+    return rc < 0 ? rc : rad_stream_sync(stream_);
 }
 
 int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,

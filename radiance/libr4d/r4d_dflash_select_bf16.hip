@@ -26,10 +26,12 @@
 // The arithmetic is tiny (steps * K * R multiply-adds per sequence, 28K at 7/16/256), so this is a
 // latency kernel: one workgroup per sequence, no global synchronisation.
 #include <hip/hip_runtime.h>
+#include <climits>
 #include "r4d_gdn_args.h"
 #include "r4d_dflash_conv_body.h"   // r4d_bf2f, r4d_u16
 #include "r4d_common.h"   // r4d_wave_sum
 #include "r4d_chain.h"
+#include "../arch/common/rad_dflash_observe.h"
 
 #define DSL_THREADS 256
 #define DSL_WAVE    32
@@ -268,4 +270,128 @@ extern "C" int r4d_rad_dflash_select(const RadArgs* a, RadStream s) {
                                       anc->data, pr->data, sc->data,
                                       out->data, (int)M, (int)steps, (int)K, (int)R, (int)V,
                                       (int)cand_ld, (int)hp_ld, (int)out_ld, (int)astr, s, ch));
+}
+
+/* Read-only instrument AFTER dflash_select, deliberately a separate launch. The selector above
+ * (including its argmax and chained variant) is untouched. Only this observer evaluates expf.
+ * Scores use its exact per-lane products/fold and actual chosen predecessors; the persistent
+ * output is not read by the drafter, target, sampler, verifier, or a depth controller. */
+__global__ __launch_bounds__(DSL_THREADS) void dflash_observe_kernel(
+    const int* cand, const float* unary, const r4d_u16* hp, const int* anchor,
+    const r4d_u16* pred, const r4d_u16* succ, const int* tokens, float* obs,
+    int steps, int K, int R, int V, int cand_ld, int hp_ld, int tok_ld, int obs_ld, int astr) {
+    using namespace rad_dflash_observe;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, s = blockIdx.x;
+    __shared__ float sa[DSL_MAX_R], ssc[DSL_MAX_K];
+    constexpr int CPW = (DSL_MAX_K + DSL_WAVES - 1) / DSL_WAVES;
+    if (tid == 0)
+        for (int l = 0; l < kDepths; ++l) {
+            float* y = obs + (long)s * obs_ld + l * kFields;
+            y[kCandidateP] = y[kScore] = y[kMargin] = NAN;
+            y[kToken] = y[kPredecessor] = -1.0f;
+        }
+    for (int l = 0; l < steps && l < kDepths; ++l) {
+        const long row = (long)s * steps + l;
+        int cid[CPW]; float un[CPW];
+#pragma unroll
+        for (int i = 0; i < CPW; ++i) {
+            const int c = wave + i * DSL_WAVES;
+            const long at = row * cand_ld + (c < K ? c : K - 1);
+            cid[i] = cand[at]; un[i] = unary[at];
+        }
+        const int pid = l == 0 ? anchor[(long)s * astr] : tokens[(long)s * tok_ld + l - 1];
+        const bool pid_ok = pid >= 0 && pid < V;
+        const r4d_u16* prow = pred + (long)(pid_ok ? pid : 0) * R;
+        if (!pid_ok) {
+            for (int r = tid; r < R; r += DSL_THREADS) sa[r] = 0.0f;
+        } else if (hp) {
+            const r4d_u16* hrow = hp + row * hp_ld;
+            for (int r = tid; r < R; r += DSL_THREADS)
+                sa[r] = r4d_bf2f(prow[r]) * r4d_bf2f(hrow[r]);
+        } else {
+            for (int r = tid; r < R; r += DSL_THREADS) sa[r] = r4d_bf2f(prow[r]);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < CPW; ++i) {
+            const int c = wave + i * DSL_WAVES;
+            if (c < K) {
+                const bool ok = cid[i] >= 0 && cid[i] < V;
+                const r4d_u16* srow = succ + (long)(ok ? cid[i] : 0) * R;
+                float acc = 0.0f;
+#pragma unroll 8
+                for (int r = lane; r < R; r += DSL_WAVE) acc += sa[r] * r4d_bf2f(srow[r]);
+                acc = r4d_wave_sum(ok ? acc : 0.0f);
+                if (lane == 0) ssc[c] = acc + un[i];
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            const int tok = tokens[(long)s * tok_ld + l];
+            float* y = obs + (long)s * obs_ld + l * kFields;
+            y[kToken] = (float)tok; y[kPredecessor] = (float)pid;
+            int best = 0; float bv = -INFINITY;
+            bool valid = pid_ok;
+            for (int c = 0; c < K; ++c) {
+                valid = valid && isfinite(ssc[c]) && cand[row * cand_ld + c] >= 0 &&
+                        cand[row * cand_ld + c] < V;
+                for (int j = 0; j < c; ++j)
+                    valid = valid && cand[row * cand_ld + j] != cand[row * cand_ld + c];
+                if (ssc[c] > bv) { bv = ssc[c]; best = c; }
+            }
+            valid = valid && cand[row * cand_ld + best] == tok;
+            if (valid) {
+                float den = 0.0f, runner = -INFINITY;
+                for (int c = 0; c < K; ++c) {
+                    den += expf(ssc[c] - bv);
+                    if (c != best && ssc[c] > runner) runner = ssc[c];
+                }
+                y[kCandidateP] = 1.0f / den;
+                y[kScore] = bv;
+                y[kMargin] = bv - runner;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" int r4d_rad_dflash_observe(const RadArgs* a, RadStream s) {
+    const RadTensor* cand = r4d_opt(a, 0), *un = r4d_opt(a, 1), *hp = r4d_opt(a, 2);
+    const RadTensor* anc = r4d_opt(a, 3), *pr = r4d_opt(a, 4), *sc = r4d_opt(a, 5);
+    const RadTensor* tok = r4d_opt(a, 6), *obs = r4d_opt(a, 7);
+    if (!cand || !un || !anc || !pr || !sc || !tok || !obs) return R4D_NO(RAD_E_INVAL);
+    for (int i = 0; i < 7; ++i) {
+        const RadTensor* in = r4d_opt(a, i);
+        if (in && in->data && in->data == obs->data) return R4D_NO(RAD_E_INVAL);
+    }
+    const long long steps = r4d_geti_or(a, "steps", 0), K = r4d_geti_or(a, "top_k", 0);
+    const long long R = r4d_geti_or(a, "rank", 0), V = r4d_geti_or(a, "n_vocab", 0);
+    const long long astr = r4d_geti_or(a, "anchor_stride", 1);
+    if (tok->rank != 2 || obs->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    const long long M = tok->shape[0];
+    if (M <= 0 || M > INT_MAX || steps < 1 || steps > 63 || K < 1 || K > DSL_MAX_K ||
+        R < DSL_WAVE || R > DSL_MAX_R || R % DSL_WAVE || V < 1 || V > (1 << 24) ||
+        astr < 1 || astr > INT_MAX || M * steps > INT_MAX) return R4D_NO(RAD_E_SHAPE);
+    const long long cld = ds_plane(cand, RAD_I32, K, M * steps);
+    const long long uld = ds_plane(un, RAD_F32, K, M * steps);
+    const long long tld = ds_plane(tok, RAD_I32, steps, M);
+    const long long old = ds_plane(obs, RAD_F32, rad_dflash_observe::kWidth, M);
+    const bool has_hp = hp && hp->data;
+    const long long hld = has_hp ? ds_plane(hp, RAD_BF16, R, M * steps) : 0;
+    if (cld < 0 || tld < 0 || old < 0 || hld < 0) return R4D_NO(RAD_E_SHAPE);
+    if (uld != cld) return R4D_NO(RAD_E_STRIDE);
+    if (cld > INT_MAX || tld > INT_MAX || old > INT_MAX || hld > INT_MAX)
+        return R4D_NO(RAD_E_STRIDE);
+    if (pr->dtype != RAD_BF16 || sc->dtype != RAD_BF16 ||
+        (anc->dtype != RAD_I32 && anc->dtype != RAD_U32)) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(pr) || !r4d_contig(sc) || !r4d_contig(anc)) return R4D_NO(RAD_E_STRIDE);
+    if (r4d_numel(pr) < V * R || r4d_numel(sc) < V * R || r4d_numel(anc) < (M - 1) * astr + 1)
+        return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(dflash_observe_kernel, dim3((unsigned)M), dim3(DSL_THREADS), 0, (hipStream_t)s,
+                      (const int*)cand->data, (const float*)un->data,
+                      has_hp ? (const r4d_u16*)hp->data : nullptr, (const int*)anc->data,
+                      (const r4d_u16*)pr->data, (const r4d_u16*)sc->data, (const int*)tok->data,
+                      (float*)obs->data, (int)steps, (int)K, (int)R, (int)V,
+                      (int)cld, (int)hld, (int)tld, (int)old, (int)astr);
+    return R4D_RAW((int)hipGetLastError());
 }

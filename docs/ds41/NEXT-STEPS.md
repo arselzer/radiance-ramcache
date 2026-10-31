@@ -323,3 +323,148 @@ serialized window queue; discoveries can extend it. The first useful decisions (
 should arrive well before the collective/norm work completes. No implementation of these new
 optimization branches has been started by this planning step. Divergence cleanup and system/BIOS
 changes remain outside this plan.
+
+
+## Active parallel execution (2026-10-31 15:00 UTC)
+
+The current performance focus is256GB RAM /192GiB expert cache. Startup budgets remain variable;
+96GiB functional spill gates are mandatory. No engine change may alter base reply bytes. All
+source lanes run concurrently; one integration owner serializes builds, tests and two-lock GPU
+windows, stopping/restoring/checking production each time.
+
+| Lane | Source state | Next proof |
+|---|---|---|
+| P1 static Vp + Rb | Implemented, long KLD and harness/N4/N8 exact; small throughput deltas | chain34 currently running: reverse-order throughput, corrected long/8K Kh,96GiB spill |
+| P1 covering SwiGLU span | Implemented, host and card full/span bytes pass | chain37 preparer: own long KLD,8K and harness Kh |
+| n128 preserving old reduction order | Implemented, host/emulator/card29 positives +10 near misses pass | chain37 preparer: separate long KLD,8K/harness Kh and actual rank dispatch |
+| LCP4096 | Implemented; admission/pins/buffers and actual balance11-height bytes pass on current library | chain38 preparer: first4K model gate keeps Rb/Vp/N128 OFF, explicit Pci4096,96GiB pair |
+| AR / Engram AG row caps | Implemented independently; host guards pass; mixed-allocation test source ready | chain39 preparer: fresh4-card independent + shared-family oracles, separate/combined KLD,8K/harness/N8 |
+| DSpark adaptive0/1/2 | Read-only capture exact; fixed matched controls implemented; policy source now separate lane | chain35 verbose binding audit, chain36 quiet TRAIN-only costs; fit once, then held-out replay and on-policy gate |
+| Packed KV codec | Source commit9f9c7ebe;288B main/68B index, original-code/scale capture contract, signed-zero/NaN/FTZ cases | Host codec + strict GPU domain/producer-store oracles, no requantization |
+| Packed KV page/prefix/accounting | Source commit56c5fa3b, requirescodec; logical BF16 vs physical U8, honest budgets/Kh | Full coherent ABI rebuild; host page/COW/prefix/snapshot/tier gates, then kernel/model gates |
+| Packed KV producer/readers | Source implementation active, preserves current arithmetic and dispatch | Decode BF16 bits at existing load sites; no permanent/fullhistory shadow; layered byte gates |
+| Variable physical KV backing | Root policy2167bd20 ready, host tests queued; transaction source lane active | Actual granule mapping/fault rollback/all-rank bookkeeping first; complete scheduler quiescence/admission wiring later |
+
+Current chain34 uses engine1042d3c2 and one coherent home-sync cohort. New source2167bd20 is
+policy/tests/docs only. Do not integrate the packed ABI into this build until the queued existing
+optimization windows have retained coherent provenance. Codec/page/GPU sources remain in their
+own worktrees; integratecodec→page→GPU and rebuild every plugin together.
+
+Window order is adaptive to evidence. No costs are fitted from held-out groups. A0.49/0.70
+historical acceptance break-even is not a candidate-set-softmax threshold. An offline replay gain
+is not an engine gain, and no probability policy is adopted before real on-policy comparison
+against the existing late-readback baseline. Source policy support may be prepared beforehand.
+
+Packed KV targets the already-quantized compressed/index values; windows stay FP8-roundtrip BF16
+and compressor state rawF32. Main/index full-history payload could become890B/token/card from
+3200, but that arithmetic is NOT a measured allocation or serving result. Exact logical hashes,
+zero/unwritten pages, partialratio2 rows, prefix sharing/COW, rollback/cancel, long positions and
+96GiB spill all require gates. Variable backing is distinct from assigning pages inside a fully
+backed pool. A policy helper alone is not runtime growth; freeing KV alone does not enlarge the
+expert slab. Real integration must retain all held granules and publish nothing unbacked.
+
+Phase2 layer-major prefill remains conditional on residual DMA after4K and the narrow changes.
+The archive audit includes all31Markdown reports, full NIGHT-LOG and current engine README;
+individual raw historical artifacts/commits were not exhaustively re-read. Closed or invalid
+trials remain labeled as such; no rebranding old mechanisms as new wins.
+
+## Autonomous execution status (2026-10-31 13:18 UTC)
+
+Current256GB/192GiB is the performance focus. Configurable startup cache budgets and prior128GB
+miss/spill optimizations remain supported; no RAM amount is baked into a new runtime path.
+Dynamic resizing and network expert tiers remain future work. Feature agents only prepared source;
+one owner performs all builds, tests, GPU windows and integration.
+
+- DSML is published; the pre-existing side-store host fixture is fixed atdac436c7, full host gate passes.
+- Rb/P1 completed first because its implementation was ready while capture was being prepared.
+  ab-20261031T123034Z: tall card oracle9shapes/3refusals passes; long KLD3397/3397, harness13/13
+  replies/IDs/counts/hashes and N4/N8 replies exact. N4 total37.84→38.49,N8 41.97→42.24tok/s;
+  summed harness TTFT72.70→72.93s. Small changes need repeat; no recommendation changed yet.
+- DSpark capture is in flight atab-20261031T130014Z, code/chat Ds2 off/on plus chat Ds1 off/on,
+  plain references, all192GiB. Host/emulator5/5 and analyzer tests9/9 pass. Observer card oracle
+  passes. Code pair is complete:1553 proposal lists identical,16/16 captured replies equal plain;
+ 3106 proposals paired with3106 terminal events. Full strict analysis follows QFN restoration.
+- A1 P1/Vp eligibility, A2 covering-span SwiGLU, B2 exact n128 and A3 AR-only slices are source-ready,
+  staged default-off on the integration candidate except A1's existing Vp knob. None is adopted.
+  N128/Rb byte coverage now includes4096 rows (new card receipts pending). P1 span metrics include
+  full-replay fallback rows, so the exit guard measures actual work rather than just enabled flags.
+- B3 LCP4096 admission/pins/buffers/height oracles and explicit checkpoint-interval harness support
+  are source-ready on an independent branch; not integrated/enabled yet. The first4K gate keeps
+  Rb/Vp/N128 off. Default checkpoint interval2048, Qe64 and ring64 stay unchanged.
+- C2 matched fixed0/1/2 early-readback controls are being prepared as instruments. They must keep
+  the same Db2 query/observer/hotset at every action, including0; no probability policy is selected.
+  Full-vocabulary/acceptance probabilities are not what candidate_p measures. Freeze train/heldout
+  groups, measure matched C0/C1/C2 including wait/overlap cost, then fit offline. A positive replay is
+  only a candidate for real on-policy testing; a negative result parks this policy path.
+
+The next prepared model window is P1/Vp: long KLD, UlongKh, UharnessKh and N4/N8 pairs, requiring
+actual nonzero packed static residents on all4ranks. A96GiB paired spill regression is required
+before adoption. Further windows gate each new span/n128/AR/4K switch independently, then combine
+only passing settings. GPU windows remain serial; both research locks are held through the series.
+
+Collective estimate correction: the implemented AR-only C2048→AR1024 path recovers85.625MiB/card
+atD5120/TP4. Engram gather remains about214.066MiB/card atesplit6400. The old~196MiB estimate
+mixed the AR and gather families; it is not the AR-only saving. Gather placement is
+[token][ascending rank][columns] with full destination row pitch; it is not changed by this patch.
+
+## Further leads after the active batch (Oct31, source research)
+
+These are unimplemented/unmeasured. Existing31-report audit and current source checked; do not
+repeat closed TBO/cache-policy/ring/grace experiments without a concrete new mechanism.
+
+1. Layer-major prefill across chunks. Existing Phase2 design; prioritize only if4K still repeats
+   costly expert transfers. Current source audit corrects retained state to about172.3KiB/row,
+   not old80/122KiB estimates: about1,147MiB/card at6817rows, plus ring/scratch/KV/final hidden.
+   Preserve existingpiece kernels, sorted six-slot folds, next-xn state, context/window metadata
+   and capture lifetimes. No old128GB throughput forecast transferred to256GB.
+2. Lazy/rebased exact RoPE backing. Two full1M tables cost512MiB/card; generate/map needed
+   absolute positions with exactly the old expressions. Separate persistent-buffer/VA/lifetime
+   design needed; current compact index work does not remove RoPE allocation.
+3. Exact FP8 window storage. Current window values are already FP8-rounded before BF16 store.
+   Native format528B/row vs1024B expanded suggests roughly48.4% payload saving, about41.8MiB
+   of C2048 window or80.5MiB of C4096 window percard beforealignment/metadata. Requires separate
+   producer/output-bit codec, physicalwindow pages, every-reader guard and prefix/window snapshot
+   proof. RawF32tails unchanged. Main/index packed implementation does not do this. Official
+   DeepInfer cache_common.py and FlashMLA README checkedOct31; no direct CUDA-kernel port assumed.
+4. Fuse index scoring with exact selection. Existing rowruns, masks and split top-k already exist;
+   the remaining lead is avoiding full score-plane materialization. Retain original BF16 score
+   rounding, causal/newest-block semantics, NaN/tie/index ordering and exact global merges. Does
+   not itself remove quadratic early-index scan work.
+5. Further attention/output fusion. Current Qnorm/RoPE/quant and inverse O-RoPE/quant chains
+   already fuse; a larger attention+output epilogue may save launches. Preserve intermediate BF16
+   rounding and current head/reduction order. Upstream FlashMLA demonstrates larger fusion on
+   NVIDIA/Ascend, not numerics equivalence or a speed prediction on RX9070XT. Lowerpriority.
+6. Temporary DSpark hot-bank lending beside concurrency. Source draft_vram.h explicitly places
+   Dv24's72local pairs static:72×18,800,640B=1.2607GiB/card, even when drafting is gated off by
+   multiple requests. Archive/source search found no bank-reclamation trial. Existing P1arena
+   lending is a possible mechanism to investigate, but immutable bank aliases/routermask and all
+   readers must be quiescent, bank restored before querying, and trunk placement stays exact.
+   Aim would be to recover the known DSpark concurrent penalty (about4.5%), not claim a new peak
+   beyond the no-bank reference. Price restore latency, hysteresis, pinned backup/SSD traffic and
+   variable96/192GiB host budgets. **User explicitly requested implementation soon; source lane
+   wt-dsbanklend/claude/ds41-dsbanklend starts after the packed-harness guard commit.**
+
+## Parallel source and measurement queue, 2026-10-31 16:48 UTC
+
+- Serving cohort is 0f62a578, with all five plugins from its build. Chain38 checks 4K prefill; chain40 evaluates the single frozen global DSpark policy after chain38 and its strict postanalysis pass. Source has advanced to 0d27ba75 for the next build, without changing the running binary/plugins.
+- Bank lending source is integrated, with bounded immutable backup, Scheduler frame ownership, all-rank drains, real target slot publication, strict restoration and resumed-query receipts. The standalone real-card oracle is also source-ready. Build and host checks wait until chain40 restores; the mixed three-role192/96GiB window follows its fresh card gate. No bank result yet.
+- Packed KV and live growing KV source cohorts remain queued; no ABI-cohort integration or model enable yet. Variable expert/KV budgets and reduced-cache gates remain mandatory.
+- RoPE audit found existing trig generation is already lazy. Sparse physical backing needs complete reader inventory and exact stable-VA funding. A monotonic prefix with the old maximum budget would reduce actual backing but create no extra expert residents; per-token D2H/synchronization is rejected as the next optimization. See engine docs/DS41-ROPE-BACKING-DESIGN.md.
+- Further source research now examines exactFP8 window storage and scorer→local selection→existing merge fusion. The latter differs from the existing split_topk but may save memory traffic rather than launches at32K; register pressure and stable tie semantics remain open.
+
+## Authoritative active queue, 2026-10-31 18:27 UTC
+
+1. Bank correctness passed at192/96 but lost the1792-token mixed workload: static→lent56.624→60.291s and79.010→82.909s. Keep experimentalOFF. Production restored+answered18:24:28.
+2. Collective slices chain39 currently running ab-20261031T182505Z, runtime35cab28d/sourceb79bac8e. FourcardindependentAR,AG/sharedoraclespassed; modelKLD/8K/harness/N8 underway. PipelinePID954213 strictpost39thenrowschain37; anyfailurestops.
+3. Rows chain37 independentP1span/n128 byte/performance gate next, samefrozenb4cohort. Preservecurrenthome-sync/builduntilbothcomplete.
+4. Next source cohortwt-kv-int44f50fb4 unbuilt: coherentpackedKV/fast/window,B16,growthcard,packedbankfill,concurrentpolicy. Rootownsmerge/build/host/card/modelqueue; onecore/all5plugins, no mixedABI.
+5. ParallelSOURCE: AexactMAX/layoutreceipt+growingmodelrunner; Bbankpackedfill192/96/longburstmanifeststwoexplicitpaidcold/warmcycles; CPhase2layermajorexecutorcontractclosure/prerequisiteimplementation. Existingpromptsetsandfrozenevidenceunchanged.
+6. Complete96GiB/combinationandconcurrencygatesbeforeadoption; README/HANDOFF/NIGHTandGitHubds41onlyrefreshafterconcretepassingintegration. Releasebothresearchlocksonlyafterallactivewindowsrestoreproduction.
+
+## Current queue, 2026-10-31 19:20 UTC
+
+OldABIqueuecomplete: collective39 androws37allbyte/hashgatespassed, performance mixed/nearneutral. QFNrestored+answered19:17:09. Stablee184c6b7mergesverifiedcontrols/README, allnewresearchflagsopt-in. Publishds41checkpointwithfrozenpolicydata+12windows next, inline scan/verify; no main change. Bothlocksremainheldfornextseries.
+
+FutureABIwt-kv-int305c6956sourceonly: packedKV/fast/window,B16,actualKVgrowth+layout/cancelreceipts,bankpackedfill+subphasetimers,concurrentadaptivepolicy,Qe128arenaextension,unusedPhase2routehelper. Awaitshortsourcefollowupactualroute/copyaudit+timedbankcardtool, thenrootmerge/freeze/fullcore+all5pluginbuildviawork/autonomous-20261031/kv-next/build-and-check.sh. RootscriptBash+2embeddedPython ASTsyntaxpassedunderbuild.lock19:18; no futureenginebuild/test/card/modelran. GateplaninKV-next/GATE-PLAN.md.
+
+Parallelresearch nowactualroute/copyIDdiagnostic, banktimer/tool/runnerwrapup, andquery-admissionfeasibility auditdistinguishingoldfailedCONFfromexistingfrozenpolicy. No newquerygateimplementationauthorizedbyanauditalone; measurematchedquery-freecostcontrolfirst.

@@ -532,6 +532,29 @@ extern "C" int r4d_rad_ar_host_init(const RadParam* p, int n_p, int rank, int wo
     return ar_init(p, n_p, rank, world, 1, out);
 }
 
+/* Selftest hook, not an ABI hook or a launch path. The caller has synchronized every rank and
+ * seeds all peers identically while the instance is idle, to exercise flag wrap and both slot
+ * parities without billions of launches. Production never calls this. */
+extern "C" int r4d_ar_test_seed_seq(void* instance, unsigned int handshake, unsigned int parity) {
+    const ArInst* in = (const ArInst*)instance;
+    if (!in || in->world != 4 || in->host) return RAD_E_UNSUPPORTED;
+    int maxb = 0, design = 0, peers = 0;
+    r4d_ar_wide_dims(&maxb, &design, &peers);
+    if (maxb < 1) return RAD_E_STATE;
+    std::vector<unsigned int> seq((size_t)kSeqWords(maxb), 0);
+    for (int b = 0; b < maxb; ++b) {
+        seq[(size_t)b] = handshake;
+        seq[(size_t)maxb + b] = parity;
+    }
+    std::vector<unsigned int> flags((size_t)maxb * (in->world + 2), 2u * handshake);
+    if (hipMemcpy((void*)(uintptr_t)in->my_seq, seq.data(), seq.size() * sizeof(unsigned int),
+                   hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy((void*)(uintptr_t)in->my_flags, flags.data(), flags.size() * sizeof(unsigned int),
+                   hipMemcpyHostToDevice) != hipSuccess)
+        return RAD_E_DEVICE;
+    return RAD_OK;
+}
+
 /* The fused all-reduce + norm declares `M` (range) and `n` instead of `numel`; the bound is
  * M * n, over the same world and buffers. */
 static int ar_mn_acquire(const RadParam* p, int n_p, int rank, int world, int host,

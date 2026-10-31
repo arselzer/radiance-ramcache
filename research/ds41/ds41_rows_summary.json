@@ -1,0 +1,159 @@
+{
+  "window": "ab-20261031T185127Z",
+  "candidate": {
+    "engine_commit": "35cab28d38667ea408cac5e74f8f9604fd2a0796",
+    "source_commit": "b79bac8ed1e47e7e2fa2429ecf13e586469266b8",
+    "engine_sha256": "dd0d1e3bc9f20330df96dd84c9627cfc8d8c83d2186e808b74c0df0561ff470e",
+    "runtime_build_receipt_sha256": "330e733a9cf3b9498f5aba11db514d452f7da9e6bb710064d6e7309a0b1d0443",
+    "source_only_files_since_build": [
+      "tools/ds41-host-experts/ds41_bank_lend_probe.py"
+    ],
+    "libraries": {
+      "kernels/libr4d.so": "b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10",
+      "kernels/libavx.so": "764ea8ccf1f0b5bdeb2e1484decb55c3dc824b2ceca76a123a69b6e4585a2655",
+      "kernels/libref.so": "334a712aff27a53ce0fd222a56024f4684dedcd1f65372fc6458ec0c2e237b19",
+      "architectures/deepseek41.so": "9399b90de377c060fa77abba5b76ba1857fb0016ce9731384693d8117d272ee0",
+      "quantizers/libquant.so": "4bf4ab40e8aa2cbe74d859a34e70c181d262f213dfc99fae3e1b4dc539296ee7"
+    },
+    "arms": [
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Lm4096-Kld",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Qsp-Lm4096-Kld",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Fn128-Lm4096-Kld",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-Kh-Lm8192-Ulong8k",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Qsp-Cs-Kh-Lm8192-Ulong8k",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Fn128-Cs-Kh-Lm8192-Ulong8k",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Qsp-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness",
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Fn128-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness"
+    ],
+    "mode": "rows",
+    "reused_card_window": "ab-20261031T144623Z",
+    "reused_card_libr4d_sha256": "b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10",
+    "immutable_receipts": {
+      "devcheck-lcp-lcp.log": "3d272f745d0468bfcbf975aaf827a6e4907e0030d764735f46a90a2a898eba5a",
+      "devcheck-lcp-sweep.log": "8aa90ae8a2256a70a42d518ade349745db93e5462ede6ae7bb57d2fb1c466144",
+      "devcheck-lcp-sweep0.log": "7421cefe0687ea3bbb7316fa0273bb762cc61c706390fe47345b09426294f0a0",
+      "devcheck-bal.log": "626d74a7d530f47bac9b74bbeb14709484140aed2cdfcf615a2830d1517b678a",
+      "devcheck-p1.log": "46b6c490b7037d203bb8ad22bdb662ec9281a94eb96d2236e51063073e5968d8",
+      "n128-off.log": "46e2d0433f960aa1a4514411c8399fe6d1c92c416db77fde7241aa419b41d8fa",
+      "n128-on.log": "df7b6e29cd7cac26bf34e4bae4568677f75b92876af6b9c9441a6ef945215e4a",
+      "n128-lcp.log": "492b39f5951a1fcaa8948e631d40f9e74ee646c6a48020dbfeaae187db94cafd"
+    },
+    "isolation": "Each new switch has its own long KLD arm.4K first model gate keeps Rb,Vp,N128 off. No optimization adopted by preparation."
+  },
+  "kld_positions_equal_each": 3397,
+  "kld_candidate_arms": [
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Lm4096-Kld",
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Qsp-Lm4096-Kld",
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Fn128-Lm4096-Kld"
+  ],
+  "groups": {
+    "long8k": [
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-Kh-Lm8192-Ulong8k",
+        "requests_equal": 1,
+        "canonical_hashes_equal": 1,
+        "mean_stream_total_tok_s": 20.6813928757304,
+        "weighted_decode_tok_s": 20.6813928757304,
+        "summed_ttft_s": 17.223708053,
+        "ttft_by_prompt_s": {
+          "long-gpl3-7k": 17.223708053
+        }
+      },
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Qsp-Cs-Kh-Lm8192-Ulong8k",
+        "requests_equal": 1,
+        "canonical_hashes_equal": 1,
+        "mean_stream_total_tok_s": 20.750879282195545,
+        "weighted_decode_tok_s": 20.750879282195545,
+        "summed_ttft_s": 17.015995646,
+        "ttft_by_prompt_s": {
+          "long-gpl3-7k": 17.015995646
+        }
+      },
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Fn128-Cs-Kh-Lm8192-Ulong8k",
+        "requests_equal": 1,
+        "canonical_hashes_equal": 1,
+        "mean_stream_total_tok_s": 20.50450225686008,
+        "weighted_decode_tok_s": 20.50450225686008,
+        "summed_ttft_s": 17.172607920999997,
+        "ttft_by_prompt_s": {
+          "long-gpl3-7k": 17.172607920999997
+        }
+      }
+    ],
+    "harness": [
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness",
+        "requests_equal": 13,
+        "canonical_hashes_equal": 13,
+        "mean_stream_total_tok_s": 25.47328661464347,
+        "weighted_decode_tok_s": 25.780853646055245,
+        "summed_ttft_s": 73.42376655,
+        "ttft_by_prompt_s": {
+          "hxA-1": 14.472818,
+          "hxB-1": 9.268507092,
+          "hxA-2": 4.26481394,
+          "hxB-2": 3.505546086,
+          "hxA-3": 3.9700124889999997,
+          "hxB-3": 4.148576821,
+          "hxA-4": 6.866293311,
+          "hxB-4": 7.876378594999999,
+          "hxA-5": 3.390351742,
+          "hxB-5": 8.58164006,
+          "hxA-6": 6.260787629999999,
+          "hxB-6": 0.498606612,
+          "hxA-7": 0.319434172
+        }
+      },
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Qsp-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness",
+        "requests_equal": 13,
+        "canonical_hashes_equal": 13,
+        "mean_stream_total_tok_s": 25.622366606940968,
+        "weighted_decode_tok_s": 25.935193440511586,
+        "summed_ttft_s": 72.872286284,
+        "ttft_by_prompt_s": {
+          "hxA-1": 14.549642842999999,
+          "hxB-1": 8.949649678,
+          "hxA-2": 4.116165261999999,
+          "hxB-2": 3.469846761,
+          "hxA-3": 3.898884447,
+          "hxB-3": 4.158281788999999,
+          "hxA-4": 6.901013891,
+          "hxB-4": 7.791296603,
+          "hxA-5": 3.409970542,
+          "hxB-5": 8.459982244999999,
+          "hxA-6": 6.343137455,
+          "hxB-6": 0.503332853,
+          "hxA-7": 0.321081915
+        }
+      },
+      {
+        "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Fn128-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness",
+        "requests_equal": 13,
+        "canonical_hashes_equal": 13,
+        "mean_stream_total_tok_s": 25.645554322462996,
+        "weighted_decode_tok_s": 25.93847243007245,
+        "summed_ttft_s": 72.787888564,
+        "ttft_by_prompt_s": {
+          "hxA-1": 14.383281828,
+          "hxB-1": 9.042814398,
+          "hxA-2": 4.135493980000001,
+          "hxB-2": 3.403226217,
+          "hxA-3": 3.8894095399999995,
+          "hxB-3": 4.174207371,
+          "hxA-4": 6.834326865,
+          "hxB-4": 7.881748936,
+          "hxA-5": 3.4667402029999996,
+          "hxB-5": 8.46713432,
+          "hxA-6": 6.289118136,
+          "hxB-6": 0.50288189,
+          "hxA-7": 0.31750487999999993
+        }
+      }
+    ]
+  }
+}

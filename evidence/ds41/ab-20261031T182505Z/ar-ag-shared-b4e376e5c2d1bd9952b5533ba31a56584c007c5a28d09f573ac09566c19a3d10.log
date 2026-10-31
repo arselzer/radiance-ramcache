@@ -1,0 +1,7 @@
+ar_ag_shared sha256 b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10
+  ok    ds41_ar_ag_shared_exact order ar-first, seed 0
+  ok    ds41_ar_ag_shared_exact order ar-first, seed 1
+  ok    ds41_ar_ag_shared_exact order ag-first, seed 0
+  ok    ds41_ar_ag_shared_exact order ag-first, seed 1
+ar_ag_shared exit 0
+ar_ag_shared finished sha256 b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10

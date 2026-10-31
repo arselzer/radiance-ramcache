@@ -1,0 +1,284 @@
+{
+  "window": "ab-20261031T165338Z",
+  "candidate": {
+    "source_commit": "0f62a578567fac8aba61dcc0da0eda5b12294e03",
+    "engine_sha256": "deed243c2eaa7f83607f0db172a19743521469b9a2426eadbf562e12224965ca",
+    "libraries": {
+      "kernels/libr4d.so": "b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10",
+      "kernels/libavx.so": "764ea8ccf1f0b5bdeb2e1484decb55c3dc824b2ceca76a123a69b6e4585a2655",
+      "kernels/libref.so": "334a712aff27a53ce0fd222a56024f4684dedcd1f65372fc6458ec0c2e237b19",
+      "architectures/deepseek41.so": "9399b90de377c060fa77abba5b76ba1857fb0016ce9731384693d8117d272ee0",
+      "quantizers/libquant.so": "4bf4ab40e8aa2cbe74d859a34e70c181d262f213dfc99fae3e1b4dc539296ee7"
+    },
+    "host_checks": "check-policy-index.log complete 16:18:43 exit0; 17 exact ctest targets + Python 3/7",
+    "arms": [
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Ucode256",
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds2-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256",
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256",
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256",
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-r2-Ucode256",
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Uchat",
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds2-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat",
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat",
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat",
+      "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-r2-Uchat"
+    ],
+    "config": "v1:0.937915564:0.97501117",
+    "frozen_fit_sha256": "f55d9c5858888d936e25343945bede08a29884dc9ed3dad73618ffac4723852b",
+    "frozen_metadata_sha256": "ad5a012102e4ef5a8be614308e9e14acbc4f85e748494131b015a6b3415b1cb1",
+    "purpose": "Real on-policy E2E/bytes, quiet with mandatory policy telemetry. Full original 16+16 prompt sets; heldout reported separately. Global candidate only, no retuning.",
+    "comparison": "Db2 original hotsets; late fixed caps2/1 versus adaptive early prefix. Policy query/observer/wait cost included. Two identical policy arms per family; r2 is only a unique result name."
+  },
+  "families": {
+    "code256": {
+      "all": {
+        "arms": [
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Ucode256",
+            "requests": 16,
+            "generated_tokens": 3995,
+            "decode_tok_s": 25.872284230398694,
+            "total_tok_s": 23.714531811280324,
+            "decode_ms": 154412.341965,
+            "total_ms": 168462.107192,
+            "wall_s": 168.47510695457458
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds2-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256",
+            "requests": 16,
+            "generated_tokens": 3995,
+            "decode_tok_s": 30.534104070054155,
+            "total_tok_s": 27.928596499631084,
+            "decode_ms": 130837.308697,
+            "total_ms": 143043.349853,
+            "wall_s": 143.05680465698242
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256",
+            "requests": 16,
+            "generated_tokens": 3995,
+            "decode_tok_s": 29.725493840804326,
+            "total_tok_s": 27.305128047297643,
+            "decode_ms": 134396.421516,
+            "total_ms": 146309.513476,
+            "wall_s": 146.34766507148743
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256",
+            "requests": 16,
+            "generated_tokens": 3995,
+            "decode_tok_s": 31.97038757330927,
+            "total_tok_s": 29.206652532669498,
+            "decode_ms": 124959.385958,
+            "total_ms": 136783.9055,
+            "wall_s": 136.79694604873657
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-r2-Ucode256",
+            "requests": 16,
+            "generated_tokens": 3995,
+            "decode_tok_s": 31.9657764633499,
+            "total_tok_s": 29.202130968630893,
+            "decode_ms": 124977.411532,
+            "total_ms": 136805.08468,
+            "wall_s": 136.8185396194458
+          }
+        ],
+        "policy_pair_decode_gain_over_fixed2_pct": 4.696315237242987,
+        "policy_pair_total_gain_over_fixed2_pct": 4.568060110086125
+      },
+      "heldout": {
+        "arms": [
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Ucode256",
+            "requests": 3,
+            "generated_tokens": 768,
+            "decode_tok_s": 24.538241449213,
+            "total_tok_s": 22.825145777064307,
+            "decode_ms": 31298.08636,
+            "total_ms": 33647.101643999995,
+            "wall_s": 33.64980864524841
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds2-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256",
+            "requests": 3,
+            "generated_tokens": 768,
+            "decode_tok_s": 29.602846012712693,
+            "total_tok_s": 27.319513732837848,
+            "decode_ms": 25943.451506999998,
+            "total_ms": 28111.774151999998,
+            "wall_s": 28.1145441532135
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256",
+            "requests": 3,
+            "generated_tokens": 768,
+            "decode_tok_s": 28.310910960005756,
+            "total_tok_s": 26.29451863347734,
+            "decode_ms": 27127.350337999997,
+            "total_ms": 29207.608274,
+            "wall_s": 29.21030569076538
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256",
+            "requests": 3,
+            "generated_tokens": 768,
+            "decode_tok_s": 30.57940717450558,
+            "total_tok_s": 28.271361204844087,
+            "decode_ms": 25114.940770999998,
+            "total_ms": 27165.299698,
+            "wall_s": 27.16811752319336
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-r2-Ucode256",
+            "requests": 3,
+            "generated_tokens": 768,
+            "decode_tok_s": 30.62240964725287,
+            "total_tok_s": 28.30919643019308,
+            "decode_ms": 25079.672333,
+            "total_ms": 27128.99329,
+            "wall_s": 27.131536722183228
+          }
+        ],
+        "policy_pair_decode_gain_over_fixed2_pct": 3.3714572248892294,
+        "policy_pair_total_gain_over_fixed2_pct": 3.5533298433896077
+      }
+    },
+    "chat": {
+      "all": {
+        "arms": [
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Uchat",
+            "requests": 16,
+            "generated_tokens": 942,
+            "decode_tok_s": 25.881071344204134,
+            "total_tok_s": 20.574193816612947,
+            "decode_ms": 36397.256800999996,
+            "total_ms": 45785.512103,
+            "wall_s": 45.79850363731384
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds2-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat",
+            "requests": 16,
+            "generated_tokens": 942,
+            "decode_tok_s": 23.21893654830846,
+            "total_tok_s": 19.02280561727239,
+            "decode_ms": 40570.333531,
+            "total_ms": 49519.509317,
+            "wall_s": 49.53272747993469
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat",
+            "requests": 16,
+            "generated_tokens": 942,
+            "decode_tok_s": 26.223940673120012,
+            "total_tok_s": 21.1496941351744,
+            "decode_ms": 35921.374737,
+            "total_ms": 44539.651211,
+            "wall_s": 44.55225682258606
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat",
+            "requests": 16,
+            "generated_tokens": 942,
+            "decode_tok_s": 28.849318929881733,
+            "total_tok_s": 22.833500099017314,
+            "decode_ms": 32652.417282,
+            "total_ms": 41255.173141,
+            "wall_s": 41.26797270774841
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-r2-Uchat",
+            "requests": 16,
+            "generated_tokens": 942,
+            "decode_tok_s": 28.765259580830758,
+            "total_tok_s": 22.79141151385092,
+            "decode_ms": 32747.835886999997,
+            "total_ms": 41331.358499999995,
+            "wall_s": 41.34405970573425
+          }
+        ],
+        "policy_pair_decode_gain_over_fixed2_pct": 24.067817982791873,
+        "policy_pair_total_gain_over_fixed2_pct": 19.921513430928695
+      },
+      "heldout": {
+        "arms": [
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Uchat",
+            "requests": 4,
+            "generated_tokens": 256,
+            "decode_tok_s": 25.64002400054478,
+            "total_tok_s": 20.253062988812516,
+            "decode_ms": 9984.390029999999,
+            "total_ms": 12640.063388999999,
+            "wall_s": 12.643435955047607
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds2-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat",
+            "requests": 4,
+            "generated_tokens": 256,
+            "decode_tok_s": 22.317344418395738,
+            "total_tok_s": 18.205985951910062,
+            "decode_ms": 11470.898830999999,
+            "total_ms": 14061.309323,
+            "wall_s": 14.064722537994385
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat",
+            "requests": 4,
+            "generated_tokens": 256,
+            "decode_tok_s": 25.431008969408886,
+            "total_tok_s": 20.34633485409385,
+            "decode_ms": 10066.450776999998,
+            "total_ms": 12582.118687999999,
+            "wall_s": 12.58523178100586
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat",
+            "requests": 4,
+            "generated_tokens": 256,
+            "decode_tok_s": 27.40707348750674,
+            "total_tok_s": 21.573090471150493,
+            "decode_ms": 9340.654343,
+            "total_ms": 11866.635443,
+            "wall_s": 11.870121955871582
+          },
+          {
+            "arm": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds-Dpp-Dkt-Db2-Dv24-Pmr-Df-Vp-r2-Uchat",
+            "requests": 4,
+            "generated_tokens": 256,
+            "decode_tok_s": 27.36144798041339,
+            "total_tok_s": 21.572730278930138,
+            "decode_ms": 9356.229984,
+            "total_ms": 11866.833575999999,
+            "wall_s": 11.870098352432251
+          }
+        ],
+        "policy_pair_decode_gain_over_fixed2_pct": 22.703854079419838,
+        "policy_pair_total_gain_over_fixed2_pct": 18.493502249865944
+      }
+    }
+  },
+  "reference": "Fixed k2 selected on TRAIN, global candidate only; k1 reported without selection.",
+  "combined": {
+    "all": {
+      "fixed2_decode_ms": 171407.64222799998,
+      "policy_decode_ms": 157668.5253295,
+      "fixed2_total_ms": 192562.85916999998,
+      "policy_total_ms": 178087.7609105,
+      "requests": 32,
+      "decode_ms_gain_pct": 8.71392490656433,
+      "total_ms_gain_pct": 8.128070219701744
+    },
+    "heldout": {
+      "fixed2_decode_ms": 37414.350338,
+      "policy_decode_ms": 34445.7487155,
+      "fixed2_total_ms": 42173.083475,
+      "policy_total_ms": 39013.8810035,
+      "requests": 7,
+      "decode_ms_gain_pct": 8.618194503532962,
+      "total_ms_gain_pct": 8.097637021081239
+    }
+  },
+  "byte_gate": "128/128 non-reference replies/counts match plain family references; original 16+16 prompts/counts; strict action/query/epoch binding in all four policy arms."
+}

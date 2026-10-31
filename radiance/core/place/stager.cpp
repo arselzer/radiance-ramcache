@@ -1,6 +1,8 @@
 /* stager.cpp -- see stager.h. */
 #include "place/stager.h"
 #include "place/dspark_native_scope.h"
+#include "place/ds41_index_memory.h"
+#include "../../arch/deepseek41/ds41_index_memory.h"
 #include "place/router_predictor.h"
 #include "ds41_host_experts.h"
 
@@ -949,7 +951,14 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     }
     want_.clear(); skip_.clear();
     for (int32_t u : L.units) {
-        if (mover_->ring_resident(u)) continue;   /* a lent-ring resident: the card's, as a VRAM one */
+        if (mover_->ring_resident(u)) {
+            if (bank_track_) {
+                bool selected=false;
+                if (!ep_route_unit_selected(counts_host_,plan_->units[(size_t)u].expert,&selected)) return RAD_E_STATE;
+                bank_selected_ += selected;
+            }
+            continue;   /* a lent-ring resident: the card's, as a VRAM one */
+        }
         bool selected = false;
         if (!ep_route_unit_selected(counts_host_, plan_->units[(size_t)u].expert, &selected))
             return RAD_E_STATE;
@@ -1701,6 +1710,20 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
                           "chunk: a libr4d that knows %s declares it to %lld", (long long)reach, kLcpEnv,
                           (long long)kEpRouteLcpMax).c_str());
         return RAD_E_INVAL;
+    }
+    /* The compact floor may cross the sparse launcher's internal48-row threshold. LCP's env
+     * pin is authoritative only for known untuned index rows from its actual admitted DSO. */
+    const char* compact = std::getenv(deepseek41::kIndexCompactEnv);
+    if (compact && !std::strcmp(compact, "1")) {
+        std::string reason;
+        if (!ds41_index_memory_admit(prog, &reason)) {
+            RAD_ERR("%s=1 refused after LCP admission: %s", deepseek41::kIndexCompactEnv, reason.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        if (plan_ && plan_->rank == 0)
+            RAD_INFO("compact index score admitted: known untuned scalar/index selection rows from the "
+                     "same loaded LCP library (%s=1); target256MiB, floor64, guard column retained",
+                     deepseek41::kIndexCompactEnv);
     }
     ep_rows_ = C;
     lcp_ = C;
@@ -2701,7 +2724,14 @@ int FileStager::hx_early_decide() {
     want_.clear();
     skip_.clear();
     for (int32_t u : L.units) {
-        if (mover_->ring_resident(u)) continue;   /* a lent-ring resident: the card's, as a VRAM one */
+        if (mover_->ring_resident(u)) {
+            if (bank_track_) {
+                bool selected=false;
+                if (!ep_route_unit_selected(counts_host_,plan_->units[(size_t)u].expert,&selected)) return RAD_E_STATE;
+                bank_selected_ += selected;
+            }
+            continue;   /* a lent-ring resident: the card's, as a VRAM one */
+        }
         bool selected = false;
         if (!ep_route_unit_selected(counts_host_, plan_->units[(size_t)u].expert, &selected))
             return RAD_E_STATE;
@@ -4527,6 +4557,14 @@ int FileStager::tbo_second(int32_t li, RadStream s) {
     return RAD_OK;
 }
 
+int FileStager::quiesce_for_draft_bank() {
+    if (draft_bank_lend_conflict() || armed_ || p1_armed_ || hx_stage_ || hx_li_ >= 0 ||
+        hx_early_li_ >= 0) return RAD_E_STATE;
+    if (p1_) RAD_TRY(p1_->quiesce_for_draft_bank());
+    drain_host_inserts();
+    return RAD_OK;
+}
+
 int FileStager::end_pass(RadStream s) {
     if (!armed_) return RAD_OK;
     armed_ = false;
@@ -4602,11 +4640,22 @@ int FileStager::end_pass(RadStream s) {
     return rc<0 ? rc : head_status_;
 }
 
+int FileStager::quiesce_for_backing() {
+    if (p1_on() || p1_lend_arena_asked()) return RAD_E_UNSUPPORTED;
+    if (armed_ || hx_stage_ != 0 || hx_li_ >= 0 || hx_early_li_ >= 0 || p1_armed_)
+        return RAD_E_STATE;
+    /* end_pass/hx_drain already joined miss posts and expert jobs before the rank barrier. The
+     * remaining insert threads touch immutable expert planes/RAM cache only, never KV. */
+    drain_host_inserts();
+    return RAD_OK;
+}
+
 /* ---- prefill Phase 1 (card_expert_stager.h) ---------------------------------------------------------- */
 
 /* RADIANCE_EXPERIMENTAL_DS41_P1: the switch's checks beyond lcp_init's bands and hx_init's CPU path, and
  * the path's start. Off (unset, empty, 0): nothing. Refused, with the reason: an invalid value; P1
- * without an admitted LCP chunk or beyond 2048; the tunables out of range; FETCH_LIST; the route trace;
+ * without an admitted LCP chunk or beyond the proven twin's bound; the tunables out of range;
+ * FETCH_LIST; the route trace;
  * the DSpark head tail; a routed layer the counts path or the CPU path does not take, or whose gate_up,
  * SwiGLU and down cannot be named; a routed unit off the card neither in the container nor pinned in
  * the host pool of a static plan (a pooled unit is copied to the ring from its pool slot, p1_pool_; a
@@ -4625,8 +4674,10 @@ int FileStager::p1_init(const Program& prog) {
     if (st < 0) return refuse("1 is on, 0 / unset / empty off");
     if (!enabled() || !mover_ || !plan_) return refuse("no routed layer is read from the container on this rank");
     if (!lcp_) return refuse(fmt("it needs large-chunk prefill (%s=<C>, the chunk the cards take)", kLcpEnv));
-    if (lcp_ > ds41p1::kTwinMaxRows || lcp_ > 2048)
-        return refuse(fmt("%s=%lld: the first milestone takes chunks of up to 2048", kLcpEnv, (long long)lcp_));
+    if (lcp_ > ds41p1::kTwinMaxRows || lcp_ > kEpRouteLcpMax)
+        return refuse(fmt("%s=%lld: chunks must fit the admitted LCP and P1 twin bounds (up to %lld)",
+                          kLcpEnv, (long long)lcp_,
+                          (long long)std::min<int64_t>(ds41p1::kTwinMaxRows, kEpRouteLcpMax)));
     p1::Tunables t;
     std::string why;
     if (!p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, &why)) return refuse(why);
@@ -4923,7 +4974,9 @@ int FileStager::p1_layer(int32_t li, RadStream s) {
         return RAD_E_STATE;
     }
     for (int e = 0; e < 96 && e < counts_cap_; ++e) p1_touched_ += counts_host_[e] > 0;
-    RAD_TRY(p1_->begin_layer(li, b));
+    /* Scatter's offsets are the exclusive prefix of these same synchronized ALL-expert counts,
+     * including the residents. The optional wave SwiGLU view needs no extra device readback. */
+    RAD_TRY(p1_->begin_layer(li, b, counts_host_, counts_cap_));
     /* The admission: none in a pass whose rows stop short of the admission row; every unit when the row
      * is 0 (a prompt within the last N tokens, or ..._LCP_ADMIT=all); else by the sorted order
      * fetched with the counts (none without it). */
@@ -5016,7 +5069,18 @@ int FileStager::launched(rad_op h, RadStream, const RadArgs* a, int (*launch)(co
     const int32_t op = (int32_t)h;
     const int which = op == hx_ops_[li].gu ? 0 : op == p1_ops_[li].sw ? 1 : op == p1_ops_[li].dn ? 2 : -1;
     if (which < 0) return RAD_OK;
-    return p1_->capture(which, a, launch);
+    bool span_ok = false;
+    if (which == 1 && p1_->tunables().swiglu_span && ep_program_ && (size_t)h < ep_program_->ops.size() &&
+        a && a->n_t == 2 && a->t && ep_program_->ops[(size_t)h].ranged_key == "M") {
+        for (const Band& b : ep_program_->ops[(size_t)h].bands) {
+            if (a->t[1].shape[0] > b.hi) continue;
+            const Resolved& r = b.dom[RAD_DOMAIN_DEVICE];
+            const RadKernelInfo* ki = r && r.row ? r.row->info : nullptr;
+            span_ok = p1::swiglu_span_launch_ok(ki, launch);
+            break;
+        }
+    }
+    return p1_->capture(which, a, launch, span_ok);
 }
 
 int FileStager::after_op(rad_op h, RadStream s) {

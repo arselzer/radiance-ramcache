@@ -28,6 +28,9 @@ L_three=$(mk three "$on" "$(held 0 740)" "$(bankl 0 1480)" "$(held 1 741)" "$(ba
 L_zero=$(mk zero "$on" "$(held 0 740)" "$(bankl 0 1480)" "$(held 1 741)" "$(bankl 1 1482)" "$(held 2 739)" "$(bankl 2 1478)" "$(held 3 742)" "$(bankl 3 0)")
 L_nobank=$(mk nobank "$on" "$(held 0 740)" "$(held 1 741)" "$(held 2 739)" "$(held 3 742)")
 L_plain=$(mk plain "nothing packed here")
+L_partial=$(mk partial "$on" "$(held 0 740)" "$(held 1 741)" "$(held 2 739)" "$(held 3 0)")
+L_missing=$(mk missing "$on" "$(held 0 740)" "$(held 1 741)" "$(held 2 739)")
+L_duplicate=$(mk duplicate "$on" "$(held 0 740)" "$(held 1 741)" "$(held 2 739)" "$(held 3 742)" "$(held 3 742)")
 expect() {   # want(0/1) what log vp bank
   local want=$1 what=$2 why rc
   why=$(vp_server_gate "$3" "$4" "$5"); rc=$?
@@ -39,6 +42,9 @@ expect 1 "Vp + bank with one rank's bank check missing"                 "$L_thre
 expect 1 "Vp + bank with a rank that packed no trunk weight"            "$L_zero"   1 1
 expect 0 "Vp without a bank: the switch's line and residents held"      "$L_nobank" 1 ""
 expect 1 "Vp without a bank, nothing held"                              "$L_plain"  1 ""
+expect 1 "Vp without a bank, one rank holds zero packed residents"      "$L_partial" 1 ""
+expect 1 "Vp without a bank, one rank's count is missing"               "$L_missing" 1 ""
+expect 1 "Vp without a bank, duplicate count is ambiguous"              "$L_duplicate" 1 ""
 expect 0 "no Vp, nothing packed (with or without a bank)"               "$L_plain"  "" 1
 expect 1 "no Vp, but the server packed (the switch from the window)"    "$L_nobank" "" ""
 

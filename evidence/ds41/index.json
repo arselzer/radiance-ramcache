@@ -23,7 +23,19 @@
     "ab-20261031T104524Z": "the merged base engine's replies and the CPU-path checks",
     "ab-20261031T111018Z": "DSML device gates and off/on references; initial live request exposed missing template",
     "ab-20261031T114348Z": "DSML parsed live tool call; trivial request chose empty reasoning before probe revision",
-    "ab-20261031T115207Z": "DSML chat parsing and generated-token identity with explicit template on unchanged chat and harness prompts"
+    "ab-20261031T115207Z": "DSML chat parsing and generated-token identity with explicit template on unchanged chat and harness prompts",
+    "ab-20261031T123034Z": "Rb beside P1 initial long and concurrency gate",
+    "ab-20261031T130014Z": "Read-only proposal capture and complete outcome binding",
+    "ab-20261031T134615Z": "P1 Vp actual packed residents; invalid long leg retained",
+    "ab-20261031T144623Z": "Corrected long and96GiB spill plus reversed concurrency repeat",
+    "ab-20261031T152308Z": "Matched fixed0/1/2 proposal identity and context lifecycle audit",
+    "ab-20261031T154102Z": "Quiet TRAIN-only matched verification costs",
+    "ab-20261031T162629Z": "4K corpus and long/prefix/small-cache gate",
+    "ab-20261031T165338Z": "Frozen adaptive policy real engine and heldout results",
+    "ab-20261031T175623Z": "Failed mixed-client admission attempt and passing backup/window codec cards",
+    "ab-20261031T180730Z": "Exact bank lending192/96 transitions and measured short-burst loss",
+    "ab-20261031T182505Z": "Exact AR and Engram gather slices with mixed performance",
+    "ab-20261031T185127Z": "Exact P1 span and n128, nearly neutral timing"
   },
   "windows": {
     "ab-20261028T220036Z": {
@@ -3744,6 +3756,213 @@
       "arms_started": 2,
       "qfn_restored": true,
       "left_out": []
+    },
+    "ab-20261031T123034Z": {
+      "files": 23,
+      "bytes": 2107919,
+      "server_logs": 8,
+      "server_log_bytes": 797926,
+      "server_log_xz_bytes": 137296,
+      "started_utc": "2026-10-31T12:30:34Z",
+      "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        }
+      ]
+    },
+    "ab-20261031T130014Z": {
+      "files": 23,
+      "bytes": 749880,
+      "server_logs": 8,
+      "server_log_bytes": 5016367,
+      "server_log_xz_bytes": 338496,
+      "started_utc": "2026-10-31T13:00:15Z",
+      "arms_started": 8,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T134615Z": {
+      "files": 32,
+      "bytes": 2279978,
+      "server_logs": 10,
+      "server_log_bytes": 1010431,
+      "server_log_xz_bytes": 173892,
+      "started_utc": "2026-10-31T13:46:16Z",
+      "arms_started": 8,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        }
+      ]
+    },
+    "ab-20261031T144623Z": {
+      "files": 33,
+      "bytes": 829222,
+      "server_logs": 10,
+      "server_log_bytes": 1010815,
+      "server_log_xz_bytes": 175328,
+      "started_utc": "2026-10-31T14:46:23Z",
+      "arms_started": 10,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T152308Z": {
+      "files": 17,
+      "bytes": 460126,
+      "server_logs": 5,
+      "server_log_bytes": 4761584,
+      "server_log_xz_bytes": 294148,
+      "started_utc": "2026-10-31T15:23:09Z",
+      "arms_started": 5,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T154102Z": {
+      "files": 26,
+      "bytes": 900541,
+      "server_logs": 10,
+      "server_log_bytes": 914737,
+      "server_log_xz_bytes": 161652,
+      "started_utc": "2026-10-31T15:41:03Z",
+      "arms_started": 10,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T162629Z": {
+      "files": 28,
+      "bytes": 2208362,
+      "server_logs": 10,
+      "server_log_bytes": 1081351,
+      "server_log_xz_bytes": 180196,
+      "started_utc": "2026-10-31T16:26:29Z",
+      "arms_started": 8,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M4096-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc4096-P1-Qe64-Mb1-Pci4096-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        }
+      ]
+    },
+    "ab-20261031T165338Z": {
+      "files": 27,
+      "bytes": 955626,
+      "server_logs": 10,
+      "server_log_bytes": 3362121,
+      "server_log_xz_bytes": 390844,
+      "started_utc": "2026-10-31T16:53:38Z",
+      "arms_started": 10,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T175623Z": {
+      "files": 16,
+      "bytes": 491167,
+      "server_logs": 1,
+      "server_log_bytes": 84941,
+      "server_log_xz_bytes": 14736,
+      "started_utc": "2026-10-31T17:56:24Z",
+      "arms_started": 0,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T180730Z": {
+      "files": 37,
+      "bytes": 8086540,
+      "server_logs": 6,
+      "server_log_bytes": 565324,
+      "server_log_xz_bytes": 100200,
+      "started_utc": "2026-10-31T18:07:30Z",
+      "arms_started": 0,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T182505Z": {
+      "files": 29,
+      "bytes": 2112685,
+      "server_logs": 10,
+      "server_log_bytes": 967782,
+      "server_log_xz_bytes": 167284,
+      "started_utc": "2026-10-31T18:25:05Z",
+      "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ag1024-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1024-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Ar1280-Ag1024-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        }
+      ]
+    },
+    "ab-20261031T185127Z": {
+      "files": 26,
+      "bytes": 2870517,
+      "server_logs": 10,
+      "server_log_bytes": 1032434,
+      "server_log_xz_bytes": 174904,
+      "started_utc": "2026-10-31T18:51:27Z",
+      "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Fn128-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Qsp-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        }
+      ]
     }
   }
 }

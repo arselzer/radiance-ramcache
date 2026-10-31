@@ -184,6 +184,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     if (!kv || !pc) return RAD_E_INVAL;
     draft_experiment_ = experiment ? *experiment : DraftExperiment{};
     if (!draft_experiment_.valid()) return RAD_E_INVAL;
+    dprob_on_ = draft_experiment_.prob_capture();
+    dprob_epoch_ = 0;
+    dprob_stats_ = {};
     // The owning Engine is the authority for bank/Program/final-Plan scope. Standalone
     // Scheduler component tests explicitly inject this private option, never read getenv.
     m_.draft_origin = {};
@@ -565,6 +568,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     dctx_.on = draft_experiment_.ctx_defer();
     /* The DSpark bank under several sequences drafts for a sequence alone (draft_conf.h); at one
      * sequence the rule decides nothing, so it is not on there. */
+    bank_observe_ = false; bank_frame_open_ = false;
+    bank_frame_step_ = -1; bank_frame_epoch_ = 0; bank_frame_solo_ = false;
     dsolo_ = !cfg.draft_bank.empty() && cfg.max_seqs > 1 && cfg.n_spec > 0 &&
              prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.depth > 0 &&
              !draft_experiment_.compute_off();
@@ -954,6 +959,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 }
 
 void Scheduler::fini() {
+    if (dprob_on_)
+        for (auto& s : reqs_) if (s) dprob_discard(*s, "scheduler_fini");
     for (auto& s : reqs_)
         if (s && s->req && (s->running || s->pending_free)) kv_->free_sequence(s->req->id);
     builder_.fini();
@@ -1048,7 +1055,9 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     if (!reqs_[(size_t)slot]) reqs_[(size_t)slot] = std::make_unique<SchedReq>();
 
     SchedReq& s = *reqs_[(size_t)slot];
+    if (dprob_on_) dprob_discard(s, "slot_reused");
     s.req = std::move(r);
+    s.dprob = {};
     s.arrival = ++arrival_;
     s.arrived_us = mono_us();
     s.first_tok_us = 0;
@@ -1143,7 +1152,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
 
     // Full5 head generation is retained. Only this explicitly configured control
     // installs a prefix before fixed-ahead exact-count validation (as adaptive does).
-    if (draft_experiment_.verify_cap() >= 0) {
+    if (draft_experiment_.verify_cap() >= 0 || draft_experiment_.early_verify() >= 0) {
         if (n > cfg_.n_spec) return RAD_E_STATE; // malformed producer, not a longer legal prefix
         n = draft_experiment_.runtime_depth(n);
     }
@@ -1305,6 +1314,10 @@ void Scheduler::trim_prefix_cache(const Request* spare, int64_t spare_tokens) {
 
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
                               bool publish, int status, const char* why) {
+    /* An in-flight verification still gets paired at commit, including a cancelled request.
+     * Otherwise this pending proposal can never acquire a target outcome. */
+    if (dprob_on_ && s.entry < 0 && s.entry_next < 0)
+        dprob_discard(s, st == ReqState::Cancelled ? "cancelled" : "request_closed", st == ReqState::Cancelled);
     ++step_finished_;
     /* Publish before freeing: this is the only moment the whole prefix is both computed and still
      * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
@@ -1526,6 +1539,7 @@ void Scheduler::take_completed(std::vector<uint64_t>* out) {
 }
 
 void Scheduler::release_locked(SchedReq& s) {
+    if (dprob_on_) dprob_discard(s, "reaped");
     if (s.pending_free) { free_kv(s); s.pending_free = false; --n_deferred_; }
     if (s.reap_pending) { s.reap_pending = false; --n_deferred_; }
     by_id_.erase(s.req->id);
@@ -1600,7 +1614,10 @@ void Scheduler::shutdown(const char* reason, int status) {
     /* Nothing will commit again, so no entry of the last step still owns its slot. */
     step_open_ = false;
     next_open_ = false;
-    for (auto& up : reqs_) if (up) { up->entry = -1; up->entry_next = -1; }
+    for (auto& up : reqs_) if (up) {
+        if (dprob_on_) dprob_discard(*up, "shutdown");
+        up->entry = -1; up->entry_next = -1;
+    }
     block_.clear();
     serial_.clear();
     sweep_deferred();
@@ -2032,6 +2049,7 @@ void Scheduler::preempt_back() {
     int32_t slot = running_.back();
     SchedReq& s = *reqs_[(size_t)slot];
     Request& r = *s.req;
+    if (dprob_on_) dprob_discard(s, "preempted");
 
     /* Preemption by recompute: the blocks go back and the request restarts from zero. Its output
      * is the tail of its token sequence, so it simply re-prefills prompt ++ output. */
@@ -2493,6 +2511,21 @@ bool Scheduler::preempt_wait_overdue(const SchedReq& s) const {
 /* ------------------------------------------------------------------ the step */
 const RadBatch* Scheduler::step() {
     std::lock_guard<std::mutex> lk(mu_);
+    return step_locked();
+}
+
+int Scheduler::step_quiescent(const std::function<int()>& before_plan, const RadBatch** out) {
+    if (!out) return RAD_E_INVAL;
+    *out = nullptr;
+    if (!before_plan) return RAD_E_INVAL;
+    std::lock_guard<std::mutex> lk(mu_);
+    const int rc = before_plan();
+    if (rc < 0) return rc;
+    *out = step_locked();
+    return RAD_OK;
+}
+
+const RadBatch* Scheduler::step_locked() {
     /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
 
@@ -2797,6 +2830,7 @@ replan:
             /* Nor one decoding beside another under the bank's one-sequence rule (solo_hold). */
             else if (solo_hold) {
                 if (s.n_draft > 0) ++dconf_tot_.solo_dropped;
+                if (dprob_on_) dprob_discard(s, "concurrency");
                 s.n_draft = 0;
             }
             else if (s.n_draft == 0) {
@@ -3552,6 +3586,11 @@ int Scheduler::commit(StepResult& res) {
         const StepEntry& e = plan_.e[(size_t)i];
         SchedReq& s = *reqs_[(size_t)e.slot];
         Request& r = *s.req;
+        if (dprob_on_ && s.dprob.n > 0 && !e.is_prefill && e.produces_token) {
+            int a = res.n_accepted ? res.n_accepted[i] : 0;
+            a = std::max(0, std::min(a, e.n_spec));
+            dprob_verify(s, e, e.dev ? r.n_computed : (int64_t)e.ctx_len, a);
+        }
         if (r.state != ReqState::Running) {
             /* Cancelled between step and commit; its blocks were held until the device finished
              * with them. If the server also reaped it, the sweep at the end of this function
@@ -4158,6 +4197,12 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_ctx_at_ = 0;
     block_len_ = 0;
     block_depth_ = 0;
+    if (bank_observe_) {
+        bank_frame_step_ = step_ - 1;
+        ++bank_frame_epoch_;
+        bank_frame_solo_ = false;
+        bank_frame_open_ = true;
+    }
     /* Where a row of the step starts: a row on the card where its sequence's commit left it (the
      * card positioned it, advance.h), any other where the build put it. */
     const auto row_pos = [&](const StepEntry& e) -> int64_t {
@@ -4239,6 +4284,7 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         solo_held = live > 1 || (live == 1 && other);
         if (solo_held) ++dconf_tot_.solo_steps;
     }
+    if (bank_observe_) bank_frame_solo_ = solo_held;
 
     int n_draft_rows = 0;
     for (size_t i = 0; i < plan_.e.size(); ++i) {
@@ -4564,8 +4610,41 @@ const RadBatch* Scheduler::block_query(int step) {
 /* The filled range moves over what the context pass wrote. The query pass's K and V are
  * speculative and not counted; the next step's context pass rewrites them from the trunk's real
  * hidden states. */
+int Scheduler::enable_draft_bank_observation() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (bank_observe_ || !dsolo_ || !dctx_.on || step_open_ || next_open_) return RAD_E_STATE;
+    bank_observe_ = true;
+    return RAD_OK;
+}
+
+int Scheduler::with_draft_bank_frame(int step,
+        const std::function<int(const draft_bank::Work&)>& fn) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!fn || !bank_observe_ || !bank_frame_open_ || !dsolo_ || !dctx_.on || !step_open_ || next_open_ ||
+        bank_frame_step_ != step || bank_frame_epoch_ == 0) return RAD_E_STATE;
+    draft_bank::Work w{};
+    w.step = step; w.epoch = bank_frame_epoch_;
+    w.deferred = dctx_.on; w.solo_held = bank_frame_solo_;
+    for (const BlockSeq& b : block_) {
+        if (!b.mirror) w.context_rows += std::max<int64_t>(b.ctx_n - b.ctx_done, 0);
+        if (b.can_draft) {
+            w.query_rows += block_len_;
+            if (w.query_seq && w.query_seq != b.seq) return RAD_E_STATE;
+            w.query_seq = b.seq;
+        }
+    }
+    return fn(w);
+}
+
+int Scheduler::with_draft_bank_idle(const std::function<int()>& fn) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!fn || step_open_ || next_open_) return RAD_E_STATE;
+    return fn();
+}
+
 void Scheduler::block_end() {
     std::lock_guard<std::mutex> lk(mu_);
+    if (bank_observe_) bank_frame_open_ = false;
     for (const BlockSeq& d : block_) {
         if (d.mirror) continue;                /* finished; it has no draft cache to track */
         if (d.slot < 0 || (size_t)d.slot >= reqs_.size() || !reqs_[(size_t)d.slot]) continue;

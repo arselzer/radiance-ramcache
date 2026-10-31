@@ -24,6 +24,11 @@
 # Rb (the routers read as bf16) are also checked in the server log, and so is a predictor part's
 # router predictor. An Rb arm runs only after SELFTEST_F32BF16's card checks passed in the window,
 # and a Vp arm only on a libr4d.so VPACK_CHECK passed (below).
+# Fn128 selects the default-off n128 fused index-key norm. It needs DEVICE_CHECKS=n128,
+# N128_CHECK_BIN (ds41_n128_device_check) and N128_CHECK_LIB, with the card oracle through M4096
+# passing on the arm's library SHA. Every normal rank must actually dispatch the fast kernel.
+# Qsp selects the default-off covering SwiGLU span beside P1; it needs the full/span wave oracle
+# and every rank must report actual reduced rows at exit. Every other arm explicitly disables it.
 #
 # Prefix caching (every other arm runs with --no-prefix-cache): Pc the prefix cache on, with
 # RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 (startup's checks after the load stop reserving the
@@ -81,7 +86,7 @@
 # f32, so one changed logit anywhere in a row shows).
 #
 # Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP=C): LcN sets it and --max-num-batched-tokens N
-# (N a multiple of 16 in 64..2048), e.g. ...-M1024-...-B1-...-Lc1024-Mr32; it needs MN (..._MISSES at
+# (N a multiple of 16 in 64..4096), e.g. ...-M1024-...-B1-...-Lc1024-Mr32; it needs MN (..._MISSES at
 # least N), B1 (the CPU takes every routed unit) and an Mr part (Mr32 or Mr64; Mr4 only as a control),
 # cannot go with Xt or BT, and leaves
 # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL unset (LCP keeps its pins; every other arm runs with LCP=0).
@@ -93,6 +98,9 @@
 # DEVICE_CHECKS (a list) runs ds41_mxfp4_device_check `lcp LCP_CHECK_C` (1024), `sweep` under LCP and
 # `sweep0` on card 0 (TALL_LIBR4D and TALL_CHECK named, as for `tall`), and an Lc arm runs only on the
 # libr4d.so (sha256) those passed on, at a chunk of at most LCP_CHECK_C.
+# Above 2048, give an explicit PciN interval at least the chunk (Pci4096 for Lc4096), also for a
+# cold arm without Pc: linear-state checkpoints cap chunks even when the prefix cache is off.
+# The interval default remains 2048. Other Pci/Pc-only combinations retain their guards below.
 #
 # MbN: RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=N (libr4d, read by the routed MXFP4 gemv): 1 every call of the
 # plain gemv kernel (the decode band to 16 tokens and the twin above), 2 the twin above 16 tokens only;
@@ -100,7 +108,8 @@
 # which mx_range hands the rank's last expert) writes zeros without reading weights. Same bytes by
 # construction. Every arm without the part runs with it at 0. `bal` in DEVICE_CHECKS runs
 # ds41_mxfp4_device_check `bal LCP_CHECK_C [BAL_ROUTES]` on card 0 (TALL_CHECK and TALL_LIBR4D, as for
-# `lcp`): the balanced kernel against the plain one, every output value, and both timed (devcheck-bal.log);
+# `lcp`): the balanced kernel against the plain one, every output value and redzones, timed through
+# M2048 and byte-only above it (devcheck-bal.log); Mb+Lc needs the receipt's actual BAL_MAX_M to cover Lc;
 # an Mb arm runs only on the libr4d.so (sha256) that passed it. Lf: RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=1,
 # the file stager's per-pass-size time lines at exit (an instrument; no change to what runs).
 #
@@ -135,10 +144,24 @@
 # "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines; a P1 arm whose stats lines count a lease held at a pass
 # end, or (Qv) a host-verified expert-row that differs from the card's, is not measured.
 #
+# Coordinated actual Ar1280+Ag1024 caps additionally need SELFTEST_AR_AG_SHARED=<r4d_selftest>:
+# fresh all-four-card ds41_ar_ag_shared_exact pointer/lifetime/mixed replay receipt. It supplements
+# both independent receipts and never enables caps or changes any other arm's requirements.
+# AgN: independent exact Engram all_gather row slices (AG_ROWS=N; all other arms state 0).
+# Needs the existing Es split plus SELFTEST_AG_ROWS=<this build's r4d_selftest>; before any arm,
+# a fresh all-four-card ds41_ag_rows_exact receipt is bound to the full served libr4d SHA256.
+# Serving and KLD require actual cap/row/output-pitch proof. No Ag arm can be a KLD reference.
+# ArN: exact all_reduce row slices (RADIANCE_EXPERIMENTAL_DS41_AR_ROWS=N; every other arm states 0).
+# SELFTEST_AR_ROWS names this build's r4d_selftest. Before any arm, after QFN stops, every Ar home's
+# libr4d.so gets a fresh four-card --case ds41_ar_rows_exact check; all four cap/ts_min cases must
+# pass, with exit0 and unchanged full SHA256. No inherited card mask or one-card mode is used.
+# An Ar arm must log the actual cap min(N, its BT/Lc step or16) at startup, including Kld runs;
+# a plain arm must not log slicing. Ar cannot provide the Kld reference. Engram gather is unchanged.
+#
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `swiglu` the default checks, `tall` the exact-tall checks, `lcp` the large-chunk
-# ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK),
+# ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK; `n128` uses N128_CHECK_BIN/LIB),
 # SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's checks and timings on card 0 before the
 # arms; unset, none, and no Rb arm runs).
 set -u
@@ -277,7 +300,73 @@ xt_check() {   # name
   fi
   [[ -n "${ARM_XT:-}" ]] && grep -m1 -E 'exact tall passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_BT:-}" ]] && grep -m1 -E 'chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  ar_rows_server_check "$name" || return 1
+  ag_rows_server_check "$name" || return 1
   lcp_check "$name"
+}
+
+ar_rows_parse() {   # ArN, positive whole rows; bounded spelling avoids shell arithmetic overflow
+  [[ $1 =~ ^Ar([0-9]{1,9})$ ]] || return 1
+  (( 10#${BASH_REMATCH[1]} > 0 )) || return 1
+  echo "$((10#${BASH_REMATCH[1]}))"
+}
+ar_rows_server_gate() {   # server log, requested rows (empty/0 off), actual expected cap
+  local f=$1 requested=${2:-0} cap=${3:-0} lines
+  lines=$(grep -c 'exact AR row slices:' "$f")
+  if [[ $requested == 0 ]]; then
+    [[ $lines == 0 ]] && return 0
+    echo 'no Ar part, but the server enabled exact AR row slices'; return 1
+  fi
+  [[ $cap =~ ^[1-9][0-9]*$ ]] || { echo 'Ar has no positive expected actual cap'; return 1; }
+  if [[ $lines != 1 ]] || ! grep -Fq "exact AR row slices: at most $cap rows (RADIANCE_EXPERIMENTAL_DS41_AR_ROWS); all_reduce bounds and launches sliced, Engram all_gather independently controlled" "$f"; then
+    echo "Ar$requested needs one startup line proving actual cap $cap, found $lines matching lines"; return 1
+  fi
+  return 0
+}
+ar_rows_server_check() {   # name; called on both serving and KLD startup paths through xt_check
+  local name=$1 why
+  if ! why=$(ar_rows_server_gate "$OUT/$name.server.log" "${ARM_AR_ROWS:-0}" "${ARM_AR_CAP:-0}"); then
+    log "arm $name: $why; not measured"; return 1
+  fi
+  if [[ -n ${ARM_AR_ROWS:-} ]]; then
+    grep -m1 'exact AR row slices:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  fi
+  return 0
+}
+
+ag_rows_parse() {   # AgN; an independent Engram-gather cap, never an AR flag
+  [[ $1 =~ ^Ag([0-9]{1,9})$ ]] || return 1
+  (( 10#${BASH_REMATCH[1]} > 0 )) || return 1
+  echo "$((10#${BASH_REMATCH[1]}))"
+}
+ag_rows_server_gate() {   # server log, requested rows, actual expected clamped cap
+  local f=$1 requested=${2:-0} cap=${3:-0} lines line re row pitch
+  lines=$(grep -c 'exact Engram gather row slices:' "$f")
+  if [[ $requested == 0 ]]; then
+    [[ $lines == 0 ]] && return 0
+    echo 'no Ag part, but the server enabled exact Engram gather row slices'; return 1
+  fi
+  [[ $cap =~ ^[1-9][0-9]*$ ]] || { echo 'Ag has no positive expected actual cap'; return 1; }
+  line=$(grep 'exact Engram gather row slices:' "$f")
+  re="^radiance: deepseek41: exact Engram gather row slices: at most $cap rows \(RADIANCE_EXPERIMENTAL_DS41_AG_ROWS\); row ([1-9][0-9]{0,8}), output pitch ([1-9][0-9]{0,8}), all_reduce unchanged by AG_ROWS$"
+  if [[ $lines != 1 || ! $line =~ $re ]]; then
+    echo "Ag$requested needs one startup line proving actual cap $cap and row pitches"; return 1
+  fi
+  row=${BASH_REMATCH[1]} pitch=${BASH_REMATCH[2]}
+  if (( row % 8 != 0 || pitch != 4 * row )); then
+    echo 'Ag needs whole-16-byte bf16 rows and the full four-rank output pitch'; return 1
+  fi
+  return 0
+}
+ag_rows_server_check() {
+  local name=$1 why
+  if ! why=$(ag_rows_server_gate "$OUT/$name.server.log" "${ARM_AG_ROWS:-0}" "${ARM_AG_CAP:-0}"); then
+    log "arm $name: $why; not measured"; return 1
+  fi
+  if [[ -n ${ARM_AG_ROWS:-} ]]; then
+    grep -m1 'exact Engram gather row slices:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  fi
+  return 0
 }
 
 # RADIANCE_EXPERIMENTAL_DS41_LCP (the LcN part): the file stager says at startup that it took passes of
@@ -344,8 +433,64 @@ lcp_check() {   # name
   return 0
 }
 
+# Fn128: require an actual normal dispatch on each active TP rank, not just a switch/startup
+# message. This window serves TP4. A plain arm must have no marker, including legacy markers.
+n128_server_gate() {   # server log, Fn128 flag, active ranks (4 here); explanation on failure
+  local f=$1 want=$2 ranks=${3:-4} r
+  if [[ -n "$want" ]]; then
+    for ((r=0; r<ranks; ++r)); do
+      if ! grep -qE "ds41 n128 active: normal dispatch rank=$r world=$ranks n=128 M=[1-9][0-9]* old_thr=(256|512|1024)([[:space:]]|$)" "$f"; then
+        echo "Fn128 has no successful normal n128 fast dispatch on rank $r of $ranks"
+        return 1
+      fi
+    done
+  elif grep -qF 'ds41 n128 active:' "$f"; then
+    echo "no Fn128 part, but a normal n128 fast dispatch was logged"
+    return 1
+  fi
+  return 0
+}
+
+n128_arm_gate() {   # library, conservative work-row bound; receipt is set by the device oracle
+  local lib=$1 rows=$2
+  if [[ "${N128_OK:-}" != 1 ]]; then
+    echo "${N128_WHY:-no n128 byte oracle}"
+    return 1
+  fi
+  if (( rows < 1 || rows > ${N128_MAX_M:-0} )); then
+    echo "work bound $rows exceeds oracle M${N128_MAX_M:-0}, or is invalid"
+    return 1
+  fi
+  if [[ ! -f "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "${N128_SUM:-}" ]]; then
+    echo "libr4d.so (${lib:-none}) is not the oracle SHA ${N128_SUM:-none}"
+    return 1
+  fi
+  return 0
+}
+
+# Read a successful bal run's actual height list, never its command line alone or a legacy
+# generic PASS. The maximum and the requested C must both be present in the increasing list.
+bal_receipt_bound() {   # log, requested C; actual checked maximum on stdout, or refusal
+  local f=$1 want=$2 line bound requested heights prev=0 h found=""
+  [[ $want =~ ^[1-9][0-9]{0,3}$ ]] || return 1
+  line=$(grep -E '^bal: byte coverage max_M=[0-9]+ requested_C=[0-9]+ heights=[0-9]+(,[0-9]+)*$' "$f")
+  [[ $line =~ ^bal:\ byte\ coverage\ max_M=([1-9][0-9]{0,3})\ requested_C=([1-9][0-9]{0,3})\ heights=([0-9]+(,[0-9]+)*)$ ]] || return 1
+  bound=${BASH_REMATCH[1]} requested=${BASH_REMATCH[2]} heights=${BASH_REMATCH[3]}
+  (( bound <= 4096 && requested == want && bound == requested )) || return 1
+  local -a tested=()
+  IFS=, read -r -a tested <<< "$heights"
+  for h in "${tested[@]}"; do
+    [[ $h =~ ^[1-9][0-9]{0,3}$ ]] || return 1
+    (( h > prev && h <= bound )) || return 1
+    (( h == requested )) && found=1
+    prev=$h
+  done
+  [[ -n "$found" ]] && (( prev == bound )) || return 1
+  echo "$bound"
+}
+
 # A Kld arm: its server records the corpus (--kld-record) instead of serving, then exits. The
-# window's first Kld arm that finishes is the reference (KLD_REF), never an Xt arm; a later one's
+# window's first Kld arm that finishes is the reference (KLD_REF), never an Xt/Lc/Fn128 arm; a later one's
 # records must equal it byte for byte. KLD_TIMEOUT (900 s) bounds a run.
 KLD_REF=
 kld_finish() {   # name; the run is SERVER_PID
@@ -358,12 +503,24 @@ kld_finish() {   # name; the run is SERVER_PID
   log "arm $name: kld run exit $rc after ${t}s"
   grep -E 'kld:|error|ERR' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   (( rc == 0 )) || return 1
+  local n128_why
+  if ! n128_why=$(n128_server_gate "$OUT/$name.server.log" "${ARM_N128:-}" 4); then
+    log "arm $name: $n128_why; not measured"
+    return 1
+  fi
+  [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   xt_check "$name" || return 1
+  lcp_check "$name" || return 1
+  local extra_why
+  if ! extra_why=$(vp_server_gate "$OUT/$name.server.log" "${ARM_VP:-}" "$([[ " ${ARGS[*]} " == *" --draft-bank "* ]] && echo 1)") ||
+     ! extra_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit); then
+    log "arm $name: $extra_why; Kld not measured"; return 1
+  fi
   if [[ -z "$KLD_REF" ]]; then
-    # The reference must be a 16-token arm's bits: an Xt or Lc arm first (the plain one failed or is
-    # missing) would let a later Xt or Lc arm be compared with another one.
-    if [[ -n "${ARM_XT:-}${ARM_LC:-}" ]]; then
-      log "arm $name: an Xt or Lc arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
+    # The reference must be a plain 16-token arm's bits: a feature arm first (the plain one failed
+    # or is missing) would let a later feature arm be compared with another one.
+    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}${ARM_AG_ROWS:-}" ]]; then
+      log "arm $name: an Xt, Lc, Fn128, Ar or Ag arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
       return 1
     fi
     KLD_REF=$OUT/kld-$name
@@ -373,7 +530,28 @@ kld_finish() {   # name; the run is SERVER_PID
   python3 -I "$HERE/ab_requests.py" --kld-compare "$KLD_REF" "$OUT/kld-$name" 2>&1 | tee -a "$OUT/window.log"
 }
 
-# RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part), from a server log: the engine names the switch at
+# Qsp must be active on every rank and reduce actual wave work, rather than only enable a switch.
+qsp_gate() {   # log, requested switch, start/exit
+  local f=$1 on=$2 stage=${3:-start} rank count line spans rows full fallbacks
+  if [[ -z "$on" ]]; then
+    if grep -q 'wave SwiGLU spans' "$f"; then echo 'no Qsp part, but SwiGLU spans are active'; return 1; fi
+    return 0
+  fi
+  for rank in 0 1 2 3; do
+    count=$(grep -cE "ds41 p1: rank $rank's wave SwiGLU spans on" "$f")
+    if [[ $count != 1 ]]; then echo "Qsp, but rank $rank lacks one startup marker"; return 1; fi
+    [[ "$stage" == exit ]] || continue
+    count=$(grep -cE "ds41 p1 stats, rank $rank: .*; wave SwiGLU spans " "$f")
+    line=$(sed -nE "s/.*ds41 p1 stats, rank $rank: .*; wave SwiGLU spans ([0-9]+), rows ([0-9]+) of ([0-9]+), full-replay fallbacks ([0-9]+).*/\\1 \\2 \\3 \\4/p" "$f")
+    read -r spans rows full fallbacks <<< "$line"
+    if [[ $count != 1 || -z "$full" ]] || (( spans == 0 || rows >= full )); then
+      echo "Qsp, but rank $rank has no demonstrated work reduction (${line:-no counters})"; return 1
+    fi
+  done
+  return 0
+}
+
+# Vp names the switch and actual packed static residents on every rank.
 # startup and each rank how many static residents it holds packed. A Vp arm without the switch's line or
 # with no rank holding any packed (a radiance without the switch, a dynamic plan), or a plain arm with
 # either line (the switch taken from the window's environment), is not measured. With a DSpark bank (a Ds
@@ -384,13 +562,23 @@ kld_finish() {   # name; the run is SERVER_PID
 # Arguments: the log, the arm's Vp (non-empty: on), its bank (non-empty: bound). 0 when the arm may be
 # measured; otherwise 1, the reason on stdout.
 vp_server_gate() {
-  local f=$1 vp=$2 bank=$3 vp_on vp_held vp_bank
+  local f=$1 vp=$2 bank=$3 vp_on vp_held vp_bank rank
   vp_on=$(grep -c 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' "$f")
   vp_held=$(grep -cE 'holds [1-9][0-9]* static residents' "$f")
   vp_bank=$(grep -cE 'VRAM packed experts: rank [0-9]+: DSpark bank bound; [1-9][0-9]* trunk weights packed' "$f")
   if [[ -n "$vp" ]] && [[ "$vp_on" == 0 || "$vp_held" == 0 ]]; then
     echo "Vp, but the server log has $vp_on 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' and $vp_held 'holds N static residents' lines with N above 0 ($(grep -m2 -E 'VRAM packed experts' "$f" | tr '\n' ' '))"
     return 1
+  fi
+  # A positive count on just one rank is insufficient, including P1's mixed reader bands.
+  # Actual packed static residents prove eligibility and placement both occurred on each rank.
+  if [[ -n "$vp" ]]; then
+    for rank in 0 1 2 3; do
+      if [[ $(grep -cE "VRAM packed experts: rank $rank holds [1-9][0-9]* static residents in the packed-scale form" "$f") != 1 ]]; then
+        echo "Vp, but rank $rank did not log exactly one nonzero packed static-resident count"
+        return 1
+      fi
+    done
   fi
   if [[ -n "$vp" && -n "$bank" && "$vp_bank" != 4 ]]; then
     echo "Vp with a DSpark bank, but $vp_bank of the 4 ranks logged 'DSpark bank bound; N trunk weights packed' with N above 0 ($(grep -m2 -E 'VRAM packed experts: (rank [0-9]+: DSpark|a DSpark)' "$f" | tr '\n' ' '))"
@@ -565,6 +753,10 @@ EOF2
     grep -m1 -E 'consumer skip: complete checkpoints' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   fi
   xt_check "$name" || { stop_server; return 1; }
+  local qsp_why
+  if ! qsp_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" start); then
+    log "arm $name: $qsp_why; not measured"; stop_server; return 1
+  fi
   # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
   # rank 0 names what it took at startup. An arm whose line is missing or says otherwise (a radiance
   # without the switch, a cache that is not packed), or a plain arm with one, is not measured.
@@ -704,10 +896,12 @@ EOF2
   # round, is not measured.
   local want got pat
   for pat in "Dc:DSpark confidence head: " "Dl:DSpark load-aware drafting: on" "Dx:DSpark context pass deferred (" \
-             "Dm:placement: 'dspark.markov_w" "Ds with NK:DSpark draft bank with up to "; do
+             "Dm:placement: 'dspark.markov_w" "Dpc:DSpark read-only proposal capture: on" \
+             "Dme:DSpark matched early verify: on" \
+             "Ds with NK:DSpark draft bank with up to "; do
     want=${pat%%:*}; got=$(grep -cF "${pat#*:}" "$OUT/$name.server.log")
     local flag; case $want in Dc) flag=${ARM_DC:-};; Dl) flag=${ARM_DL:-};; Dx) flag=${ARM_DX:-};; Dm) flag=${ARM_DM:-};;
-                              "Ds with NK") flag=${ARM_SOLO:-};; esac
+                              Dpc) flag=${ARM_DPC:-};; Dme) flag=${ARM_DME:-};; "Ds with NK") flag=${ARM_SOLO:-};; esac
     if [[ -n "$flag" && "$got" == 0 ]]; then
       log "arm $name: $want, but the server log has no '${pat#*:}' line (a radiance or plugin without the switch?); not measured"
       stop_server; return 1
@@ -717,7 +911,16 @@ EOF2
       stop_server; return 1
     fi
   done
-  grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |placement: 'dspark.markov_w|DSpark draft bank with up to " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  if [[ -n "${ARM_DME:-}" ]] && ! grep -qF "DSpark matched early verify: on k=${ARM_DME}" "$OUT/$name.server.log"; then
+    log "arm $name: Dme${ARM_DME}, but startup reports another fixed prefix; not measured"
+    stop_server; return 1
+  fi
+  if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --log "$OUT/$name.server.log" >>"$OUT/window.log" 2>&1; then
+    log "arm $name: DSpark policy startup/config guard failed; not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_DPP:-}" ]] && grep -F 'DSpark prefix policy: on config=' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |DSpark read-only proposal capture: on|DSpark matched early verify: on|placement: 'dspark.markov_w|DSpark draft bank with up to " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Df (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): the plugin names, on each rank, the drafter's dense
   # weights it reads from E4M3 codes. A Df arm without such a line with N above 0, or another arm
   # with one, is not measured.
@@ -757,6 +960,25 @@ EOF2
     log "arm $name: teacher-forced along $lpref: exit $?"
   fi
   stop_server
+  if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --log "$OUT/$name.server.log" --complete >>"$OUT/window.log" 2>&1; then
+    log "arm $name: DSpark policy action/cycle/config guard failed; not measured"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
+  local n128_why
+  if ! n128_why=$(n128_server_gate "$OUT/$name.server.log" "${ARM_N128:-}" 4); then
+    log "arm $name: $n128_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
+  [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  if [[ -n "${ARM_DME:-}" ]] && {
+       ! grep -qE "DSpark matched early costs: k=${ARM_DME} n=[1-9][0-9]* " "$OUT/$name.server.log" ||
+       ! grep -qE 'DSpark matched early totals: queries=[1-9][0-9]* .* waits=[1-9][0-9]* ' "$OUT/$name.server.log"; }; then
+    log "arm $name: matched early control lacks steady cycles/query/wait totals; not measured"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
   # Dk / Dkt (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV): libr4d names the mode at its first draft call
   # and counts the calls when the server exits. A Dk arm without the first line, or whose exit line
   # leaves draft-shaped calls on the old path, or another arm with either line, is not measured:
@@ -772,6 +994,11 @@ EOF2
   fi
   if [[ -n "$dk_bad" ]]; then
     log "arm $name: $dk_bad; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  local qsp_exit_why
+  if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit); then
+    log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   # P1 at exit: each rank's "ds41 p1 stats, rank" line counts the leases its passes still held at their
@@ -937,6 +1164,9 @@ echo $$ > /home/as/ds41-claude-build/work/qfn_stopped_by   # the QFN watchdog le
 log "stopping $NAME"
 "${DOCKER[@]}" stop -t 60 "$NAME" >>"$OUT/window.log" 2>&1
 sleep 5
+AR_AG_SHARED_WINDOW_ACTIVE=1
+AG_ROWS_WINDOW_ACTIVE=1
+AR_ROWS_WINDOW_ACTIVE=1   # the AR checker also verifies QFN's actual exited state
 
 if [[ "${DEVICE_CHECKS:-1}" == ptime && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
   log "prefill-shaped moe_gemm_ggml timing on card 0 with $RHOME/kernels/libr4d.so"
@@ -952,7 +1182,7 @@ LCP_OK="" LCP_LIB="" LCP_SUM="" LCP_C=0
 LCP_WHY="no large-chunk prefill device checks in this window (DEVICE_CHECKS=lcp with TALL_CHECK and TALL_LIBR4D)"
 if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
   # RADIANCE_EXPERIMENTAL_DS41_LCP on card 0: the twin and the sparse ops at chunk heights up to
-  # LCP_CHECK_C (`lcp`, which also sweeps every other height-dependent op to 2048 rows, gemm_nt by the
+  # LCP_CHECK_C (`lcp`, which also sweeps every other height-dependent op through that chunk, gemm_nt by the
   # row the table resolves, the router's column split and gemm_nt_bf16f8 at N 1280 and 4096 among
   # them), the sweep under LCP alone, and
   # without any switch (`sweep0`), each row against the same row alone and in launches of 16.
@@ -962,8 +1192,8 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
   if [[ ! -x "$TC" || ! -f "$TL" ]]; then
     LCP_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
     log "large-chunk prefill device checks: $LCP_WHY; no Lc arm is measured"
-  elif ! [[ $LC =~ ^[0-9]+$ ]] || (( 10#$LC < 64 || 10#$LC > 2048 || 10#$LC % 16 )); then
-    LCP_WHY="LCP_CHECK_C=$LC is not a multiple of 16 in 64..2048"
+  elif ! [[ $LC =~ ^[0-9]+$ ]] || (( 10#$LC < 64 || 10#$LC > 4096 || 10#$LC % 16 )); then
+    LCP_WHY="LCP_CHECK_C=$LC is not a multiple of 16 in 64..4096"
     log "large-chunk prefill device checks: $LCP_WHY; no Lc arm is measured"
   else
     LC=$((10#$LC))
@@ -988,6 +1218,9 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
     for f in lcp sweep; do
       grep -q 'gemm_nt_bf16f8 N=1280 K=5120' "$OUT/devcheck-lcp-$f.log" && grep -q 'gemm_nt_bf16f8 N=4096 K=1024' "$OUT/devcheck-lcp-$f.log" ||
         lcp_bad+=" $f did not sweep gemm_nt_bf16f8 (a harness without its case?);"
+      if (( LC > 2048 )) && ! grep -Eq " ${LC}:ok([[:space:]]|$)" "$OUT/devcheck-lcp-$f.log"; then
+        lcp_bad+=" $f did not check the requested $LC-row height (an older 2048-only sweep?);"
+      fi
     done
     if [[ -z "$lcp_bad" ]]; then
       LCP_OK=1 LCP_LIB=$TL LCP_C=$LC LCP_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
@@ -1000,7 +1233,7 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
 fi
 # The Mb arms' gate (RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE): an Mb arm runs only on the libr4d.so (sha256)
 # whose `bal` check passed in this window (the balanced gemv and twin give the plain kernel's bytes).
-BAL_OK="" BAL_LIB="" BAL_SUM=""
+BAL_OK="" BAL_LIB="" BAL_SUM="" BAL_MAX_M=0
 BAL_WHY="no balanced-gemv device check in this window (DEVICE_CHECKS=bal with TALL_CHECK and TALL_LIBR4D)"
 if [[ " ${DEVICE_CHECKS:-1} " == *" bal "* ]]; then
   TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} LC=${LCP_CHECK_C:-1024}
@@ -1015,11 +1248,13 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" bal "* ]]; then
       echo "bal exit $?" >>"$OUT/devcheck-bal.log" )
     grep -E '^(PASS|FAIL)|exit|^bal: ' "$OUT/devcheck-bal.log" | tail -6 | tee -a "$OUT/window.log"
     if grep -qx "bal exit 0" "$OUT/devcheck-bal.log" && grep -q '^PASS: bal: ' "$OUT/devcheck-bal.log" &&
+       BAL_MAX_M=$(bal_receipt_bound "$OUT/devcheck-bal.log" "$LC") &&
        ! grep -q '^FAIL' "$OUT/devcheck-bal.log"; then
       BAL_OK=1 BAL_LIB=$TL BAL_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
-      log "balanced gemv device check passed on $TL, sha256 ${BAL_SUM:0:16}: Mb arms on it are measured"
+      log "balanced gemv device check passed through M$BAL_MAX_M on $TL, sha256 ${BAL_SUM:0:16}: covered Mb arms on it are measured"
     else
-      BAL_WHY="the balanced gemv device check did not pass on $TL (devcheck-bal.log)"
+      BAL_MAX_M=0
+      BAL_WHY="the balanced gemv device check or its actual requested-height receipt did not pass on $TL (devcheck-bal.log)"
       log "$BAL_WHY; no Mb arm is measured"
       fi
     fi
@@ -1192,6 +1427,44 @@ elif [[ -n "${SELFTEST_F32BF16:-}" ]]; then
   log "$RB_WHY: no Rb arm is measured"
 fi
 
+# Fn128's byte gate: the same loaded library, forced old/new and public dispatch, original
+# THR1024/512/256 and LCP's pin. The exact final marker includes the tested bound and case count.
+# No cache/recommendation changes: this only authorizes explicitly named Fn128 arms in this window.
+N128_OK="" N128_LIB="" N128_SUM="" N128_MAX_M=0
+N128_WHY="no n128 device oracle in this window (DEVICE_CHECKS=n128, N128_CHECK_BIN and N128_CHECK_LIB)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" n128 "* ]]; then
+  NB=${N128_CHECK_BIN:-} NL=${N128_CHECK_LIB:-}
+  if [[ ! -x "$NB" || ! -f "$NL" ]]; then
+    N128_WHY="N128_CHECK_BIN=$NB is not executable or N128_CHECK_LIB=$NL is not a file"
+  else
+    n128_before=$(sha256sum "$NL" 2>/dev/null | cut -d' ' -f1)
+    n128_bad=""
+    for mode in off on lcp; do
+      n128_switch=1 n128_lcp=0 n128_tall=0
+      [[ $mode == off ]] && n128_switch=0
+      [[ $mode == lcp ]] && { n128_lcp=2048; n128_tall=; }
+      log "n128 byte oracle on card 0, $mode, with $NL ($NB)"
+      ( export HIP_VISIBLE_DEVICES=0 RADIANCE_EXPERIMENTAL_DS41_N128=$n128_switch
+        export RADIANCE_EXPERIMENTAL_DS41_LCP=$n128_lcp RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=$n128_tall
+        export RADIANCE_EXPERIMENTAL_DS41_P1=0
+        timeout 900 "$NB" "$NL" >"$OUT/n128-$mode.log" 2>&1
+        echo "n128 $mode exit $?" >>"$OUT/n128-$mode.log" )
+      grep -E '^PASS: ds41 n128|^FAIL|^n128 .* exit ' "$OUT/n128-$mode.log" | tee -a "$OUT/window.log"
+      grep -qx "n128 $mode exit 0" "$OUT/n128-$mode.log" || n128_bad+=" $mode exit;"
+      grep -q '^FAIL' "$OUT/n128-$mode.log" && n128_bad+=" $mode FAIL;"
+      grep -qxF 'PASS: ds41 n128 wave norm matches unchanged fused norm, all output/guard bytes; exceptional and rounding cases, eligibility refusals; through M4096 (29 positive cases)' "$OUT/n128-$mode.log" ||
+        n128_bad+=" $mode missing M4096/29-case PASS;"
+    done
+    N128_SUM=$(sha256sum "$NL" 2>/dev/null | cut -d' ' -f1)
+    [[ -n "$N128_SUM" && "$N128_SUM" == "$n128_before" ]] || n128_bad+=" library changed or SHA unavailable;"
+    if [[ -z "$n128_bad" ]]; then
+      N128_OK=1 N128_LIB=$NL N128_MAX_M=4096
+      log "n128 byte oracle PASS through M4096 on $NL, sha256 $N128_SUM: Fn128 arms on it may run"
+    else N128_WHY="n128 device oracle did not pass:$n128_bad"; fi
+  fi
+  [[ -n "$N128_OK" ]] || log "$N128_WHY; no Fn128 arm is measured"
+fi
+
 # The Vp arms' gate (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED). VPACK_CHECK=<ds41_vpack_device_check binary>
 # runs, once for each libr4d.so a Vp arm serves (the first of the arm's run homes holding one, the one its
 # server loads), libr4d's gemv_vp row against the plain gemv row on card 0, byte for byte (`check 48`), and
@@ -1254,6 +1527,225 @@ if [[ -n "${VPACK_CHECK:-}" && -x "${VPACK_CHECK:-}" ]]; then
     [[ "-$a-" == *-H3-* ]] && h=${RADIANCE_HOME_DIR3:-$RHOME}
     IFS=: read -r -a homes <<< "$h"
     for hh in "${homes[@]}"; do [[ -f "$hh/kernels/libr4d.so" ]] && { vpack_check "$hh/kernels/libr4d.so"; break; }; done
+  done
+fi
+
+declare -A AR_ROWS_PASSED=() AR_ROWS_RECEIPT=()
+ar_rows_receipt_ok() {   # fresh log, full library SHA256; four exact case lines, no skips/failures
+  local f=$1 sum=$2 cap ts
+  [[ $sum =~ ^[0-9a-f]{64}$ && -f $f ]] || return 1
+  [[ $(grep -Fxc "ar_rows sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -Fxc "ar_rows finished sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -xc 'ar_rows exit 0' "$f") == 1 ]] || return 1
+  ! grep -Eq 'FAIL|[[:space:]]skip[[:space:]]|ar_rows exit [1-9]' "$f" || return 1
+  for cap in 1024 64; do for ts in 0 32768; do
+    [[ $(grep -Fxc "  ok    ds41_ar_rows_exact cap $cap, ts_min $ts" "$f") == 1 ]] || return 1
+  done; done
+  return 0
+}
+ar_rows_check() {   # library; GPU work only in the stopped-QFN portion of this window
+  local lib=$1 sum after f
+  [[ -f $lib && -x ${SELFTEST_AR_ROWS:-} ]] || return 1
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ -n ${AR_ROWS_PASSED[$sum]+present} ]]; then [[ ${AR_ROWS_PASSED[$sum]} == 1 ]]; return; fi
+  if [[ ${AR_ROWS_WINDOW_ACTIVE:-} != 1 ]] ||
+     [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) != exited ]]; then
+    log 'AR row check refused: no active stopped-QFN window'; return 1
+  fi
+  f=$OUT/ar-rows-$sum.log
+  log "exact AR row check on all four cards with $lib, sha256 $sum"
+  ( unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
+    echo "ar_rows sha256 $sum"
+    timeout 1800 "$SELFTEST_AR_ROWS" "$lib" --case ds41_ar_rows_exact
+    echo "ar_rows exit $?"
+    echo "ar_rows finished sha256 $(sha256sum "$lib" | cut -d' ' -f1)"
+  ) >"$f" 2>&1
+  after=$(sha256sum "$lib" | cut -d' ' -f1)
+  AR_ROWS_PASSED[$sum]=0
+  AR_ROWS_RECEIPT[$sum]=$f
+  if [[ $after == "$sum" ]] && ar_rows_receipt_ok "$f" "$sum"; then AR_ROWS_PASSED[$sum]=1; fi
+  tail -8 "$f" | tee -a "$OUT/window.log"
+  [[ ${AR_ROWS_PASSED[$sum]} == 1 ]]
+}
+ar_rows_gate() {   # arm, library; never starts a checker after the reference arms have run
+  local a=$1 lib=$2 sum
+  [[ -f $lib ]] || { log "arm $a: Ar has no served libr4d.so; skipped"; return 1; }
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || { log "arm $a: Ar cannot hash its served library; skipped"; return 1; }
+  if [[ ${AR_ROWS_PASSED[$sum]:-} != 1 ]] ||
+     ! ar_rows_receipt_ok "${AR_ROWS_RECEIPT[$sum]:-}" "$sum"; then
+    log "arm $a: Ar needs a fresh successful SELFTEST_AR_ROWS receipt for served SHA256 $sum; skipped"; return 1
+  fi
+  return 0
+}
+if [[ -x ${SELFTEST_AR_ROWS:-} ]]; then
+  for a in $ARMS; do
+    h=$RHOME ar_parts=0 ar_bad=0
+    IFS=- read -r -a preflight_parts <<< "$a"
+    for p in "${preflight_parts[@]}"; do
+      case $p in
+        Ar*) ar_parts=$((ar_parts + 1)); ar_rows_parse "$p" >/dev/null || ar_bad=1 ;;
+        H) h=${RADIANCE_HOME_DIR2:-$RHOME} ;;
+        H3) h=${RADIANCE_HOME_DIR3:-$RHOME} ;;
+      esac
+    done
+    [[ $ar_parts == 1 && $ar_bad == 0 ]] || continue
+    IFS=: read -r -a homes <<< "$h"
+    for hh in "${homes[@]}"; do [[ -f "$hh/kernels/libr4d.so" ]] && { ar_rows_check "$hh/kernels/libr4d.so"; break; }; done
+  done
+fi
+
+
+declare -A AG_ROWS_PASSED=() AG_ROWS_RECEIPT=()
+ag_rows_receipt_ok() {   # fresh log, full library SHA256; four exact cap/layout case lines, no skips/failures
+  local f=$1 sum=$2 cap layout
+  [[ $sum =~ ^[0-9a-f]{64}$ && -f $f ]] || return 1
+  [[ $(grep -Fxc "ag_rows sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -Fxc "ag_rows finished sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -xc 'ag_rows exit 0' "$f") == 1 ]] || return 1
+  ! grep -Eq 'FAIL|[[:space:]]skip[[:space:]]|ag_rows exit [1-9]' "$f" || return 1
+  for cap in 1024 64; do for layout in tight pitched; do
+    [[ $(grep -Fxc "  ok    ds41_ag_rows_exact cap $cap, $layout" "$f") == 1 ]] || return 1
+  done; done
+  return 0
+}
+ag_rows_check() {   # library; GPU work only in the stopped-QFN portion of this window
+  local lib=$1 sum after f
+  [[ -f $lib && -x ${SELFTEST_AG_ROWS:-} ]] || return 1
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ -n ${AG_ROWS_PASSED[$sum]+present} ]]; then [[ ${AG_ROWS_PASSED[$sum]} == 1 ]]; return; fi
+  if [[ ${AG_ROWS_WINDOW_ACTIVE:-} != 1 ]] ||
+     [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) != exited ]]; then
+    log 'Engram gather row check refused: no active stopped-QFN window'; return 1
+  fi
+  f=$OUT/ag-rows-$sum.log
+  log "exact Engram gather row check on all four cards with $lib, sha256 $sum"
+  ( unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
+    echo "ag_rows sha256 $sum"
+    timeout 1800 "$SELFTEST_AG_ROWS" "$lib" --case ds41_ag_rows_exact
+    echo "ag_rows exit $?"
+    echo "ag_rows finished sha256 $(sha256sum "$lib" | cut -d' ' -f1)"
+  ) >"$f" 2>&1
+  after=$(sha256sum "$lib" | cut -d' ' -f1)
+  AG_ROWS_PASSED[$sum]=0
+  AG_ROWS_RECEIPT[$sum]=$f
+  if [[ $after == "$sum" ]] && ag_rows_receipt_ok "$f" "$sum"; then AG_ROWS_PASSED[$sum]=1; fi
+  tail -8 "$f" | tee -a "$OUT/window.log"
+  [[ ${AG_ROWS_PASSED[$sum]} == 1 ]]
+}
+ag_rows_gate() {   # arm, library; never starts a checker after the reference arms have run
+  local a=$1 lib=$2 sum
+  [[ -f $lib ]] || { log "arm $a: Ag has no served libr4d.so; skipped"; return 1; }
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || { log "arm $a: Ag cannot hash its served library; skipped"; return 1; }
+  if [[ ${AG_ROWS_PASSED[$sum]:-} != 1 ]] ||
+     ! ag_rows_receipt_ok "${AG_ROWS_RECEIPT[$sum]:-}" "$sum"; then
+    log "arm $a: Ag needs a fresh successful SELFTEST_AG_ROWS receipt for served SHA256 $sum; skipped"; return 1
+  fi
+  return 0
+}
+if [[ -x ${SELFTEST_AG_ROWS:-} ]]; then
+  for a in $ARMS; do
+    h=$RHOME ag_parts=0 ag_bad=0
+    IFS=- read -r -a preflight_parts <<< "$a"
+    for p in "${preflight_parts[@]}"; do
+      case $p in
+        Ag*) ag_parts=$((ag_parts + 1)); ag_rows_parse "$p" >/dev/null || ag_bad=1 ;;
+        H) h=${RADIANCE_HOME_DIR2:-$RHOME} ;;
+        H3) h=${RADIANCE_HOME_DIR3:-$RHOME} ;;
+      esac
+    done
+    [[ $ag_parts == 1 && $ag_bad == 0 ]] || continue
+    IFS=: read -r -a homes <<< "$h"
+    for hh in "${homes[@]}"; do [[ -f "$hh/kernels/libr4d.so" ]] && { ag_rows_check "$hh/kernels/libr4d.so"; break; }; done
+  done
+fi
+
+
+# The optional mixed oracle supplements both independent gates only for the coordinated actual
+# caps Ar1280+Ag1024 covered by its real D5120/esplit6400 geometry. It selects no configuration.
+ar_ag_shared_arm() {   # arm spelling; match the same BT/Lc cap clamp as the main arm loop
+  local a=$1 p ar= ag= bt=16 lc= step
+  local -a fields
+  IFS=- read -r -a fields <<< "$a"
+  for p in "${fields[@]:1}"; do
+    case $p in
+      Ar*) [[ -z $ar ]] && ar=$(ar_rows_parse "$p") || return 1 ;;
+      Ag*) [[ -z $ag ]] && ag=$(ag_rows_parse "$p") || return 1 ;;
+      BT*) bt=${p#BT} ;;
+      Lc*) lc=${p#Lc} ;;
+    esac
+  done
+  step=${lc:-$bt}
+  [[ $step =~ ^[0-9]{1,9}$ ]] && (( 10#$step > 0 )) || return 1
+  step=$((10#$step))
+  [[ -n $ar && -n $ag ]] || return 1
+  (( ar > step )) && ar=$step
+  (( ag > step )) && ag=$step
+  [[ $ar == 1280 && $ag == 1024 ]]
+}
+declare -A AR_AG_SHARED_PASSED=() AR_AG_SHARED_RECEIPT=()
+ar_ag_shared_receipt_ok() {   # fresh log, full library SHA256; four exact init-order/seed case lines, no skips/failures
+  local f=$1 sum=$2 order seed
+  [[ $sum =~ ^[0-9a-f]{64}$ && -f $f ]] || return 1
+  [[ $(grep -Fxc "ar_ag_shared sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -Fxc "ar_ag_shared finished sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -xc 'ar_ag_shared exit 0' "$f") == 1 ]] || return 1
+  ! grep -Eq 'FAIL|[[:space:]]skip[[:space:]]|ar_ag_shared exit [1-9]' "$f" || return 1
+  for order in ar-first ag-first; do for seed in 0 1; do
+    [[ $(grep -Fxc "  ok    ds41_ar_ag_shared_exact order $order, seed $seed" "$f") == 1 ]] || return 1
+  done; done
+  return 0
+}
+ar_ag_shared_check() {   # library; GPU work only in the stopped-QFN portion of this window
+  local lib=$1 sum after f
+  [[ -f $lib && -x ${SELFTEST_AR_AG_SHARED:-} ]] || return 1
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ -n ${AR_AG_SHARED_PASSED[$sum]+present} ]]; then [[ ${AR_AG_SHARED_PASSED[$sum]} == 1 ]]; return; fi
+  if [[ ${AR_AG_SHARED_WINDOW_ACTIVE:-} != 1 ]] ||
+     [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) != exited ]]; then
+    log 'mixed shared AR/AG check refused: no active stopped-QFN window'; return 1
+  fi
+  f=$OUT/ar-ag-shared-$sum.log
+  log "mixed shared AR/AG check on all four cards with $lib, sha256 $sum"
+  ( unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
+    echo "ar_ag_shared sha256 $sum"
+    timeout 1800 "$SELFTEST_AR_AG_SHARED" "$lib" --case ds41_ar_ag_shared_exact
+    echo "ar_ag_shared exit $?"
+    echo "ar_ag_shared finished sha256 $(sha256sum "$lib" | cut -d' ' -f1)"
+  ) >"$f" 2>&1
+  after=$(sha256sum "$lib" | cut -d' ' -f1)
+  AR_AG_SHARED_PASSED[$sum]=0
+  AR_AG_SHARED_RECEIPT[$sum]=$f
+  if [[ $after == "$sum" ]] && ar_ag_shared_receipt_ok "$f" "$sum"; then AR_AG_SHARED_PASSED[$sum]=1; fi
+  tail -8 "$f" | tee -a "$OUT/window.log"
+  [[ ${AR_AG_SHARED_PASSED[$sum]} == 1 ]]
+}
+ar_ag_shared_gate() {   # arm, library; never starts a checker after the reference arms have run
+  local a=$1 lib=$2 sum
+  [[ -f $lib ]] || { log "arm $a: shared AR/AG has no served libr4d.so; skipped"; return 1; }
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || { log "arm $a: shared AR/AG cannot hash its served library; skipped"; return 1; }
+  if [[ ${AR_AG_SHARED_PASSED[$sum]:-} != 1 ]] ||
+     ! ar_ag_shared_receipt_ok "${AR_AG_SHARED_RECEIPT[$sum]:-}" "$sum"; then
+    log "arm $a: shared AR/AG needs a fresh successful SELFTEST_AR_AG_SHARED receipt for served SHA256 $sum; skipped"; return 1
+  fi
+  return 0
+}
+
+if [[ -x ${SELFTEST_AR_AG_SHARED:-} ]]; then
+  for a in $ARMS; do
+    ar_ag_shared_arm "$a" || continue
+    h=$RHOME
+    IFS=- read -r -a preflight_parts <<< "$a"
+    for p in "${preflight_parts[@]}"; do
+      case $p in H) h=${RADIANCE_HOME_DIR2:-$RHOME} ;; H3) h=${RADIANCE_HOME_DIR3:-$RHOME} ;; esac
+    done
+    IFS=: read -r -a homes <<< "$h"
+    for hh in "${homes[@]}"; do [[ -f "$hh/kernels/libr4d.so" ]] && { ar_ag_shared_check "$hh/kernels/libr4d.so"; break; }; done
   done
 fi
 
@@ -1348,7 +1840,19 @@ for a in $ARMS; do
 # Markov codebooks pinned in host memory with the embedding (..._DSPARK_CODEBOOK_RAM=1; needs Er): each
 # needs a Ds part (Dc / Dl / Dx not Ds0, Dc not with Dg) and a radiance (Dc, Dx: and a deepseek41
 # plugin) that has it; measured only with its startup line, and every other arm runs with it 0 and must
-# not have it; their shutdown report goes to window.log; H3 the third run home (RADIANCE_HOME_DIR3); Es
+# not have it; their shutdown report goes to window.log.
+# Dpc is read-only proposal probability/score/margin capture (DSPARK_PROB_CAPTURE), beside a drafting
+# Ds part only, never Ds0. It writes JSON events to the arm's server log; candidate_p is normalized
+# over the existing Markov-conditioned candidate set, not full vocabulary or target acceptance.
+# Dme0/1/2 is fixed-depth matched early-readback MEASUREMENT (DSPARK_EARLY_VERIFY), with bare Ds,
+# max-num-seqs1 and no Dc/Dl/Dg. Every action runs the SAME configured query (Db2 stays two rows),
+# observer and step_end wait before issue_ahead; only the verified/published prefix changes. Quiet
+# by default; Dpc adds proposal/cycle JSON. All arms explicitly set off unless a Dme part is present.
+# Dpp is a separate default-off prefix policy, supplied ONLY by DSPARK_POLICY_CONFIG=v1:T1:T2
+# after TRAIN fitting. It requires bare Ds, Db2/from1, one sequence and no Dme/Dc/Dl/Dg. Every
+# query/observer/early wait stays identical to Dme0/1/2; invalid numeric signals use prefix2.
+# Its mandatory action/cycle logs are on-policy evidence and are refused by the quiet cost extractor.
+# H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
 # from the use-order list up to N MiB an issue point, the read that crosses it cut
@@ -1476,11 +1980,13 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf="" dc="" dl="" dx="" dm="" ds="" nseq=""
-  p1="" q1=() qm="" ql="" qg="" qe=""
+  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
+  fn128=""
+  arm_checkpoint_interval=2048
   psc="" prs=12 pk="" pw="" ns="" pv=""
   hpe="" hpg="" hpl="" hpb="" hpm="" hpr=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
@@ -1513,6 +2019,7 @@ for a in $ARMS; do
       Sc[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=${p#Sc}) ;;   # profile-hot cached units get N second chances
       Iy[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_INSERT_YIELD_US=${p#Iy}) ;;     # background inserts wait up to N us for an idle pool
       Xs)      env+=(RADIANCE_EXPERIMENTAL_DS41_SWIGLU_SCALAR=1) ;;   # the pool's swiglu as the scalar loop (old way)
+      Fn128)   fn128=1 ;;                  # exact n128 fused norm; byte oracle and per-rank dispatch proof
       F8)      f8=1 ;;                     # FP8-sourced dense linears from E4M3 codes (gemm_nt_bf16f8)
       F8n)     f8=1 f8x='*_shexp.weight' ;;   # the same, the shared expert left bf16
       i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
@@ -1587,6 +2094,15 @@ for a in $ARMS; do
                  log "arm $a: $p: DlN takes 2-64; the arm is skipped"; skip=1
                fi ;;
       Dx)      dx=1 ;;                     # the drafter's context pass deferred while nothing drafts (DSPARK_CTX_DEFER)
+      Dpc)     dpc=1 ;;                    # read-only candidate-set probability/score/margin capture (DSPARK_PROB_CAPTURE)
+      Dme[0-2])                            # SAME query/observer/early wait, fixed verified prefix0/1/2 (measurement only)
+               if [[ -n "$dme" ]]; then log "arm $a: duplicate Dme prefix; the arm is skipped"; skip=1; fi
+               dme=${p#Dme} ;;
+      Dpp)     if [[ -n "$dpp" ]]; then log "arm $a: duplicate Dpp; the arm is skipped"; skip=1; fi
+               dpp=${DSPARK_POLICY_CONFIG:-}
+               if [[ -z "$dpp" ]] || ! python3 -I "$HERE/dspark_policy_gate.py" --config "$dpp" --arm Ds 2 1 0 >>"$OUT/window.log" 2>&1; then
+                 log "arm $a: Dpp requires explicit DSPARK_POLICY_CONFIG=v1:T1:T2; the arm is skipped"; skip=1
+               fi ;;
       Dm)      dm=1 ;;                     # the drafter's Markov codebooks pinned with the embedding (DSPARK_CODEBOOK_RAM; needs Er)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
@@ -1596,7 +2112,7 @@ for a in $ARMS; do
       Pc0)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                      # prefix cache on, the margin as before (the control)
       Pcn)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume nearest)                        # prefix cache on, a hit resumes at the deepest snapshot
                env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... (Kh against a cold arm checks it stays exact)
-      Pci[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-interval "${p#Pci}") ;;                    # snapshot interval (2048)
+      Pci[0-9]*) pcopt+=" $p"; arm_checkpoint_interval=${p#Pci}; ARGS+=(--checkpoint-interval "${p#Pci}") ;;  # interval (default2048)
       Pcs[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                       # snapshot store slots (auto)
       Pcx)     pcopt+=" $p"; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;           # publish only cold-cut chunks
       Pce)     pcopt+=" $p"; hpe=1; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EORS=1) ;;              # end-of-request snapshots
@@ -1619,13 +2135,20 @@ for a in $ARMS; do
       Ei)      env+=(RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1) ;;      # routed card ops ahead of the counts sync
       Ss)      env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1) ;;   # no pass behind a reply's last token
       Xt)      xt=1 ;;                                                 # exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1)
+      Ar*)     if [[ -n "$ar_rows" ]] || ! ar_value=$(ar_rows_parse "$p"); then
+                 log "arm $a: $p: use one positive whole ArN row cap; the arm is skipped"; skip=1
+               else ar_rows=$ar_value; fi ;;
+      Ag*)     if [[ -n "$ag_rows" ]] || ! ag_value=$(ag_rows_parse "$p"); then
+                 log "arm $a: $p: use one positive whole AgN row cap; the arm is skipped"; skip=1
+               else ag_rows=$ag_value; fi ;;
       BT[0-9]*) bt=${p#BT}; ARGS+=(--max-num-batched-tokens "$bt") ;;  # this arm's step: prefill chunks of N
       Kld)     kld=1 ;;                                                # --kld-record over the corpus instead of serving
       Lc[0-9]*) lc=${p#Lc}                                             # large-chunk prefill: chunks of N (RADIANCE_EXPERIMENTAL_DS41_LCP)
-               if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc >= 64 && 10#$lc <= 2048 && 10#$lc % 16 == 0 )); then
+               if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc >= 64 && 10#$lc <= 4096 && 10#$lc % 16 == 0 )); then
                  lc=$((10#$lc)); ARGS+=(--max-num-batched-tokens "$lc"); env+=(RADIANCE_EXPERIMENTAL_DS41_LCP=$lc)
-               else log "arm $a: $p: a chunk is a multiple of 16 in 64..2048; the arm is skipped"; skip=1; fi ;;
+               else log "arm $a: $p: a chunk is a multiple of 16 in 64..4096; the arm is skipped"; skip=1; fi ;;
       P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
+      Qsp)     qsp=1 ;;                                                 # each P1 wave's covering sorted-slot SwiGLU span
       Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*|Qe[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold / lent arena slots
                qn=${p:2}
                case ${p:0:2} in
@@ -1738,6 +2261,25 @@ for a in $ARMS; do
     fi
   fi
   ARM_RB=$rb ARM_PRED=$pred
+  # Explicitly state the switch for every arm. Unpinned compressor work can use
+  # max_tok+max_seqs rows, so check that conservative bound as well as the library SHA.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_N128=${fn128:-0})
+  ARM_N128=$fn128
+  if [[ -n "$fn128" ]]; then
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    lib=""
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+    n128_tokens=${lc:-${bt:-16}} n128_seqs=${nseq:-${MAX_SEQS:-1}}
+    if ! [[ $n128_tokens =~ ^[0-9]{1,9}$ && $n128_seqs =~ ^[0-9]{1,9}$ ]]; then
+      log "arm $a: Fn128 refused: invalid token/sequence bound; the arm is skipped"; skip=1
+    else
+      n128_bound=$(( 10#$n128_tokens ))
+      [[ -n "$lc$xt" ]] || n128_bound=$(( n128_bound + 10#$n128_seqs ))
+      if ! n128_why=$(n128_arm_gate "$lib" "$n128_bound"); then
+        log "arm $a: Fn128 refused: $n128_why; the arm is skipped"; skip=1
+      fi
+    fi
+  fi
   # Pu / Pu2: a partly read unit's rest in its layer's own read only in an arm whose name says so,
   # whatever the window's environment (0: the urgent pieces, as before); arm() checks the log both
   # ways. Without a PpK part there is nothing to finish, and the arm would not test it.
@@ -1795,11 +2337,20 @@ for a in $ARMS; do
   ARM_CK=
   [[ -n "$cs" && -n "$pc" ]] && ARM_CK=${ck:-512}
   if [[ -n "$kh" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=0); fi
-  # The prefix cache's parts: PciN, PcsN and Pcx act only with the cache on (Pc or Pc0); without it
-  # the arm would run cold under their names. Every arm states both prefix switches, so a window's
+  # Prefix-only parts need Pc or Pc0. Above 2048 the interval also admits an Lc chunk with the
+  # prefix cache off, so allow that Pci part alone; retain every other prefix-only refusal.
+  # Every arm states both prefix switches, so a window's
   # VAR=val cannot turn a cold arm or the Pc0 control into something its name does not say.
-  if [[ -n "$pcopt" && -z "$pc" ]]; then
-    log "arm $a:$pcopt without Pc or Pc0 (the prefix cache stays off); the arm is skipped"; skip=1
+  pc_cache_parts=$pcopt
+  if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc > 2048 )); then
+    pc_cache_parts=""
+    read -r -a pc_gate_parts <<< "$pcopt"
+    for pc_part in "${pc_gate_parts[@]}"; do
+      [[ $pc_part == Pci[0-9]* ]] || pc_cache_parts+=" $pc_part"
+    done
+  fi
+  if [[ -n "$pc_cache_parts" && -z "$pc" ]]; then
+    log "arm $a:$pc_cache_parts without Pc or Pc0 (the prefix cache stays off); the arm is skipped"; skip=1
   fi
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=0)
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=0)
@@ -1864,10 +2415,27 @@ for a in $ARMS; do
   fi
   if [[ -n "$dc" && -n "$dg" ]]; then log "arm $a: Dc and Dg both decide the query pass; the arm is skipped"; skip=1; fi
   if [[ -n "$dm" && "-$a-" != *-Er-* ]]; then log "arm $a: Dm needs Er (the codebooks go where the embedding goes); the arm is skipped"; skip=1; fi
+  if [[ -n "$dpc" && ( -z "$ds" || "$ds" == Ds0 ) ]]; then
+    log "arm $a: Dpc needs a drafting Ds part (not Ds0); the arm is skipped"; skip=1
+  fi
+  # Matched costs, not a policy: bare Ds retains the same bank/query; Db2 remains two rows at ALL
+  # prefixes. Legacy DsN caps, adaptive/gated queries and multi-sequence load are refused.
+  if [[ -n "$dme" && ( "$ds" != Ds || -n "$dc$dl$dg" || "${nseq:-${MAX_SEQS:-1}}" != 1 ) ]]; then
+    log "arm $a: Dme0/1/2 needs bare Ds, one sequence and no Dc/Dl/Dg (Db2/Dkt/Dv/Df retained); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$dpp" ]]; then
+    policy_conflicts=0; [[ -n "$dme$dc$dl$dg" ]] && policy_conflicts=1
+    if ! python3 -I "$HERE/dspark_policy_gate.py" --config "$dpp" --arm "${ds:-none}" "${db:-none}" "${nseq:-${MAX_SEQS:-1}}" "$policy_conflicts" >>"$OUT/window.log" 2>&1; then
+      log "arm $a: Dpp configuration/scope guard failed; the arm is skipped"; skip=1
+    fi
+  fi
   env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=${dc:-0} "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF_HEAD=${dc:+$DRAFT_CONF_HEAD}"
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=${dl:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=${dx:-0}
-        RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=${dm:-0})
-  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=${dm:-0}
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_PROB_CAPTURE=${dpc:-0}
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_EARLY_VERIFY=${dme:-off}
+        "RADIANCE_EXPERIMENTAL_DS41_DSPARK_PREFIX_POLICY=${dpp:-off}")
+  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm ARM_DPC=$dpc ARM_DME=$dme ARM_DPP=$dpp
   # A drafting Ds part under --max-num-seqs above 1 (an NK part, or MAX_SEQS for the window): the
   # scheduler drafts for a sequence alone and says so at startup (arm() checks the line both ways).
   ARM_SOLO=
@@ -1920,6 +2488,8 @@ for a in $ARMS; do
     for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
     if [[ -z "$BAL_OK" ]]; then
       log "arm $a: Mb refused: $BAL_WHY"; skip=1
+    elif (( ${lc:-${bt:-16}} > ${BAL_MAX_M:-0} )); then
+      log "arm $a: Mb refused: its row bound ${lc:-${bt:-16}} exceeds the balance oracle's actual M${BAL_MAX_M:-0}; the arm is skipped"; skip=1
     elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$BAL_SUM" ]]; then
       log "arm $a: Mb refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the bal check passed on ($BAL_LIB, sha256 ${BAL_SUM:0:16})"; skip=1
     fi
@@ -1941,6 +2511,11 @@ for a in $ARMS; do
   # RADIANCE_EXPERIMENTAL_DS41_LCP: an Lc arm's chunk, 0 in every other arm.
   if [[ -n "$lc" ]]; then
     [[ -n "$xt$bt" ]] && { log "arm $a: Lc goes with neither Xt nor BT (it sets the step itself); the arm is skipped"; skip=1; }
+    if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc > 2048 )); then
+      if ! [[ $arm_checkpoint_interval =~ ^[0-9]+$ ]] || (( 10#$arm_checkpoint_interval < lc )); then
+        log "arm $a: Lc$lc needs an explicit PciN interval at least $lc (default 2048 caps linear-state chunks even without Pc); the arm is skipped"; skip=1
+      fi
+    fi
     mm=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
     bn=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
     if [[ -n "$p1" ]]; then
@@ -1968,6 +2543,14 @@ for a in $ARMS; do
   elif [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 RADIANCE_EXPERIMENTAL_DS41_LCP=0)
   else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0 RADIANCE_EXPERIMENTAL_DS41_LCP=0); fi
   if [[ -n "$ad" && -z "$lc" ]]; then log "arm $a: Ad$ad needs Lc (it acts on large chunks only); the arm is skipped"; skip=1; fi
+  # Qsp is default-off; its oracle must include the new full/span wave comparisons.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=${qsp:-0})
+  if [[ -n "$qsp" ]]; then
+    [[ -n "$p1" ]] || { log "arm $a: Qsp needs P1; the arm is skipped"; skip=1; }
+    if ! grep -qE '^p1: PASS: .*full/span SwiGLU waves' "$OUT/devcheck-p1.log" 2>/dev/null; then
+      log "arm $a: Qsp needs the full/span SwiGLU card oracle; the arm is skipped"; skip=1
+    fi
+  fi
   # P1 (RADIANCE_EXPERIMENTAL_DS41_P1): with Lc, on the libr4d.so the `p1` device check passed on; every
   # other arm states the switch 0 and the Q knobs empty, so a window's VAR=val cannot turn them on.
   if [[ -n "$p1" ]]; then
@@ -2032,7 +2615,41 @@ for a in $ARMS; do
     rm -rf "$OUT/kld-$a"
     ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe
+  env+=(RADIANCE_EXPERIMENTAL_DS41_AR_ROWS=${ar_rows:-0})
+  ARM_AR_ROWS=$ar_rows ARM_AR_CAP=0
+  if [[ -n "$ar_rows" ]]; then
+    ARM_AR_CAP=${lc:-${bt:-16}}
+    if [[ $ARM_AR_CAP =~ ^[0-9]{1,9}$ ]] && (( 10#$ARM_AR_CAP > 0 )); then
+      ARM_AR_CAP=$((10#$ARM_AR_CAP))
+      (( ar_rows < ARM_AR_CAP )) && ARM_AR_CAP=$ar_rows
+    else log "arm $a: Ar needs a valid BT/Lc step for its actual cap; skipped"; skip=1; fi
+    if [[ -z "$skip" ]]; then
+      arlib=""
+      IFS=: read -r -a homes <<< "$ARM_HOME"
+      for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { arlib=$h/kernels/libr4d.so; break; }; done
+      ar_rows_gate "$a" "$arlib" || skip=1
+    fi
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_AG_ROWS=${ag_rows:-0})
+  ARM_AG_ROWS=$ag_rows ARM_AG_CAP=0
+  if [[ -n "$ag_rows" ]]; then
+    ARM_AG_CAP=${lc:-${bt:-16}}
+    if [[ $ARM_AG_CAP =~ ^[0-9]{1,9}$ ]] && (( 10#$ARM_AG_CAP > 0 )); then
+      ARM_AG_CAP=$((10#$ARM_AG_CAP))
+      (( ag_rows < ARM_AG_CAP )) && ARM_AG_CAP=$ag_rows
+    else log "arm $a: Ag needs a valid BT/Lc step for its actual cap; skipped"; skip=1; fi
+    if [[ -z "$skip" ]]; then
+      aglib=""
+      IFS=: read -r -a homes <<< "$ARM_HOME"
+      for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { aglib=$h/kernels/libr4d.so; break; }; done
+      ag_rows_gate "$a" "$aglib" || skip=1
+    fi
+  fi
+  # A coordinated arm must pass BOTH independent receipts above plus this mixed-family oracle.
+  if [[ -z "$skip" && $ARM_AR_CAP == 1280 && $ARM_AG_CAP == 1024 ]]; then
+    ar_ag_shared_gate "$a" "$aglib" || skip=1
+  fi
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in
@@ -2102,4 +2719,12 @@ for a in $ARMS; do
   python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"
 done
 [[ " $ARMS" == *-Pc* ]] && python3 -I "$HERE/ab_requests.py" --ttft "$OUT" $ARMS | tee -a "$OUT/window.log"
+# The read-only capture must preserve the draft/acceptance counts of its otherwise identical arm.
+for a in $ARMS; do
+  [[ "-$a-" == *-Dpc-* ]] || continue
+  b=$(sed -E 's/-Dpc(-|$)/\1/' <<< "$a")
+  if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
+  log "draft stats: read-only capture $a against $b"
+  python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"
+done
 log "arms done"

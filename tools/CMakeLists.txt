@@ -39,6 +39,10 @@ endfunction()
 
 rad_add_tool(rad-info     rad_info.cpp)
 
+# Explicit guarded-window invocation only; never auto-registered with host ctest.
+# Copies the real native-sized DSpark bank spans through its production DeviceIO.
+rad_add_tool(ds41-bank-backup-check ds41_bank_backup_check.cpp)
+
 # The tokeniser's independent reference encoder (tokref.h), which core/text's pre-tokeniser is
 # checked against. A library because tests/tokenizer_test uses it too; core/ does not link it.
 add_library(rad_tokref STATIC ${CMAKE_CURRENT_SOURCE_DIR}/tokref.cpp)

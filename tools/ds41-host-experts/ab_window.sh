@@ -538,7 +538,10 @@ kv_server_gate() {   # log, packed flag, fast flag, start/exit, attending ranks 
   [[ -f $f && $ranks == 4 && ( $stage == start || $stage == exit ) && ( $on == 0 || $on == 1 ) && ( $fast == 0 || $fast == 1 ) ]] || return 1
   [[ $window == 0 || ( $window == 1 && $on == 1 ) ]] || return 1
   if [[ $window == 0 ]]; then
-    ! grep -qF 'WINDOW_PACKED' "$f" || { echo 'no Kvwin part, but packed WINDOW was enabled/logged'; return 1; }
+    # Startup inventories list full experimental variable names even when disabled.
+    # Refuse the standalone runtime token, including malformed/unknown activity,
+    # without mistaking the suffix of an environment-variable name for activity.
+    ! grep -Eq '(^|[^[:alnum:]_])WINDOW_PACKED([^[:alnum:]_]|$)' "$f" || { echo 'no Kvwin part, but packed WINDOW was enabled/logged'; return 1; }
   else
     window_name='packed FP8'
     [[ $(grep -c '^radiance: deepseek41: WINDOW_PACKED rank=' "$f") == 4 &&
@@ -561,7 +564,7 @@ kv_server_gate() {   # log, packed flag, fast flag, start/exit, attending ranks 
     fi
   fi
   if [[ $on == 0 ]]; then
-    ! grep -qF 'KV_PACKED' "$f" || { echo 'no Kvfp4 part, but packed KV was enabled/logged'; return 1; }
+    ! grep -Eq '(^|[^[:alnum:]_])KV_PACKED(_FAST)?([^[:alnum:]_]|$)' "$f" || { echo 'no Kvfp4 part, but packed KV was enabled/logged'; return 1; }
     [[ $fast == 0 ]] || return 1
     return 0
   fi

@@ -172,6 +172,20 @@ emit_server() { # mode0/1, modern0/1
 }
 echo plain >"$T/plain.log"; emit_server 0 0 >"$T/old.log"; emit_server 0 1 >"$T/ref.log"; emit_server 1 1 >"$T/fast.log"
 expect 0 'plain arm stays plain' kv_server_gate "$T/plain.log" 0 0 exit 4
+cat >>"$T/plain.log" <<'EOF'
+I   RADIANCE_EXPERIMENTAL_DS41_KV_PACKED
+I   RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST
+I   RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED
+I   RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED=0
+EOF
+expect 0 'disabled startup variable inventory is not runtime packed activity' kv_server_gate "$T/plain.log" 0 0 exit 4
+for marker in 'WINDOW_PACKED unexpected' 'KV_PACKED unexpected' 'KV_PACKED_FAST unexpected'; do
+  cp "$T/plain.log" "$T/plain-leak.log"
+  echo "I ds41 $marker" >>"$T/plain-leak.log"
+  expect 1 "standalone runtime token still refuses: $marker" kv_server_gate "$T/plain-leak.log" 0 0 exit 4
+done
+cat "$T/plain.log" "$T/ref.log" >"$T/ref-inventory.log"
+expect 0 'startup inventory keeps every actual packed rank proof mandatory' kv_server_gate "$T/ref-inventory.log" 1 0 exit 4
 expect 0 'initial codec cohort has exact startup and four rank paths' kv_server_gate "$T/old.log" 1 0 exit 4
 expect 0 'modern reference decoder complete' kv_server_gate "$T/ref.log" 1 0 exit 4
 expect 0 'fast decoder complete' kv_server_gate "$T/fast.log" 1 1 exit 4

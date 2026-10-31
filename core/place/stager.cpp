@@ -711,8 +711,13 @@ bool FileStager::begin_pass(const RadBatch* b) {
     /* The lent ring (card_expert_stager.h): a pass that arms the card path takes the residents' slots
      * back, and its first ring copy waits on their last reader too; any other pass, once the grace has
      * run out, reloads them and publishes those whose copies have passed. Here only, before the run
-     * phase brings the weight tables up to date. */
-    if (p1_on() && p1_->lending()) (void)p1_->lender().begin_pass(p1_arms, p1_now_ms());
+     * phase brings the weight tables up to date. With the lent arena a pass at the full plan takes them
+     * back as well (its buffers reach the arena's top), its ops behind any reload copy still queued. */
+    p1_lend_took_ = false;
+    if (p1_on() && p1_->lending()) {
+        p1_lend_took_ = p1_arms || (p1_arena_full_ && p1_arena_full_());
+        (void)p1_->lender().begin_pass(p1_lend_took_, p1_now_ms());
+    }
     if (p1_arms) {
         const RadEvent hand[3] = { free_rec_[0] ? free_[0] : nullptr, free_rec_[1] ? free_[1] : nullptr,
                                    p1_lend_rec_ ? p1_lend_ev_ : nullptr };
@@ -1533,7 +1538,7 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
         p1::Tunables t;
         if (p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, nullptr)) {
             p1_min_rows_ = t.min_rows;
-            p1_lend_asked_ = t.lend > 0;
+            p1_lend_asked_ = t.lend > 0 || t.lend_arena > 0;
         }
     }
     if (xt && *xt && std::strcmp(xt, "1") != 0)
@@ -4488,15 +4493,25 @@ int FileStager::end_pass(RadStream s) {
     /* Prefill Phase 1: every copy seen and every source let go before the buffers are released; the
      * mover's stream then waits behind this pass's last reader of the ring. */
     int p1_rc = RAD_OK;
-    /* The lent ring: the grace runs from the card path's last pass, and the residents' last reader so
-     * far is behind this pass, which a later armed pass's first ring copy waits on. */
+    /* The lent ring: the grace runs from the last pass that took the slots back, and the residents' last
+     * reader so far is behind this pass, which a later armed pass's first ring copy waits on. */
     if (p1_ && p1_->lending()) {
-        if (p1_armed_) p1_->lender().end_p1(p1_now_ms());
+        if (p1_lend_took_) p1_->lender().end_p1(p1_now_ms());
         if (p1_->lender().residents() > 0) {
             const int r = s ? rad_event_record(p1_lend_ev_, s) : RAD_E_STATE;
             if (r >= 0) p1_lend_rec_ = true;
             else p1_rc = r;
         }
+        /* The lent arena: a pass at the full plan that the card path did not take (an armed pass's own
+         * end_pass does this below) wrote the arena's top with nothing of it on the DMA lane, so the
+         * mover's stream waits on its end: a later reload copy into an arena slot lands behind its last
+         * reader of those bytes. */
+        if (p1_lend_took_ && !p1_armed_ && p1_->lend_arena_slots() > 0) {
+            int r = s ? rad_event_record(p1_end_, s) : RAD_E_STATE;
+            if (r >= 0) r = mover_->mover_wait(p1_end_);
+            if (r < 0 && p1_rc >= 0) p1_rc = r;
+        }
+        p1_lend_took_ = false;
     }
     if (p1_armed_) {
         p1_armed_ = false;
@@ -4681,7 +4696,11 @@ int FileStager::p1_init(const Program& prog) {
     if (rc < 0) return refuse(why);
     p1_ = std::move(path);
     p1_min_rows_ = t.min_rows;
-    if (t.lend > 0 && p1_lend_init(t, &why) < 0) {
+    p1_tun_ = t;
+    /* With the lent arena the lending waits for the arena's top (p1_lend_arena, once the engine has bound
+     * its level), and the ring's slots join it there. */
+    p1_arena_asked_ = t.lend_arena > 0;
+    if (t.lend > 0 && !p1_arena_asked_ && p1_lend_init(t, {}, &why) < 0) {
         p1_.reset();
         return refuse(why);
     }
@@ -4723,13 +4742,16 @@ bool FileStager::p1_pool_source(int32_t u, p1::Source* out) const {
 
 /* The lent ring (card_expert_stager.h): the ring's slots that neither file buffer's alias base names,
  * each lent to one of this rank's hottest file-tier units by the profile (a trunk layer's, one the CPU
- * path can read), at most ..._P1_LEND of them; the reloads begin at once, and every pass from the next
- * publishes what has landed. Refused when no slot or no unit can be lent. */
-int FileStager::p1_lend_init(const p1::Tunables& t, std::string* why) {
+ * path can read), at most ..._P1_LEND of them; then the lent arena's slots (`arena`, p1_lend_arena), up
+ * to ..._P1_LEND_ARENA of them, to the next hottest. The ring's reloads begin at once and every pass
+ * from the next publishes what has landed; with arena slots the reloads begin at the first pass that
+ * does not take the slots back (a step below the full plan: the arena's top is not free before one).
+ * Refused when a slot kind asked for has no slot or no unit left to lend. */
+int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& arena, std::string* why) {
     const char* const ring = p1_->ring_base();
     const int n_slots = p1_->ring_slots();
     std::vector<int> slots;
-    for (int r = 0; r < n_slots; ++r) {
+    for (int r = 0; t.lend > 0 && r < n_slots; ++r) {
         const char* at = ring + (int64_t)r * ds41p1::kSlotBytes;
         bool alias = false;
         for (int b = 0; b < 2; ++b)
@@ -4753,14 +4775,22 @@ int FileStager::p1_lend_init(const p1::Tunables& t, std::string* why) {
     });
     const int alias_slots = n_slots - (int)slots.size();
     const int k = std::min<int>(t.lend, (int)std::min(slots.size(), cand.size()));
-    if (k <= 0) {
+    if (t.lend > 0 && k <= 0) {
         if (why)
             *why = fmt("%s=%d: no ring slot (%d slots, %zu past the file buffers' alias bases) or file-tier unit "
                        "(%zu) to lend", ds41p1::kLendEnv, t.lend, n_slots, slots.size(), cand.size());
         return RAD_E_INVAL;
     }
-    std::vector<p1::CardExpertPath::LendUnit> units((size_t)k);
-    for (int i = 0; i < k; ++i) {
+    const int ka = std::min<int>((int)arena.size(), (int)cand.size() - std::max(k, 0));
+    if (!arena.empty() && ka <= 0) {
+        if (why)
+            *why = fmt("%s=%d: no file-tier unit left to lend (%zu, %d of them to the ring)", ds41p1::kLendArenaEnv,
+                       t.lend_arena, cand.size(), std::max(k, 0));
+        return RAD_E_INVAL;
+    }
+    const int nk = std::max(k, 0), n = nk + std::max(ka, 0);
+    std::vector<p1::CardExpertPath::LendUnit> units((size_t)n);
+    for (int i = 0; i < n; ++i) {
         const MoveUnit& mu = plan_->units[(size_t)cand[(size_t)i]];
         p1::CardExpertPath::LendUnit& lu = units[(size_t)i];
         lu.unit = cand[(size_t)i];
@@ -4769,29 +4799,74 @@ int FileStager::p1_lend_init(const p1::Tunables& t, std::string* why) {
             lu.bytes[w] = ep_program_->weights[mu.weights[(size_t)w]].stored_bytes;
         }
     }
-    slots.resize((size_t)k);
+    slots.resize((size_t)nk);
+    const std::vector<char*> at(arena.begin(), arena.begin() + std::max(ka, 0));
     if (!p1_lend_ev_ && rad_event_create_local(&p1_lend_ev_) < 0) {
         p1_lend_ev_ = nullptr;
         if (why) *why = "could not create the lent ring's event";
         return RAD_E_DEVICE;
     }
     p1_lend_rec_ = false;
-    RAD_TRY(p1_->lend_init(units, slots, t.grace_ms, why));
-    (void)p1_->lender().begin_pass(false, p1_now_ms());   /* the first reloads begin now */
-    if (plan_->rank == 0) {
+    RAD_TRY(p1_->lend_init(units, slots, at, t.grace_ms, why));
+    if (at.empty()) (void)p1_->lender().begin_pass(false, p1_now_ms());   /* the first reloads begin now */
+    if (plan_->rank == 0 && nk > 0) {
         double share = 0.0;
-        for (int i = 0; i < k; ++i) share += plan_->units[(size_t)cand[(size_t)i]].profile_share;
+        for (int i = 0; i < nk; ++i) share += plan_->units[(size_t)cand[(size_t)i]].profile_share;
         RAD_INFO("%s: %d of the ring's %d slots (%d of them past the file buffers' alias bases; %s=%d) hold "
                  "rank 0's %d hottest file-tier units (profile share %.4f) as decode residents outside the card "
                  "path's passes; a pass that arms it takes them back, and %d ms after its last pass (%s) they are "
                  "reloaded in the background (from the RAM cache where it holds the card's block form, else read "
                  "from the drive and relaid into two pinned buffers of %.0f MiB) and published again; a unit not "
                  "yet reloaded, or whose reload failed, takes the CPU path",
-                 ds41p1::kLogLend, k, n_slots, n_slots - alias_slots, ds41p1::kLendEnv, t.lend, k, share, t.grace_ms,
+                 ds41p1::kLogLend, nk, n_slots, n_slots - alias_slots, ds41p1::kLendEnv, t.lend, nk, share, t.grace_ms,
                  ds41p1::kGraceEnv,
                  (double)ds41p1::kSlotBytes / 1048576.0);
     }
+    if (plan_->rank == 0 && !at.empty()) {
+        double share = 0.0;
+        for (int i = nk; i < n; ++i) share += plan_->units[(size_t)cand[(size_t)i]].profile_share;
+        RAD_INFO("%s: %d slots (%s=%d; %zu fit) in the activation arena's top, above the buffers of steps of up "
+                 "to %lld tokens and the guard, hold rank 0's next %d hottest file-tier units (profile share "
+                 "%.4f) as decode residents; a step at the full plan (above %lld tokens: every card-path pass "
+                 "among them) takes them back, its ops behind any reload copy still queued, and %d ms after the "
+                 "last such step (%s) they are reloaded in the background as the lent ring's are (from the drive "
+                 "where the RAM cache is packed) and published again; a unit not yet reloaded takes the CPU path",
+                 ds41p1::kLogLendArena, ka, ds41p1::kLendArenaEnv, t.lend_arena, arena.size(),
+                 (long long)p1_arena_rows_, ka, share, (long long)p1_arena_rows_, t.grace_ms, ds41p1::kGraceEnv);
+    }
     return RAD_OK;
+}
+
+/* The lent arena: the engine bound the arena's smallest level (steps of up to `rows` tokens) and hands
+ * over the top above its buffers and guard; the lending starts with as many whole slots as fit there
+ * (at most ..._P1_LEND_ARENA), the ring's (..._P1_LEND) beside them. */
+int FileStager::p1_lend_arena(char* lo, int64_t bytes, int64_t rows, std::function<bool()> full, std::string* why) {
+    if (!p1_lend_arena_asked() || p1_->lending() || !full) {
+        if (why) *why = "the card path does not wait for the arena, or lends already";
+        return RAD_E_STATE;
+    }
+    /* The CPU path keeps a layer's gate_up operand addresses from an earlier pass (hx_capture), and a
+     * change of arena level moves them: only early issue's refetch takes the move, so without it (or
+     * with the M1 trace, which forces the ordinary path) the first pass after each level change would
+     * stop at its gate_up. */
+    if (!hx_early_ || trace_requested_) {
+        if (why)
+            *why = fmt("the lent arena needs RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1 and no %s: an arena level change "
+                       "moves the gate_up operands the CPU path fetched from", kM1PrefetchTraceEnv);
+        return RAD_E_INVAL;
+    }
+    const std::vector<char*> slots = p1::arena_slots(lo, bytes, p1_tun_.lend_arena);
+    if (slots.empty()) {
+        if (why)
+            *why = fmt("the arena's top above the %lld-token level (%.1f MiB) holds no slot of %lld bytes", (long long)rows,
+                       (double)std::max<int64_t>(bytes, 0) / 1048576.0, (long long)ds41p1::kSlotBytes);
+        return RAD_E_INVAL;
+    }
+    p1_arena_full_ = std::move(full);
+    p1_arena_rows_ = rows;
+    const int rc = p1_lend_init(p1_tun_, slots, why);
+    if (rc < 0) p1_arena_full_ = nullptr;
+    return rc;
 }
 
 /* Layer li of an armed pass, its counts in counts_host_ and its selected file-tier units in want_

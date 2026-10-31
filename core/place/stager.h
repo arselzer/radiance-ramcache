@@ -533,6 +533,14 @@ public:
         return b.phase == RAD_PHASE_PREFILL && b.n_tok_decode == 0 && b.draft_pass == 0 && b.n_spec == 0 &&
                b.n_tok >= ds41p1::kMinArmRows && b.n_tok >= min_rows && b.n_tok <= max_rows;
     }
+    /* The lent arena (..._P1_LEND_ARENA, card_expert_stager.h). Asked for, p1_init lends nothing yet;
+     * the engine then binds the arena's smallest level and hands p1_lend_arena the arena's top [lo, lo +
+     * bytes) above that level's buffers (steps of up to `rows` tokens) and guard, and `full`, whether
+     * the step about to be issued runs at the full plan (Ctx::level() 0): the lending starts, the ring's
+     * slots (..._P1_LEND) with the arena's, and every pass at the full plan takes them all back. < 0
+     * with *why when no slot fits or no unit is left to lend (the engine refuses to start). */
+    bool p1_lend_arena_asked() const { return p1_ && p1_arena_asked_; }
+    int  p1_lend_arena(char* lo, int64_t bytes, int64_t rows, std::function<bool()> full, std::string* why);
     //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
     int shutdown_head_cache();
 
@@ -636,12 +644,13 @@ private:
      * three launches (launched) and runs its waves behind its down projection (after_op). */
     int  p1_state_ = 0;
     int64_t p1_min_rows_ = ds41p1::kDefMinRows;   /* ..._P1_MIN_ROWS as lcp_init read it */
-    bool    p1_lend_asked_ = false;               /* ..._P1_LEND > 0 as lcp_init read it */
+    bool    p1_lend_asked_ = false;               /* ..._P1_LEND or ..._P1_LEND_ARENA > 0 as lcp_init read it */
     /* The rows the CPU path takes under P1: every layer pass below the threshold (ds41p1::cpu_rows). */
     int64_t p1_cpu_rows() const { return ds41p1::cpu_rows(ep_rows_, p1_min_rows_); }
     /* hx_init's ..._MISSES bound: every pass's rows (ep_rows_), but under P1 without the lent ring only the
      * layer passes below the threshold (p1_cpu_rows); with it a pass that does not arm P1 would stage its
-     * misses in the file buffers, whose idle slots then hold published residents. */
+     * misses in the file buffers, whose idle slots then hold published residents. The lent arena keeps
+     * the same bound (the copy path refuses whenever a slot is lent). */
     int64_t hx_need_rows() const { return lcp_ && p1_state_ == 1 && !p1_lend_asked_ ? p1_cpu_rows() : ep_rows_; }
     std::unique_ptr<p1::CardExpertPath> p1_;
     bool p1_armed_ = false;
@@ -654,7 +663,18 @@ private:
      * ring resident, recorded at its end; an armed pass's first ring copy waits on it. */
     RadEvent p1_lend_ev_ = nullptr;
     bool     p1_lend_rec_ = false;
-    int  p1_lend_init(const p1::Tunables& t, std::string* why);
+    /* The lent ring's slots (..._P1_LEND) and the arena's (`arena`, from p1_lend_arena), the hottest
+     * file-tier units to the ring first. */
+    int  p1_lend_init(const p1::Tunables& t, const std::vector<char*>& arena, std::string* why);
+    /* The lent arena (..._P1_LEND_ARENA): asked for (p1_init then waits for p1_lend_arena), p1_init's
+     * tunables, whether the step being issued runs at the full plan, and the level its slots sit above.
+     * p1_lend_took_: this pass took the lent slots back (it armed the card path, or ran at the full plan
+     * with the lent arena), so the grace restarts at its end. */
+    bool    p1_arena_asked_ = false;
+    p1::Tunables p1_tun_;
+    std::function<bool()> p1_arena_full_;
+    int64_t p1_arena_rows_ = 0;
+    bool    p1_lend_took_ = false;
     static int64_t p1_now_ms() {
         return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now().time_since_epoch()).count();

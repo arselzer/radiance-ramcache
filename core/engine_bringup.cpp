@@ -4425,6 +4425,60 @@ int Engine::start() {
             for (auto& r : ranks_) r->arena_lent.clear();
         }
     }
+    /* ---- the top of the activation arena, lent to prefill Phase 1's residents ---------------
+     *
+     * RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA (place/card_expert_stager.h, the lent arena). A static
+     * plan lends the expert slab nothing (the block above needs the heat engine), so the arena's top
+     * goes to the card path's lender instead: the smallest level alone is bound, every step runs at it
+     * or at the full plan, and each rank's file stager gets everything above that level's buffers and
+     * the guard. A step at the full plan takes the lent slots back at its begin_pass, before its first
+     * op; arena_step picks the level as for the slab's loan, which stays 0. Refused when the plugin gave
+     * no level (deepseek41 declares at a smaller step only beside the switch) or the arena is lent to
+     * the slab already. */
+    if (!ranks_.empty() && ranks_[0]->fstager.p1_lend_arena_asked()) {
+        std::string why;
+        size_t li = SIZE_MAX;
+        for (size_t i = 0; i < ranks_[0]->arena_levels.size(); ++i)
+            if (ranks_[0]->arena_levels[i].rows != arena_span_rows_ &&
+                (li == SIZE_MAX || ranks_[0]->arena_levels[i].rows < ranks_[0]->arena_levels[li].rows))
+                li = i;
+        if (!arena_rows_.empty())
+            why = "the activation arena is lent to the expert slab already (a dynamic plan)";
+        else if (li == SIZE_MAX)
+            why = fmt("the activation arena has no smaller level (the '%s' plugin declares at a smaller step only "
+                      "beside %s=1 and this switch: rebuild it from a tree that does; the levels' lines above say "
+                      "why a level was dropped)", plugins_.arch_plugin.c_str(), ds41p1::kEnv);
+        for (size_t i = 0; why.empty() && i < ranks_.size(); ++i) {
+            Rank& r = *ranks_[i];
+            RAD_TRY(rad_dev_set(r.device));
+            const ArenaLevel& lv = r.arena_levels[li];
+            if (r.ctx.add_level(lv.rows, lv.offset, lv.decl) != 1) {
+                why = fmt("rank %d: the %lld-token level would not bind", r.index, (long long)lv.rows);
+                break;
+            }
+            const int64_t top = r.program.arena_bytes;
+            const int64_t edge = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+            Ctx* const rctx = &r.ctx;
+            std::string w;
+            if (r.fstager.p1_lend_arena((char*)r.ctx.arena_base() + edge, top > edge ? top - edge : 0, lv.rows,
+                                        [rctx] { return rctx->level() == 0; }, &w) < 0) {
+                why = fmt("rank %d: %s", r.index, w.c_str());
+                break;
+            }
+            r.arena_lent.assign(2, 0);
+            if (r.index == 0)
+                RAD_INFO("activation arena: steps of up to %lld tokens take %s of %s; the %s above them and a %s "
+                         "guard go to prefill Phase 1's lent arena (%s)", (long long)lv.rows, humanb(lv.end).c_str(),
+                         humanb(top).c_str(), humanb(top > edge ? top - edge : 0).c_str(), humanb(kArenaGuard).c_str(),
+                         ds41p1::kLendArenaEnv);
+        }
+        (void)rad_dev_set(ranks_[0]->device);
+        if (!why.empty()) {
+            RAD_ERR("%s (prefill Phase 1's lent arena) refused: %s", ds41p1::kLendArenaEnv, why.c_str());
+            return RAD_E_INVAL;
+        }
+        arena_rows_ = { cfg_.max_tok, ranks_[0]->arena_levels[li].rows };
+    }
     /* Immediate recall: when a request needs more cache than is in hand, rank 0's cache calls this
      * from the scheduler between dispatches, with every rank thread parked. Each rank's slab is
      * drained to the affordable loan before the blocks are handed out, and the followers' marks

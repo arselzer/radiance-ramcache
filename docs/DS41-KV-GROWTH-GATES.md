@@ -76,19 +76,45 @@ then explicitly freeze MAX for its paired live arms. Prefix-on/off and packed-on
 change the layout, so they require their own bound. The source first funds that entire
 maximum plus late allocations and max(startup,runtime) headroom before its initial commit.
 
-MIN is a total floor, not extra backing above fixed state/window/dummy readers. Start with
+MIN is a total floor, not extra backing above fixed state/window readers. Start with
 MIN0/WARM0/HYSTERESIS0/HEADROOM256 (all suffixes explicitly provided); a second independent
 arm uses MIN equal to one granule, WARM one granule, HYSTERESIS one granule and HEADROOM256.
 Record actual bytes rather than assuming either arm starts at MIN. The second arm's spare
 growth may be logged with cause=shrink because begin_plan performs policy reconciliation;
 classify physical changes by actual versus old as well as retaining the cause field.
 
-Tiny prompts cannot guarantee a growth event. Page0 readers pin the first granule in each
-FULL layer stripe. For a2MiB granule, BF16 latent1024B rows cross after about2048 rows, but
-packed288B rows can stay in the same granule through about7281 rows (alignment can change
-the exact point). Thus an unchanged6817-token prompt is a concrete initial BF16 demand;
-the eventual packed gate should use the existing roughly9.7K harness history. Require logs
-showing actual positive growth on all ranks; no numerical threshold estimate substitutes.
+The actual381d30ad source does not permanently pin FULL block0. Invalid and padded native
+reader lanes use a null/constant-zero pointer after guards; they do not speculatively use
+cache block0. Thus even a short request may cause the first allocation-driven growth. Require
+logs showing actual positive growth on all ranks rather than predicting it from prompt size.
+The unchanged6817-token prompt remains useful for crossing further granules; the existing
+roughly9.7K harness covers longer prefix lifetimes. An earlier preparation note incorrectly
+assumed a permanent page0 floor and inferred roughly7281 packed rows were needed for first
+growth. That was not verified and is withdrawn; no such threshold is part of this gate.
+
+The source audit supporting this correction (native current geometry only):
+
+| Site | Guard before forming or dereferencing the cache pointer |
+|---|---|
+| sparse.hip192–224 scalar index | j<C, j<reach and valid table/block; otherwise kp=null and no read |
+| sparse.hip1578–1592 WMMA index | same reach/table/block guards; invalid kp becomes kDsZeroKey |
+| sparse.hip658–675 scalar attention | invalid window/selection leaves null; ds_kv helpers return zero |
+| sparse.hip1091–1118 all decode forms | ptr begins kDsZeroKey, replaced only after valid window/selection/table/block |
+| sparse.hip1387–1404 WMMA attention | invalid ptr becomes kDsZeroKey; separate validity mask |
+| sparse.hip472–477 top-k | every unused selected position is written -1 |
+| qsa_work_bf16.hip74–91 compressor | work beyond actual count writes page=-1; valid work uses its owned table entry |
+| ds41_elem.hip1292–1294 /1329–1330 stores | negative or out-of-range page skips both plain/packed cache writes |
+| core/sched/batch.cpp759–777 | table suffix past owned entries is explicitly staged -1 |
+
+All native compressed-cache pointer formation sites in sparse.hip were enumerated: scalar
+and WMMA index, scalar/decode/WMMA attention; every packed-fast load shares these pointers.
+Plain fast PV's unconditional loads use the constant-zero row for invalid keys. The reference
+index/attention implementations also guard the same logical bounds before cache access, but
+this does not authorize a host-copy fallback that stages a whole unbacked tensor. The model
+gate must retain native resolved rows and reject unknown whole-cache copy/read consumers.
+These are static findings; actual VMem access and padded/native dispatch remain card/model
+gates. A future added consumer must close its own range contract or conservatively pin its
+required floor in every bootstrap/grow/shrink transaction.
 
 ## Lifetime and strict evidence
 

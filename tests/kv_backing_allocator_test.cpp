@@ -18,11 +18,11 @@ struct Fixture {
         cfg.host_pool_mib = 0; cfg.max_seqs = 2; cfg.max_tok = 4; cfg.max_ctx = 131072;
         std::vector<KVGroupInfo> groups(1);
         KVGroupInfo full; full.name = "packed_index"; full.decl.kind = RAD_KV_FULL;
-        full.decl.dtype = RAD_BF16; full.decl.n_head_kv = 1; full.decl.head_dim = 64;
+        full.decl.dtype = RAD_BF16; full.decl.n_head_kv = 1; full.decl.head_dim = 32;
         full.decl.storage_format = RAD_KV_STORAGE_DS41_FP4_POW2_G32; full.decl.storage_block_bytes = 68;
         full.block_size = 2; full.layers = {2, 8}; groups.push_back(full);
-        if (whole_index) { groups.back().block_size = 1; groups.back().decl.head_dim = 128; }
-        full.name = "packed_latent"; full.decl.head_dim = 512; full.block_size = 1; full.layers = {20};
+        if (whole_index) { groups.back().block_size = 1; groups.back().decl.head_dim = 64; }
+        full.name = "packed_latent"; full.decl.head_dim = 256; full.block_size = 1; full.layers = {20};
         full.decl.storage_format = RAD_KV_STORAGE_DS41_FP4_E4M3_G16; full.decl.storage_block_bytes = 288;
         groups.push_back(full);
         KVGroupInfo state; state.name = "raw_state"; state.decl.kind = RAD_KV_LINEAR;

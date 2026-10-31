@@ -311,7 +311,7 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
   nullptr, nullptr, r4d_shape_rmsnorm_rope_roundtrip, nullptr, r4d_fuse_rmsnorm_rope_roundtrip },
 { "rmsnorm_rope_roundtrip_fp4_bf16", "rmsnorm_rope_roundtrip", "norm",
   "rmsnorm, rope_rows and an e2m1 quant_roundtrip of a row in one pass",
-  "any M, n <= 16384; rmsnorm_bf16's workgroup a row (r4d_act_threads), the row in LDS between steps",
+  "any M, n <= 16384; workgroup a row (r4d_act_threads); RADIANCE_EXPERIMENTAL_DS41_N128=1: n128 index key in a wave",
   "bf16 x and y, f32 or bf16 w, f32 cos_sin, i32 positions", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDs41NormRopeRtFp4), NOTUNE, nullptr, nullptr, r4d_rad_rmsnorm_rope_roundtrip, nullptr,
   nullptr, nullptr, r4d_shape_rmsnorm_rope_roundtrip, nullptr, r4d_fuse_rmsnorm_rope_roundtrip },

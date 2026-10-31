@@ -17,6 +17,8 @@ int r4d_rad_router_scored_topk(const RadArgs* a, RadStream stream);
 int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream stream);
 /* The fused chains (one launch each, byte-identical to the chain r4d_fuse.cpp declares). */
 int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream stream);
+/* Oracle only: 0 unchanged workgroup, 1 n128 index-key wave form (strict geometry check). */
+int r4d_rad_rmsnorm_rope_roundtrip_n128_check(const RadArgs* a, RadStream stream, int form);
 int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream stream);

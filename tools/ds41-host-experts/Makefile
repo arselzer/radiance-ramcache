@@ -52,7 +52,12 @@ $(O)/ds41_mxfp4_device_check: $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_expe
 	$(HIPCC) $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_experts_dc.o -o $@ -ldl
 mxfp4-check: $(O)/ds41_mxfp4_device_check
 
+# Same n128 oracle cases as the SIMT emulator, over a built libr4d. Run only in a GPU window.
+$(O)/ds41_n128_device_check: $(TREE)/tests/r4d_emu/test_ds41n128.cpp $(TREE)/libr4d/r4d_ds41_elem.h
+	$(HIPCC) $(HIPFLAGS) -DDS41_N128_DEVICE -I$(TREE)/abi -I$(TREE)/libr4d -o $@ $< -ldl
+n128-check: $(O)/ds41_n128_device_check
+
 clean:
 	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
 
-.PHONY: clean scan device-check mxfp4-check router-eval
+.PHONY: clean scan device-check mxfp4-check n128-check router-eval

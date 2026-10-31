@@ -47,7 +47,12 @@
 # grid past its prompt snapshots the state there, so a conversation's next turn resumes at most 15
 # tokens before the reply's end; refused, and the arm skipped, with Pcx or speculation; skipped
 # with Xt, which no Kh run has yet covered end to end, unless the window sets PCE_XT=1 for that
-# Kh run); Pcl the
+# Kh run); PcgN those snapshots on an N-token grid (RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=N: under
+# large-chunk prefill the resume grid is the chunk, so Pce alone snapshots a reply every C tokens
+# and the next turn re-prefills up to C - 1 of them; with PcgN, N a multiple of 16 that divides C,
+# every N tokens past the prompt, so the next turn resumes at most N - 1 tokens before the reply's
+# end, off the cold run's chunk grid, exact by ds41's partition invariance under LCP: gate it with
+# Kh against the cold arm; it needs Pce and an Lc part, or the arm is skipped); Pcl the
 # snapshot store gives up the least recently used conversation first (..._PREFIX_SESSION_LRU); PcbN
 # the store as a byte budget of N MiB (..._CHECKPOINT_STORE_MIB, auto otherwise; not with PcsN);
 # PcmN --prefix-cache-mib N (the host KV tier: a finished conversation's KV copied to pinned host
@@ -434,8 +439,8 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   # A Pc arm: the prefix cache's startup lines (the snapshot store, the interval, the resume rule).
   [[ -z "${ARM_NOPC---no-prefix-cache}" ]] && \
     grep -E 'host headroom|chunk geometry|prefix resume|prefix cache|checkpoint slots|end-of-request snapshots|snapshot store|kv tiers' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
-  # The harness parts (Pce, Pcl, PcbN, PcmN, Pcr): each switch's startup line in an arm that names
-  # it, and none in an arm that does not (a switch left set for the window), or the arm is not
+  # The harness parts (Pce, PcgN, Pcl, PcbN, PcmN, Pcr): each switch's startup line in an arm that
+  # names it, and none in an arm that does not (a switch left set for the window), or the arm is not
   # measured.
   local hp_bad=""
   hp_check() {   # part, set in this arm (1 or empty), the line that says it took effect
@@ -444,12 +449,13 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     if [[ -z "$2" && "$n" != 0 ]]; then hp_bad+=" no $1 part, but a '$3' line;"; fi
   }
   hp_check Pce "${ARM_EORS:-}" 'end-of-request snapshots: on'
+  hp_check PcgN "${ARM_RGRID:-}" 'end-of-request snapshots: on a [0-9]+-token grid'
   hp_check Pcl "${ARM_SLRU:-}" 'snapshot store: by session'
   hp_check PcbN "${ARM_STOREMIB:-}" 'checkpoint slots: a byte budget'
   hp_check PcmN "${ARM_TIER:-}" "kv tiers: a finished conversation's KV is copied"
   hp_check Pcr "${ARM_KVREP:-}" 'KV_REPLICATED: [0-9]+ paged group'
   if [[ -n "$hp_bad" ]]; then
-    log "arm $name: not measured:$hp_bad $(grep -m2 -E 'end-of-request snapshots: refused|KV_REPLICATED refused' "$OUT/$name.server.log" | tr '\n' ' ')"
+    log "arm $name: not measured:$hp_bad $(grep -m2 -E 'end-of-request snapshots: refused|RESUME_GRID=[^ ]* refused|KV_REPLICATED refused' "$OUT/$name.server.log" | tr '\n' ' ')"
     stop_server; return 1
   fi
   # RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8 (the F8 parts): the plugin names the weights it reads from
@@ -1470,7 +1476,7 @@ for a in $ARMS; do
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   psc="" prs=12 pk="" pw="" ns="" pv=""
-  hpe="" hpl="" hpb="" hpm="" hpr=""
+  hpe="" hpg="" hpl="" hpb="" hpm="" hpr=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
@@ -1586,6 +1592,7 @@ for a in $ARMS; do
       Pcs[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                       # snapshot store slots (auto)
       Pcx)     pcopt+=" $p"; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;           # publish only cold-cut chunks
       Pce)     pcopt+=" $p"; hpe=1; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EORS=1) ;;              # end-of-request snapshots
+      Pcg[0-9]*) pcopt+=" $p"; hpg=${p#Pcg}; env+=(RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=${p#Pcg}) ;;   # ...on an N-token grid
       Pcl)     pcopt+=" $p"; hpl=1; env+=(RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=1) ;;       # snapshot store LRU by session
       Pcb[0-9]*) pcopt+=" $p"; hpb=1; env+=(RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=${p#Pcb}) ;;   # snapshot store as N MiB
       Pcm[0-9]*) pcopt+=" $p"; hpm=1; ARGS+=(--prefix-cache-mib "${p#Pcm}") ;;                 # host KV tier of N MiB
@@ -1806,11 +1813,23 @@ for a in $ARMS; do
   if [[ -n "$hpb" && " ${ARGS[*]} " == *" --checkpoint-slots "* ]]; then
     log "arm $a: PcbN with PcsN (a count given takes no byte budget); the arm is skipped"; skip=1
   fi
+  # PcgN: the grid of Pce's snapshots under large-chunk prefill, whose chunk C is the resume grid; N a
+  # multiple of 16 below C that divides it (the engine refuses anything else, and LCP's absence).
+  if [[ -n "$hpg" ]]; then
+    if [[ -z "$hpe" ]]; then
+      log "arm $a: PcgN needs Pce (it sets the grid end-of-request snapshots are taken on); the arm is skipped"; skip=1
+    elif [[ -z "$lc" ]]; then
+      log "arm $a: PcgN needs an Lc part (large-chunk prefill's pins are the partition invariance it stands on; the engine refuses it otherwise); the arm is skipped"; skip=1
+    elif ! [[ $hpg =~ ^[0-9]+$ ]] || (( 10#$hpg < 16 || 10#$hpg % 16 || 10#$hpg >= lc || lc % 10#$hpg )); then
+      log "arm $a: Pcg$hpg: the grid is a multiple of 16 below the chunk $lc that divides it; the arm is skipped"; skip=1
+    fi
+  fi
   [[ -n "$hpe" ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_EORS=0)
+  [[ -n "$hpg" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=0)
   [[ -n "$hpl" ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=0)
   [[ -n "$hpb" ]] || env+=(RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=)
   [[ -n "$hpr" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=0)
-  ARM_EORS=$hpe ARM_SLRU=$hpl ARM_STOREMIB=$hpb ARM_TIER=$hpm ARM_KVREP=$hpr
+  ARM_EORS=$hpe ARM_RGRID=$hpg ARM_SLRU=$hpl ARM_STOREMIB=$hpb ARM_TIER=$hpm ARM_KVREP=$hpr
   # MrN: arms without it take jobs of the default 4 rows, whatever the window's environment (0 is
   # not this switch's off: any value outside 1-32 turns host experts off).
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=4)

@@ -169,6 +169,7 @@ Mover::~Mover() {
     for (RadEvent e : win_ev_) if (e) rad_event_destroy(e);
     if (gate_) rad_event_destroy(gate_);
     /* Only what this object allocated; a Pool reservation belongs to the Pool. */
+    if (calm_owned_) rad_dev_free(calm_, RAD_MEM_HOST_PINNED);   /* ours: the region outside the budget */
     if (owns_memory_) {
         for (ClassPools& c : pools_) {
             if (c.slab_base) rad_dev_free(c.slab_base, RAD_MEM_DEVICE);
@@ -550,6 +551,13 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
          * finite -- pointing it at the staging buffer's base handed it real weight bytes whose
          * reinterpretation produced NaNs. */
         calm_ = (char*)reserve("file-tier dummy region", 8 << 20, RAD_MEM_HOST_PINNED);
+        if (!calm_ && budget_) {
+            /* Ours: a host pool the plan filled to its last slot (a small --host-pool-mib, which
+             * the planner's staging reserve does not grow for this region) has no room for it; only
+             * dummy table entries read it, so it is taken outside the budget then. */
+            calm_ = (char*)rad_dev_alloc(8 << 20, RAD_MEM_HOST_PINNED);
+            calm_owned_ = calm_ != nullptr;
+        }
         if (!calm_) {
             RAD_ERR("mover: no pinned memory for the file tier's dummy region");
             return RAD_E_NOMEM;

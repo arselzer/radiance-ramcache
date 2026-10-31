@@ -527,7 +527,10 @@ int Engine::stage_couple_draws(const Row* rows, int n) {
 /* One drafter pass through the barrier. Neither pass samples (no logits in the context pass; the
  * query pass has its own selector), so the sampler chain is zero rows. */
 int Engine::block_pass(const RadBatch* db, const char* what, int step) {
-    if (draft_experiment_.query_free() && db->draft_pass == 1) return RAD_E_STATE;
+    if (draft_experiment_.query_free() && db->draft_pass == 1) {
+        RAD_ERR("DSpark query-free refused: stage=block_pass reason=query_dispatch step=%d", step);
+        return RAD_E_STATE;
+    }
     for (auto& rk : ranks_) {
         int s = rk->sampler.build_greedy(0);
         if (s < 0) {
@@ -630,8 +633,10 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     if (draft_experiment_.query_free()) {
         /* Preserve block_begin's normal reservations and EVERY owed context pass. No query
          * batch, ADV_BLOCK/BTAKE, observation/readback or proposal epoch is created. A real
-         * context pass must have run: it already performs the same build_greedy(0) reset as
-         * the omitted query; no sampler state/reset or target RNG work is silently dropped. */
+         * context pass must have run for an actual opportunity: it already performs the same
+         * build_greedy(0) reset as the omitted query. Nonproducing prefill pieces instead pause
+         * with the full5 shape, no owner and no owed context issued yet, as fixed0Q does. No
+         * sampler state/reset or target RNG work is silently dropped. */
         RAD_TRY(sched_.query_free_opportunity(step, block_row_.data(), n, &dnq_candidate_));
         return RAD_OK;
     }

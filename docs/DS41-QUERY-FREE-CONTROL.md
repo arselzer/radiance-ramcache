@@ -44,6 +44,17 @@ the omitted query's second reset is idempotent. A zero-context opportunity is re
 than quietly dropping a reset or adding a differently timed reset. Native target sampling still
 starts with its ordinary `build_step`; request RNG coordinates and inflight ownership are untouched.
 
+Before a multipart prompt produces its first token, `Engine::block_shape` still returns the
+declared full5/depth5: `decoded_seqs()` counts producing plan entries, and Db2 starts on the
+last prompt piece. Such a full5 frame is accepted only as an empty pause (`n=0` with no
+`can_draft` owner). It creates no opportunity, boundary, wait or query epoch, and leaves Dx tap
+history owed. The first producing Db2 piece must run all retained context before it can form an
+opportunity. This corrects the first M16 piece of the 28-token TRAIN request failing before
+generation; it does not alter the query controls or promote empty full5 frames to measurements.
+Any nonempty full5 frame, unknown/reset shape, stale phase/epoch, mismatched owner or incomplete
+context remains refused. Error paths now identify `stage=opportunity|ready|finish|block_pass`
+and a static `reason`; successful paths add no per-step logging.
+
 At fixed0, `ADV_BLOCK` only stages query inputs and does not mutate target StepSlot state.
 `ADV_BTAKE` only fills proposal tokens (and tree fields, excluded here). The next target
 `ADV_TRUNK` reads `tok[0]` because its speculative depth is0. The retained `ADV_ACCEPT` supplies
@@ -81,9 +92,14 @@ Prepared checks (all still unexecuted):
 
 - `draft_query_free_test`: six pure cases for parsing, scope/request refusals, actual-commit clock,
   prefill, gap, owner/slot/card reuse, cancellation and context/time/output discontinuities.
-- `sched_test dspark_query_free`: four real scheduler fake-backend cases comparing Q0/NQ retained
+- `sched_test dspark_query_free`: six real scheduler fake-backend cases comparing Q0/NQ retained
   Dx rows/positions and target-ahead tokens; refusing incomplete context/stale step/nonzero proposal
-  epoch; actual cancellation and replacement-owner exclusion. No model or emulator involved.
+  epoch; actual cancellation and replacement-owner exclusion. The multipart case follows the
+  actual engine full5-to-Db2 shape switch over 28- and 80-token prompts at M16, requires one/four
+  initial empty pauses, exact complete 16+12/five-by16 context catch-up, subsequent one-row
+  context, fixed0Q/NQ output and ahead-token equality. The companion case refuses nonempty
+  full5, unknown/reset shapes, omitted owners and stale/malformed frames. No model or emulator
+  involved. These added cases are prepared source, not an executed proof.
 - `python3 -I tools/ds41-host-experts/test_dspark_query_free_gate.py`: eight fake receipt cases,
   missing/duplicate first use, wrong owner/context, nonzero query/epoch/publication and wrong sums.
 

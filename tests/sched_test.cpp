@@ -10517,6 +10517,141 @@ TEST(dspark_query_free_retains_fixed0_dx_context_reservations_and_target_ahead) 
     CHECK_EQ(nq.opportunities, 5);
 }
 
+TEST(dspark_query_free_actual_db2_shape_preserves_28_and_80_token_multipart_prefill) {
+    struct Run {
+        std::vector<int32_t> output, context, context_rows, query_rows, blocks;
+        int pauses = 0, opportunities = 0;
+    };
+    const auto run = [](int prompt, bool no_query, Run& out) {
+        const auto x = DraftExperiment::capture("1", nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                "1", nullptr, "0", nullptr, no_query ? "1" : "0");
+        Fixture f; f.build(4096, 64, 16, 512, false, false);
+        f.cfg.max_seqs = 1; f.cfg.draft_short_from = 1;
+        dspark_group(f, 4096, true, false); REQUIRE_EQ(f.start(&x), (int)RAD_OK);
+        auto r = f.request(prompt, 30); r->sp.temp = 0; r->speculation_fixed = true;
+        const auto id = f.add(std::move(r)); REQUIRE(id);
+        const RadBatch* b = f.sch.step(); REQUIRE(b);
+        std::vector<StepSlot> slots(1);
+        bool short_on = false;
+        for (int t = 0; t < 32 && out.opportunities < 4; ++t) {
+            REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+            const StepEntry entry = f.sch.plan().e[0]; CHECK_EQ(entry.n_spec, 0);
+            const int32_t token = 700 + out.opportunities;
+            std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+            if (entry.produces_token) {
+                REQUIRE(entry.dev_out >= 0); sampled[(size_t)entry.dev_out] = token;
+            } else { CHECK_EQ(entry.dev_out, -1); CHECK_EQ(b->n_out, 0); }
+            AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+            accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+            /* Exactly Engine::block_shape: declared full5/depth5 until the plan has a
+             * producing row, then Db2 subtracts three from both block and depth. */
+            short_on = Scheduler::short_block_on(short_on, f.sch.decoded_seqs(), 1);
+            const int block = short_on ? 2 : 5, depth = short_on ? 2 : 5;
+            out.blocks.push_back(block);
+            CHECK_EQ(block, entry.produces_token ? 2 : 5);
+            Scheduler::BlockRow row[1];
+            const int n = f.sch.block_begin(block, depth, 129, 128799, row, 1, true);
+            CHECK_EQ(n, entry.produces_token ? 1 : 0);
+            int rows = 0, passes = 0;
+            while (const RadBatch* cb = f.sch.block_context(b->step)) {
+                REQUIRE(cb->n_tok > 0); CHECK(cb->n_tok <= 16);
+                for (int64_t i = 0; i < cb->n_tok; ++i) out.context.push_back(cb->positions[i]);
+                rows += (int)cb->n_tok; ++passes;
+            }
+            DraftQueryFreeFrame frame;
+            if (no_query) CHECK_OK(f.sch.query_free_opportunity(b->step, row, n, &frame));
+            if (!entry.produces_token) {
+                CHECK_EQ(rows, 0); CHECK_EQ(passes, 0); CHECK_EQ(frame.seq, (uint64_t)0);
+                ++out.pauses;
+            } else {
+                CHECK_EQ(rows, out.opportunities ? 1 : prompt);
+                CHECK_EQ(passes, out.opportunities ? 1 : (prompt + 15) / 16);
+                out.context_rows.push_back(rows);
+                if (no_query) {
+                    CHECK_EQ(frame.seq, id); CHECK_EQ(frame.context_rows, rows);
+                    CHECK_EQ(frame.pure_decode, !entry.is_prefill);
+                    frame.boundary = (uint64_t)out.opportunities + 1; frame.token = token;
+                } else {
+                    const RadBatch* qb = f.sch.block_query(b->step); REQUIRE(qb);
+                    CHECK_EQ(qb->n_tok, 2); out.query_rows.push_back((int32_t)qb->n_tok);
+                    AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK;
+                    q.st = slots.data(); adv_row(q, 0);
+                    int32_t generated[5] = { 800 + out.opportunities, 900 + out.opportunities, -7, -7, -7 };
+                    AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 2;
+                    take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+                    f.sch.expect_draft(id, 2); // fixed0Q still queries but never verifies proposals
+                }
+                ++out.opportunities;
+            }
+            const RadBatch* next = f.sch.step_next();
+            if (entry.produces_token) {
+                REQUIRE(next); CHECK_EQ(next->n_spec, 0);
+                AdvanceArgs trunk = f.sch.advance_args(0); trunk.mode = ADV_TRUNK;
+                trunk.st = slots.data(); adv_row(trunk, 0);
+                CHECK_EQ(next->token_ids[0], token);
+            } else CHECK(next == nullptr); // actual engine cannot issue a mid-prompt piece ahead
+            const size_t before = f.sch.find(id)->output.size();
+            CHECK_OK(f.commit(token)); f.sch.block_end();
+            CHECK_EQ(f.sch.find(id)->output.size(), before + (entry.produces_token ? 1 : 0));
+            if (entry.produces_token) {
+                if (no_query) {
+                    uint64_t count = 0; CHECK(f.sch.query_free_committed(frame, &count));
+                    CHECK_EQ(count, (uint64_t)out.opportunities);
+                } else {
+                    const int32_t ids[2] = { 799 + out.opportunities, 899 + out.opportunities };
+                    CHECK_OK(f.sch.set_draft(id, ids, 2));
+                }
+            }
+            CHECK_EQ(f.sch.draft_prob_stats().proposed, (uint64_t)0);
+            f.sch.step_finished();
+            if (next) { f.sch.promote_next(); b = next; }
+            else b = f.sch.step();
+            REQUIRE(b);
+        }
+        CHECK_EQ(out.opportunities, 4);
+        out.output = f.sch.find(id)->output;
+    };
+    for (int prompt : { 28, 80 }) {
+        Run q, nq; run(prompt, false, q); run(prompt, true, nq);
+        CHECK(q.output == nq.output); CHECK(q.context == nq.context);
+        CHECK(q.context_rows == nq.context_rows); CHECK(q.blocks == nq.blocks);
+        CHECK_EQ(nq.pauses, (prompt + 15) / 16 - 1);
+        CHECK_EQ(q.pauses, nq.pauses); CHECK_EQ(q.query_rows.size(), (size_t)4);
+        CHECK(nq.query_rows.empty()); CHECK_EQ(nq.context.size(), (size_t)prompt + 3);
+        for (size_t i = 0; i < nq.context.size(); ++i) CHECK_EQ(nq.context[i], (int32_t)i);
+        REQUIRE_EQ(nq.output.size(), (size_t)4);
+        for (size_t i = 0; i < nq.output.size(); ++i) CHECK_EQ(nq.output[i], 700 + (int32_t)i);
+    }
+}
+
+TEST(dspark_query_free_full_shape_is_only_an_empty_pause_not_a_query_opportunity) {
+    const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                            "1", nullptr, "0", nullptr, "1");
+    for (int prompt : { 16, 28 }) {
+        Fixture f; f.build(4096, 64, 16, 512, false, false); f.cfg.max_seqs = 1;
+        dspark_group(f, 4096, true, false); CHECK_OK(f.start(&x));
+        auto r = f.request(prompt, 30); r->sp.temp = 0; r->speculation_fixed = true;
+        const auto id = f.add(std::move(r)); REQUIRE(id);
+        const RadBatch* b = f.sch.step(); REQUIRE(b);
+        Scheduler::BlockRow row[1]; DraftQueryFreeFrame frame;
+        const int n = f.sch.block_begin(5, 5, 129, 128799, row, 1, true);
+        while (f.sch.block_context(b->step)) {}
+        CHECK_EQ(n, prompt == 16 ? 1 : 0);
+        CHECK_EQ(f.sch.query_free_opportunity(b->step, row, n, &frame),
+                 (int)(n ? RAD_E_STATE : RAD_OK));
+        CHECK_EQ(frame.seq, (uint64_t)0);
+        if (n) CHECK_EQ(f.sch.query_free_opportunity(b->step, row, 0, &frame), (int)RAD_E_STATE);
+        CHECK_EQ(f.sch.query_free_opportunity(b->step + 1, row, 0, &frame), (int)RAD_E_STATE);
+        CHECK_EQ(f.sch.query_free_opportunity(b->step, nullptr, 1, &frame), (int)RAD_E_STATE);
+        f.sch.block_end();
+        f.sch.block_begin(3, 3, 129, 128799, row, 1, true);
+        CHECK_EQ(f.sch.query_free_opportunity(b->step, row, 0, &frame), (int)RAD_E_STATE);
+        f.sch.block_end();
+        CHECK_EQ(f.sch.block_begin(0, 0, 129, 128799, row, 1, true), 0);
+        CHECK_EQ(f.sch.query_free_opportunity(b->step, row, 0, &frame), (int)RAD_E_STATE);
+    }
+}
+
 TEST(dspark_query_free_refuses_request_before_slot_allocation_and_stale_query_epochs) {
     const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                             "1", nullptr, "0", nullptr, "1");

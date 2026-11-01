@@ -730,7 +730,9 @@ private:
     static int64_t window_table_len(const KVGroupPlan& p, const SeqWindow& w, int64_t n_tokens);
 
     std::vector<KVGroupPlan> plans_;
-    std::vector<std::vector<int32_t>> free_blocks_;   /* per group */
+    /* Per-group private minimum-free-ID candidates. Backing mode includes unbacked candidates;
+     * backed_ids_/free_usable_ alone advertise physical eligibility, and every grab gates it. */
+    std::vector<std::vector<int32_t>> free_blocks_;
     std::vector<std::vector<int32_t>> refcount_;      /* per group, per block */
     /* Per group, per block: the prefix cache holds one of the references. A free block is never
      * marked. `cache_only_` is, per group, how many marked blocks are at a count of one. */
@@ -770,8 +772,10 @@ private:
      * out first: held blocks pack at the bottom and the top, the only part a loan reaches, drains.
      * A stack would hand out the most recently freed id, often a high one. The heap also makes the
      * gate a single check: if any free id is below live_, the smallest one is.
-     * Explicit backing mode keeps separate physical page masks and filters the heap instead;
-     * unbacked IDs are future capacity, never allocatable free IDs. It cannot coexist with loans.
+     * Explicit backing mode retains this same global candidate order and maps the lowest
+     * requested candidates before handing them out. Separate masks/counts advertise physical
+     * eligibility; an unbacked heap candidate is never an allocatable ID. It cannot coexist
+     * with loans. Preferring a backed high ID would change legacy page-table relationships.
      *
      * `held_hist_` counts held blocks per bucket, so finding the highest held block is a walk of
      * a few thousand counters, not a refcount scan. It bounds how far a loan may reach, so it is

@@ -90,8 +90,12 @@ int KVManager::backing_stage(const KVBackingSnapshot& old, const KVBackingSnapsh
                 }
                 out->mask[g][(size_t)b] = backed;
                 if (!backed && refcount_[g][(size_t)b] > 0) return RAD_E_STATE;
-                if (backed && b < live_[g] && refcount_[g][(size_t)b] == 0) {
-                    out->heap[g].push_back((int32_t)b); ++out->usable[g];
+                if (b < live_[g] && refcount_[g][(size_t)b] == 0) {
+                    // Private candidates retain the legacy global minimum-free-ID order.
+                    // Eligibility is still exclusively the separate backed mask/count: an
+                    // unbacked candidate must pass backing_need before grab can return it.
+                    out->heap[g].push_back((int32_t)b);
+                    if (backed) ++out->usable[g];
                 }
             }
         }
@@ -155,16 +159,41 @@ int KVManager::backing_need_ids(const std::vector<KVBackingBlock>& ids) {
 int KVManager::backing_need(int32_t g, int64_t free) {
     RAD_TRY(backing_ready());
     if (free <= 0) return RAD_OK;
-    if (!backing_collect_intent_ && free <= free_usable_[(size_t)g]) return RAD_OK;
+    if (g < 0 || (size_t)g >= plans_.size() || !plans_[(size_t)g].paged()) return RAD_E_INVAL;
+    if (free > available_blocks(g)) return RAD_E_FULL;
     const auto& p = plans_[(size_t)g];
+    auto& heap = free_blocks_[(size_t)g];
+    // reserve_specific leaves a stale heap entry, just as on the legacy path. Remove only
+    // stale held entries at the front; never search the whole refcount array for candidates.
+    const auto valid_id = [&](int32_t b) { return b >= 0 && b < p.n_blocks && b < live_[(size_t)g]; };
+    while (!heap.empty()) {
+        const int32_t b = heap.front();
+        if (!valid_id(b)) { backing_poison(RAD_E_STATE); return backing_error_; }
+        if (refcount_[(size_t)g][(size_t)b] == 0) break;
+        std::pop_heap(heap.begin(), heap.end(), std::greater<int32_t>()); heap.pop_back();
+    }
+    if (!backing_collect_intent_ && free == 1 && !heap.empty() && block_backed(g, heap.front()))
+        return RAD_OK;
     std::vector<KVBackingBlock> ids;
-    for (int64_t b = 0; b < p.n_blocks && (int64_t)ids.size() < free; ++b)
-        if (block_backed(g, (int32_t)b) && refcount_[(size_t)g][(size_t)b] == 0)
-            ids.push_back({g, (int32_t)b});
-    for (int64_t b = 0; b < p.n_blocks && (int64_t)ids.size() < free; ++b)
-        if (!block_backed(g, (int32_t)b) && refcount_[(size_t)g][(size_t)b] == 0)
-            ids.push_back({g, (int32_t)b});
-    if ((int64_t)ids.size() < free) return RAD_E_FULL;
+    // Allocate the existing N-candidate workspace before removing anything. Restoring these
+    // trivial entries cannot grow the heap beyond its original size/capacity. A growth callback
+    // can swap the entire publication, so no heap reference is used after backing_need_ids.
+    try { ids.reserve((size_t)free); }
+    catch (const std::exception&) { return RAD_E_NOMEM; }
+    bool invalid = false;
+    while (!heap.empty() && (int64_t)ids.size() < free) {
+        std::pop_heap(heap.begin(), heap.end(), std::greater<int32_t>());
+        const int32_t b = heap.back(); heap.pop_back();
+        if (!valid_id(b)) { invalid = true; break; }
+        if (refcount_[(size_t)g][(size_t)b] != 0) continue;
+        // A specific reservation followed by release can leave duplicate stale entries.
+        // Extraction is sorted, so distinct candidates need no second heap or bitmap.
+        if (ids.empty() || ids.back().block != b) ids.push_back({g, b});
+    }
+    for (const auto& id : ids) {
+        heap.push_back(id.block); std::push_heap(heap.begin(), heap.end(), std::greater<int32_t>());
+    }
+    if (invalid || (int64_t)ids.size() != free) { backing_poison(RAD_E_STATE); return backing_error_; }
     RAD_TRY(backing_need_ids(ids));
     if (free_usable_[(size_t)g] < free) { backing_poison(RAD_E_STATE); return backing_error_; }
     return RAD_OK;

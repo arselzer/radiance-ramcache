@@ -87,7 +87,8 @@ TEST(kv_backing_allocator_bootstrap_hides_ids_and_requires_fixed_floor) {
     CHECK_EQ(f.kv.held_blocks(1), int64_t(1));
     // Granule rounding can back an entire small group while mapping just its requested pages.
     // Count physical publication independently from the map, rather than require a gap in that
-    // particular group. Logical availability includes unbacked IDs; the free heap must not.
+    // particular group. Logical availability includes unbacked private candidates; the public
+    // free count and backed mask must not advertise them as physically allocatable.
     int64_t hidden_full = 0;
     for (int g : {1, 2, 4}) {
         const auto* p = f.kv.plan(g);

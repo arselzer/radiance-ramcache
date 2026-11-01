@@ -12,7 +12,8 @@ no allocatable pages or state slots. The unchanged legacy carve remains the defa
 `KVManagerBackingPublisher(KVManager*)` implements the transaction's stage/withdraw/publish/
 rollback/poison interface. Stage derives an explicit committed page mask from every layer
 fragment of each physical page, including packed pages crossing mapping granules. It builds
-both old and target filtered min-heaps/counts before any withdrawal, validates every held page
+both old and target global candidate min-heaps and physically backed free counts before any
+withdrawal, validates every held page
 and pending COW source/destination, and requires the target's complete window/raw-state floor.
 An empty old bootstrap map is valid only without holders. Withdrawal hides all allocatable
 IDs/counts; final publication uses allocation-free swaps. Poison is idempotent and hides every
@@ -31,6 +32,10 @@ seeding may grow several groups before grabbing anything: a later group's transa
 release an earlier group's newly mapped candidates. The manager includes these temporary IDs
 in its required inventory and validates them in the target publication until the complete
 attempt returns. Actual grabbed/COW/retained-prefix IDs then carry the ordinary references.
+The private candidate heap retains every logically free ID in legacy minimum-ID order, including
+unbacked IDs. Allocation must map its exact lowest candidates before returning them; already
+mapped higher IDs cannot displace an unmapped lower ID. The published mask and free count remain
+restricted to physical backing. See `DS41-KV-GROWTH-FREE-ORDER.md` for the 512K failure and fix.
 Free blocks count only currently published mapped IDs; admission availability includes future
 unbacked free capacity. The initial engine cohort will fund the whole rounded logical maximum;
 an optional pure capacity callback exists for future tighter physical ceilings.
@@ -44,7 +49,7 @@ lease while the same ownership lock is still held, including failure and excepti
 A rolled-back map failure is still fatal for inference: the controller must poison every rank,
 even though the transaction restored the old heaps successfully.
 
-Prepared host sources cover empty bootstrap/fixed floors, mask-filtered heaps, intended writer
+Prepared host sources cover empty bootstrap/fixed floors, backing-filtered eligibility, intended writer
 lifetimes across groups, prefix retention/adoption, COW, exact/specific restore, cross-granule
 pages, ordinary budget refusal versus fatal mapping, follower mask agreement, and actual manager
 publishers in a later-rank failed-map rollback. Mapping backends in those cases are metadata

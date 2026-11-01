@@ -32,6 +32,7 @@
 #include "place/ds41_index_b16.h"
 #include "place/ds41_scored_scatter.h"
 #include "place/ds41_fp4_classify.h"
+#include "place/ds41_fp8_convert.h"
 #include "place/ds41_window_packed.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
@@ -4536,6 +4537,21 @@ int Engine::start() {
             if(!ds41_fp4_classify_admit(r->program,&n,&why)){
                 RAD_ERR("%s=1 refused rank%d: %s",rad_ds41_fp4_runtime::kEnv,r->index,why.c_str());return RAD_E_UNSUPPORTED;}
             RAD_INFO("ds41 fp4 classifier admitted: rank=%d ops=%d original_arithmetic=1 capture_reuses_nibble=1 model_qualified=0",r->index,n);
+        }
+    }
+    bool fp8_on=false,fp8_audit_on=false;
+    if(!rad_ds41_fp8_runtime::parse(std::getenv(rad_ds41_fp8_runtime::kEnv),&fp8_on)||
+       !rad_ds41_fp8_runtime::parse(std::getenv(rad_ds41_fp8_runtime::kAuditEnv),&fp8_audit_on)||
+       (fp8_audit_on&&!fp8_on))return RAD_E_INVAL;
+    if(fp8_on){
+        if(!meta_.arch_id||std::strcmp(meta_.arch_id,"deepseek41")||ranks_.size()!=4)
+            return RAD_E_UNSUPPORTED;
+        for(const auto&r:ranks_){int n=0;std::string why;RadDeviceProps props{};
+            if(rad_dev_props(r->device,&props)<0||std::strcmp(props.arch,"gfx1201")||props.is_host_backend||props.warp_size!=32)
+                return RAD_E_UNSUPPORTED;
+            if(!ds41_fp8_convert_admit(r->program,&n,&why)){
+                RAD_ERR("%s=1 refused rank%d: %s",rad_ds41_fp8_runtime::kEnv,r->index,why.c_str());return RAD_E_UNSUPPORTED;}
+            RAD_INFO("ds41 fp8 conversion admitted: rank=%d ops=%d trunk_rope=40 n=8192 group=32 original_arithmetic=1 capture=unchanged model_qualified=0",r->index,n);
         }
     }
     RAD_TRY(load_weights());

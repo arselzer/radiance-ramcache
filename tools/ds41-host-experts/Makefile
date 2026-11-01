@@ -44,6 +44,13 @@ $(O)/ds41_scored_scatter_device_check: ds41_scored_scatter_device_check.hip
 scored-scatter-check: $(O)/ds41_scored_scatter_device_check
 .PHONY: scored-scatter-check
 
+# BUILD ONLY. New FP8 native aliases require actual ISA admission and all4card byte oracles
+# in stopped-QFN windows before any serving enablement; no implicit run from this target.
+$(O)/ds41_fp8_runtime_device_check: ds41_fp8_runtime_device_check.hip $(TREE)/arch/common/rad_ds41_fp8_runtime.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
+fp8-runtime-check: $(O)/ds41_fp8_runtime_device_check
+.PHONY: fp8-runtime-check
+
 # The card check of the host experts against libr4d's decode kernels (check, swiglu, time, ptime)
 # and of RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL (`tall`: the routed GEMM's twin row, the sparse
 # attention and the indexer score at passes taller than 16 tokens against the same rows in smaller

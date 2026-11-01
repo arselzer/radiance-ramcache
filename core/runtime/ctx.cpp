@@ -10,6 +10,7 @@
 #include "xp_state.h"
 #include "../device/device.h"
 #include "../sched/tbo.h"
+#include "../../arch/common/rad_ds41_fp8_runtime.h"
 
 #include <algorithm>
 #include <cstring>
@@ -80,11 +81,12 @@ void Ctx::shutdown() {
     rowpf_worker_.reset();   /* joins the read-ahead helper, if one started */
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
-    if (fp4_audit_live_) {
+    if (fp4_audit_live_ || fp8_audit_live_) {
         const int device = rad_dev_set(device_);
         const int main = device >= 0 && stream_ ? rad_stream_sync(stream_) : RAD_E_STATE;
         const int other = lane1_ ? rad_stream_sync(lane1_) : RAD_OK;
-        close_fp4_classifier_audit(main >= 0 && other >= 0);
+        if (fp4_audit_live_) close_fp4_classifier_audit(main >= 0 && other >= 0);
+        if (fp8_audit_live_) close_fp8_convert_audit(main >= 0 && other >= 0);
     } else {
         if (stream_) rad_stream_sync(stream_);
         if (lane1_) rad_stream_sync(lane1_);
@@ -145,6 +147,8 @@ int Ctx::prepare() {
     RAD_TRY(bind_routing());
     RAD_TRY(bind_profiling());
     RAD_TRY(bind_fp4_classifier_audit());
+    if(const char*e=std::getenv(rad_ds41_fp8_runtime::kAuditEnv);e&&!std::strcmp(e,"1"))
+        RAD_TRY(bind_fp8_convert_audit());
     /* Recorded passes need a recording backend, and are off whenever every issue must be seen:
      * per-op profile, oracle, and a calibration tap. A `gram_accum` sums across passes while its
      * plugin counts the rows it has summed in step and writes the Grams once a token target is
@@ -273,6 +277,45 @@ void Ctx::close_fp4_classifier_audit(bool drained) {
             (unsigned long long)p[f::CapturedFast],(unsigned long long)p[f::Blocks],(unsigned long long)p[f::Overflow]);
     }
     RAD_INFO("ds41 fp4 classifier audit complete: rank=%d rows=12 bytes=%d readbacks=1 drained=1",rank_,f::kBytes);
+}
+
+int Ctx::bind_fp8_convert_audit() {
+    namespace f=rad_ds41_fp8_runtime;
+    fp8_audit_device_=fp8_audit_host_=0;fp8_audit_live_=false;
+    for(size_t i=1;i<program_->buffers.size();++i){const auto&b=program_->buffers[i];
+        const bool device=b.name==f::kDevice,host=b.name==f::kHost;if(!device&&!host)continue;
+        rad_buf&found=device?fp8_audit_device_:fp8_audit_host_;
+        if(found||b.decl.kind!=RAD_BUF_PERSIST||b.decl.dtype!=RAD_I64||b.decl.rank!=1||b.decl.shape[0]!=f::kWords||
+           b.bytes!=f::kBytes||b.decl.domain!=(host?RAD_DOMAIN_HOST:RAD_DOMAIN_DEVICE)||!b.ptr||
+           (reinterpret_cast<uintptr_t>(b.ptr)&7u))return RAD_E_STATE;
+        found=(rad_buf)i;
+    }
+    if(!fp8_audit_device_||!fp8_audit_host_||!stream_)return RAD_E_STATE;
+    RAD_TRY(rad_memset_async(buf_tmpl_[fp8_audit_device_].data,0,f::kBytes,stream_));
+    RAD_TRY(rad_stream_sync(stream_));
+    fp8_audit_live_=true;
+    constexpr size_t state=(2*sizeof(rad_buf)+sizeof(bool)+alignof(void*)-1)/alignof(void*)*alignof(void*);
+    RAD_INFO("ds41 fp8 conversion audit initialized: rank=%d device_payload=%d host_payload=%d context_state_charge=%zu readback=teardown_once",
+             rank_,f::kBytes,f::kBytes,state);
+    return RAD_OK;
+}
+void Ctx::close_fp8_convert_audit(bool drained) {
+    namespace f=rad_ds41_fp8_runtime;
+    fp8_audit_live_=false;const auto dev=fp8_audit_device_,host=fp8_audit_host_;
+    fp8_audit_device_=fp8_audit_host_=0;
+    if(!drained||!dev||!host||dev>=buf_tmpl_.size()||host>=buf_tmpl_.size()){
+        RAD_ERR("ds41 fp8 conversion audit FAILED: rank=%d reason=teardown_drain_or_binding",rank_);return;}
+    void*dst=buf_tmpl_[host].data;const void*src=buf_tmpl_[dev].data;
+    if(rad_memcpy_async(dst,src,f::kBytes,stream_)<0||rad_stream_sync(stream_)<0){
+        RAD_ERR("ds41 fp8 conversion audit FAILED: rank=%d reason=teardown_readback",rank_);return;}
+    const auto*words=static_cast<const uint64_t*>(dst);
+    for(int k=0;k<f::kSlotCount;++k)if(!f::valid_row(words+k*f::FieldCount)){
+        RAD_ERR("ds41 fp8 conversion audit FAILED: rank=%d reason=overflow_or_counter_contract",rank_);return;}
+    for(int k=0;k<f::kSlotCount;++k){const auto*p=words+k*f::FieldCount;
+        RAD_INFO("ds41 fp8 conversion audit: rank=%d op=%s n=%d fast=%llu fallback=%llu blocks=%llu overflow=%llu readbacks=1 scope=rank_op_width lifetime=cohort",
+            rank_,f::kNames[f::kSlots[k].op],f::kSlots[k].width,(unsigned long long)p[f::Fast],
+            (unsigned long long)p[f::Fallback],(unsigned long long)p[f::Blocks],(unsigned long long)p[f::Overflow]);}
+    RAD_INFO("ds41 fp8 conversion audit complete: rank=%d rows=3 bytes=%d readbacks=1 drained=1",rank_,f::kBytes);
 }
 
 int Ctx::bind_buffers() {

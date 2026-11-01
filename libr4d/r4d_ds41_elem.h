@@ -46,6 +46,11 @@ int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream stream);
 int r4d_rad_rmsnorm_rope_roundtrip_n128_check(const RadArgs* a, RadStream stream, int form);
 int r4d_rad_rmsnorm_rope_roundtrip_kvpack_n128_check(const RadArgs*, RadStream, int form);
 int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream stream);
+int r4d_rad_quant_roundtrip_fp8_convert(const RadArgs*, RadStream);
+int r4d_rad_rope_rows_roundtrip_fp8_convert(const RadArgs*, RadStream);
+int r4d_rad_ds41_fp8_convert_probe(const RadArgs*, RadStream, int, int);
+int r4d_shape_quant_roundtrip_fp8_convert(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_rope_rows_roundtrip_fp8_convert(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream stream);
 

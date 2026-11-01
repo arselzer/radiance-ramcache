@@ -471,6 +471,8 @@ private:
     int  bind_buffers();
     int  bind_fp4_classifier_audit();
     void close_fp4_classifier_audit(bool drained);
+    int  bind_fp8_convert_audit();
+    void close_fp8_convert_audit(bool drained);
     int  bind_weights();
     int  bind_ops();
     int  issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
@@ -846,6 +848,8 @@ private:
      * buffers/allocation. Read once after both ordinary teardown drains, before arena release. */
     rad_buf fp4_audit_device_ = 0, fp4_audit_host_ = 0;
     bool fp4_audit_live_ = false;
+    rad_buf fp8_audit_device_ = 0, fp8_audit_host_ = 0;
+    bool fp8_audit_live_ = false;
     std::vector<int32_t>   buf_bits_;
     std::vector<uint8_t>   buf_host_;   /* per handle: a RAD_DOMAIN_HOST buffer */
     /* Every level's templates; `buf_tmpl_` is a copy of the active one. */

@@ -7,6 +7,7 @@
 #include "../arch/common/rad_ds41_kv_codec.h"
 #include "../arch/common/rad_ds41_window_codec.h"
 #include "r4d_ds41_fp4_shapes.inc"
+#include "r4d_ds41_fp8_shapes.inc"
 
 static int64_t ds41_pack_bytes(const RadParam* p, int n_p, int64_t width) {
     const uint32_t kind = (uint32_t)pi(p, n_p, "kv_format");

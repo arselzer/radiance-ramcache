@@ -26,6 +26,7 @@
 #include "../arch/common/rad_ds41_kv_codec.h"
 #include "../arch/common/rad_ds41_window_codec.h"
 #include "../arch/common/rad_ds41_fp4_runtime.h"
+#include "../arch/common/rad_ds41_fp8_runtime.h"
 
 #include <atomic>
 #include <climits>
@@ -2362,6 +2363,7 @@ int post_collapse_norm_body(const RadArgs* a, RadStream stream) {
 
 #include "r4d_ds41_fp4_classify.inc"
 
+#include "r4d_ds41_fp8_convert.inc"
 }  // namespace
 
 extern "C" int r4d_rad_quant_roundtrip_fp4_classify(const RadArgs* a, RadStream s) { return fp4_quant_dispatch(a,s,false); }
@@ -2467,6 +2469,15 @@ extern "C" int r4d_rad_rmsnorm_rope_roundtrip_kvpack_n128_check(const RadArgs* a
 }
 extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s) {
     return rope_rt_body(a, s);
+}
+extern "C" int r4d_rad_quant_roundtrip_fp8_convert(const RadArgs* a, RadStream s) {
+    return fp8_quant_body(a,s);
+}
+extern "C" int r4d_rad_rope_rows_roundtrip_fp8_convert(const RadArgs* a, RadStream s) {
+    return fp8_rope_body(a,s);
+}
+extern "C" int r4d_rad_ds41_fp8_convert_probe(const RadArgs*a,RadStream s,int op,int candidate) {
+    return fp8_probe_body(a,s,op,candidate);
 }
 extern "C" int r4d_rad_rope_rows_roundtrip_kvpack(const RadArgs* a, RadStream s) {
     if (!a || r4d_geti_or(a, "kv_format", 0) == 3) return RAD_E_UNSUPPORTED;

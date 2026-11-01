@@ -33,6 +33,7 @@
 #include "ds41_index_memory.h"
 #include "../common/rad_ds41_scored_scatter.h"
 #include "../common/rad_ds41_fp4_runtime.h"
+#include "../common/rad_ds41_fp8_runtime.h"
 #include "ista_dialect.h"
 #include "../../core/sched/tbo.h"
 #include "../../tools/ds41-host-experts/ds41_p1.h"   /* the lent arena's switch (probe) */
@@ -609,6 +610,8 @@ struct Model {
     bool scored_scatter = false;
     bool fp4_classify = false, fp4_classify_audit = false;
     rad_buf fp4_audit = 0, fp4_audit_host = 0;
+    bool fp8_convert = false, fp8_convert_audit = false;
+    rad_buf fp8_audit = 0, fp8_audit_host = 0;
     int n_router_bf16 = 0, n_comp_bf16 = 0;
     int64_t bf16_saved = 0;
     rad_buf final_hidden = 0, logit_input = 0, logits = 0;
@@ -984,6 +987,29 @@ static rad_op entry_store(RadBuilder* b, int64_t rows, int64_t n, int64_t bs, ra
               {}, { x, page }, {});
 }
 
+/* Wrappers leave the whole old declaration/resolver chain unchanged when disabled or outside
+ * the closed site. In particular, they do not force a fused producer to decline to plain ops. */
+static rad_op fp8_alias(RadBuilder*b,const char*name,std::vector<RadParam>ps,
+                        std::initializer_list<rad_buf>rd,std::initializer_list<rad_buf>wr,rad_buf audit) {
+    const rad_op h=rad_decl_op(b,name,ps.data(),(int)ps.size(),nullptr,0);
+    if(!h||!rad_op_resolved(b,h))return 0;
+    rw(b,h,rd,wr);
+    if(audit&&(rad_op_reads(b,h,&audit,1)<0||rad_op_writes(b,h,&audit,1)<0))return 0;
+    return h;
+}
+static rad_op fp8_roundtrip(RadBuilder*b,const Model&m,int64_t rows,int64_t n,int64_t block,
+                            const char*fmt,const char*scale,rad_buf x,rad_buf packed=0,int kind=0) {
+    if(rows>0&&rows<=INT_MAX&&rad_ds41_fp8_runtime::declare_quant(m.fp8_convert,n,block,fmt,scale,packed!=0))
+        return fp8_alias(b,rad_ds41_fp8_runtime::kNames[rad_ds41_fp8_runtime::Quant],
+            {RAD_RANGE("M",1,rows),RAD_INT("n",n),RAD_INT("block",block),RAD_STR("format",fmt),
+             RAD_STR("scale",scale),RAD_STR("dtype","bf16")},{x},{x},m.fp8_audit);
+    return roundtrip(b,rows,n,block,fmt,scale,x,packed,kind);
+}
+static RadOperand fp8_audit_operand(const Model&m) {
+    if(!m.fp8_audit)return RAD_NONE;
+    RadOperand o=RAD_B(m.fp8_audit);o.rows=rad_ds41_fp8_runtime::kWords;return o;
+}
+
 /* ---- fused chains (docs/OPS.md rmsnorm_rope_roundtrip, rope_rows_roundtrip,
  * mhc_collapse_rmsnorm): one launch for a chain of two or three dependent ops on the same rows,
  * the same bytes as the chain (a kernel library's `replaces`). A decode step pays a fixed cost per
@@ -1065,6 +1091,16 @@ static rad_op rope_rt(RadBuilder* b, const Model& m, int64_t rows, int64_t heads
                    RAD_INT("inverse", inverse), RAD_INT("block", block), RAD_STR("format", fmt),
                    RAD_STR("scale", scale), RAD_STR("dtype", "bf16") },
                  {}, { x, cs }, { x });
+}
+static rad_op fp8_rope_rt(RadBuilder*b,const Model&m,int64_t rows,int64_t heads,int64_t hd,
+                          int inverse,int64_t block,const char*fmt,const char*scale,rad_buf x,rad_buf cs) {
+    if(rows>0&&rows<=INT_MAX&&heads==16&&hd==512&&rad_ds41_fp8_runtime::declare_quant(m.fp8_convert,heads*hd,block,fmt,scale,false)&&
+       m.c.rope==64&&inverse==1&&rad_ds41_fp8_runtime::rope_scope(heads*hd,hd,32,hd-64,heads*32,true,-1.0f))
+        return fp8_alias(b,rad_ds41_fp8_runtime::kNames[rad_ds41_fp8_runtime::Rope],
+            {RAD_RANGE("M",1,rows),RAD_INT("n_head",heads),RAD_INT("head_dim",hd),RAD_INT("rot",m.c.rope),
+             RAD_INT("off",hd-m.c.rope),RAD_STR("mode","gptj"),RAD_INT("inverse",inverse),RAD_INT("block",block),
+             RAD_STR("format",fmt),RAD_STR("scale",scale),RAD_STR("dtype","bf16")},{x,cs},{x},m.fp8_audit);
+    return rope_rt(b,m,rows,heads,hd,inverse,block,fmt,scale,x,cs);
 }
 /* mhc_collapse (h, pre -> x) then rmsnorm (x, w -> y), as one op. */
 static rad_op collapse_norm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, rad_buf h,
@@ -1320,6 +1356,11 @@ static int buffers(RadBuilder* b, Model& m) {
     const auto& c = m.c;
     const int64_t T = g.max_tok, D = c.n_embd, W = m.work;
     const int64_t HN = c.hc * D, HD = g.n_head * c.head_dim;
+    if(m.fp8_convert_audit){
+        m.fp8_audit=decl_b(b,rad_ds41_fp8_runtime::kDevice,RAD_I64,{rad_ds41_fp8_runtime::kWords},RAD_BUF_PERSIST);
+        m.fp8_audit_host=decl_b(b,rad_ds41_fp8_runtime::kHost,RAD_I64,{rad_ds41_fp8_runtime::kWords},RAD_BUF_PERSIST,RAD_DOMAIN_HOST);
+        if(!m.fp8_audit||!m.fp8_audit_host)return RAD_E_INVAL;
+    }
     auto bf = [&](const char* n, std::initializer_list<int64_t> s) {
         return decl_b(b, nm.f("%s", n), RAD_BF16, s);
     };
@@ -1792,7 +1833,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         if (!L.kv_f) {
             L.kv_n = rmsnorm(b, m, T, L.kv_norm, hd, m.kv, m.kvn);
             L.kv_rope = rope_rows(b, m, T, 1, hd, 0, m.kvn, cs);
-            L.kv_q = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn,
+            L.kv_q = fp8_roundtrip(b, m, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn,
                                   m.window_packed ? m.win_pack : 0, m.window_packed ? 3 : 0);
         }
         if (!m.win && !(m.win = win_group(b, m))) return RAD_E_INVAL;
@@ -1966,10 +2007,10 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                     r > 0 ? std::initializer_list<rad_buf>{ m.q, m.sel }
                           : std::initializer_list<rad_buf>{ m.q },
                     { m.o });
-        L.o_f = rope_rt(b, m, T, g.n_head, hd, 1, 32, "fp8_e4m3", "ue8m0", m.o, cs);
+        L.o_f = fp8_rope_rt(b, m, T, g.n_head, hd, 1, 32, "fp8_e4m3", "ue8m0", m.o, cs);
         if (!L.o_f) {
             L.o_rope = rope_rows(b, m, T, g.n_head, hd, 1, m.o, cs);
-            L.o_q = roundtrip(b, T, HD, 32, "fp8_e4m3", "ue8m0", m.o);
+            L.o_q = fp8_roundtrip(b, m, T, HD, 32, "fp8_e4m3", "ue8m0", m.o);
         }
         /* This rank's output groups, each a block of the block-diagonal wo_a. */
         const int64_t gd = HD / m.gr;
@@ -2277,7 +2318,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
         L.kv_g = linear(b, m, Q, L.wkv, hd, D, d.xn, d.kv_);
         L.kv_n = rmsnorm(b, m, Q, L.kv_norm, hd, d.kv_, d.kvn);
         L.kv_rope = rope_rows(b, m, Q, 1, hd, 0, d.kvn, m.cs_a);
-        L.kv_q = roundtrip(b, Q, hd, 32, "fp8_e4m3", "ue8m0", d.kvn);
+        L.kv_q = fp8_roundtrip(b, m, Q, hd, 32, "fp8_e4m3", "ue8m0", d.kvn);
         L.kv_st = op(b, "kv_store",
                      { RAD_RANGE("M", 1, Q), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
                        RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", "bf16") },
@@ -2299,7 +2340,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
             if (!L.attn_lo) return RAD_E_INVAL;
         }
         L.o_rope = rope_rows(b, m, Q, g.n_head, hd, 1, d.o, m.cs_a);
-        L.o_q = roundtrip(b, Q, HD, 32, "fp8_e4m3", "ue8m0", d.o);
+        L.o_q = fp8_roundtrip(b, m, Q, HD, 32, "fp8_e4m3", "ue8m0", d.o);
         const int64_t gd = HD / m.gr;
         for (int j = 0; j < m.gr; ++j) L.o_a.push_back(linear(b, m, Q, L.wo_a[(size_t)j], c.o_rank, gd, d.o, d.oa));
         L.o_b = linear(b, m, Q, L.wo_b, D, m.gr * c.o_rank, d.oa, d.attn_out);
@@ -2481,7 +2522,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             L.d_kv = linear(b, m, T, L.wkv, hd, D, d.cn, d.ckv);
             L.d_kvn = rmsnorm(b, m, T, L.kv_norm, hd, d.ckv, d.ckvn);
             L.d_kvrope = rope_rows(b, m, T, 1, hd, 0, d.ckvn, m.cs_a);
-            L.d_kvq = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", d.ckvn);
+            L.d_kvq = fp8_roundtrip(b, m, T, hd, 32, "fp8_e4m3", "ue8m0", d.ckvn);
             if (!d.kv && !(d.kv = rad_decl_kv_group(b, nm.f("kv_dspark"), &kd))) return RAD_E_INVAL;
             L.d_kvst = op(b, "kv_store", stp, {}, { d.ckvn }, {});
             if (!L.d_kv || !L.d_kvn || !L.d_kvrope || !L.d_kvst) return RAD_E_INVAL;
@@ -2957,6 +2998,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         for (const char* name : rad_ds41_fp4_runtime::kNames)
             if (!rad_op_declared(b,name)) return RAD_E_UNSUPPORTED;
     }
+    if(!rad_ds41_fp8_runtime::parse(std::getenv(rad_ds41_fp8_runtime::kEnv),&m.fp8_convert)||
+       !rad_ds41_fp8_runtime::parse(std::getenv(rad_ds41_fp8_runtime::kAuditEnv),&m.fp8_convert_audit)||
+       (m.fp8_convert_audit&&!m.fp8_convert))return RAD_E_INVAL;
+    if(m.fp8_convert){
+        if(g.world!=4||m.aw!=4||m.zero||g.n_head!=16||c.head_dim!=512||c.n_head!=64||c.rope!=64||
+           c.n_layer!=40||c.n_embd!=5120||g.max_tok<1||g.max_tok>INT_MAX)return RAD_E_UNSUPPORTED;
+        for(const char*name:rad_ds41_fp8_runtime::kNames)if(!rad_op_declared(b,name))return RAD_E_UNSUPPORTED;
+    }
     if(!rad_ds41_scored_scatter::parse(std::getenv(rad_ds41_scored_scatter::kEnv),&m.scored_scatter))return RAD_E_INVAL;
     if(m.scored_scatter) {
         if(!rad_ds41_scored_scatter::scope(g.world,g.rank,g.max_tok,c.n_expert,c.n_expert/g.world,
@@ -3274,7 +3323,8 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
         RAD_ISSUE_N(x, L.d_kv, T, brows(d.cn, T), RAD_W(L.wkv), brows(d.ckv, T));
         RAD_ISSUE_N(x, L.d_kvn, T, brows(d.ckv, T), RAD_W(L.kv_norm), brows(d.ckvn, T));
         RAD_ISSUE_N(x, L.d_kvrope, T, brows(d.ckvn, T), brows(m.cs_a, g.max_ctx), pos);
-        if (L.d_kvq) RAD_ISSUE_N(x, L.d_kvq, T, brows(d.ckvn, T));
+        if (L.d_kvq && m.fp8_convert_audit) RAD_ISSUE_N(x,L.d_kvq,T,brows(d.ckvn,T),fp8_audit_operand(m));
+        else if (L.d_kvq) RAD_ISSUE_N(x, L.d_kvq, T, brows(d.ckvn, T));
         RAD_ISSUE_N(x, L.d_kvst, T, bcol(d.ckvn, 0, hd / 2, T), bcol(d.ckvn, hd / 2, hd / 2, T),
                     praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
     }
@@ -3330,7 +3380,8 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.kv_g, T, brows(d.xn, T), RAD_W(L.wkv), brows(d.kv_, T));
             RAD_ISSUE_N(x, L.kv_n, T, brows(d.kv_, T), RAD_W(L.kv_norm), brows(d.kvn, T));
             RAD_ISSUE_N(x, L.kv_rope, T, brows(d.kvn, T), brows(m.cs_a, g.max_ctx), pos);
-            if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(d.kvn, T));
+            if (L.kv_q && m.fp8_convert_audit) RAD_ISSUE_N(x,L.kv_q,T,brows(d.kvn,T),fp8_audit_operand(m));
+            else if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(d.kvn, T));
             /* The block's keys past the committed end; the next context pass overwrites them. */
             RAD_ISSUE_N(x, L.kv_st, T, bcol(d.kvn, 0, hd / 2, T), bcol(d.kvn, hd / 2, hd / 2, T),
                         praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
@@ -3338,7 +3389,8 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                         praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
                         RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
             RAD_ISSUE_N(x, L.o_rope, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
-            if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(d.o, T));
+            if (L.o_q && m.fp8_convert_audit) RAD_ISSUE_N(x,L.o_q,T,brows(d.o,T),fp8_audit_operand(m));
+            else if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(d.o, T));
             const int64_t gd = HD / m.gr;
             for (int j = 0; j < m.gr; ++j)
                 RAD_ISSUE_N(x, L.o_a[(size_t)j], T, bcol(d.o, j * gd, gd, T), RAD_W(L.wo_a[(size_t)j]),
@@ -3755,6 +3807,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto kv_q = [&] {
                 if (L.kv_q && m.window_packed) RAD_ISSUE_N(x,L.kv_q,nk,KR(m.kvn,hd),KR(m.win_pack,528));
+                else if (L.kv_q && m.fp8_convert_audit) RAD_ISSUE_N(x,L.kv_q,nk,KR(m.kvn,hd),fp8_audit_operand(m));
                 else if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, nk, KR(m.kvn, hd));
             };
             const auto kv_st = [&] {
@@ -3976,10 +4029,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
                             RAD_NONE, RAD_NONE, fpos, vcu, RAD_W(L.sinks), FR(m.o, HD));
             }
             if (L.o_f) {
-                RAD_ISSUE_N(x, L.o_f, nf, FR(m.o, HD), brows(cs, g.max_ctx), fpos);
+                if(m.fp8_convert_audit)RAD_ISSUE_N(x,L.o_f,nf,FR(m.o,HD),brows(cs,g.max_ctx),fpos,fp8_audit_operand(m));
+                else RAD_ISSUE_N(x, L.o_f, nf, FR(m.o, HD), brows(cs, g.max_ctx), fpos);
             } else {
                 RAD_ISSUE_N(x, L.o_rope, nf, FR(m.o, HD), brows(cs, g.max_ctx), fpos);
-                if (L.o_q) RAD_ISSUE_N(x, L.o_q, nf, FR(m.o, HD));
+                if (L.o_q && m.fp8_convert_audit) RAD_ISSUE_N(x,L.o_q,nf,FR(m.o,HD),fp8_audit_operand(m));
+                else if (L.o_q) RAD_ISSUE_N(x, L.o_q, nf, FR(m.o, HD));
             }
             const int64_t gd = HD / m.gr, ow = m.gr * c.o_rank;
             for (int j = 0; j < m.gr; ++j)

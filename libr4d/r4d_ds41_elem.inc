@@ -39,6 +39,17 @@ static const RadParamSpec pDs41QuantRoundtrip[] = { P_INT("M"),      P_INT("n"),
                                                     P_INT("block"),  P_STR("format"),
                                                     P_STR("scale"),  P_STR("dtype") };
 static const RadOperandSpec oDs41QuantRoundtrip[] = { { "x", RAD_OPD_INOUT, 0 } };
+static const RadOperandSpec oDs41QuantFp8Convert[] = {
+    { "x", RAD_OPD_INOUT, 0 }, { "convert_audit", RAD_OPD_INOUT, 1 },
+};
+static const RadOperandSpec oDs41RopeFp8Convert[] = {
+    { "x", RAD_OPD_INOUT, 0 }, { "cos_sin", RAD_OPD_IN, 0 },
+    { "positions", RAD_OPD_IN, 0 }, { "convert_audit", RAD_OPD_INOUT, 1 },
+};
+static const RadConstraint cDs41QuantFp8Convert[] = {
+    C_GE("M",1), C_GE("n",512), C_LE("n",8192), C_EQ("block",32),
+    C_IN("format","fp8_e4m3"), C_IN("scale","ue8m0"), C_IN("dtype","bf16"),
+};
 /* One row a format, so each states the scales that format takes. */
 static const RadConstraint cDs41QuantFp8[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("block", 1), C_IN("format", "fp8_e4m3"),
@@ -178,6 +189,11 @@ static const RadOperandSpec oDs41RopeRt[] = {
 static const RadConstraint cDs41RopeRtFp8[] = {
     C_DS41_ROPE, C_IN("format", "fp8_e4m3"), C_IN("scale", "ue8m0 f32"),
 };
+static const RadConstraint cDs41RopeFp8Convert[] = {
+    C_GE("M",1), C_EQ("n_head",16), C_EQ("head_dim",512), C_EQ("rot",64), C_EQ("off",448),
+    C_IN("mode","gptj"), C_EQ("inverse",1), C_EQ("block",32),
+    C_IN("format","fp8_e4m3"), C_IN("scale","ue8m0"), C_IN("dtype","bf16"),
+};
 static const RadConstraint cDs41RopeRtFp4[] = {
     C_DS41_ROPE, C_IN("format", "fp4_e2m1"), C_IN("scale", "ue8m0 e4m3"),
 };
@@ -298,6 +314,10 @@ SCHEMA("entry_store_kvpack", pDs41EntryKvPack, oDs41EntryKvPack,
            "amax*f32(1/448); fp4_e2m1: ue8m0 from amax floored at 6*2^-126 times f32(1/6), e4m3 = "
            "fp8(max(amax, 6*2^-9)/6)), codes of clamp(x/scale) (fp8 RNE saturating, e2m1 ties to the "
            "even code), times scale in f32, rounded once to dtype."),
+    SCHEMA("quant_roundtrip_fp8_convert",pDs41QuantRoundtrip,oDs41QuantFp8Convert,
+           "Native BF16 FP8 group32 alias, unchanged scale/division/clamp/product/store; finite conversion only."),
+    SCHEMA("rope_rows_roundtrip_fp8_convert",pDs41RopeRt,oDs41RopeFp8Convert,
+           "Native output inverse GPTJ RoPE plus original FP8 roundtrip; conversion-only candidate, no capture."),
     SCHEMA("mhc_mix", pDs41MhcMix, oDs41MhcMix,
            "mhc_pre without the collapse: the same RMS-scaled projection, gates and Sinkhorn mixing, with "
            "the pre gates written to `pre` (f32 [M, hc]) instead of collapsing h. For models that collapse "
@@ -438,6 +458,12 @@ SCHEMA("entry_store_kvpack", pDs41EntryKvPack, oDs41EntryKvPack,
   "bf16 x, f32 arithmetic", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41QuantFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_quant_roundtrip, nullptr, nullptr, nullptr,
   r4d_shape_quant_roundtrip },
+{ "ds41_quant_fp8_convert", "quant_roundtrip_fp8_convert", "quant",
+  "Default-off conversion-only native group32 alias", "M>=1, BF16 widths512/8192, UE8M0",
+  "Unchanged old arithmetic, finite hardware conversion only, optional checked audit",
+  RAD_DOMAIN_DEVICE,R4D_PRIO_ONLY,ROW(cDs41QuantFp8Convert),NOTUNE,
+  nullptr,nullptr,r4d_rad_quant_roundtrip_fp8_convert,nullptr,nullptr,nullptr,
+  r4d_shape_quant_roundtrip_fp8_convert },
 { "quant_roundtrip_fp4_bf16", "quant_roundtrip", "quant",
   "block-scaled e2m1 quantise-dequantise in place, ue8m0 or e4m3 scale",
   "any M, n a multiple of block; a lane group a block up to 32 (powers of two), else a thread",
@@ -506,6 +532,12 @@ SCHEMA("entry_store_kvpack", pDs41EntryKvPack, oDs41EntryKvPack,
   "bf16 x, f32 cos_sin, i32 positions", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41RopeRtFp8),
   NOTUNE, nullptr, nullptr, r4d_rad_rope_rows_roundtrip, nullptr, nullptr, nullptr,
   r4d_shape_rope_rows_roundtrip, nullptr, r4d_fuse_rope_rows_roundtrip },
+{ "ds41_rope_fp8_convert", "rope_rows_roundtrip_fp8_convert", "attn",
+  "Default-off native output inverse RoPE FP8 conversion alias", "TP4 native H16 D512 rot64 off448 inverse1 group32 UE8M0",
+  "Unchanged old RoPE/reduction/arithmetic, optional checked audit",
+  RAD_DOMAIN_DEVICE,R4D_PRIO_ONLY,ROW(cDs41RopeFp8Convert),NOTUNE,
+  nullptr,nullptr,r4d_rad_rope_rows_roundtrip_fp8_convert,nullptr,nullptr,nullptr,
+  r4d_shape_rope_rows_roundtrip_fp8_convert },
 { "rope_rows_roundtrip_fp4_bf16", "rope_rows_roundtrip", "attn",
   "rope_rows then an e2m1 quant_roundtrip, in place, in one pass",
   "any M; a thread a column, the gptj partner by a lane shuffle (head_dim and off even, block a "

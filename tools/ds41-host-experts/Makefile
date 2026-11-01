@@ -107,3 +107,9 @@ $(O)/ds41_window_packed_paths_check: ds41_window_packed_paths_check.hip ds41_win
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_window_packed_paths_check.hip -ldl
 window-packed-paths-check: $(O)/ds41_window_packed_paths_check
 .PHONY: window-packed-paths-check
+
+# Standalone pointwise FP4 classifier proof; no serving flag/ABI wiring. GPU window only.
+$(O)/ds41_fp4_classifier_device_check: ds41_fp4_classifier_device_check.hip ds41_fp4_classifier_oracle.h $(TREE)/arch/common/rad_ds41_fp4_classifier.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
+fp4-classifier-check: $(O)/ds41_fp4_classifier_device_check
+.PHONY: fp4-classifier-check

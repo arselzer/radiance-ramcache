@@ -4,6 +4,7 @@
 #include <vector>
 #include "ctx.h"
 #include "place/ds41_phase2_audit.h"
+#include "../../arch/common/rad_ds41_fp4_runtime.h"
 #include "kvstream/bind.h"
 #include "kvstream/stage.h"
 #include "xp_state.h"
@@ -79,8 +80,15 @@ void Ctx::shutdown() {
     rowpf_worker_.reset();   /* joins the read-ahead helper, if one started */
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
-    if (stream_) rad_stream_sync(stream_);
-    if (lane1_) rad_stream_sync(lane1_);
+    if (fp4_audit_live_) {
+        const int device = rad_dev_set(device_);
+        const int main = device >= 0 && stream_ ? rad_stream_sync(stream_) : RAD_E_STATE;
+        const int other = lane1_ ? rad_stream_sync(lane1_) : RAD_OK;
+        close_fp4_classifier_audit(main >= 0 && other >= 0);
+    } else {
+        if (stream_) rad_stream_sync(stream_);
+        if (lane1_) rad_stream_sync(lane1_);
+    }
 
     for (PassTape& t : tapes_) tape_drop(t);
     tapes_.clear();
@@ -136,6 +144,7 @@ int Ctx::prepare() {
     RAD_TRY(bind_ops());
     RAD_TRY(bind_routing());
     RAD_TRY(bind_profiling());
+    RAD_TRY(bind_fp4_classifier_audit());
     /* Recorded passes need a recording backend, and are off whenever every issue must be seen:
      * per-op profile, oracle, and a calibration tap. A `gram_accum` sums across passes while its
      * plugin counts the rows it has summed in step and writes the Grams once a token target is
@@ -213,6 +222,57 @@ int Ctx::bind_arena() {
         RAD_DEBUG("arena: %s host, mapped (host-site activations)", humanb(host_hw).c_str());
     }
     return RAD_OK;
+}
+
+int Ctx::bind_fp4_classifier_audit() {
+    namespace f = rad_ds41_fp4_runtime;
+    fp4_audit_device_ = fp4_audit_host_ = 0; fp4_audit_live_ = false;
+    for (size_t i=1;i<program_->buffers.size();++i) {
+        const auto& b=program_->buffers[i];
+        const bool device=b.name==f::kDevice, host=b.name==f::kHost;
+        if (!device && !host) continue;
+        rad_buf& found=device?fp4_audit_device_:fp4_audit_host_;
+        if (found || b.decl.kind!=RAD_BUF_PERSIST || b.decl.dtype!=RAD_I64 || b.decl.rank!=1 ||
+            b.decl.shape[0]!=f::kWords || b.bytes!=f::kBytes ||
+            b.decl.domain!=(host?RAD_DOMAIN_HOST:RAD_DOMAIN_DEVICE) || !b.ptr ||
+            (reinterpret_cast<uintptr_t>(b.ptr)&7u)) return RAD_E_STATE;
+        found=(rad_buf)i;
+    }
+    if (!fp4_audit_device_ && !fp4_audit_host_) return RAD_OK;
+    if (!fp4_audit_device_ || !fp4_audit_host_ || !stream_) return RAD_E_STATE;
+    RAD_TRY(rad_memset_async(buf_tmpl_[fp4_audit_device_].data,0,f::kBytes,stream_));
+    /* Once at startup, before either rank lane may issue. Never reset at a graph replay/step. */
+    RAD_TRY(rad_stream_sync(stream_));
+    fp4_audit_live_=true;
+    constexpr size_t state_charge=(2*sizeof(rad_buf)+sizeof(bool)+alignof(void*)-1)/alignof(void*)*alignof(void*);
+    RAD_INFO("ds41 fp4 classifier audit initialized: rank=%d device_payload=%d host_payload=%d planner_aligned_each=512 context_state_charge=%zu readback=teardown_once",
+             rank_,f::kBytes,f::kBytes,state_charge);
+    return RAD_OK;
+}
+
+void Ctx::close_fp4_classifier_audit(bool drained) {
+    namespace f = rad_ds41_fp4_runtime;
+    /* Consume ownership before any fallible copy: shutdown/destruction cannot report twice. */
+    fp4_audit_live_=false;
+    const auto dev=fp4_audit_device_,host=fp4_audit_host_;
+    fp4_audit_device_=fp4_audit_host_=0;
+    if (!drained || !dev || !host || dev>=buf_tmpl_.size() || host>=buf_tmpl_.size()) {
+        RAD_ERR("ds41 fp4 classifier audit FAILED: rank=%d reason=teardown_drain_or_binding",rank_);return;
+    }
+    void* dst=buf_tmpl_[host].data;const void* src=buf_tmpl_[dev].data;
+    if (rad_memcpy_async(dst,src,f::kBytes,stream_)<0 || rad_stream_sync(stream_)<0) {
+        RAD_ERR("ds41 fp4 classifier audit FAILED: rank=%d reason=teardown_readback",rank_);return;
+    }
+    const auto* words=static_cast<const uint64_t*>(dst);
+    bool valid=true;
+    for(int k=0;k<f::kSlotCount;++k)valid=valid&&f::valid_row(words+k*f::FieldCount,(f::kSlots[k].op&1)!=0);
+    if(!valid){RAD_ERR("ds41 fp4 classifier audit FAILED: rank=%d reason=overflow_or_counter_contract",rank_);return;}
+    for(int k=0;k<f::kSlotCount;++k){const auto* p=words+k*f::FieldCount;
+        RAD_INFO("ds41 fp4 classifier audit: rank=%d op=%s n=%d fast=%llu fallback=%llu capture_fast=%llu blocks=%llu overflow=%llu readbacks=1 scope=rank_op_width lifetime=cohort",
+            rank_,f::kNames[f::kSlots[k].op],f::kSlots[k].width,(unsigned long long)p[f::Fast],(unsigned long long)p[f::Fallback],
+            (unsigned long long)p[f::CapturedFast],(unsigned long long)p[f::Blocks],(unsigned long long)p[f::Overflow]);
+    }
+    RAD_INFO("ds41 fp4 classifier audit complete: rank=%d rows=12 bytes=%d readbacks=1 drained=1",rank_,f::kBytes);
 }
 
 int Ctx::bind_buffers() {

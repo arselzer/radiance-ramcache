@@ -31,6 +31,7 @@
 #include "place/draft_vram_load.h"
 #include "place/ds41_index_b16.h"
 #include "place/ds41_scored_scatter.h"
+#include "place/ds41_fp4_classify.h"
 #include "place/ds41_window_packed.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
@@ -4525,6 +4526,16 @@ int Engine::start() {
             if(!ds41_scored_scatter_admit(r->program,r->index,&n,&why)){
                 RAD_ERR("%s=1 refused rank%d: %s",rad_ds41_scored_scatter::kEnv,r->index,why.c_str());return RAD_E_UNSUPPORTED;}
             RAD_INFO("ds41 scored scatter admitted: rank=%d ops=%d M=1 experts=384 local=96 topk=6 projection=unchanged",r->index,n);
+        }
+    }
+    const char* fp4_requested=std::getenv(rad_ds41_fp4_runtime::kEnv);
+    if(fp4_requested&&std::strcmp(fp4_requested,"0")) {
+        if(std::strcmp(fp4_requested,"1")||!meta_.arch_id||std::strcmp(meta_.arch_id,"deepseek41")||ranks_.size()!=4)
+            return RAD_E_UNSUPPORTED;
+        for(const auto&r:ranks_){int n=0;std::string why;
+            if(!ds41_fp4_classify_admit(r->program,&n,&why)){
+                RAD_ERR("%s=1 refused rank%d: %s",rad_ds41_fp4_runtime::kEnv,r->index,why.c_str());return RAD_E_UNSUPPORTED;}
+            RAD_INFO("ds41 fp4 classifier admitted: rank=%d ops=%d original_arithmetic=1 capture_reuses_nibble=1 model_qualified=0",r->index,n);
         }
     }
     RAD_TRY(load_weights());

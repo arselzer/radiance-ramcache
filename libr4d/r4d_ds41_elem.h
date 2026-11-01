@@ -3,6 +3,20 @@
 #ifndef R4D_DS41_ELEM_H
 #define R4D_DS41_ELEM_H
 
+int r4d_rad_quant_roundtrip_fp4_classify(const RadArgs*, RadStream);
+int r4d_rad_quant_roundtrip_fp4_classify_kvpack(const RadArgs*, RadStream);
+int r4d_rad_rmsnorm_rope_roundtrip_fp4_classify(const RadArgs*, RadStream);
+int r4d_rad_rmsnorm_rope_roundtrip_fp4_classify_kvpack(const RadArgs*, RadStream);
+int r4d_rad_rope_rows_roundtrip_fp4_classify(const RadArgs*, RadStream);
+int r4d_rad_rope_rows_roundtrip_fp4_classify_kvpack(const RadArgs*, RadStream);
+int r4d_rad_rmsnorm_rope_roundtrip_fp4_classify_n128_check(const RadArgs*, RadStream, int, int);
+int r4d_shape_quant_roundtrip_fp4_classify(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_quant_roundtrip_fp4_classify_kvpack(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_rmsnorm_rope_roundtrip_fp4_classify(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_rmsnorm_rope_roundtrip_fp4_classify_kvpack(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_rope_rows_roundtrip_fp4_classify(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_rope_rows_roundtrip_fp4_classify_kvpack(const RadParam*, int, int, RadOpdDesc*);
+
 /* Launches (r4d_ds41_elem.hip). */
 int r4d_rad_token_map(const RadArgs* a, RadStream stream);
 int r4d_rad_stream_gate_add(const RadArgs* a, RadStream stream);

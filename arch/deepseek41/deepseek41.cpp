@@ -32,6 +32,7 @@
 #include "ds41_prefetch_plan.h"
 #include "ds41_index_memory.h"
 #include "../common/rad_ds41_scored_scatter.h"
+#include "../common/rad_ds41_fp4_runtime.h"
 #include "ista_dialect.h"
 #include "../../core/sched/tbo.h"
 #include "../../tools/ds41-host-experts/ds41_p1.h"   /* the lent arena's switch (probe) */
@@ -606,6 +607,8 @@ struct Model {
      * counted, with the bytes that saves. */
     bool router_bf16 = false;
     bool scored_scatter = false;
+    bool fp4_classify = false, fp4_classify_audit = false;
+    rad_buf fp4_audit = 0, fp4_audit_host = 0;
     int n_router_bf16 = 0, n_comp_bf16 = 0;
     int64_t bf16_saved = 0;
     rad_buf final_hidden = 0, logit_input = 0, logits = 0;
@@ -929,8 +932,29 @@ static rad_op rope_rows(RadBuilder* b, const Model& m, int64_t rows, int64_t hea
                 RAD_INT("inverse", inverse), RAD_STR("dtype", "bf16") },
               {}, { x, cs }, { x });
 }
+static rad_op fp4_alias(RadBuilder* b, const char* name, std::vector<RadParam> ps,
+                        std::vector<rad_weight> ws, std::initializer_list<rad_buf> rd,
+                        std::initializer_list<rad_buf> wr, rad_buf audit, bool fuse) {
+    if (fuse && !rad_op_declared(b,name)) return 0;
+    const rad_op h = rad_decl_op(b,name,ps.data(),(int)ps.size(),ws.empty()?nullptr:ws.data(),(int)ws.size());
+    if (!h || (fuse && !rad_op_resolved(b,h))) return 0;
+    rw(b,h,rd,wr);
+    if (audit && (rad_op_reads(b,h,&audit,1) < 0 || rad_op_writes(b,h,&audit,1) < 0)) return 0;
+    return h;
+}
 static rad_op roundtrip(RadBuilder* b, int64_t rows, int64_t n, int64_t block, const char* fmt,
-                        const char* scale, rad_buf x, rad_buf packed = 0, int kind = 0) {
+                        const char* scale, rad_buf x, rad_buf packed = 0, int kind = 0,
+                        bool classify = false, rad_buf audit = 0) {
+    if (rows>0 && rows<=INT_MAX && rad_ds41_fp4_runtime::declare_quant(classify,n,block,fmt,scale,packed!=0,kind)) {
+        const char* name = rad_ds41_fp4_runtime::kNames[packed ? rad_ds41_fp4_runtime::QuantCapture : rad_ds41_fp4_runtime::Quant];
+        if (packed) return fp4_alias(b,name,
+            { RAD_RANGE("M",1,rows), RAD_INT("n",n), RAD_INT("block",block), RAD_STR("format",fmt),
+              RAD_STR("scale",scale), RAD_STR("dtype","bf16"), RAD_INT("kv_format",kind) },
+            {}, {x}, {x,packed},audit,false);
+        return fp4_alias(b,name,
+            { RAD_RANGE("M",1,rows), RAD_INT("n",n), RAD_INT("block",block), RAD_STR("format",fmt),
+              RAD_STR("scale",scale), RAD_STR("dtype","bf16") }, {}, {x}, {x},audit,false);
+    }
     if (packed)
         return op(b, kind == 3 ? "quant_roundtrip_windowpack" : "quant_roundtrip_kvpack",
                   { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block", block),
@@ -940,6 +964,12 @@ static rad_op roundtrip(RadBuilder* b, int64_t rows, int64_t n, int64_t block, c
               { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block", block),
                 RAD_STR("format", fmt), RAD_STR("scale", scale), RAD_STR("dtype", "bf16") },
               {}, { x }, { x });
+}
+static RadOperand fp4_audit_operand(const Model& m, rad_ds41_fp4_runtime::Op) {
+    if (!m.fp4_audit) return RAD_NONE;
+    RadOperand o = RAD_B(m.fp4_audit);
+    o.rows = rad_ds41_fp4_runtime::kWords;
+    return o;
 }
 static rad_op entry_store(RadBuilder* b, int64_t rows, int64_t n, int64_t bs, rad_buf x,
                           rad_buf page, rad_buf packed = 0, int kind = 0) {
@@ -973,6 +1003,20 @@ static rad_op fused(RadBuilder* b, const char* name, std::vector<RadParam> ps,
 static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                            int64_t block, const char* fmt, const char* scale, rad_buf x, rad_buf y,
                            rad_buf cs, rad_buf packed = 0, int kind = 0) {
+    if (rows>0 && rows<=INT_MAX && n==128 && m.c.rope==64 &&
+        rad_ds41_fp4_runtime::declare_quant(m.fp4_classify,n,block,fmt,scale,packed!=0,kind)) {
+        const char* name = rad_ds41_fp4_runtime::kNames[packed ? rad_ds41_fp4_runtime::NormCapture : rad_ds41_fp4_runtime::Norm];
+        if (packed) return fp4_alias(b,name,
+            { RAD_RANGE("M",1,rows), RAD_INT("n",n), RAD_F64("eps",m.c.eps), RAD_INT("n_head",1),
+              RAD_INT("head_dim",n), RAD_INT("rot",m.c.rope), RAD_INT("off",n-m.c.rope), RAD_STR("mode","gptj"),
+              RAD_INT("inverse",0), RAD_INT("block",block), RAD_STR("format",fmt), RAD_STR("scale",scale),
+              RAD_STR("dtype","bf16"), RAD_INT("kv_format",kind) }, {w}, {x,cs}, {y,packed},m.fp4_audit,true);
+        return fp4_alias(b,name,
+            { RAD_RANGE("M",1,rows), RAD_INT("n",n), RAD_F64("eps",m.c.eps), RAD_INT("n_head",1),
+              RAD_INT("head_dim",n), RAD_INT("rot",m.c.rope), RAD_INT("off",n-m.c.rope), RAD_STR("mode","gptj"),
+              RAD_INT("inverse",0), RAD_INT("block",block), RAD_STR("format",fmt), RAD_STR("scale",scale),
+              RAD_STR("dtype","bf16") }, {w}, {x,cs}, {y},m.fp4_audit,true);
+    }
     if (packed)
         return fused(b, kind == 3 ? "rmsnorm_rope_roundtrip_windowpack" : "rmsnorm_rope_roundtrip_kvpack",
                      { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", m.c.eps),
@@ -993,6 +1037,21 @@ static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weig
 static rad_op rope_rt(RadBuilder* b, const Model& m, int64_t rows, int64_t heads, int64_t hd,
                       int inverse, int64_t block, const char* fmt, const char* scale, rad_buf x,
                       rad_buf cs, rad_buf packed = 0, int kind = 0) {
+    if (rows>0 && rows<=INT_MAX && heads>0 && hd>0 && heads<=4096/hd && inverse==0 && m.c.rope==64 &&
+        rad_ds41_fp4_runtime::declare_quant(m.fp4_classify,heads*hd,block,fmt,scale,packed!=0,kind) &&
+        rad_ds41_fp4_runtime::rope_scope(heads*hd,hd,32,hd-64,heads*32,true,1.0f)) {
+        const char* name = rad_ds41_fp4_runtime::kNames[packed ? rad_ds41_fp4_runtime::RopeCapture : rad_ds41_fp4_runtime::Rope];
+        if (packed) return fp4_alias(b,name,
+            { RAD_RANGE("M",1,rows), RAD_INT("n_head",heads), RAD_INT("head_dim",hd), RAD_INT("rot",m.c.rope),
+              RAD_INT("off",hd-m.c.rope), RAD_STR("mode","gptj"), RAD_INT("inverse",inverse), RAD_INT("block",block),
+              RAD_STR("format",fmt), RAD_STR("scale",scale), RAD_STR("dtype","bf16"), RAD_INT("kv_format",kind) },
+            {}, {x,cs}, {x,packed},m.fp4_audit,true);
+        return fp4_alias(b,name,
+            { RAD_RANGE("M",1,rows), RAD_INT("n_head",heads), RAD_INT("head_dim",hd), RAD_INT("rot",m.c.rope),
+              RAD_INT("off",hd-m.c.rope), RAD_STR("mode","gptj"), RAD_INT("inverse",inverse), RAD_INT("block",block),
+              RAD_STR("format",fmt), RAD_STR("scale",scale), RAD_STR("dtype","bf16") },
+            {}, {x,cs}, {x},m.fp4_audit,true);
+    }
     if (packed)
         return fused(b, kind == 3 ? "rope_rows_roundtrip_windowpack" : "rope_rows_roundtrip_kvpack",
                      { RAD_RANGE("M", 1, rows), RAD_INT("n_head", heads), RAD_INT("head_dim", hd),
@@ -1264,6 +1323,13 @@ static int buffers(RadBuilder* b, Model& m) {
     auto bf = [&](const char* n, std::initializer_list<int64_t> s) {
         return decl_b(b, nm.f("%s", n), RAD_BF16, s);
     };
+    if (m.fp4_classify_audit) {
+        m.fp4_audit = decl_b(b,rad_ds41_fp4_runtime::kDevice,RAD_I64,
+                           {rad_ds41_fp4_runtime::kWords},RAD_BUF_PERSIST);
+        m.fp4_audit_host = decl_b(b,rad_ds41_fp4_runtime::kHost,RAD_I64,
+                           {rad_ds41_fp4_runtime::kWords},RAD_BUF_PERSIST,RAD_DOMAIN_HOST);
+        if (!m.fp4_audit || !m.fp4_audit_host) return RAD_E_INVAL;
+    }
     m.h0 = bf("streams", { T, HN });
     m.h1 = bf("streams_next", { T, HN });
     m.xcol = bf("collapsed", { T, D });
@@ -1808,7 +1874,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             if (!L.k_f) {
                 L.k_norm = rmsnorm(b, m, rows, L.ik_norm, c.idim, m.ik, m.ikn);
                 L.k_rope = rope_rows(b, m, rows, 1, c.idim, 0, m.ikn, m.cs_b);
-                L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn, m.ik_pack, 2);
+                L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn, m.ik_pack, 2, m.fp4_classify, m.fp4_audit);
             }
             if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", c.idim, r))) return RAD_E_INVAL;
             L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ik_pack, 2);
@@ -1817,7 +1883,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.l_f = rope_rt(b, m, rows, 1, hd, 0, 16, "fp4_e2m1", "e4m3", m.lat, m.cs_b, m.lat_pack, 1);
             if (!L.l_f) {
                 L.l_rope = rope_rows(b, m, rows, 1, hd, 0, m.lat, m.cs_b);
-                L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat, m.lat_pack, 1);
+                L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat, m.lat_pack, 1, m.fp4_classify, m.fp4_audit);
             }
             if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", hd, r))) return RAD_E_INVAL;
             L.l_st = entry_store(b, rows, hd, r, m.lat, m.page, m.lat_pack, 1);
@@ -1839,7 +1905,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.i_f = rope_rt(b, m, T, c.ih, c.idim, 0, 32, "fp4_e2m1", "ue8m0", m.iq, m.cs_b);
             if (!L.i_f) {
                 L.i_rope = rope_rows(b, m, T, c.ih, c.idim, 0, m.iq, m.cs_b);
-                L.i_qq = roundtrip(b, T, c.ih * c.idim, 32, "fp4_e2m1", "ue8m0", m.iq);
+                L.i_qq = roundtrip(b, T, c.ih * c.idim, 32, "fp4_e2m1", "ue8m0", m.iq, 0, 0, m.fp4_classify, m.fp4_audit);
             }
             L.i_w = linear(b, m, T, L.iproj, c.ih, D, m.xn, m.iw);
             const int64_t width = g.max_ctx / r + 1, IR = m.irows;
@@ -2882,6 +2948,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     const auto& c = m.c;
     auto& g = m.g;
+    if (!rad_ds41_fp4_runtime::parse(std::getenv(rad_ds41_fp4_runtime::kEnv),&m.fp4_classify) ||
+        !rad_ds41_fp4_runtime::parse(std::getenv(rad_ds41_fp4_runtime::kAuditEnv),&m.fp4_classify_audit) ||
+        (m.fp4_classify_audit && !m.fp4_classify)) return RAD_E_INVAL;
+    if (m.fp4_classify) {
+        if (g.world != 4 || m.aw != 4 || m.zero || c.n_layer != 40 || c.n_embd != 5120 ||
+            c.head_dim != 512 || c.idim != 128 || c.ih != 32 || c.rope != 64) return RAD_E_UNSUPPORTED;
+        for (const char* name : rad_ds41_fp4_runtime::kNames)
+            if (!rad_op_declared(b,name)) return RAD_E_UNSUPPORTED;
+    }
     if(!rad_ds41_scored_scatter::parse(std::getenv(rad_ds41_scored_scatter::kEnv),&m.scored_scatter))return RAD_E_INVAL;
     if(m.scored_scatter) {
         if(!rad_ds41_scored_scatter::scope(g.world,g.rank,g.max_tok,c.n_expert,c.n_expert/g.world,
@@ -3723,7 +3798,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
              * function issues the fused op at the chain's first point and nothing at the others. */
             const auto k_norm = [&] {
                 if (!L.src) return;
-                if (L.k_f && m.kv_packed)
+                if (L.k_f && m.fp4_classify && m.kv_packed)
+                    RAD_ISSUE_N(x,L.k_f,rows,brows(m.ik,rows),RAD_W(L.ik_norm),brows(m.ikn,rows),
+                                brows(m.cs_b,g.max_ctx),bpos,brows(m.ik_pack,rows),
+                                fp4_audit_operand(m,rad_ds41_fp4_runtime::NormCapture));
+                else if (L.k_f && m.fp4_classify)
+                    RAD_ISSUE_N(x,L.k_f,rows,brows(m.ik,rows),RAD_W(L.ik_norm),brows(m.ikn,rows),
+                                brows(m.cs_b,g.max_ctx),bpos,fp4_audit_operand(m,rad_ds41_fp4_runtime::Norm));
+                else if (L.k_f && m.kv_packed)
                     RAD_ISSUE_N(x, L.k_f, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows),
                                 brows(m.cs_b, g.max_ctx), bpos, brows(m.ik_pack, rows));
                 else if (L.k_f)
@@ -3737,7 +3819,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto k_q = [&] {
                 if (L.src && L.k_q) {
-                    if (m.kv_packed) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows), brows(m.ik_pack, rows));
+                    if (m.fp4_classify && m.kv_packed)
+                        RAD_ISSUE_N(x,L.k_q,rows,brows(m.ikn,rows),brows(m.ik_pack,rows),
+                                    fp4_audit_operand(m,rad_ds41_fp4_runtime::QuantCapture));
+                    else if (m.fp4_classify)
+                        RAD_ISSUE_N(x,L.k_q,rows,brows(m.ikn,rows),fp4_audit_operand(m,rad_ds41_fp4_runtime::Quant));
+                    else if (m.kv_packed) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows), brows(m.ik_pack, rows));
                     else RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows));
                 }
             };
@@ -3749,7 +3836,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto l_rope = [&] {
                 if (!L.src) return;
-                if (L.l_f && m.kv_packed)
+                if (L.l_f && m.fp4_classify && m.kv_packed)
+                    RAD_ISSUE_N(x,L.l_f,rows,brows(m.lat,rows),brows(m.cs_b,g.max_ctx),bpos,brows(m.lat_pack,rows),
+                                fp4_audit_operand(m,rad_ds41_fp4_runtime::RopeCapture));
+                else if (L.l_f && m.fp4_classify)
+                    RAD_ISSUE_N(x,L.l_f,rows,brows(m.lat,rows),brows(m.cs_b,g.max_ctx),bpos,
+                                fp4_audit_operand(m,rad_ds41_fp4_runtime::Rope));
+                else if (L.l_f && m.kv_packed)
                     RAD_ISSUE_N(x, L.l_f, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos,
                                 brows(m.lat_pack, rows));
                 else if (L.l_f)
@@ -3759,7 +3852,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto l_q = [&] {
                 if (L.src && L.l_q) {
-                    if (m.kv_packed) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows), brows(m.lat_pack, rows));
+                    if (m.fp4_classify && m.kv_packed)
+                        RAD_ISSUE_N(x,L.l_q,rows,brows(m.lat,rows),brows(m.lat_pack,rows),
+                                    fp4_audit_operand(m,rad_ds41_fp4_runtime::QuantCapture));
+                    else if (m.fp4_classify)
+                        RAD_ISSUE_N(x,L.l_q,rows,brows(m.lat,rows),fp4_audit_operand(m,rad_ds41_fp4_runtime::Quant));
+                    else if (m.kv_packed) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows), brows(m.lat_pack, rows));
                     else RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows));
                 }
             };
@@ -3780,13 +3878,18 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto i_rope = [&] {
                 if (!L.i_score) return;
-                if (L.i_f)
+                if (L.i_f && m.fp4_classify)
+                    RAD_ISSUE_N(x,L.i_f,nf,FR(m.iq,iqw),brows(m.cs_b,g.max_ctx),fpos,
+                                fp4_audit_operand(m,rad_ds41_fp4_runtime::Rope));
+                else if (L.i_f)
                     RAD_ISSUE_N(x, L.i_f, nf, FR(m.iq, iqw), brows(m.cs_b, g.max_ctx), fpos);
                 else
                     RAD_ISSUE_N(x, L.i_rope, nf, FR(m.iq, iqw), brows(m.cs_b, g.max_ctx), fpos);
             };
             const auto i_qq = [&] {
-                if (L.i_score && L.i_qq) RAD_ISSUE_N(x, L.i_qq, nf, FR(m.iq, iqw));
+                if (L.i_score && L.i_qq && m.fp4_classify)
+                    RAD_ISSUE_N(x,L.i_qq,nf,FR(m.iq,iqw),fp4_audit_operand(m,rad_ds41_fp4_runtime::Quant));
+                else if (L.i_score && L.i_qq) RAD_ISSUE_N(x, L.i_qq, nf, FR(m.iq, iqw));
             };
             const auto i_w = [&] {
                 if (L.i_score) RAD_ISSUE_N(x, L.i_w, nf, FR(m.xn, D), RAD_W(L.iproj), FR(m.iw, c.ih));

@@ -469,6 +469,8 @@ private:
     int  prepare();
     int  bind_arena();
     int  bind_buffers();
+    int  bind_fp4_classifier_audit();
+    void close_fp4_classifier_audit(bool drained);
     int  bind_weights();
     int  bind_ops();
     int  issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
@@ -840,6 +842,10 @@ private:
      * packed strides; a weight's carries WeightInfo::ptr. An issue copies one and patches at most
      * the data pointer and dim 0. */
     std::vector<RadTensor> buf_tmpl_;
+    /* Handles only; the plan owns both fixed 480B payloads (512B aligned regions). No flag0
+     * buffers/allocation. Read once after both ordinary teardown drains, before arena release. */
+    rad_buf fp4_audit_device_ = 0, fp4_audit_host_ = 0;
+    bool fp4_audit_live_ = false;
     std::vector<int32_t>   buf_bits_;
     std::vector<uint8_t>   buf_host_;   /* per handle: a RAD_DOMAIN_HOST buffer */
     /* Every level's templates; `buf_tmpl_` is a copy of the active one. */

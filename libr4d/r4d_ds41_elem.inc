@@ -201,6 +201,46 @@ static const RadOperandSpec oDs41RopeKvPack[] = {
 };
 #undef C_DS41_ROPE
 
+static const RadOperandSpec oDs41QuantClassify[] = {
+    { "x", RAD_OPD_INOUT, 0 },
+    { "classifier_audit", RAD_OPD_INOUT, 1 },
+};
+static const RadOperandSpec oDs41QuantCaptureClassify[] = {
+    { "x", RAD_OPD_INOUT, 0 },
+    { "capture", RAD_OPD_OUT, 0 },
+    { "classifier_audit", RAD_OPD_INOUT, 1 },
+};
+static const RadOperandSpec oDs41NormClassify[] = {
+    { "x", RAD_OPD_IN, 0 },
+    { "w", RAD_OPD_WEIGHT, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+    { "cs", RAD_OPD_IN, 0 },
+    { "pos", RAD_OPD_IN, 0 },
+    { "classifier_audit", RAD_OPD_INOUT, 1 },
+};
+static const RadOperandSpec oDs41NormCaptureClassify[] = {
+    { "x", RAD_OPD_IN, 0 },
+    { "w", RAD_OPD_WEIGHT, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+    { "cs", RAD_OPD_IN, 0 },
+    { "pos", RAD_OPD_IN, 0 },
+    { "capture", RAD_OPD_OUT, 0 },
+    { "classifier_audit", RAD_OPD_INOUT, 1 },
+};
+static const RadOperandSpec oDs41RopeClassify[] = {
+    { "x", RAD_OPD_INOUT, 0 },
+    { "cs", RAD_OPD_IN, 0 },
+    { "pos", RAD_OPD_IN, 0 },
+    { "classifier_audit", RAD_OPD_INOUT, 1 },
+};
+static const RadOperandSpec oDs41RopeCaptureClassify[] = {
+    { "x", RAD_OPD_INOUT, 0 },
+    { "cs", RAD_OPD_IN, 0 },
+    { "pos", RAD_OPD_IN, 0 },
+    { "capture", RAD_OPD_OUT, 0 },
+    { "classifier_audit", RAD_OPD_INOUT, 1 },
+};
+
 static const RadParamSpec pDs41CollapseNorm[] = { P_INT("M"),     P_INT("n"),     P_INT("hc"),
                                                   P_F64("eps"),   P_STR("dtype"), P_F64O("wadd"),
                                                   P_F64O("mult") };
@@ -300,7 +340,45 @@ SCHEMA("entry_store_kvpack", pDs41EntryKvPack, oDs41EntryKvPack,
            "w -> y): out, xc and y as the three ops leave them, each rounded to dtype before the next "
            "step reads it. out must not alias h."),
 
+    SCHEMA("quant_roundtrip_fp4_classify", pDs41QuantRoundtrip, oDs41QuantClassify,
+           "Exact bounded FP4 classifier alias; final optional i64[60] is persistent audit state."),
+    SCHEMA("quant_roundtrip_fp4_classify_kvpack", pDs41QuantKvPack, oDs41QuantCaptureClassify,
+           "Exact bounded FP4 classifier alias; final optional i64[60] is persistent audit state."),
+    SCHEMA("rmsnorm_rope_roundtrip_fp4_classify", pDs41NormRopeRt, oDs41NormClassify,
+           "Exact bounded FP4 classifier alias; final optional i64[60] is persistent audit state."),
+    SCHEMA("rmsnorm_rope_roundtrip_fp4_classify_kvpack", pDs41NormRopeKvPack, oDs41NormCaptureClassify,
+           "Exact bounded FP4 classifier alias; final optional i64[60] is persistent audit state."),
+    SCHEMA("rope_rows_roundtrip_fp4_classify", pDs41RopeRt, oDs41RopeClassify,
+           "Exact bounded FP4 classifier alias; final optional i64[60] is persistent audit state."),
+    SCHEMA("rope_rows_roundtrip_fp4_classify_kvpack", pDs41RopeKvPack, oDs41RopeCaptureClassify,
+           "Exact bounded FP4 classifier alias; final optional i64[60] is persistent audit state."),
+
 #elif defined(R4D_DS41_ROWS)
+
+{ "ds41_quant_fp4_classify", "quant_roundtrip_fp4_classify", "quant", "native exact bounded classifier; unknown sites use whole original body",
+  "unchanged arithmetic and BF16; optional checked workgroup audit", "BF16 plus optional original code/scale and i64[60]", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41QuantFp4), NOTUNE, nullptr, nullptr, r4d_rad_quant_roundtrip_fp4_classify,
+  nullptr, nullptr, nullptr, r4d_shape_quant_roundtrip_fp4_classify },
+{ "ds41_quant_fp4_classify_kvpack", "quant_roundtrip_fp4_classify_kvpack", "quant", "native exact bounded classifier; unknown sites use whole original body",
+  "unchanged arithmetic and BF16; optional checked workgroup audit", "BF16 plus optional original code/scale and i64[60]", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41QuantFp4), NOTUNE, nullptr, nullptr, r4d_rad_quant_roundtrip_fp4_classify_kvpack,
+  nullptr, nullptr, nullptr, r4d_shape_quant_roundtrip_fp4_classify_kvpack },
+{ "ds41_norm_rope_fp4_classify", "rmsnorm_rope_roundtrip_fp4_classify", "quant", "native exact bounded classifier; unknown sites use whole original body",
+  "unchanged arithmetic and BF16; optional checked workgroup audit", "BF16 plus optional original code/scale and i64[60]", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41NormRopeRtFp4), NOTUNE, nullptr, nullptr, r4d_rad_rmsnorm_rope_roundtrip_fp4_classify,
+  nullptr, nullptr, nullptr, r4d_shape_rmsnorm_rope_roundtrip_fp4_classify },
+{ "ds41_norm_rope_fp4_classify_kvpack", "rmsnorm_rope_roundtrip_fp4_classify_kvpack", "quant", "native exact bounded classifier; unknown sites use whole original body",
+  "unchanged arithmetic and BF16; optional checked workgroup audit", "BF16 plus optional original code/scale and i64[60]", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41NormRopeRtFp4), NOTUNE, nullptr, nullptr, r4d_rad_rmsnorm_rope_roundtrip_fp4_classify_kvpack,
+  nullptr, nullptr, nullptr, r4d_shape_rmsnorm_rope_roundtrip_fp4_classify_kvpack },
+{ "ds41_rope_fp4_classify", "rope_rows_roundtrip_fp4_classify", "quant", "native exact bounded classifier; unknown sites use whole original body",
+  "unchanged arithmetic and BF16; optional checked workgroup audit", "BF16 plus optional original code/scale and i64[60]", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41RopeRtFp4), NOTUNE, nullptr, nullptr, r4d_rad_rope_rows_roundtrip_fp4_classify,
+  nullptr, nullptr, nullptr, r4d_shape_rope_rows_roundtrip_fp4_classify },
+{ "ds41_rope_fp4_classify_kvpack", "rope_rows_roundtrip_fp4_classify_kvpack", "quant", "native exact bounded classifier; unknown sites use whole original body",
+  "unchanged arithmetic and BF16; optional checked workgroup audit", "BF16 plus optional original code/scale and i64[60]", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41RopeRtFp4), NOTUNE, nullptr, nullptr, r4d_rad_rope_rows_roundtrip_fp4_classify_kvpack,
+  nullptr, nullptr, nullptr, r4d_shape_rope_rows_roundtrip_fp4_classify_kvpack },
 
 { "quant_roundtrip_fp8_windowpack", "quant_roundtrip_windowpack", "quant", "original FP8 capture; same BF16 output",
   "native512/group32/pow2 format3", "bf16 x, u8 original capture", RAD_DOMAIN_DEVICE,

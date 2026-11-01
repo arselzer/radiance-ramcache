@@ -113,3 +113,9 @@ $(O)/ds41_fp4_classifier_device_check: ds41_fp4_classifier_device_check.hip ds41
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
 fp4-classifier-check: $(O)/ds41_fp4_classifier_device_check
 .PHONY: fp4-classifier-check
+
+# New runtime aliases/fused/capture/audit oracle; does not reuse standalone-only authority.
+$(O)/ds41_fp4_runtime_device_check: ds41_fp4_runtime_device_check.hip $(TREE)/arch/common/rad_ds41_fp4_runtime.h $(TREE)/arch/common/rad_ds41_fp4_classifier.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
+fp4-runtime-check: $(O)/ds41_fp4_runtime_device_check
+.PHONY: fp4-runtime-check

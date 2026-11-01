@@ -25,6 +25,7 @@
 #include "r4d_moe_sort.h"
 #include "../arch/common/rad_ds41_kv_codec.h"
 #include "../arch/common/rad_ds41_window_codec.h"
+#include "../arch/common/rad_ds41_fp4_runtime.h"
 
 #include <atomic>
 #include <climits>
@@ -2359,7 +2360,21 @@ int post_collapse_norm_body(const RadArgs* a, RadStream stream) {
 #undef FZ_PCN
 }
 
+#include "r4d_ds41_fp4_classify.inc"
+
 }  // namespace
+
+extern "C" int r4d_rad_quant_roundtrip_fp4_classify(const RadArgs* a, RadStream s) { return fp4_quant_dispatch(a,s,false); }
+extern "C" int r4d_rad_quant_roundtrip_fp4_classify_kvpack(const RadArgs* a, RadStream s) { return fp4_quant_dispatch(a,s,true); }
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip_fp4_classify(const RadArgs* a, RadStream s) { return fp4_norm_dispatch(a,s,false); }
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip_fp4_classify_kvpack(const RadArgs* a, RadStream s) { return fp4_norm_dispatch(a,s,true); }
+extern "C" int r4d_rad_rope_rows_roundtrip_fp4_classify(const RadArgs* a, RadStream s) { return fp4_rope_dispatch(a,s,false); }
+extern "C" int r4d_rad_rope_rows_roundtrip_fp4_classify_kvpack(const RadArgs* a, RadStream s) { return fp4_rope_dispatch(a,s,true); }
+/* Checker-only forced n128 comparison. Does not emit a model-use receipt. */
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip_fp4_classify_n128_check(const RadArgs* a, RadStream s, int form, int capture) {
+    if ((form != 0 && form != 1) || (capture != 0 && capture != 1)) return RAD_E_INVAL;
+    return fp4_norm_dispatch(a,s,capture != 0,form);
+}
 
 extern "C" int r4d_rad_token_map(const RadArgs* a, RadStream s) { return token_map_body(a, s); }
 extern "C" int r4d_rad_stream_gate_add(const RadArgs* a, RadStream s) {

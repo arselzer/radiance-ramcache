@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "e184c6b7f019535a592e5c1474bac38b7ba6a360",
+  "engine_commit": "1c0a01b3e5da305af18af9c296221d72fa5456cd",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -43,7 +43,10 @@
     "PREFILL-P0.md",
     "UPSTREAM-SYNC-20261031.md",
     "LONG-CONTEXT.md",
-    "SECOND-SERVER.md"
+    "SECOND-SERVER.md",
+    "PREFILL-QA0-20261102.md",
+    "PREFILL-QA0-20261103.md",
+    "PREFILL-QW-20261103.md"
   ],
   "research": [
     "ds41_supply_model.py",
@@ -71,7 +74,8 @@
     "ds41_policy_metadata_frozen.json",
     "ds41_policy_real_summary.json",
     "ds41_collective_summary.json",
-    "ds41_rows_summary.json"
+    "ds41_rows_summary.json",
+    "ds41_prefill_qa0_stable_20261103.json"
   ],
   "docs_left_out": {
     "READAHEAD-PLAN-EXCERPT.md": "scratch: a verbatim excerpt of RESEARCH-2-RANKED-PLAN.md section #5, used as an agent prompt",

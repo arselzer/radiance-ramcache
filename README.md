@@ -4,7 +4,7 @@ Experimental work on running DeepSeek-V4.1-Flash with its native MXFP4 experts (
 
 This branch is a research checkpoint, not a serving deployment. The GLM 5.3 checkpoint is on [main](https://github.com/arselzer/radiance-ramcache/tree/main).
 
-On 30 Oct the box went from 128 GB to 256 GB of RAM, so the RAM cache now holds 192 GiB of experts and drive reads are rare. Unless a row says otherwise, measurements use the 8 held-out prompts: 64 tokens each, greedy, four cards (TP4). Every number comes from an A/B window in `evidence/ds41/`:
+On 30 Oct the box went from 128 GB to 256 GB of RAM, so the RAM cache now holds 192 GiB of experts and drive reads are rare. Unless a row says otherwise, measurements use the 8 held-out prompts: 64 tokens each, greedy, four cards (TP4). The original results below come from A/B windows in `evidence/ds41/`; the November prefill reports separately identify their custom guarded windows and exported timing records.
 
 | Measure | Result | Window |
 |---|---|---|
@@ -23,6 +23,8 @@ The latest follow-up checkpoint adds measured opt-in controls, with all serving 
 
 | Follow-up | Result | Evidence |
 |---|---|---|
+| P1 speculative read-ahead disabled (Qa0), stable build | Independent 8/0/8 comparison: 3,086-token TTFT 8.71/7.65/8.92 s (12.22–14.25% lower); 6,817-token 11.85/10.82/11.83 s (8.52–8.67% lower). Short 82-token request 1.8–3.5% slower; default 8 unchanged. All 15 replies and 6 full hash checks exact. | [Stable Qa0 report](docs/ds41/PREFILL-QA0-20261103.md), [timing records](research/ds41/ds41_prefill_qa0_stable_20261103.json) |
+| P1 wave size at Qa0, current research build | Qw4 longest-prompt TTFT 11.05 s against 11.44/11.64 s Qw2 controls; 3K 0.47% slower. All 15 replies, 6 hash checks and fresh four-card native gates pass. Diagnostic screening only; unadopted. | [Qw report](docs/ds41/PREFILL-QW-20261103.md) |
 | Frozen adaptive DSpark verification | Code +4.7% versus fixed2; chat +9.9% versus fixed1. Held-out +3.4% / +7.7%; query/observer/wait and required telemetry included. One global TRAIN-selected policy, no refit; single-stream, 192 GiB cache. | `ab-20261031T165338Z`; frozen fit/cost/metadata in `research/ds41/ds41_policy_*` |
 | Optional 4K prefill chunks | 3,086-token TTFT 7.33→5.69 s; 6,817-token 17.12→12.69 s (~537 tok/s). Long/prefix/96 GiB checks passed; the five-prompt sum was neutral and the first tiny request slower. General recommendation remains 2K until concurrency/combination gates complete. | `ab-20261031T162629Z` |
 | P1 plus packed static experts | Actual packed residents and corrected long/96 GiB gate passed. Reverse N4/N8 pairs 38.31→39.06 / 41.35→42.47 tok/s; previous N8 pair neutral. Small, noisy gain. | `ab-20261031T144623Z` |
@@ -31,7 +33,7 @@ The latest follow-up checkpoint adds measured opt-in controls, with all serving 
 
 New research switches remain opt-in. The 4K window initially kept Rb/Vp/N128 off; the adaptive policy still needs its separate smaller-cache and concurrent-solo composition gates. Packed KV, physical KV growth, larger arena lending and further bank optimizations remain separate unvalidated source work, outside this exported engine checkpoint. Failed windows and invalid legs are retained and identified in the night log.
 
-Hardware: four RX 9070 XT 16 GB cards (gfx1201, PCIe 4.0 x16 each; two of them share one CPU quadrant) and an AMD EPYC 7443 (24 cores). Memory is 8 x 32 GB DDR4-2666 RDIMM: 247 GiB visible. The CPU reads ~121 GB/s, and ~140 GB/s together with the cards' host-to-card copies (`research/ds41/membw_dur.bwmix.out.txt`). One Samsung 990 Pro NVMe (~6.4 GB/s O_DIRECT) holds the 388 GB model container. The box also runs a production service (QFN). Each window waits for it to be idle and stops it. It then runs every configuration ("arm") as its own server on a cold RAM cache and compares every reply with the window's first arm. QFN is always restored at the end.
+Hardware: four RX 9070 XT 16 GB cards (gfx1201, PCIe 4.0 x16 host paths) and an AMD EPYC 7443 (24 cores). Since the owner's 2 November slot move, the four primary cards span four CPU root buses; older windows had two cards on one quadrant. An optional R9700 is excluded from the four-card November comparisons. Memory is 8 x 32 GB DDR4-2666 RDIMM: 247 GiB visible. The earlier CPU measurement was ~121 GB/s, and ~140 GB/s together with the cards' host-to-card copies (`research/ds41/membw_dur.bwmix.out.txt`). One Samsung 990 Pro NVMe (~6.4 GB/s O_DIRECT) holds the 388 GB model container. The box also runs a production service (QFN). Each window waits for it to be idle, stops it, runs fresh servers for its configurations, and checks replies against its retained references. QFN is restored and checked at the end.
 
 On Linux with Python 3.10+, both checks below read files only. They need no build, model, GPU or network:
 
@@ -45,13 +47,13 @@ The second compares every held-out reply of that window with the base engine's (
 
 Nothing was rebuilt for this export. Each window ran a build of the engine branch at that time, and `docs/ds41/NIGHT-LOG.md` names the commit for most of them. The post-upgrade decode windows ran builds of `claude/ds41-lcpfast` and `claude/ds41-dsvp`, both merged in the exported engine; the Phase 1 adoption window ran a build of `claude/ds41-int5` (merged in the exported engine) with its own deepseek41 plugin; the first Phase 1 window, `ab-20261030T201710Z`, ran a build of `claude/ds41-p1`; the DSpark-beside-concurrency window `ab-20261030T234957Z` ran a build of `claude/ds41-dsconc`, and the lent-arena windows `ab-20261031T011849Z` to `ab-20261031T030023Z` builds of `claude/ds41-p1big` with its own plugin, and the upstream-sync windows `ab-20261031T100852Z` and `ab-20261031T104524Z` a build of `claude/ds41-sync` with every plugin from it (all merged). The host-expert optimizations use opt-in `RADIANCE_EXPERIMENTAL_*` switches or flags. The DSML chat reply format is registered by default.
 
-- `radiance/`: the exact tracked tree of engine commit `e184c6b7` (1,849 files) from branch `claude/ds41-decode-impl`. Its switches, the recommended configuration and the A/B tools are described in `radiance/tools/ds41-host-experts/README.md`.
-- `docs/ds41/`: 31 reports: the review, the plan, the night log, research, designs, implementation reports and the upstream sync (`UPSTREAM-SYNC-20261031.md`). `provenance/` pins every engine file.
+- `radiance/`: the exact tracked tree of engine commit `1c0a01b3` (1,849 files) from branch `claude/ds41-decode-impl`; the latest commit adds a README note and leaves runtime e184 unchanged. Its switches, the recommended configuration and the A/B tools are described in `radiance/tools/ds41-host-experts/README.md`.
+- `docs/ds41/`: 34 reports: the review, the plan, the night log, research, designs, implementation reports, November prefill results and the upstream sync (`UPSTREAM-SYNC-20261031.md`). `provenance/` pins every engine file.
 - `evidence/ds41/`: 127 A/B windows, each with its log, per-arm results and memory traces. Server logs (compressed) are kept for the thirty-four windows the numbers above and the prefill exactness come from.
 - `research/ds41/`: the small measurement programs and outputs the reports cite.
 - `tools/`: `verify_snapshot.py` (snapshot verification), `ds41_reply_check.py` (reply identity check) and `ds41_refresh.py`. The refresh tool rebuilds this branch from an engine commit, the report folder and a window list.
 
-The engine is Radiance ([upstream](https://codeberg.org/StillDeadcode/radiance)). It contains upstream main through `b6acbd69` (2026-10-31, v1.15.0 and 12 commits), the 80 commits of the deepseek41 architecture pull request 266 (at `bd65d4e5`), and 325 commits of this work. Upstream licensing and notices remain (`LICENSE`, `radiance/LICENSE`, `radiance/NOTICE`).
+The engine is Radiance ([upstream](https://codeberg.org/StillDeadcode/radiance)). It contains upstream main through `b6acbd69` (2026-10-31, v1.15.0 and 12 commits), the 80 commits of the deepseek41 architecture pull request 266 (at `bd65d4e5`), and 326 commits of this work. Upstream licensing and notices remain (`LICENSE`, `radiance/LICENSE`, `radiance/NOTICE`).
 
 These are excluded:
 

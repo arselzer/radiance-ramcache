@@ -1,15 +1,15 @@
 {
-  "commit": "e184c6b7f019535a592e5c1474bac38b7ba6a360",
-  "tree": "2d9448c5566c315fe3bf1a2d7df14093d5820d69",
+  "commit": "1c0a01b3e5da305af18af9c296221d72fa5456cd",
+  "tree": "c33c83f0c27a44b1948e25c41c13a67b1a2f056e",
   "branch": "claude/ds41-decode-impl",
-  "subject": "Document the verified DS41 controls and mixed performance results",
-  "committed_utc": "2026-10-31T19:18:50Z",
+  "subject": "Document the stable P1 read-ahead latency result",
+  "committed_utc": "2026-11-03T02:42:34Z",
   "files": 1849,
-  "bytes": 71038520,
+  "bytes": 71039518,
   "executable_files": 65,
   "pins": "docs/ds41/provenance/ENGINE_SOURCE_PINS.json",
-  "pins_sha256": "39df32043acd6b6b1927fd02a7cf87da5ef65de7f74a33fa887fbcd1f8fa520f",
-  "export": "git archive --format=tar e184c6b7f019535a592e5c1474bac38b7ba6a360 (tracked files only, modes kept)",
+  "pins_sha256": "c26419aba88e8d0de779266650c4812554717eba826a0d88c73fdd7afd371f32",
+  "export": "git archive --format=tar 1c0a01b3e5da305af18af9c296221d72fa5456cd (tracked files only, modes kept)",
   "upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -17,12 +17,12 @@
       "upstream main (upstream/main, v1.15.0 + 12)": {
         "commit": "b6acbd69e475b064f61c76ef7dbdea4e22956394",
         "contained": true,
-        "commits_after": 405
+        "commits_after": 406
       },
       "pull request 266, deepseek41 (upstream/pr-266 as of 2026-10-28)": {
         "commit": "bd65d4e58f7c4233de09ad5245a82c9510eb8962",
         "contained": true,
-        "commits_after": 584
+        "commits_after": 585
       }
     }
   }

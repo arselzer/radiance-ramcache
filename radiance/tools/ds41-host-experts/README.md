@@ -1104,6 +1104,18 @@ its rows, which does not pay below ~300 rows):
 - **Unchanged.** Decode, every pass of up to 16 tokens and every layer pass below the threshold run the
   CPU path as before.
 
+For long prompts on the measured 256 GB host with a 192 GiB expert cache and four RX 9070 XTs,
+set `RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD=0` alongside the P1 configuration above. The independent
+stable-build check on 3 November used fresh Qa8/Qa0 hash arms, then quiet Qa8/Qa0/Qa8 controls:
+3,086-token TTFT fell from 8.71–8.92 s to 7.65 s (12–14%), and 6,817-token TTFT from 11.83–11.85 s
+to 10.82 s (8.5–8.7%). All 15 replies and all six full prefill hash checks matched. This disables
+speculative P1 reads; demand reads, weights and arithmetic stay unchanged. The 82-token prompt was
+1.8–3.5% slower, so the existing default remains 8. These measurements cover the stated cache and
+no-prefix long-prompt profile; other cache budgets and broader lifecycle tests have separate scopes.
+The raw result is `work/autonomous-20261101/stable_e184_Qa_B/summary.json`; the report is
+`PREFILL-QA0-20261103.md` in the review archive. No engine or plugin rebuild is needed for this
+existing switch.
+
 Switches (each a whole number; anything else refuses to start): `..._P1_WAVE` (2; 1-16),
 `..._P1_INFLIGHT` (drive units read at once a rank, 16), `..._P1_READY` (pinned ready slots a rank, 6,
 18.8 MB each), `..._P1_AHEAD` (8; 0 off), `..._P1_VERIFY` (0: after each layer's waves, up to N

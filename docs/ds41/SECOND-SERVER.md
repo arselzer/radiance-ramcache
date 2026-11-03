@@ -106,3 +106,30 @@ Evidence: [chain34 currentN4/P1/Vp log](/home/as/radiance-ds41-claude/tools/ds41
 core/place/planner.cpp:424–435/483–487. Actual held-out GPU execution requires the existing
 route_trace.h per-pick statuses (lines1–21/38–56), not startup calibration mass. No such new trace
 or complementary-placement replay was run for this hypothetical.
+
+## Local PCIe topology follow-up, 2026-10-31 21:11 UTC
+
+Read-only lspci/sysfs inspection of this host:03:00.0 is under root bus00,83:00.0 under80,
+andc3:00.0/c6:00.0 both underc0 on distinct root ports. Root40 currently has the NVMe/NIC and
+no GPU. All four complete host paths negotiate Gen4x16 (16GT/s); their internal GPU bridge links
+show Gen5x16, which does not make the end-to-end host connection Gen5. Current OS exposes one
+NUMA node; GPU numa_node is unknown(-1), so no finer locality was inferred.
+
+The existing work/bwmix/out/cmd.log has27.52–27.53GB/s perGPU alone, but concurrent copies give
+two16.82–16.85GB/s and two27.40–27.48GB/s. This is compatible with shared-resource contention,
+not causal proof: that benchmark did not persist PCI BDFs, so its ordinal-to-root pairing must
+be measured explicitly before suggesting a slot move. CPU-only streaming was~121GB/s; simultaneous
+CPU and GPU reads compete for shared resources. Do not add isolated peak bandwidths.
+
+AMD documents root-complex-specific NBIO/LCLK behavior in the [EPYC7003 tuning guide](https://docs.amd.com/v/u/en-US/amd-epyc-7003-tg-workload-57011).
+[Linux PCI P2P documentation](https://docs.kernel.org/driver-api/pci/p2pdma.html) explains why crossing
+host bridges is platform-dependent; a more distributed placement need not improve peer collectives.
+Any proposed slot move is on-site work; no PCI, BIOS, power, driver or service setting was changed.
+
+Next measurement is a separately guarded BDF-labelled single/pair/all transfer+peer-latency matrix,
+with actual backend distinctions (HIP, AQL blit, AQL SDMA lists), bounded pinned memory and explicit
+CPU-contention conditions. Passive sysfs inventory/cost-profile source is in dispatch-profile;
+probe backend source is separatepcie-calibration-backend. No new GPU benchmark has run.
+Discovery/profile structures support arbitrary physical GPU counts. The current native ds41 model
+still assumesTP4; a fifth device can be inventoried/selected separately, while an auxiliary expert
+worker requires its own routing, ownership, original logical-rank fold and byte gates.

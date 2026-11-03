@@ -58,6 +58,8 @@ RADIANCE_EXPERIMENTAL_DS41_LCP=2048                         # large-chunk prefil
 RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1                    # routed gemv: work split by row passes, all-dropped passes skipped (exact)
 RADIANCE_EXPERIMENTAL_DS41_P1=1                             # prefill Phase 1: layer passes of >= 320 rows (..._P1_MIN_ROWS) compute every routed expert on the cards (needs the libr4d whose P1 card check passed)
 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64                 # the activation arena's idle top holds ~42 decode residents a card between long prefills (needs the deepseek41 plugin from this tree and ..._EARLY_ISSUE=1)
+RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1                    # static VRAM experts in the packed-scale form, x1.044 as many a card (gemv_vp and the P1 row read it; needs --deterministic and the libr4d whose vpack card check passed)
+RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1                    # the 40 routers and 3 compressor kv|gate projections read as bf16, 180 MiB a card back to the experts (the load refuses one with a nonzero f32 low half; the deepseek41 plugin and libr4d from one build, whose gemm_nt_f32bf16 card check passed)
 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1                # no pass after a reply's end-of-generation token
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1               # a partly read read-ahead unit's rest read whole in its layer's own read
 RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256            # background inserts in 256 KiB pieces, waiting for an idle pool
@@ -65,7 +67,7 @@ RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8             # the read-ahead pred
 RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=7                    # up to 7 units a rank the packed cache refuses keep their planes
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1            # pool workers sleep on a futex, woken without a lock
 
-radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
+radiance ... --tp 4 --placement expert_tiered --weights-disk-tier --deterministic \
   --expert-ram-cache-total-mib 196608 --host-pool-mib 256 --embedding-placement ram \   # 192 GiB on a 256 GB box (98304 on 128 GB)
   --max-num-batched-tokens 2048 --expert-profile <decode profile> \
   --expert-plane-mirror <dir of the checkpoint's model-*.safetensors> \
@@ -101,16 +103,61 @@ by SHA256. No model/container metadata was modified.
 **For concurrent requests** (agent harnesses) add `RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1` and `--max-num-seqs N`
 (with `--max-model-len` sized so N sequences' KV fit, e.g. 1024 at N = 4-8): large-chunk prefill refuses steps that
 mix a prompt's chunk with other sequences' decode rows, and the window arms at 4 and 8 streams below ran that way.
+In the paragraphs from here to the two-batch overlap one, every 4- and 8-stream arm also ran
+`..._PREFETCH_MULTIROW=N` (parts `Pmr4` / `Pmr8`) with `--max-model-len 1024` (`L1024`), sending the 8 held-out
+requests N at a time. A total at N streams is N times the mean of the requests' `predicted_per_second`
+(`ab_requests.py --compare` prints it per request); a one-stream rate is that tool's decode line.
 
-**2,048-token chunks with the lent arena** (the block above; ab-20261031T011849Z, T022949Z, T030023Z: prefill hashes
-and every reply identical): time to first token 5.0 / 7.2 / 17.2 s for prompts of 1,890 / 3,086 / 6,817 tokens,
-against 7.5 / 8.6 / 26.7 s at 1,024-token chunks (shorter prompts unchanged); held-out decode 29.45 against 29.91
-tok/s (−1.5%); 4 and 8 streams 37.2 / 41.5 against 38.0 / 41.2 tok/s in total; short replies right after a long
-prompt decode ~6% slower until the lent residents are reloaded (~1-1.5 s). For decode-heaviest use keep
+**2,048-token chunks with the lent arena** (the block above without `..._VRAM_PACKED` and `..._ROUTER_BF16`;
+ab-20261031T011849Z, T022949Z, T030023Z, before the upstream sync: prefill hashes and every reply identical): time to
+first token 5.0 / 7.2 / 17.2 s for prompts of 1,890 / 3,086 / 6,817 tokens, against 7.5 / 8.6 / 26.7 s at 1,024-token
+chunks (the 26.7 s from ab-20261030T231526Z; shorter prompts unchanged); held-out decode 29.45 against 29.91 tok/s
+(−1.5%); 4 and 8 streams 37.2 / 41.5 against 38.0 / 41.2 tok/s in total (−1.9% at 4, a tie at 8); short replies right
+after a long prompt decode ~6% slower until the lent residents are reloaded (~1-1.5 s). For decode-heaviest use keep
 `..._LCP=1024`, `--max-num-batched-tokens 1024`, `..._MISSES=1024` and no lent arena. Both chunk sizes include the
-compressor tail sized to the step (+0.6% decode at 1,024). The LCP/P1 configurations cannot use packed VRAM
-residents, so under concurrency they stay 2-4% below the decode-only M16 setup with `..._VRAM_PACKED` (38.7 / 42.9
-at 4 / 8 streams) while prefilling 3-10x faster.
+compressor tail sized to the step (+0.6% decode at 1,024). On the stable build (runtime e184c6b7, libr4d 501b98e2,
+four RX 9070 XT) the same configuration decoded 37.27 / 40.84 tok/s in total at 4 / 8 streams (ab-20261103T090558Z,
+one run each; 37.20-37.54 / 41.24-41.53 on earlier builds in ab-20261031T030023Z, T100852Z and T123034Z) and 28.68
+tok/s at one stream (ab-20261103T110235Z, one run; 27.83 and 24.41 in ab-20261103T114720Z and T090558Z, each the first
+arm after production stopped, with a slow first or stalled request); it took 1.89 / 3.86 / 4.24 / 5.39 / 7.39 s to
+first token at 82 / 272 / 933 / 1,890 / 3,086 tokens (ab-20261103T090558Z, one run with prefill hashes on) and 17.22 s
+at 6,817 tokens sent alone after a start (ab-20261103T114720Z, the second of two runs; 17.39 s in
+ab-20261103T110235Z). Times depend on the prompts before them: the `..._P1_AHEAD` note below took
+8.71-8.92 / 11.83-11.85 s at 3,086 / 6,817 tokens on the same build (with `Rb`/`Vp`, the default read-ahead), with 82,
+3,086 and 6,817 tokens sent in turn to one server, the 6,817-token prompt's first chunk reading 178 drive units
+instead of 279. Every held-out reply was identical to the base engine. The decode-only M16 setup with
+`..._VRAM_PACKED` and `..._ROUTER_BF16` measured 38.7 / 42.9 at 4 / 8 streams (ab-20261030T231526Z, before the
+upstream sync; not re-measured).
+
+**4,096-token chunks** (opt-in, exact; for one stream prefilling uncached prompts well above 2,048 tokens, not for
+concurrent decode): `..._LCP=4096` with `--max-num-batched-tokens 4096`, `..._MISSES=4096` and
+`--checkpoint-interval 4096` (Phase 1 refuses an interval below the chunk; the default is 2048); window parts `M4096`
+`Lc4096` `Pci4096`, card checks with `LCP_CHECK_C=4096`. With `..._VRAM_PACKED` and `..._ROUTER_BF16` on the stable
+build (ab-20261103T090558Z; against 2,048-token chunks without them unless noted): every held-out reply at 1, 4 and 8
+streams identical to the base engine (24 of 24), prefill hashes identical to plain 16-token passes on the five long
+prompts (against the plain arm of ab-20261103T110235Z), logits identical to them at 3,397 of 3,397 positions over 20
+documents. A 3,086-token prompt took 6.00 against 7.39 s (7.41 with `Rb`/`Vp`, ab-20261103T110235Z): one 3,086-row
+Phase 1 chunk instead of two chunks (1,040 + 2,046 tokens; Phase 1 passes of 1,040 + 2,032 rows), 401 drive units
+against 587 (5.69 against 7.33 s in ab-20261031T162629Z, both without `Rb`/`Vp`); prompts of up to 2,048 tokens gained
+nothing (1,890: 5.53 against 5.39 s, and 5.09 with `Rb`/`Vp` in ab-20261103T110235Z). Costs: the activation arena
+doubles (1.78 GiB against 910 MiB a card at `--max-model-len 1024`), leaving 590 / 598 static residents a card against
+665 / 674 at 2,048 with `Rb`/`Vp` (627 / 635 without), which the lent arena's 64 slots (the cap) do not make up: 4 / 8
+streams total 36.27 / 39.63 tok/s, −4.5% / −5.1% against 2,048-token chunks with `Rb`/`Vp` and −2.7% / −3.0% without
+(one run each; its 8-stream arm ran in a 10-minute interval with about 5x the direct page reclaim, `sar -B`, of the
+interval that held its 4-stream arm and the 2,048-token arms at 4 and 8 streams). The replies after the long prompts
+decoded 5.8% slower (23.56 against 25.00 tok/s, one run each); the first request after a start was slow (82 tokens
+4.88 against 1.89 s; 3.48 against 1.91 s in ab-20261031T162629Z), and the 933-token prompt took 9.53 against 4.24 s,
+its first Phase 1 chunk reading the same 383 drive units at 0.76 against 1.70 GB/s (the slow first chunk noted under
+`..._VRAM_PACKED` below, which 2,048-token chunks show too). These prefill times are single runs with prefill hashes
+on, each after the 2,048 arm. The 6,817-token gain (12.69 against 17.12 s, ab-20261031T162629Z, without `Rb`/`Vp`) is
+not re-measured on the stable build, whose 2,048-token chunks take 17.22-17.58 s for that prompt alone after a start,
+with or without `Rb`/`Vp` (ab-20261103T114720Z, the three runs after one with the slow first chunk). With the prefix
+cache, ab-20261031T162629Z's 13 harness turns took 64.96 s summed time to first token against 72.70-73.84 s at 2,048
+in ab-20261031T100852Z, T123034Z and T182505Z (11-12% less) but decoded at 24.20 against 25.81-25.95 tok/s (6-7%
+slower): different builds, without `Rb`/`Vp`, not re-measured. Above 2,048 rows the stable build's exactness evidence
+is that one 3,086-row chunk and the card checks (the logit corpus stops at 1,886 tokens); without `Rb`/`Vp`,
+ab-20261031T162629Z also matched 2,048-token chunks on the long prompts (at 96 GiB too) and the 6,817-token prompt,
+and ab-20261031T100852Z's 13 harness turns.
 
 **Phase 1 prefill** (`..._P1=1` with the 6-unit file buffers; ab-20261030T231526Z, every reply and prefill hash
 identical to the large-chunk path): time to first token 1.9 / 3.7 / 4.2 / 7.4 / 8.7 s for prompts of 82 / 272 / 933 /
@@ -120,12 +167,36 @@ Decode stays within ~1% (29.68 against 29.88 tok/s on the held-out prompts). `..
 ring's idle slots) measured nothing more and stays off. 2,048-token chunks are faster still for long prompts
 (6.6 s at 3,086 tokens in ab-20261030T201710Z) but their activation arena costs ~50 VRAM residents a card.
 
-`RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` (packed VRAM residents, ~31 more a card, about +1% decode) and
-`RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1` (bf16 routers, +0.6%) are left out above. Large-chunk prefill refuses the
-packed residents, because their gemv_vp serves passes of up to 16 tokens (found in ab-20261030T223155Z), and the
-bf16 routers were never measured beside it: the windows behind the large-chunk numbers ran without both. For a
-decode-only server without `..._LCP`, add both (with their card checks). Under Phase 1 the packer packs no residents, so `..._VRAM_PACKED` does
-nothing there either.
+`RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` (part `Vp`) and `RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1` (part `Rb`) are
+in the block above since the stable build (runtime e184c6b7, libr4d 501b98e2, four RX 9070 XT) passed their gates
+under Phase 1 at 2,048-token chunks (ab-20261103T090558Z, T110235Z, T114720Z). Under Phase 1 the packer packs (gemv_vp
+serves passes of up to 16 tokens, the P1 row decodes the packed form above them; large-chunk prefill without Phase 1
+still refuses `Vp`), and `Rb` gives 180 MiB a card back, so a card holds 665 / 674 static residents (rank 0 / the
+others) against 627 / 635 without them at `--max-model-len 1024` (658 / 667 and 620 / 628 at 8192, 642 / 650 and
+604 / 613 at 32768). Against the block without them: 4 / 8 streams 37.98 / 41.77 against 37.27 / 40.84 tok/s in total
+(+1.9% / +2.3%, one run each, the pairs in opposite orders; the same RAM-cache misses and 3.3% fewer rows sent to the
+CPU; ab-20261103T090558Z), above every run without them on the earlier builds too (the 2,048-token paragraph); one
+stream, one run each: 28.36 against 28.68 tok/s (−1.1%, ab-20261103T110235Z) and 29.29 against 27.83
+(ab-20261103T114720Z, where the arm without them ran first after production stopped and its first request was slow);
+13 harness turns with the prefix cache in 78.29 against 79.02 s summed time to first token, decoding at 25.00 against
+24.46 tok/s (ab-20261103T110235Z, one run each); the 6,817-token prompt in 21.01 / 17.58 / 17.22 / 17.22 s without,
+with, with and without them, in that order (ab-20261103T114720Z; the 21.01 s run had the slow first chunk below).
+Exact: all 32 held-out replies at 1, 4 and 8 streams identical to the base engine; prefill hashes identical to plain
+16-token passes on the five long prompts and the 6,817-token one (8c583a997ef6f1db in all seven runs of it,
+ab-20261103T110235Z and T114720Z); 13 of 13 harness turns identical to the block without them (prefill hashes,
+replies, 60,272 cached tokens); logits identical to plain 16-token passes at 3,397 of 3,397 positions over 20
+documents (ab-20261103T110235Z against ab-20261103T090558Z's plain record). These stable-build gates ran at 192 GiB;
+at 96 GiB both switches were checked only on an earlier build (ab-20261031T144623Z: prefill hashes on the five long
+prompts identical to plain 16-token passes). `Rb` needs the deepseek41 plugin and libr4d from one build, `Vp` a static
+plan (`--deterministic`) to pack, and each its card check passed on the served libr4d (`SELFTEST_F32BF16` for `Rb`,
+`VPACK_CHECK` for `Vp`; `ab_window.sh` measures their arms only on a libr4d checked in the same window). A server's
+first Phase 1 chunk sometimes read the drive at about half rate, cause unknown: in the first 6,817-token run above
+(without them; the same 279 drive units at 0.97 against 1.59-1.77 GB/s in the three runs after it), in the long-prompt
+run at 4,096-token chunks (above; the same 383 units at 0.76 GB/s, while the 2,048-token run just before it read them
+at 1.70) and in both logit-corpus arms (with both switches; 399 units at 0.87 GB/s at 2,048-token chunks in
+ab-20261103T110235Z, 0.68 at 4,096 in ab-20261103T090558Z). Time long prompts over repeats. ab-20261103T110235Z's
+6,817-token run with both (25.36 s) overlapped a git push on the box and is not used. A decode-only server without
+`..._LCP` (and so without Phase 1) keeps both; there `Vp` packs only with `--max-num-batched-tokens` at most 16.
 
 Two-batch overlap of concurrent decode steps (`RADIANCE_EXPERIMENTAL_SCHED_TBO=1`, opt-in, exact) loses on 256 GB
 too: 37.4 against 38.7 tok/s in total at 4 streams and 40.7 against 42.9 at 8 (ab-20261030T231526Z). Leave it off.
@@ -204,7 +275,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `..._PREFETCH_ATTN=1` | +2.8% | in the deepseek41 plugin: while the card waits for a layer's CPU rows, lane 1 reads the next layer's q_a, kv, q_b and wo_a (~56 MB a card) into the 64 MB on-die cache (libr4d `prefetch`, read-only); decode passes only, and not ahead of an Engram layer. That stays its behaviour unless one of the three modifiers below is set |
 | `..._PREFETCH_MIB=N`, `..._PREFETCH_SET=k1,k2,..`, `..._PREFETCH_ENGRAM=1` | MIB=56: 17.65 / 17.29 / 17.58; MIB=56 + ENGRAM: 17.65 / 17.73 / 17.36 tok/s against 16.53 (a dip) / 17.51 / 17.24 (+1.0 to +1.4%), every reply identical; ENGRAM overlaps the Engram all_gather, so it was also checked on the 16 chat prompts with 256-token replies: 16/16 identical, 15.84 against 15.74 tok/s. Adopted (MIB=56 + ENGRAM) | modifiers of `..._PREFETCH_ATTN=1` (deepseek41 plugin, `arch/deepseek41/ds41_prefetch_plan.h`). `MIB`: a budget of N MiB an issue point, filled in use order (`ekv` engram_kv, `comp` the compressor, `qa`, `kv`, `iq` the indexer's q_b, `qb`, `oa` wo_a's groups, `ob` wo_b, `rt` the f32 router, `sgu`/`sdn` the shared expert's gate\|up and down), the read that crosses it cut to what is left: at bf16 56 MiB is the four reads above plus 2.5 MiB of wo_b; with `..._DENSE_FP8=1`, whose E4M3 codes halve the reads (the four alone are then 26.75 MiB), the whole list through the shared expert (rank 0 55.5 MiB). `SET`: the reads named, in that order (also `iw`, `ik`: the indexer's small projections; `ma`, `mf`: the connections' mixes), whole unless a budget is set. `ENGRAM`: an Engram layer (1, 14) is read too, its engram_kv by the layer before when `ekv` is listed, the rest right behind its Engram GEMM. Each rank prints its plan at startup and its counts at shutdown (`rank R: on-die reads`). Arm parts `PmN`, `Pl<k1+k2+..>`, `Pe` |
 | `..._CACHE_SECOND_CHANCE=N` | N=1 +3.9%, N=2 +5.1% (TTFT −1.5% / +1.2%) | a cached unit the decode profile calls hot (`..._CACHE_PROTECT_SHARE`, default 6 of the sealed profile's 4326 selections a layer: ~1150 units a rank) moves to the front up to N times between uses before an insert may evict it. The held-out prompts share task families with the profile; replayed on the 16 chat prompts too, critical decode misses fell 7.9% (N=1) |
-| `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` | alone 17.56 / 17.60 / 17.58 against 17.37 / 17.65 / 17.69 tok/s (+0.1%), TTFT −3%, replies identical; those runs used the first gemv_vp kernel, 27-51% slower a call than the plain row (register spills). claude/ds41-vpk2's default kernel (r2cz: the raw rounds' bytes through the scalar unit, one rolled block loop, and a pass of dropped slots alone storing its zeros) is 2.3-5.3x faster a call than the plain row (gate_up 28 / 54 / 73 us against 148 / 169 / 177 at 1 / 2 / 3 live experts; down 20 / 30 / 43 against 105 / 105 / 99), mostly from the dropped-slot skip (5 of a decode call's 6 passes with the live tail off); r2cf, the kernel without the skip, is 0.69-0.77 of plain. Every bit identical (card `check 48` and `check 48 tail`, 0 of 6,087,680 values differ; dropped slots 0 non-zero). `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL=old|r2|r2cf|r2cz` picks a kernel for an A/B (an unknown value refuses every gemv_vp call); not yet measured end to end | the cards' static expert residents in the same packed form (below): 18,001,920 instead of 18,800,640 bytes a unit, so x1.0444 the residents (with F8, 712 / 720 a rank should become ~743 / 752); needs a `libr4d.so` with the row `moe_gemm_ggml_mxfp4_gemv_vp` in the run home, `--deterministic` and passes of at most 16 tokens; `..._VRAM_PACKED_RAW=<gate_up>,<down>` (512,320) sets the raw rounds of room; arm part `Vp`, which runs only on a `libr4d.so` the device check passed (`VPACK_CHECK`, below) |
+| `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` | alone 17.56 / 17.60 / 17.58 against 17.37 / 17.65 / 17.69 tok/s (+0.1%), TTFT −3%, replies identical; those runs used the first gemv_vp kernel, 27-51% slower a call than the plain row (register spills). claude/ds41-vpk2's default kernel (r2cz: the raw rounds' bytes through the scalar unit, one rolled block loop, and a pass of dropped slots alone storing its zeros) is 2.3-5.3x faster a call than the plain row (gate_up 28 / 54 / 73 us against 148 / 169 / 177 at 1 / 2 / 3 live experts; down 20 / 30 / 43 against 105 / 105 / 99), mostly from the dropped-slot skip (5 of a decode call's 6 passes with the live tail off); r2cf, the kernel without the skip, is 0.69-0.77 of plain. Every bit identical (card `check 48` and `check 48 tail`, 0 of 6,087,680 values differ; dropped slots 0 non-zero). `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL=old|r2|r2cf|r2cz` picks a kernel for an A/B (an unknown value refuses every gemv_vp call); not yet measured end to end | the cards' static expert residents in the same packed form (below): 18,001,920 instead of 18,800,640 bytes a unit, so x1.0444 the residents (with F8, 712 / 720 a rank should become ~743 / 752); needs a `libr4d.so` with the row `moe_gemm_ggml_mxfp4_gemv_vp` in the run home, `--deterministic` and passes of at most 16 tokens, or any pass under `..._P1=1`; `..._VRAM_PACKED_RAW=<gate_up>,<down>` (512,320) sets the raw rounds of room; arm part `Vp`, which runs only on a `libr4d.so` the device check passed (`VPACK_CHECK`, below) |
 | `..._PACKED_CACHE=1` | +3.2% alone, TTFT −5.5%; with `..._CACHE_SECOND_CHANCE=2` 15.52 / 15.48 tok/s (+8.2%) | the RAM cache holds each expert's codes plane plus its e8m0 scales packed to 2 bits from one base a weight (raw rounds beside, budget 512 / 320, `..._PACKED_CACHE_RAW`): x1.0444 slots and 4.4% fewer bytes a CPU hit; 7 of 15,360 experts never fit and stay misses. Refused unless the CPU takes every routed unit (all, M16, B1); the card's copy path never reads or fills it |
 | `RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=N` | not yet measured (estimate +0.3-0.5% decode: the 7 never-packable experts' ~0.1 misses a token, ~2.7 ms each, gone; refused inserts down to one per distinct unit) | with the packed cache (`..._PACKED_CACHE=1`) and misses on the CPU: the planes of up to N units a rank whose inserts the packed cache refuses over its raw-round room (7 of 15,360 experts; 1-2 a rank in the held-out runs) are kept after their first miss (the insert thread, `core/place/hx_side_store.h`) and handed to their later misses as a unit read ahead whole is: no drive read, the same bytes, the container's epoch checked first; never inserted again, and the read-ahead treats them as cached. ~18 MiB of planes a unit held (2 MiB-rounded buffers); the store only ever holds units the cache refused, 1-2 a rank in the held-out runs (~36 MiB a rank), and N bounds it (N=7: every never-packable expert even if one rank had them all). Refused without the packed cache or the CPU's misses. Startup line `side store: the planes of up to N units a rank ...`; shutdown `host experts' side store: K of at most N units held (...); M misses handed their planes without a read`, and the mover's `unit inserts refused over a raw-round budget` count should equal the distinct units. Arm part `NsN` |
 | `RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1` (`=2`) | neutral: 16.85 / 16.65 against 17.07 / 16.36 tok/s (47% of launches went unordered; the card's chain is not the critical path) | in decode passes (in every pass issued live), a device launch whose first dispatch reads nothing the dispatches in flight on its queue write, and writes nothing they read or write, goes without the AQL barrier bit (`core/runtime/live_chain.h`): what `haz_mark` does for recorded passes, which a staged pass never is. Exact: only start order changes. Anything on the queue the issue path did not write (events, waits, copies, table patches) orders the next launch; collectives, kernels without `rad_kernel_concurrent` and host-visible launches never go unordered. Shutdown line `live chain: ...`; arm parts `Ov` / `Ov2` |
@@ -439,14 +510,15 @@ round at every block position (down's tail included), widened rounds on the gene
 
 ## Packed VRAM residents
 
-The cards hold 712 / 720 static expert residents a rank in block_mxfp4 in the recommended configuration
+The cards hold 712 / 720 static expert residents a rank in block_mxfp4 in the decode-only M16 configuration
 (with F8; 598 / 615 without). With `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` they take the packed form the
 RAM cache uses (the codes plane and 2-bit e8m0 codes from one base a weight, raw rounds beside, room for
 512 / 320 raw rounds): 18,001,920 bytes a unit instead of 18,800,640, so the same weights pool holds
 x1.0444 the residents. From the room each rank left (712 units and 3.90 MiB free on rank 0, 720 and
 10.62 MiB on the others) that is 743 / 752, 31 / 32 more a rank, one fewer for each ~10-15 MB that
 weights over their raw-round budget (charged block_mxfp4) take back (`core/place/vram_packed.h` has the
-whole design).
+whole design). The Lc2048/P1/lent-arena block holds 627 / 635 block or 665 / 674 packed (with `Rb`) at
+`--max-model-len 1024` (ab-20261103T090558Z).
 
 - **Selection.** The engine sets the machine fact `device.ds41_vram_packed` before declare, which lets
   libr4d's `moe_gemm_ggml_mxfp4_gemv_vp` row take the routed GEMMs' decode band (priority 59 over the gemv
@@ -454,12 +526,14 @@ whole design).
   pinned pool, the file tier, the RAM cache, the CPU path and the expert profile's checks all keep
   block_mxfp4: only the VRAM copies change.
 - **Planning.** A weight is eligible when it is a trunk routed expert's `ggml_mxfp4` gate_up or down,
-  whole on its rank, read only by `moe_gemm_ggml` ops every band of which resolved the gemv_vp row (so
-  `--max-num-batched-tokens` at most 16). The expert fill charges a unit at its packed size after reading
-  its weights' scales from the container (only the units it considers for VRAM: 1.1 MB a unit, about
-  0.8 GB a rank with F8); a weight over its raw-round budget stays block_mxfp4 in VRAM and is charged so.
-  Only a static plan (`--deterministic`) packs. The startup log prints per rank what was packed and how
-  long the scan took; the planner report (`--debug-placement`) has a `vram packed` line.
+  whole on its rank, read only by `moe_gemm_ggml` ops every band of which resolved the gemv_vp row, or
+  whose bands of up to 16 rows resolved it and every higher band the packed-aware P1 row through its
+  4096-row bound (so passes of at most 16 tokens, or any pass under `..._P1=1`). The expert fill charges
+  a unit at its packed size after reading its weights' scales from the container (only the units it
+  considers for VRAM: 1.1 MB a unit, about 0.8 GB a rank with F8); a weight over its raw-round budget
+  stays block_mxfp4 in VRAM and is charged so. Only a static plan (`--deterministic`) packs. The startup
+  log prints per rank what was packed and how long the scan took; the planner report
+  (`--debug-placement`) has a `vram packed` line.
 - **Loading.** The loader packs each such weight from its planes and checks it before the upload: every
   block's e8m0 as the kernels widen it equals the planes' byte for byte, and the codes plane is unchanged.
   Any mismatch refuses the load.
@@ -918,20 +992,20 @@ one changed logit anywhere in a row shows), and the second must equal the first 
 
 ## Large-chunk prefill
 
-`RADIANCE_EXPERIMENTAL_DS41_LCP=C` (C a multiple of 16 in 64..2048) runs a lone prompt's prefill in
+`RADIANCE_EXPERIMENTAL_DS41_LCP=C` (C a multiple of 16 in 64..4096) runs a lone prompt's prefill in
 chunks of C tokens, each giving every row the bits of the same tokens in 16-token passes. It needs
 `--max-num-batched-tokens C`, the CPU path on every routed unit (`..._POLICY=all`, `..._MISSES` ≥ C,
 `..._FILE_BUFFER_UNITS`), chunks of C (the default checkpoint interval 2048 serves C up to 2048;
 above it, `--checkpoint-interval C`; with the prefix cache and a smaller interval, `--prefill-span
 C/I`), and a step a chunk alone; the server refuses anything else at startup with the reason (also
-speculation, KV streaming, `..._FETCH_LIST`, `..._VRAM_PACKED` and `..._EXACT_TALL` other than 1),
-and refuses a libr4d.so whose twin does not reach C (so a run home with an old plugin cannot mix
-sums).
+speculation, KV streaming, `..._FETCH_LIST`, `..._VRAM_PACKED` without `..._P1=1` and
+`..._EXACT_TALL` other than 1), and refuses a libr4d.so whose twin does not reach C (so a run home
+with an old plugin cannot mix sums).
 Under it libr4d's `ds41_mxfp4_device_check LIBR4D lcp [C]` holds the twin, the sparse ops (also as
 the suffix launches of the per-row cut) and every other height-dependent op (gemm_nt by the row the
 table resolves, the router's f32 projection and its 96-column split, the norms, mhc_mix, the head) to
-their rows launched alone and 16 at a time, up to 2048 rows; `r4d_emu_ds41tall_lcp` holds the twin to
-256 tokens, the norms to 1024 rows, gemm_nt's tiled row and the f32 split on the host.
+their rows launched alone and 16 at a time, up to 2048 rows (C above 2048); `r4d_emu_ds41tall_lcp`
+holds the twin to 256 tokens, the norms to 1024 rows, gemm_nt's tiled row and the f32 split on the host.
 
 The CPU path at C rows: jobs of up to `..._HOST_EXPERTS_MAX_ROWS` (now up to 64: two many-row calls
 on one weight tile; set it to 32 or 64, since at the default 4 a chunk's experts take about twice the
@@ -953,8 +1027,10 @@ the Kld reference), `AdN` / `Ada`, `LpN`, `LiN`, `Mr` up to 64. `lcp` in `DEVICE
 `sweep0` on card 0 (logs `devcheck-lcp-*.log`), and the window measures an Lc arm only on the libr4d.so
 (sha256) those passed on, at a chunk of at most `LCP_CHECK_C`. The byte gates are those of exact tall
 passes: a plain `Kld` arm first, then `...-M1024-...-Lc1024-Kld` (identical records), and `Kh` arms
-with and without `Cs` (identical prefill hashes). Leave `Vp` out of an Lc arm (refused) and `Rb` too
-(`gemm_nt_f32bf16` is not in the sweep).
+with and without `Cs` (identical prefill hashes). Leave `Vp` out of an Lc arm without `P1` (refused:
+gemv_vp serves 16 rows; under `P1` the P1 row decodes the packed form). `Rb` arms run only after
+`SELFTEST_F32BF16` passed in the window (its tall cases reach M 4096); the `lcp` sweep does not cover
+`gemm_nt_f32bf16`.
 
 ### Balanced routed gemv (`RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE`)
 
@@ -1084,7 +1160,7 @@ its rows, which does not pay below ~300 rows):
   has seen the copy pass; until then, or after a failed reload, they take the CPU path. Residency changes
   only at a pass's start, before the weight tables are brought up to date, and a copy a card-path pass
   overtakes is never published. Off by default.
-- **The lent arena** (`..._P1_LEND_ARENA=K`, for chunks of 2,048). The activation arena is sized for the
+- **The lent arena** (`..._P1_LEND_ARENA=K`; measured with chunks of 1,024, 2,048 and 4,096). The activation arena is sized for the
   chunk and its buffers are live across the whole graph, so it is about the sum of its buffers: 935 MiB a
   card at 2,048 rows, 468 at 1,024 (`expert_down` 60 KiB a row, `expert_gate_up` 54, `engram_kv` 50, the
   two hyper-connection streams 40 each, `expert_ff` 27, ...; all but ~22 MiB of persistent buffers scale
@@ -1098,9 +1174,12 @@ its rows, which does not pay below ~300 rows):
   begin_pass, before its first op; the compute stream first waits on any reload copy still queued
   (`LendHost::fence`), and at its end the mover's stream waits on an event behind it, so a later reload
   lands behind its last reader. The grace runs from the last such step. Residency moves, bytes do not:
-  replies stay byte-identical. At Lc2048 ~42 slots fit a card (the 39 residents Lc2048 costs against
-  Lc1024), at Lc1024 ~18. The plugin must come from a tree with the change (arch/deepseek41). Off by
-  default.
+  replies stay byte-identical. At Lc2048 the slots that fit a card grow with `--max-model-len`: 41 at 512
+  and 1024, 42 at 4096, 44 at 8192 and 53 at 32768 on the stable build, the same with and without `Rb`/`Vp`
+  where both ran (ab-20261103T090558Z, T110235Z, T114720Z); before the upstream sync, at 4096, 41-42 at Lc2048
+  (the 39 residents Lc2048 costs against Lc1024) and 17 at Lc1024 (ab-20261031T011849Z, T022949Z). At Lc4096
+  the cap of 64 fits at 512-8192 (ab-20261103T090558Z). The plugin must come from a tree with the change
+  (arch/deepseek41). Off by default.
 - **Unchanged.** Decode, every pass of up to 16 tokens and every layer pass below the threshold run the
   CPU path as before.
 
@@ -1128,8 +1207,8 @@ for every pass above 16 tokens, as before the threshold), `..._P1_LEND` (lent ri
 64, at most the ring's slots less two), `..._P1_LEND_ARENA` (lent arena slots, 0 off; up to 64, as many
 as fit), `..._P1_GRACE_MS` (1000; 0-60000).
 
-Refused at startup, with the reason: an invalid switch value; P1 without an admitted LCP chunk, or above
-2048; a routed band of 17 rows or more not on the P1 row (a libr4d with LCP's twin is named as such); a
+Refused at startup, with the reason: an invalid switch value; P1 without an admitted LCP chunk; a
+routed band of 17 rows or more not on the P1 row (a libr4d with LCP's twin is named as such); a
 band of up to 16 rows not on the gemv or gemv_vp; `FILE_BUFFER_UNITS` unset or below 2 (fewer than 4 ring
 slots); the CPU path not taking the layer passes below the threshold (host experts with `..._POLICY=all`,
 `..._MISSES` of min(C, threshold - 1) or more: 319 at the default, 16 at 17); speculation (so no DSpark
@@ -1202,11 +1281,11 @@ LCP twin and 30 for lcpfast's balanced twin.
 
 ## October31 follow-up experiments (256 GB RAM, 192 GiB cache)
 
-The follow-up controls preserve the merged base replies. New switches remain opt-in; the general recommendation stays Lc2048/P1/lent arena until the additional combinations and smaller-cache checks are complete.
+The follow-up controls preserve the merged base replies. Since ab-20261103T090558Z / T110235Z / T114720Z the recommendation is Lc2048/P1/lent arena with `Rb` and `Vp` (above, gated at 192 GiB); the other new switches remain opt-in.
 
 - The frozen DSpark verification policy (`Dpp`, `RADIANCE_EXPERIMENTAL_DS41_DSPARK_PREFIX_POLICY=v1:0.937915564:0.97501117`) improved weighted decode on the original code/chat sets by 4.7% / 9.9% against fixed 2 / fixed 1, including the query/observer/wait and required policy telemetry. Held-out gains were 3.4% / 7.7%. All 128 non-reference replies/counts equal the plain controls. These are single-stream 192 GiB results; the same frozen policy's 96 GiB and concurrent-solo composition require their own gates. No family-specific threshold or refit was used. Evidence: ab-20261031T165338Z.
-- Optional Lc4096 / Pci4096 passed long corpus, logical KV/logit hashes, prefix turns and 96 GiB spill. The 3,086-token TTFT changed 7.33→5.69s; 6,817 changed 17.12→12.69s (~537tok/s). The short/long five-prompt TTFT sum was neutral and the first tiny prompt was slower. This establishes a long-prompt option, not a general concurrency recommendation. Its first model window keepsRb / Vp / N128 off. Evidence: ab-20261031T162629Z.
-- P1+staticVp now has actual packed residents and passes the long/spill gate. Reverse-order N4/N8 pairs changed 38.31→39.06 and 41.35→42.47tok/s; the previous N8 pair was neutral, so the small gain is noisy. Evidence: ab-20261031T134615Z and ab-20261031T144623Z (the former's Ulong leg was invalid; use the latter's corrected long/96GiB results).
-- AR/Engram gather row slicing passed fresh four-card byte oracles and 3,397-position corpus comparisons independently and together. Combined Ar1280 / Ag1024 changed long TTFT 17.68→16.96s, prefix-turn sum 73.84→72.80s, and N8 total 41.80→41.33tok/s. It is not recommended generally on this single mixed-performance pair. Evidence: ab-20261031T182505Z.
+- Optional Lc4096 / Pci4096 passed long corpus, logical KV/logit hashes, prefix turns and 96 GiB spill. The 3,086-token TTFT changed 7.33→5.69s; 6,817 changed 17.12→12.69s (~537tok/s). The short/long five-prompt TTFT sum was neutral and the first tiny prompt was slower. This establishes a long-prompt option, not a general concurrency recommendation. Its first model window keepsRb / Vp / N128 off. Evidence: ab-20261031T162629Z. With `Rb` and `Vp` on the stable build, see **4,096-token chunks** above (ab-20261103T090558Z).
+- P1+staticVp now has actual packed residents and passes the long/spill gate. Reverse-order N4/N8 pairs changed 37.67→38.40 and 40.66→41.75tok/s; the previous N8 pair was neutral, so the small gain is noisy. Evidence: ab-20261031T134615Z and ab-20261031T144623Z (the former's Ulong leg was invalid; use the latter's corrected long/96GiB results).
+- AR/Engram gather row slicing passed fresh four-card byte oracles and 3,397-position corpus comparisons independently and together. Combined Ar1280 / Ag1024 changed long TTFT 17.68→16.96s, prefix-turn sum 73.84→72.80s, and N8 total 41.08→40.64tok/s. It is not recommended generally on this single mixed-performance pair. Evidence: ab-20261031T182505Z.
 - DSpark bank lending restored every borrowed bank byte/alias/mask and resumed a real solo query after actual N4 execution at 192 / 96 GiB, with all replies/counts equal. The 1,792-token mixed workload was slower than a static bank: 56.62→60.29s and 79.01→82.91s. Full cold lifecycle was also slower. Keep it experimental; packed fills, transition subphase timing and longer paid bursts are separate follow-ups. Evidence: ab-20261031T180730Z. The earlier ab-20261031T175623Z client attempt is invalid and is retained as failed evidence.
 - P1 SwiGLU span and n128 passed their independent 3,397-position corpus gates and all 42 long/prefix serving requests with logical hashes equal. Long TTFT reference/span/n128 was 17.22 / 17.02 / 17.17 s; prefix sums 73.42 / 72.87 / 72.79 s. These small single-pair differences do not establish a repeatable performance gain. Both remain opt-in. Evidence: ab-20261031T185127Z.

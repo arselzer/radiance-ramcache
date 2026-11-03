@@ -62,10 +62,13 @@ install them together.
 
 ## Status of the 1.16.0 merge
 
-The merge of upstream 1.16.0 is verified only by CPU builds and host tests. GPU verification is
-pending. Until a GPU window has run the card checks, a base-engine reply comparison against the
-1.15 merge, and the byte gates of the recommended configuration, take measured results from
-`ds41-stable`.
+The merge of upstream 1.16.0 is verified on CPU (builds, host tests) and on the four RX 9070 XT cards
+(window `ab-20261103T211924Z`, 3 November): every card check passed on this build's libr4d; the base
+engine's held-out replies are byte-identical to the 1.15 merge's (8 of 8); the recommended configuration
+(Phase 1 at 2,048-token chunks with the lent arena, bf16 routers and packed residents) decoded 29.8 tok/s
+at one stream and 37.9 / 42.2 tok/s in total at 4 / 8 streams, on par with `ds41-stable`, with all 32
+replies identical; its logit records equal plain 16-token passes over 3,397 positions, and the plain
+record is byte-identical to `ds41-stable`'s, so 1.16 changed no ds41 output bit.
 
 Upstream changes that reach ds41's path:
 - libr4d's RMS norm now reads its lane sum eight at a time. Upstream states the bits are

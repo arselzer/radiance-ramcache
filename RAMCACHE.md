@@ -7,7 +7,7 @@ This file covers only what the fork adds.
 
 ## What the fork adds
 
-- **The deepseek41 plugin** from upstream PR 266 (head bd65d4e5, not yet in upstream main):
+- **The deepseek41 plugin** from upstream PR 266 (taken at bd65d4e5; the PR has since moved on and is not yet in upstream main):
   arch/deepseek41, libr4d/r4d_ds41_*, and the matching libref/libavx reference ops.
 - **Expert RAM cache**: routed experts held in host RAM, either as mapped slabs or in an optional
   CPU-only packed form. The cache is filled from a decode profile at startup. Missed experts are
@@ -52,7 +52,7 @@ install them together.
 - `main`: this tree, which is upstream radiance 1.16.0 merged into `ds41-stable`.
 - `ds41-stable`: the stable engine line. It is upstream main b6acbd69 (1.15.0 + 12 commits),
   PR 266, and the work above; the README's recommended configuration refers to it.
-- `ds41-research`: `ds41-stable`'s parent plus about 70 default-off prototypes that are not in
+- `ds41-research`: `ds41-stable`'s parent plus about 70 commits of default-off prototypes that are not in
   `main`: packed and growing KV, DSpark bank lending, FP4/FP8 storage candidates, and Phase 2
   preparation.
 - `ds41`: curated snapshots of the ds41 documentation and A/B evidence, with the engine under

@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "1c0a01b3e5da305af18af9c296221d72fa5456cd",
+  "engine_commit": "0fb1f93e5aebc9b71f3aedb692509bbc6e58fb6d",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -214,7 +214,11 @@
     "ab-20261031T175623Z",
     "ab-20261031T180730Z",
     "ab-20261031T182505Z",
-    "ab-20261031T185127Z"
+    "ab-20261031T185127Z",
+    "ab-20261103T090558Z",
+    "ab-20261103T110235Z",
+    "ab-20261103T114720Z",
+    "ab-20261103T143939Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",
@@ -250,7 +254,11 @@
     "ab-20261031T175623Z": "Failed mixed-client admission attempt and passing backup/window codec cards",
     "ab-20261031T180730Z": "Exact bank lending192/96 transitions and measured short-burst loss",
     "ab-20261031T182505Z": "Exact AR and Engram gather slices with mixed performance",
-    "ab-20261031T185127Z": "Exact P1 span and n128, nearly neutral timing"
+    "ab-20261031T185127Z": "Exact P1 span and n128, nearly neutral timing",
+    "ab-20261103T090558Z": "bf16 routers and packed residents under Phase 1, and 4,096-token chunks, on the stable build",
+    "ab-20261103T110235Z": "the gates for bf16 routers and packed residents: logits, prefill hashes, harness turns, one stream",
+    "ab-20261103T114720Z": "the clean 6,817-token re-measure",
+    "ab-20261103T143939Z": "startup cache fill, GPU clocks and memory compaction"
   },
   "allowed_emails": [
     "aselzer3@gmail.com",

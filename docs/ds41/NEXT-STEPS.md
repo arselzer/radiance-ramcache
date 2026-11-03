@@ -1,5 +1,45 @@
 **2026-11-03 02:46 UTC current queue:** ROOT30251 remainingQa0functional_C ACTIVE39NEW+1cancel afteractual37+1certificate17412097/15guards/AST17/bash1/fullpreparePASS. Complete76+2aggregate/restore/postbeforeheavyCPU. ROOT10380GitHubrefreshQUEUEDafterGPU; README-onlystablebranchHEAD1c0a01b3 nowrecordsindependentstable15FULLPASS/longTTFT12.22–14.25%/8.52–8.67%gain/shortloss; installed43/default8unchanged. VMsource-root2actualmode0all24PASS/firstjoinedMAPstubguardexit88unsupported, QFNnormal02:31:45; source8e689043showsCPUPTalreadysynchronous/no missingflushcauseproof. ParkbroadVMwaitswithoutnewmechanism, no stubwaiver. FinishROOTM48fastlastproof/full13→all4bytes→TOTAL; Qw2/4Qa0freshcurrent43nativeall4then5modelserversSOURCEparallel. Current256GB192focus/variablebudgets/exactness unchanged;bothresearchlocksheld.
 
+## Latest handoff — 3 November 2026, 08:45 UTC
+
+User requested a handoff because of the limit. **No tests/builds/windows active or queued;
+production normal; both research locks released.** Resume from HANDOFF.md (read fully, then
+latest NIGHT-LOG). It has exact paths, pins, commands, failures, ownership and guard requirements.
+The older dated queues below are historical and do not supersede this order.
+
+1. **Native M4/M8 fused router:** CPU caller compiled; reader recovery READY exists and must not
+   be rerun into its existing output. Finish the explicitly UNSEALED/DISABLED byte adapter's six
+   wiring tasks in `N/scored-m48-native-byte-source/README-HANDOFF.md`. Write actual separate
+   four-key native ABI review bound to reader READY/compiled7b, then fresh all4 full byte window.
+   Reuse reviewed25c7 GPU image; no GPU/core/five rebuild needed. DirectHIP fullbytes and both
+   paid TOTAL orders already passed, saving about3–5us per representative component call;
+   **no model-TPS gain claimed**. Native timing/Engine integration follow only after these gates.
+2. **Packing reuse, parallel source/CPU:** sealed d3fe proposal; 13 HOST accounting fixtures are
+   NOT RUN. Validate them before thin current43 one-CXX private child and original six OFF/ON
+   fullKh requests. Cost is ~100us/planpair, actual runtime repeats remain unknown. No cache yet.
+3. **KV growth correctness, parallel source:** prewrapper diagnostic all24PASS/noquery is
+   inconclusive; do not repeat it. Implement sealed93f8 design's public exactVA retain/export/
+   per-fpriv PRIME/GEM query ONLY after original savedfailure+drain. No pre-failure tracker.
+   New ownership/error/provider checks and a single original capture window are still needed.
+4. **Row-slice qualification:** stable-only lifecycle window parked because it lacks required
+   receipts. Current43 alternative can reuse existing binaries but needs fresh native all4 byte
+   oracle, two3397KLD/twoKhtriplets, then narrow currentQa0/M2048 prefix/cancel/96N8 release2
+   consumer (sixservers60complete+2acceptedcancels). No new consumer/window is authored yet.
+5. **Larger levers:** KV/target-bank VRAM recovery stays blocked on exactness. Layer-major P2
+   needs persistent per-layer activations and a preGU seam. Optional fifth-card expert worker
+   source is not runnable; main four9070XT/256GB/192GiB profile remains priority. Preserve all
+   variable cache/VRAM budgets; no inexact arithmetic/routing/quantization/reduction changes.
+6. **Integrate/publish only actual exact measured wins.** Qa0 stable12.22–14.25%/8.52–8.67%
+   lower long TTFT and separate broader76+2 PASS are documented/pushed in ds41bdcb07a6;
+   short requests regress1.8–3.5% and defaults remain8. Qw4 longest3.44–5.08% lower but3K0.47%
+   slower is diagnostic/unadopted. New M48/packing/KV results are local HANDOFF/NIGHT until a
+   later refresh. No wholesale current43 merge, existing-failure rewrite or cross-build retag.
+
+`N=/home/as/ds41-claude-build/work/autonomous-20261101`. Reacquire BOTH research locks and obey
+AGENT-LOAD-RULES before another testing series. Source authors remain source-only; ROOT owns
+serialized physical-flock/nice19 CPU/GPU execution. Every GPU window stops/restores/checks QFN.
+
+
 **2026-11-03 01:56 UTC current queue:** Qa0broader_B ROOT19813 ACTIVE /retry1 33e7/actualprepare13+AST15/bash1/full43authorityPASS. FirstQa8prefix15/fullKh/lifecyclePASS;Qa0loading/all76+2/restorationpending. OriginalA output-contractFAILimmutable. Nativepostfail2 capturedactual11KVpairs/fullmetadata, exactmetadatabut6KVwrong inclgranule33entire2MiBzero; nooraclefix. RealoriginalissuerVMtimeline SOURCE13b14; AaddsCPUfakeAPIqualification+thin3CXXbuilder/window, samebinarymode0mustreproduce. CactualM48fullsort/HOSTrange/validator/packagedHIPsourceclosure; Bstablee184five-server6Kh/9quietexistingQa0confirmationSOURCE next. Current43evidencecannotretagstable; noblanketcandidatemerge. Bothlocks201214/201216held/nophysicalCPUwhileGPU;current43/stablee184/published4f4unchanged.
 
 **2026-11-03 01:47 UTC current queue:** NativecaptureROOT8457 window320-postfail2 ACTIVE after retry7e284 build7 actual6/AST11/bash1/twoCXX/fullELF READY18.957s/HOST4honestreuse and bridge576e actual4/AST3/bash1/freshpreparePASS. Existingprimary firstKVpair retained; captureonlyAFTERarena/KVfailure. Qa0broader_A FAILED firstprefix_Qa8 after15ordinaryreplies due exactknown tokenizerline beforePASSmarker; noQa0run. Originalfailedimmutable/QFNnormal01:46:07; B preparesminimal sealed exactoutput-contract successor then repeat8role76+2. No delay sweeps/hashwaivers/defaultchange. RealoriginalissuerVMtimeline SOURCE A; actualM48fullHOST/sort/provider proofs C inparallel. Bothresearchlocksheld/current43/stablee184/published4f4unchanged.

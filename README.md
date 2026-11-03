@@ -6,7 +6,8 @@ APIs, Anthropic's Messages API and llama-server's native one, so their clients a
 unchanged. Model architectures, kernel libraries and quantisers are `.so` plugins; the ones in this
 tree are built and loaded the same way a third party's are ([`docs/PLUGIN.md`](docs/PLUGIN.md)).
 
-The bundled device kernels (`libr4d`) target AMD RDNA4 (`gfx1200`, `gfx1201`). The serve flags
+The bundled device kernels target AMD RDNA4 (`libr4d`: `gfx1200`, `gfx1201`), RDNA3 (`libr3d`:
+`gfx11xx`) and Strix Halo (`libhalo`: `gfx1151`). The serve flags
 below are for two 32 GB cards (Radeon AI PRO R9700). The engine starts on any AMD GPU family;
 another card needs a kernel library for it. A machine with no GPU builds the host backend, whose
 AVX-512/AVX2 kernels (`libavx`) serve every model here: the small ones (EmbeddingGemma 2,
@@ -34,7 +35,10 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
+| Gemma 4 31B w5: GPTQ int5 trunk (a scale and a zero point per 128 weights), MTP, vision | `gemma4-31b-w5.rad` (23 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w5) | `gemma4-31b-w5.yaml` |
 | Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
+| Gemma 4 31B: int8 trunk and lm_head (no calibration), MTP, vision | `gemma4-31b-i8g.rad` (33 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-i8g) | `gemma4-31b-i8g.yaml` |
+| Gemma 4 31B heretic-ara (refusals removed): int8 trunk and lm_head (no calibration), MTP, vision | `gemma4-31b-heretic-ara-i8g.rad` (33 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-i8g) | `gemma4-31b-heretic-ara-i8g.yaml` |
 | Gemma 4 31B: int4 trunk, int8 activations and lm_head, DFlash drafter, vision | `gemma4-31b-dense-w4a8-df.rad` (22 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash) | `gemma4-31b-w4a8-df.yaml` |
 | Gemma 4 31B Q8: int8 trunk and lm_head (Q8_0's grid at group 128), int8 DFlash drafter, vision | `gemma4-31b-dense-q8-df.rad` (33 GiB) | [convert](#convert-a-checkpoint) | `gemma4-31b-q8-df.yaml` |
 | Gemma 4 31B on four cards: int4 trunk, int8 activations and lm_head, RedHatAI's DFlash2 drafter, vision | `gemma4-31b-dense-w4a8-df2-qkv.rad` (23 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2) | `gemma4-31b-w4a8-df2-tp4.yaml` |
@@ -147,8 +151,8 @@ card works best with Resizable BAR on (Above 4G Decoding and Resizable BAR in th
 without it the engine keeps kernel arguments in pinned host memory, and every dispatch reads them
 over the link. The image
 is [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance), with its kernels
-built for `gfx1201`. Pull it, clone this repository for its compose files, then start a model from
-one of them:
+built for `gfx1201` (RDNA4), `gfx11-generic` (RDNA3) and `gfx1151` (Strix Halo). Pull it, clone
+this repository for its compose files, then start a model from one of them:
 
 ```sh
 docker pull stilldeadcode/radiance

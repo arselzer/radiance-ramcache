@@ -19,10 +19,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <new>
 #include <set>
 #include <string>
+#include <tuple>
 
 #include <unistd.h>
 
@@ -9477,6 +9479,465 @@ TEST(lcp_row_cut_makes_the_checkpoints_below_the_target_whole) {
             CHECK_EQ(cs.ckpt_cut, (uint64_t)0);
         }
         CHECK(cs.rows_skipped > 0);
+    }
+}
+
+/* ================================================================== whole prompts admitted together */
+/* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT (Scheduler::batch_rows_) beside prefill alone and large-chunk
+ * prefill, in DeepSeek-V4.1's shape (lcp_fixture: linear state beside the window, the prefix cache off)
+ * at C = 2,048 and --max-num-seqs 8, as the A/B's N8 arms run. A wave of prompts waiting together is
+ * admitted in arrival order into prefill-only steps of at most R rows, each prompt whole (one chunk
+ * from position 0, the chunk it takes alone); everything else is as with the switch off. */
+namespace {
+
+/* init reads the switches, so they are set around start() alone. `admit`: the switch's value, or
+ * null for unset. */
+int batch_start(Fixture& f, const char* admit, int64_t seqs, bool alone = true) {
+    f.cfg.max_seqs = seqs;
+    if (alone) setenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE", "1", 1);
+    if (admit) setenv(Scheduler::kBatchAdmitEnv, admit, 1);
+    else unsetenv(Scheduler::kBatchAdmitEnv);
+    const int rc = f.start();
+    unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+    unsetenv(Scheduler::kBatchAdmitEnv);
+    return rc;
+}
+
+/* The held-out wave of the A/B (8 prompts) as the server tokenizes them: 312 rows. */
+const std::vector<int> kHeldOut = { 46, 40, 39, 44, 35, 32, 40, 36 };
+
+using BaEntry = std::tuple<uint64_t, int32_t, int32_t, bool>;   /* seq, ctx_len, n_tokens, is_prefill */
+struct BaStep {
+    std::vector<BaEntry> e;
+    int pf = 0, dec = 0;
+    int64_t n_tok = 0, n_seq = 0, n_out = 0;
+    int phase = -1;
+    bool cut = false;               /* consumer_full or consumer_row0 set */
+    int32_t admit_row = -1;         /* lcp_admit_row */
+};
+struct BaRun {
+    std::vector<BaStep> steps;
+    std::map<uint64_t, size_t> out;   /* each request's tokens out, as last seen */
+    /* Every prefill entry's chunk, by request: (ctx_len, n_tokens) in step order. */
+    std::map<uint64_t, std::vector<std::pair<int32_t, int32_t>>> chunks;
+};
+
+/* Runs every request the fixture holds to its end, committing token 7 a step; `before(k)` is called
+ * before step k is planned (a later arrival, a cancel). */
+BaRun batch_run(Fixture& f, const std::vector<uint64_t>& ids,
+                const std::function<void(int)>& before = nullptr) {
+    BaRun r;
+    for (int k = 0; k < 600; ++k) {
+        if (before) before(k);
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        BaStep s;
+        for (const StepEntry& e : p.e) {
+            s.e.emplace_back(e.seq, e.ctx_len, e.n_tokens, e.is_prefill);
+            if (e.is_prefill) { ++s.pf; r.chunks[e.seq].emplace_back(e.ctx_len, e.n_tokens); }
+            else ++s.dec;
+        }
+        s.n_tok = b->n_tok;
+        s.n_seq = b->n_seq;
+        s.n_out = b->n_out;
+        s.phase = (int)b->phase;
+        s.cut = b->consumer_full != 0 || b->consumer_row0 != nullptr;
+        s.admit_row = b->lcp_admit_row;
+        r.steps.push_back(std::move(s));
+        f.commit_plain();
+        for (uint64_t id : ids)
+            if (const Request* q = f.sch.find(id)) r.out[id] = q->output.size();
+    }
+    return r;
+}
+
+std::vector<uint64_t> submit_all(Fixture& f, const std::vector<int>& lens, int max_tokens) {
+    std::vector<uint64_t> ids;
+    for (int n : lens) ids.push_back(f.submit(n, max_tokens));
+    return ids;
+}
+
+int ba_prefill_steps(const BaRun& r) {
+    int n = 0;
+    for (const BaStep& s : r.steps) n += s.pf > 0;
+    return n;
+}
+
+/* A request's tokens out as last seen (0 when it was never seen running). */
+size_t out_of(const BaRun& r, uint64_t id) {
+    const auto it = r.out.find(id);
+    return it == r.out.end() ? 0 : it->second;
+}
+
+}  /* namespace */
+
+/* The held-out wave at N8: the first six prompts (236 rows; the seventh's 40 would make 276) in one
+ * prefill-only step, each whole from position 0 and sampling its first token, the RAM cache admitting
+ * every unit (no admission row); the last two together in the next, the six decoding rows waiting for
+ * it as prefill alone has them wait; then all eight decode together. Two prefill steps instead of
+ * eight, and the counters say so. At N4 (waves of four) a wave is one step. */
+TEST(batch_admission_takes_a_waves_whole_short_prompts_in_one_prefill_step) {
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        REQUIRE_EQ(batch_start(f, "256", 8), RAD_OK);
+        REQUIRE_EQ(f.sch.batch_admit_rows(), (int64_t)256);
+        const std::vector<uint64_t> ids = submit_all(f, kHeldOut, 4);
+        const BaRun r = batch_run(f, ids);
+        REQUIRE(r.steps.size() >= 3);
+        const BaStep& a = r.steps[0];
+        CHECK_EQ(a.pf, 6);
+        CHECK_EQ(a.dec, 0);
+        CHECK_EQ(a.n_tok, (int64_t)236);
+        CHECK_EQ(a.n_seq, (int64_t)6);
+        CHECK_EQ(a.n_out, (int64_t)6);
+        CHECK_EQ(a.phase, (int)RAD_PHASE_PREFILL);
+        CHECK_EQ(a.admit_row, 0);
+        for (size_t i = 0; i < 6 && i < a.e.size(); ++i)
+            CHECK(a.e[i] == BaEntry(ids[i], 0, kHeldOut[i], true));
+        const BaStep& b = r.steps[1];
+        CHECK_EQ(b.pf, 2);
+        CHECK_EQ(b.dec, 0);
+        CHECK_EQ(b.n_tok, (int64_t)76);
+        REQUIRE_EQ(b.e.size(), (size_t)2);
+        CHECK(b.e[0] == BaEntry(ids[6], 0, 40, true));
+        CHECK(b.e[1] == BaEntry(ids[7], 0, 36, true));
+        CHECK_EQ(r.steps[2].dec, 8);
+        CHECK_EQ(r.steps[2].pf, 0);
+        CHECK_EQ(ba_prefill_steps(r), 2);
+        const SchedMetrics m = f.sch.metrics();
+        CHECK_EQ(m.batch_admit_steps, (int64_t)2);
+        CHECK_EQ(m.batch_admit_prompts, (int64_t)8);
+        CHECK_EQ(m.batch_admit_rows, (int64_t)312);
+        CHECK_EQ(m.steps_prefill, (int64_t)2);
+        CHECK_EQ(m.steps_mixed, (int64_t)0);
+        for (uint64_t id : ids) CHECK_EQ(out_of(r, id), (size_t)4);
+    }
+    {   /* N4: a wave of four is one step (169 rows), and a lone prompt is admitted as before */
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        REQUIRE_EQ(batch_start(f, "256", 4), RAD_OK);
+        const std::vector<uint64_t> ids = submit_all(f, { 46, 40, 39, 44 }, 3);
+        const BaRun r = batch_run(f, ids);
+        REQUIRE(!r.steps.empty());
+        CHECK_EQ(r.steps[0].pf, 4);
+        CHECK_EQ(r.steps[0].n_tok, (int64_t)169);
+        CHECK_EQ(ba_prefill_steps(r), 1);
+        const uint64_t lone = f.submit(46, 3);
+        const BaRun l = batch_run(f, { lone });
+        REQUIRE(!l.steps.empty());
+        CHECK(l.steps[0].e == std::vector<BaEntry>({ BaEntry(lone, 0, 46, true) }));
+        CHECK_EQ(f.sch.metrics().batch_admit_steps, (int64_t)1);
+    }
+}
+
+/* Off (unset, or 0) the scheduler is exactly as before: prefill alone admits one prompt a step, eight
+ * prefill steps for the wave, and both spellings plan the same steps entry for entry. On, only the steps'
+ * composition changes: every prompt is computed in the same chunks (here one, [0, n)) as off. */
+TEST(batch_admission_off_plans_every_step_as_before_and_on_changes_only_the_steps) {
+    auto run = [](const char* admit, BaRun* out) {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        std::string err;
+        int rc = 0;
+        err = info_of([&] { rc = batch_start(f, admit, 8); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)(admit && std::strcmp(admit, "0") ? 256 : 0));
+        CHECK_EQ(has(err, "batch admission: on"), admit && std::strcmp(admit, "0") != 0);
+        CHECK(!has(err, "batch admission: refused"));
+        const std::vector<uint64_t> ids = submit_all(f, kHeldOut, 4);
+        *out = batch_run(f, ids);
+        if (!admit || !std::strcmp(admit, "0")) {
+            CHECK_EQ(f.sch.metrics().batch_admit_steps, (int64_t)0);
+            CHECK_EQ(f.sch.metrics().steps_prefill, (int64_t)8);
+        }
+    };
+    BaRun unset, zero, on;
+    run(nullptr, &unset);
+    run("0", &zero);
+    run("256", &on);
+    REQUIRE_EQ(unset.steps.size(), zero.steps.size());
+    for (size_t k = 0; k < unset.steps.size(); ++k) {
+        CHECK(unset.steps[k].e == zero.steps[k].e);
+        CHECK_EQ(unset.steps[k].n_tok, zero.steps[k].n_tok);
+    }
+    /* Off: steps 0..7 one prompt each, alone (the decoding rows wait), then the decode steps. */
+    REQUIRE(unset.steps.size() > 8);
+    for (int k = 0; k < 8; ++k) {
+        CHECK_EQ(unset.steps[(size_t)k].pf, 1);
+        CHECK_EQ(unset.steps[(size_t)k].dec, 0);
+        CHECK_EQ(unset.steps[(size_t)k].n_tok, (int64_t)kHeldOut[(size_t)k]);
+    }
+    CHECK_EQ(ba_prefill_steps(unset), 8);
+    CHECK_EQ(ba_prefill_steps(on), 2);
+    /* Each prompt's chunks, on and off: the same. */
+    CHECK(on.chunks == unset.chunks);
+    for (const auto& [id, c] : unset.chunks) CHECK_EQ(c.size(), (size_t)1);
+    CHECK(on.out == unset.out);
+}
+
+/* What a batch does not take, each admitted in a step of its own as before: a prompt longer than the
+ * rows left (and, in arrival order, every prompt behind it), a prompt longer than R (it opens no
+ * batch), a prompt with plugin words or a LoRA adapter (ops issued for some of a step's rows only). A
+ * prompt behind a long one forms a batch with the next once the long one has run. */
+TEST(batch_admission_keeps_out_what_it_cannot_take_whole) {
+    auto start = [](Fixture& f) {
+        lcp_fixture(f, 2048, 2048);
+        REQUIRE_EQ(batch_start(f, "256", 8), RAD_OK);
+    };
+    {   /* [40, 1000, 30]: 1000 does not fit beside 40, and 30 is not taken ahead of it */
+        LcpOn on(2048, 1);
+        Fixture f;
+        start(f);
+        const std::vector<uint64_t> ids = submit_all(f, { 40, 1000, 30 }, 2);
+        const BaRun r = batch_run(f, ids);
+        REQUIRE(r.steps.size() >= 3);
+        CHECK(r.steps[0].e == std::vector<BaEntry>({ BaEntry(ids[0], 0, 40, true) }));
+        CHECK(r.steps[1].e == std::vector<BaEntry>({ BaEntry(ids[1], 0, 1000, true) }));
+        CHECK(r.steps[2].e == std::vector<BaEntry>({ BaEntry(ids[2], 0, 30, true) }));
+        CHECK_EQ(f.sch.metrics().batch_admit_steps, (int64_t)0);
+    }
+    {   /* [1000, 40, 30]: 1000 alone (longer than R), then 40 and 30 together */
+        LcpOn on(2048, 1);
+        Fixture f;
+        start(f);
+        const std::vector<uint64_t> ids = submit_all(f, { 1000, 40, 30 }, 2);
+        const BaRun r = batch_run(f, ids);
+        REQUIRE(r.steps.size() >= 2);
+        CHECK(r.steps[0].e == std::vector<BaEntry>({ BaEntry(ids[0], 0, 1000, true) }));
+        CHECK(r.steps[1].e == std::vector<BaEntry>({ BaEntry(ids[1], 0, 40, true), BaEntry(ids[2], 0, 30, true) }));
+        CHECK_EQ(f.sch.metrics().batch_admit_steps, (int64_t)1);
+    }
+    for (int kind = 0; kind < 2; ++kind) {   /* plugin words, an adapter: [40, 30*, 20] one a step */
+        LcpOn on(2048, 1);
+        Fixture f;
+        start(f);
+        std::vector<uint64_t> ids;
+        ids.push_back(f.submit(40, 2));
+        auto q = f.request(30, 2);
+        if (kind == 0) q->plugin_words = { 0, 5 };
+        else q->lora_slot = 0;
+        ids.push_back(f.add(std::move(q)));
+        ids.push_back(f.submit(20, 2));
+        REQUIRE(ids[1] != 0);
+        const BaRun r = batch_run(f, ids);
+        REQUIRE(r.steps.size() >= 3);
+        CHECK(r.steps[0].e == std::vector<BaEntry>({ BaEntry(ids[0], 0, 40, true) }));
+        CHECK(r.steps[1].e == std::vector<BaEntry>({ BaEntry(ids[1], 0, 30, true) }));
+        CHECK(r.steps[2].e == std::vector<BaEntry>({ BaEntry(ids[2], 0, 20, true) }));
+        CHECK_EQ(f.sch.metrics().batch_admit_steps, (int64_t)0);
+    }
+    {   /* --max-num-seqs bounds a batch as it bounds any step: 3 of the wave a step at N3 */
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        REQUIRE_EQ(batch_start(f, "256", 3), RAD_OK);
+        const std::vector<uint64_t> ids = submit_all(f, { 46, 40, 39, 44 }, 2);
+        const BaRun r = batch_run(f, ids);
+        REQUIRE(!r.steps.empty());
+        CHECK_EQ(r.steps[0].pf, 3);
+        int later = 0;
+        for (size_t k = 1; k < r.steps.size(); ++k) later += r.steps[k].pf;
+        CHECK_EQ(later, 1);
+        for (uint64_t id : ids) CHECK_EQ(out_of(r, id), (size_t)2);
+    }
+}
+
+/* With the consumer skip at the 16-row grain (large-chunk prefill's per-row cut), a prompt alone in its
+ * step is cut and a batch of prompts is not: a shared step runs every layer on every row, the base
+ * engine's step, which the builder counts as shared. */
+TEST(batch_admission_runs_a_shared_step_uncut) {
+    LcpOn on(2048, 1);
+    Fixture f;
+    lcp_fixture(f, 2048, 2048);
+    f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 16 };
+    f.cfg.consumer_skip = 1;
+    REQUIRE_EQ(batch_start(f, "256", 8), RAD_OK);
+    REQUIRE(f.sch.consumer_on());
+    const uint64_t a = f.submit(200, 6);
+    std::vector<uint64_t> ids = { a };
+    uint64_t b = 0, c = 0;
+    const BaRun r = batch_run(f, ids, [&](int k) {
+        if (k == 1) { b = f.submit(120, 4); c = f.submit(100, 4); }
+    });
+    REQUIRE(r.steps.size() >= 3);
+    CHECK(r.steps[0].e == std::vector<BaEntry>({ BaEntry(a, 0, 200, true) }));
+    CHECK(r.steps[0].cut);
+    CHECK(r.steps[1].e == std::vector<BaEntry>({ BaEntry(b, 0, 120, true), BaEntry(c, 0, 100, true) }));
+    CHECK(!r.steps[1].cut);
+    const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+    CHECK_EQ(cs.shared, (uint64_t)1);
+    CHECK(cs.cut >= 1);
+}
+
+/* A cancel: of a prompt still waiting (the batch forms without it), and of one in a batch whose step
+ * is in flight (it closes at the commit, the others decode on). The pool refusing a prompt's blocks
+ * ends the batch there (head of line), and no prompt is ever taken in part. */
+TEST(batch_admission_survives_a_cancel_and_a_pool_that_refuses) {
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        REQUIRE_EQ(batch_start(f, "256", 8), RAD_OK);
+        const std::vector<uint64_t> ids = submit_all(f, kHeldOut, 4);
+        CHECK_OK(f.sch.cancel(ids[1]));   /* waiting: the batch is 46 39 44 35 32 40 (236) */
+        bool cancelled = false;
+        BaRun r;
+        for (int k = 0; k < 200; ++k) {
+            const RadBatch* sb = f.sch.step();
+            if (!sb) break;
+            const StepPlan& p = f.sch.plan();
+            BaStep s;
+            for (const StepEntry& e : p.e) {
+                s.e.emplace_back(e.seq, e.ctx_len, e.n_tokens, e.is_prefill);
+                if (e.is_prefill) ++s.pf; else ++s.dec;
+                CHECK(e.seq != ids[1]);
+                if (cancelled) CHECK(e.seq != ids[3]);
+            }
+            r.steps.push_back(s);
+            if (k == 0 && !cancelled) { CHECK_OK(f.sch.cancel(ids[3])); cancelled = true; }   /* in flight */
+            f.commit_plain();
+            for (uint64_t id : ids)
+                if (const Request* q = f.sch.find(id)) r.out[id] = q->output.size();
+        }
+        REQUIRE(r.steps.size() >= 2);
+        CHECK_EQ(r.steps[0].pf, 6);
+        CHECK(r.steps[0].e[0] == BaEntry(ids[0], 0, 46, true));
+        CHECK(r.steps[0].e[1] == BaEntry(ids[2], 0, 39, true));
+        CHECK(r.steps[1].e == std::vector<BaEntry>({ BaEntry(ids[7], 0, 36, true) }));
+        for (size_t i : { 0, 2, 4, 5, 6, 7 }) CHECK_EQ(out_of(r, ids[i]), (size_t)4);
+        CHECK_EQ(out_of(r, ids[1]), (size_t)0);
+        CHECK(out_of(r, ids[3]) <= 1);
+    }
+    for (const int64_t blocks : { 24, 40, 64 }) {   /* a pool that holds a few of the wave at a time */
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, blocks, 64);
+        REQUIRE_EQ(batch_start(f, "256", 8), RAD_OK);
+        const std::vector<uint64_t> ids = submit_all(f, kHeldOut, 24);
+        const BaRun r = batch_run(f, ids);
+        int batched = 0, bad = 0;
+        for (const BaStep& s : r.steps) {
+            if (s.pf > 1) ++batched;
+            if (s.pf > 1 && s.dec > 0) ++bad;   /* a batch is never beside decode rows */
+            for (const BaEntry& e : s.e)        /* never a part of a prompt in a shared step */
+                if (std::get<3>(e) && s.pf > 1) {
+                    bad += std::get<1>(e) != 0;
+                    bool is_prompt = false;
+                    for (size_t i = 0; i < ids.size(); ++i)
+                        is_prompt |= std::get<0>(e) == ids[i] && std::get<2>(e) == kHeldOut[i];
+                    bad += !is_prompt;
+                }
+        }
+        CHECK_EQ(bad, 0);
+        CHECK(batched >= 1);
+        for (uint64_t id : ids) CHECK_EQ(out_of(r, id), (size_t)24);
+    }
+}
+
+/* Where it is not covered the switch is refused with the reason, and the scheduler admits one prompt a
+ * step as before: without prefill alone, without large-chunk prefill, at --max-num-seqs 1, with the
+ * prefix cache. A value outside 32..256 refuses to start. Under prefill Phase 1 the rows are held below
+ * its threshold, so a batch never arms the card path. */
+TEST(batch_admission_is_refused_where_it_is_not_covered) {
+    auto refused = [](Fixture& f, const char* what, bool alone, int64_t seqs) {
+        std::string err;
+        int rc = 0;
+        err = info_of([&] { rc = batch_start(f, "256", seqs, alone); });
+        CHECK_EQ(rc, RAD_OK);
+        CHECK(has(err, "batch admission: refused"));
+        CHECK(has(err, what));
+        CHECK(!has(err, "batch admission: on"));
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)0);
+    };
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        refused(f, "RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1", /*alone=*/false, 1);
+    }
+    {
+        LcpOn off(0, 0);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        refused(f, "large-chunk prefill", true, 8);
+    }
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        refused(f, "--max-num-seqs 1", true, 1);
+    }
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        f.cfg.prefix_cache = true;
+        refused(f, "the prefix cache is on", true, 8);
+        /* refused, it admits one prompt a step */
+        const std::vector<uint64_t> ids = submit_all(f, { 46, 40 }, 2);
+        const BaRun r = batch_run(f, ids);
+        CHECK_EQ(ba_prefill_steps(r), 2);
+    }
+    for (const char* bad : { "16", "257", "1024", "-1", "256x", "on" }) {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = batch_start(f, bad, 8); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+        CHECK(has(err, "RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT="));
+    }
+    {   /* on: the line the A/B harness keys on */
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = batch_start(f, "128", 8); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(err, "batch admission: on (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=128)"));
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)128);
+    }
+    {   /* Phase 1 (its threshold 100): batches of at most 99 rows, the first prompt's chunk end-aligned */
+        struct P1Env {
+            P1Env() {
+                setenv(ds41p1::kEnv, "1", 1);
+                setenv(ds41p1::kMinRowsEnv, "100", 1);
+            }
+            ~P1Env() { unsetenv(ds41p1::kEnv); unsetenv(ds41p1::kMinRowsEnv); }
+        } p1;
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = batch_start(f, "256", 8); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(err, "held below Phase 1's threshold of 100 rows"));
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)99);
+        const std::vector<uint64_t> ids = submit_all(f, { 46, 40, 39, 44 }, 2);
+        const BaRun r = batch_run(f, ids);
+        REQUIRE(r.steps.size() >= 2);
+        CHECK(r.steps[0].e == std::vector<BaEntry>({ BaEntry(ids[0], 0, 46, true), BaEntry(ids[1], 0, 40, true) }));
+        CHECK(r.steps[1].e == std::vector<BaEntry>({ BaEntry(ids[2], 0, 39, true), BaEntry(ids[3], 0, 44, true) }));
+        for (const BaStep& s : r.steps) CHECK(s.n_tok < 100);
+    }
+    {   /* Phase 1 at a threshold that leaves fewer than 32 rows: refused */
+        struct P1Env {
+            P1Env() {
+                setenv(ds41p1::kEnv, "1", 1);
+                setenv(ds41p1::kMinRowsEnv, "17", 1);
+            }
+            ~P1Env() { unsetenv(ds41p1::kEnv); unsetenv(ds41p1::kMinRowsEnv); }
+        } p1;
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        refused(f, "leaves fewer than 32 rows", true, 8);
     }
 }
 

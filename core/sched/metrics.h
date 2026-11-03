@@ -36,6 +36,11 @@ struct SchedMetrics {
     int64_t steps_prefill = 0;
     int64_t steps_mixed = 0;
     int64_t steps_decode = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT: steps that admitted two or more whole prompts together,
+     * those prompts and their rows (Scheduler::batch_admit_report). Zero with the switch off. */
+    int64_t batch_admit_steps = 0;
+    int64_t batch_admit_prompts = 0;
+    int64_t batch_admit_rows = 0;
     /* --prefill-interleave: decode-only steps the hold inserted, issued ahead or not; each kept a
      * ready chunk out. */
     int64_t steps_held = 0;

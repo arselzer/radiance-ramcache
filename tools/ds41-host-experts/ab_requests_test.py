@@ -293,5 +293,45 @@ class HarnessTurns(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class PrefillHashes(unittest.TestCase):
+    """--hashes: requests sent together reach the server in an order of their own, so an arm's prompts
+    are matched to the first arm's by tokens and digest wherever they sit in its log; a real difference
+    (another digest) still fails."""
+
+    @staticmethod
+    def log(d, arm, prompts):
+        with open(os.path.join(d, arm + ".server.log"), "w") as f:
+            for seq, (n, digest) in enumerate(prompts, 1):
+                f.write("I[0] prefill hash: seq %d, %d tokens (cut for %d), rank 0: win[40]=%016x logits=%016x\n"
+                        % (seq, n, n, digest, digest))
+                f.write("I prefill hash: seq %d, %d tokens: all ranks %016x\n" % (seq, n, digest))
+
+    def run_hashes(self, d, arms):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ab_requests.hashes(d, arms)
+        return rc, out.getvalue()
+
+    def test_reordered_prompts_match_and_a_different_digest_does_not(self):
+        d = tempfile.mkdtemp(prefix="abreq-hash-")
+        try:
+            wave = [(46, 1), (40, 2), (39, 3), (40, 7)]           # two prompts of 40 tokens
+            self.log(d, "alone", wave)
+            self.log(d, "batched", [wave[1], wave[0], wave[3], wave[2]])
+            self.log(d, "swapped40", [wave[3], wave[1], wave[2], wave[0]])
+            self.log(d, "wrong", [wave[0], (40, 9), wave[2], wave[3]])
+            rc, text = self.run_hashes(d, ["alone", "batched", "swapped40"])
+            self.assertEqual(rc, 0, text)
+            self.assertIn("batched: 4 of 4 prompts identical", text)
+            self.assertIn("matched out of order", text)
+            self.assertIn("swapped40: 4 of 4 prompts identical", text)
+            rc, text = self.run_hashes(d, ["alone", "wrong"])
+            self.assertEqual(rc, 1, text)
+            self.assertIn("DIFFERS", text)
+            self.assertIn("wrong: 3 of 4 prompts identical", text)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -832,7 +832,10 @@ def hash_log(path):
 
 def hashes(d, arms):
     """Each arm's prompts against the first arm's, by position: the same tokens and digest, or what
-    differs. Exit status 1 when anything differs, 2 when an arm has no hashes."""
+    differs. Requests sent together (CK) reach the server in an order of their own in each arm, so a
+    prompt whose position differs is matched to the arm's prompt of the same tokens and digest
+    elsewhere in its log (each used once; counted as reordered). Exit status 1 when anything
+    differs, 2 when an arm has no hashes."""
     logs = {}
     for a in arms:
         try:
@@ -851,7 +854,19 @@ def hashes(d, arms):
     for a in arms[1:]:
         got = logs[a]
         same = 0
+        moved = 0
+        used = [False] * len(got)
         for i, r in enumerate(ref):
+            j = i if (i < len(got) and not used[i] and got[i]["tokens"] == r["tokens"] and
+                      got[i]["all"] == r["all"]) else None
+            if j is None:
+                j = next((k for k, g in enumerate(got) if not used[k] and g["tokens"] == r["tokens"] and
+                          g["all"] == r["all"]), None)
+                moved += j is not None
+            if j is not None:
+                used[j] = True
+                same += 1
+                continue
             if i >= len(got):
                 print("  %s: prompt %d (%d tokens) missing" % (a, i, r["tokens"]))
                 bad += 1
@@ -861,9 +876,6 @@ def hashes(d, arms):
                 print("  %s: prompt %d is %d tokens, %s's %d: not the same prompts" %
                       (a, i, g["tokens"], first, r["tokens"]))
                 bad += 1
-                continue
-            if g["all"] == r["all"]:
-                same += 1
                 continue
             bad += 1
             diffs = []
@@ -878,8 +890,8 @@ def hashes(d, arms):
             print("  %s: prompt %d (%d tokens, %s): DIFFERS: %s" %
                   (a, i, r["tokens"], g["cut"].get(0, "?"), "; ".join(diffs) or "the digest"))
         cut = sum(1 for g in got if g["cut"].get(0, "").startswith("cut"))
-        print("  %s: %d of %d prompts identical (%d of its prefills cut)" %
-              (a, same, len(ref), cut))
+        print("  %s: %d of %d prompts identical (%d of its prefills cut%s)" %
+              (a, same, len(ref), cut, ", %d matched out of order" % moved if moved else ""))
     return 1 if bad else 0
 
 

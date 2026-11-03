@@ -1502,6 +1502,8 @@ int Engine::step_loop() {
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE: its counters and every finished sequence's. */
     sched_.draft_gate_report();
     sched_.draft_conf_report();
+    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT: the steps that admitted whole prompts together. */
+    sched_.batch_admit_report();
     dmeasure_report();
     eors_report();
     return RAD_OK;

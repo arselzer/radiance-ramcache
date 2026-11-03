@@ -2,7 +2,7 @@
 
 Experimental work on running DeepSeek-V4.1-Flash with its native MXFP4 experts (40 layers of 384 routed experts) on four 16 GB RX 9070 XT cards, whose VRAM holds only part of the routed experts. The engine keeps the others in a RAM cache and on one NVMe drive. The CPU computes every routed expert the cards do not hold, with the same arithmetic as the cards' MXFP4 GEMV, so replies stay byte-identical to the base engine's.
 
-This branch is a research checkpoint, not a serving deployment. The GLM 5.3 checkpoint is on [main](https://github.com/arselzer/radiance-ramcache/tree/main).
+This branch is a research checkpoint, not a serving deployment: exported source snapshots plus the reports and A/B evidence. The engine with its full git history is on [main](https://github.com/arselzer/radiance-ramcache/tree/main), a radiance fork on upstream 1.16.0 (see its RAMCACHE.md); the history of the exported engine commits is on [ds41-stable](https://github.com/arselzer/radiance-ramcache/tree/ds41-stable) and the default-off prototypes on [ds41-research](https://github.com/arselzer/radiance-ramcache/tree/ds41-research).
 
 On 30 Oct the box went from 128 GB to 256 GB of RAM, so the RAM cache now holds 192 GiB of experts and drive reads are rare. Unless a row says otherwise, measurements use the 8 held-out prompts: 64 tokens each, greedy, four cards (TP4). The original results below come from A/B windows in `evidence/ds41/`; the November prefill reports separately identify their custom guarded windows and exported timing records.
 

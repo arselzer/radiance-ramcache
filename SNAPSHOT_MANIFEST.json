@@ -1,6 +1,6 @@
 {
   "created_utc": "2026-10-30T09:33:17.154025+00:00",
-  "updated_utc": "2026-11-03T07:40:24.165514+00:00",
+  "updated_utc": "2026-11-03T11:46:20.093113+00:00",
   "branch": "ds41",
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "source_checkpoint": "radiance engine 1c0a01b3e5da (claude/ds41-decode-impl)",
@@ -16,7 +16,7 @@
   "files_sha256": {
     ".gitignore": "5b6b7c23165a945f1c3ffe5c4855c472a807e34a750a14dc3a4655c68a7dbca4",
     "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
-    "README.md": "fa666920324844352601552df3e3e262a15f78b0f4eeec91cc808fad6098dfd7",
+    "README.md": "58fdf984a1d52387e5429abe4a2bed2493c3f1c6c31a9f00c748920b25358272",
     "STATUS.md": "b77d6bdcbe90c472c95dbc99c52ea53b30eaad105d6eba4bf86159621592eb3f",
     "docs/ds41/FP8-DENSE-CRITIQUE.md": "4a369272231a6fe1dfd9e0545251891480a7c2439d26f7441ee4892d5069f4b5",
     "docs/ds41/FP8-DENSE-DESIGN.md": "ce3caf69731931547768b4904e642c269f582ed8ccd2b5fe2c3e1aa90dccabd4",

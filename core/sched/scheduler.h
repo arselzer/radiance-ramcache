@@ -136,8 +136,8 @@ struct SchedReq {
     /* The consumer skip's target for this prefill (consumer_skip.h): the first position whose
      * state must be exact, its end or the deepest checkpoint below it; 0 when its prefill is not
      * cut. Set at each admission (Scheduler::consumer_target), carried by its prefill entries
-     * (StepEntry::consumer_end); a checkpoint below it is written only if it is one of
-     * `consumer_ckpts`. */
+     * (StepEntry::consumer_end; a step of several prompts runs uncut whatever they carry); a
+     * checkpoint below it is written only if it is one of `consumer_ckpts`. */
     int64_t  consumer_end = 0;
     /* The checkpoints below that target its cut makes whole (consumer_skip.h, "complete
      * checkpoints"), ascending: those its idle prefill writes that the policy keeps
@@ -584,6 +584,12 @@ public:
     int64_t consumer_ckpt_policy() const { return cs_band_; }
     /* Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP): C once init admitted it, else 0. */
     int64_t lcp_rows() const { return lcp_; }
+    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT (batch_rows_): the rows a step of whole prompts admitted
+     * together may hold once init took the switch, else 0; and its shutdown line (nothing while off). */
+    static constexpr const char* kBatchAdmitEnv = "RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT";
+    static constexpr int64_t kBatchAdmitMin = 32, kBatchAdmitMax = 256;
+    int64_t batch_admit_rows() const { return batch_rows_; }
+    void    batch_admit_report() const;
     /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
      * at the whole step budget, or -1; with `all`, every one of them, ascending. */
     int64_t idle_prefill_checkpoint(const Request& r, int64_t end,
@@ -967,6 +973,26 @@ private:
      * step, since the step after it must bring them back. */
     int     prefill_alone_ = 0;
     int64_t pf_skipped_ = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=<R> (batch_admit_init; 0 or unset: off, and step() admits
+     * one prompt a step under prefill alone exactly as before). Beside prefill alone and large-chunk
+     * prefill, prompts that wait together are admitted into one prefill-only step, each whole (its
+     * whole prompt one chunk from position 0, as alone), while their rows fit in batch_rows_: R, at
+     * most the chunk and below Phase 1's threshold, so the step stays on the activation arena's
+     * smallest level (256 rows: the lent arena stays lent) and arms no card path. A step that holds
+     * anything else (decode rows, a running prompt's chunk, a prompt not whole or not batchable,
+     * batch_fits) admits one prompt as before. Only the step's composition changes: every row is
+     * computed by the same ops, each of which gives a row the same bytes whichever rows share its
+     * launch (LCP's admission and its tall checks; the attention, compressor, indexer and Engram ops
+     * read each sequence's own rows and state through cu_seqlens and its tables). */
+    int64_t batch_rows_ = 0;
+    int     batch_admit_init(const Config& cfg);
+    /* Whether waiting request `s` may join this step's batch of whole prompts, `used` of its rows
+     * taken (-1: the step is no such batch), `budget` tokens left: a fresh request that runs whole in
+     * the rows left, the chunk admit_one would plan for it the whole prompt with no snapshot. */
+    bool    batch_fits(const SchedReq& s, int64_t used, int64_t budget) const;
+    /* After admission: whether `s`'s entry is a whole prompt from position 0 a batch may hold (and
+     * `fresh`: it was not a preempted request's recompute). */
+    static bool batch_whole(const SchedReq& s, bool fresh);
     /* The consumer skip, as init decided it (consumer_on), and its checkpoint policy
      * (consumer_ckpt_policy). */
     bool    cs_on_ = false;

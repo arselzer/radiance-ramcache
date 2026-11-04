@@ -544,6 +544,17 @@ set_tests_properties(ab_window_ag_test PROPERTIES LABELS "unit;fast" TIMEOUT ${R
 add_test(NAME ab_window_shared_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_shared_test.sh)
 set_tests_properties(ab_window_shared_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# ab_window.sh's Ba / BaN parts (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT): the arm loop with every action
+# stubbed (launches, and the skips with their reasons) and arm()'s startup-line guard. No card, no server,
+# no model.
+add_test(NAME ab_window_ba_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_ba_test.sh)
+set_tests_properties(ab_window_ba_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# ab_window.sh's long-context prompt sets (receipts with max_context_tokens: the context gate and the request
+# timeout), the --hashes-ref step and the lsparse card check's wiring, all with every action stubbed.
+add_test(NAME ab_window_longctx_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_longctx_test.sh)
+set_tests_properties(ab_window_longctx_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 
 # ================================================================== libr4d's kernels, on the host
 #

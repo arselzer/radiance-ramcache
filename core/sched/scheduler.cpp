@@ -177,6 +177,82 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
     return RAD_OK;
 }
 
+/* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=<R> (batch_rows_, scheduler.h): R in [kBatchAdmitMin,
+ * kBatchAdmitMax], 0 or unset off; any other value refuses to start. Taken only where prefill alone
+ * already gives each prompt a step of its own and large-chunk prefill's admission holds every op to one
+ * form at every pass height up to the chunk (each row's bytes launched alone, 16 at a time and whole:
+ * ds41_mxfp4_device_check `lcp`), the row-independence a step of several prompts stands on; refused,
+ * with the reason, where the scheduler plans a prompt alone in its step for more than its rows: the
+ * prefix cache (a hit's snapshot restore, the snapshots a prompt writes, exact publish's chunks
+ * computed alone in their step), --kld-record / --kld-ref (every row scored), --prefill-span (a span is
+ * a prefill alone in its step) and a runtime window (R-SWA). The rows are held to the chunk and, under
+ * Phase 1, below its threshold (RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS, 320), so a batch never arms the
+ * card path nor takes the lent ring's slots back; at most 256, the activation arena's smallest level,
+ * so it never takes the lent arena's slots back either. */
+int Scheduler::batch_admit_init(const Config& cfg) {
+    batch_rows_ = 0;
+    const char* v = std::getenv(kBatchAdmitEnv);
+    if (!v || !*v || !std::strcmp(v, "0")) return RAD_OK;
+    char* end = nullptr;
+    const long long n = std::strtoll(v, &end, 10);
+    if (end == v || *end || n < kBatchAdmitMin || n > kBatchAdmitMax) {
+        RAD_ERR("%s=%s: the rows a step of whole prompts admitted together may hold, %lld to %lld (0 or "
+                "unset: off)", kBatchAdmitEnv, v, (long long)kBatchAdmitMin, (long long)kBatchAdmitMax);
+        return RAD_E_INVAL;
+    }
+    int64_t rows = std::min<int64_t>(n, lcp_ > 0 ? lcp_ : n);
+    std::string why, held;
+    if (!prefill_alone_)
+        why = "it needs RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 (without it admissions share steps with "
+              "decode rows and each other already)";
+    else if (lcp_ <= 0)
+        why = "it needs large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP), whose admission holds every op "
+              "to one form at every pass height up to the chunk: the row-independence a step of several "
+              "prompts stands on";
+    else if (cfg.max_seqs < 2)
+        why = "--max-num-seqs 1 admits one prompt at a time anyway";
+    else if (cfg.prefix_cache)
+        why = "the prefix cache is on: a hit's snapshot restore and the snapshots a prompt writes are "
+              "planned for a prompt alone in its step; run --no-prefix-cache";
+    else if (cfg.kld())
+        why = "--kld-record / --kld-ref score every prompt row";
+    else if (cfg.prefill_span > 1)
+        why = "--prefill-span: a span is planned for a prefill alone in its step";
+    else if (!rswa_windows_.empty())
+        why = "a runtime window (R-SWA) is not covered";
+    if (why.empty() && ds41p1::env_state(std::getenv(ds41p1::kEnv)) == 1) {
+        int64_t min_rows = ds41p1::kDefMinRows;
+        if (const char* m = std::getenv(ds41p1::kMinRowsEnv); m && *m) {
+            char* e = nullptr;
+            const long long t = std::strtoll(m, &e, 10);
+            if (e != m && !*e && t >= ds41p1::kMinArmRows) min_rows = t;   /* the stager refuses the rest */
+        }
+        if (rows > min_rows - 1) {
+            rows = min_rows - 1;
+            held = fmt(", held below Phase 1's threshold of %lld rows (%s)", (long long)min_rows,
+                       ds41p1::kMinRowsEnv);
+        }
+        if (rows < kBatchAdmitMin)
+            why = fmt("Phase 1's threshold of %lld rows (%s) leaves fewer than %lld rows a batch",
+                      (long long)min_rows, ds41p1::kMinRowsEnv, (long long)kBatchAdmitMin);
+    }
+    if (!why.empty()) {
+        RAD_WARN("batch admission: refused (%s=%s) -- %s; prompts are admitted one a step as before",
+                 kBatchAdmitEnv, v, why.c_str());
+        return RAD_OK;
+    }
+    batch_rows_ = rows;
+    RAD_INFO("batch admission: on (%s=%lld) -- whole prompts waiting together share one prefill-only step "
+             "of at most %lld rows%s, no decode rows beside them, in arrival order: each its whole prompt as "
+             "one chunk from position 0, as it runs alone; a prompt that would not run whole there (longer "
+             "than the rows left, back from preemption, with media, scored, an embedding input, an adapter "
+             "or plugin words) ends the batch and is admitted as before, none behind it taken ahead of it. A "
+             "shared step runs every layer on every row (the consumer skip cuts a prompt alone in its step) "
+             "and admits every unit it routes to into the RAM cache",
+             kBatchAdmitEnv, (long long)n, (long long)rows, held.c_str());
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ init */
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
                     const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo,
@@ -817,6 +893,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             }
         }
     }
+    /* Whole prompts admitted together (batch_rows_): after prefill alone, large-chunk prefill and the
+     * consumer skip, whose decisions it reads. */
+    RAD_TRY(batch_admit_init(cfg));
 
     /* ---------------------------------------------------------- end-of-request snapshots off the
      *                                                            chunk grid
@@ -2074,6 +2153,46 @@ void Scheduler::preempt_back() {
     ++m_.preemptions;
 }
 
+/* ------------------------------------------------------------------ whole prompts admitted together */
+/* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT (batch_rows_, scheduler.h). Kept out of a batch, each in a step
+ * of its own as before: a request back from preemption (its recompute of prompt and output), one with
+ * media (encoder rows), a scored prompt (KLD rows) or an embedding input, one with a LoRA adapter or
+ * plugin words (ops issued for some rows of the step only), a prompt longer than R, and one whose chunk
+ * would write a snapshot (none below the checkpoint interval, a multiple of the chunk under LCP). A whole
+ * prompt of at most R rows that the rows left cannot take ends the batch and opens the next step's. */
+bool Scheduler::batch_fits(const SchedReq& s, int64_t used, int64_t budget) const {
+    if (batch_rows_ <= 0 || used < 0 || !s.req) return false;
+    const Request& r = *s.req;
+    if (r.state == ReqState::Preempted || r.n_computed != 0 || r.media || r.score || r.embed ||
+        r.token_scores || r.lora_slot >= 0 || !r.plugin_words.empty())
+        return false;
+    const int64_t target = s.seq_len();
+    const int64_t left = std::min<int64_t>(batch_rows_ - used, budget);
+    if (target <= 0 || target > left) return false;
+    if (s.card < 0 && free_cards_.empty()) return false;
+    /* The chunk admit_one plans for it on the rows left (no reserve: busy_cap as admit_one calls it
+     * in a step already holding rows): the whole prompt, and no checkpoint. */
+    int64_t ck = -1;
+    const int64_t cap = busy_cap(0, target, left, 0, true);
+    return plan_chunk(0, chunk_end(r, target), cap, &ck, r.checkpoint_at) == target && ck < 0;
+}
+
+bool Scheduler::batch_whole(const SchedReq& s, bool fresh) {
+    if (!fresh || !s.req) return false;
+    const Request& r = *s.req;
+    return r.n_computed == 0 && (int64_t)s.sched_tokens == s.seq_len() && s.pending_ckpt <= 0 &&
+           !r.media && !r.score && !r.embed && !r.token_scores && r.lora_slot < 0 && r.plugin_words.empty();
+}
+
+void Scheduler::batch_admit_report() const {
+    if (batch_rows_ <= 0) return;
+    const SchedMetrics m = metrics();
+    RAD_INFO("batch admission: %lld steps admitted %lld whole prompts together (%lld rows, at most %lld a "
+             "step); %lld prefill-only steps in all",
+             (long long)m.batch_admit_steps, (long long)m.batch_admit_prompts, (long long)m.batch_admit_rows,
+             (long long)batch_rows_, (long long)m.steps_prefill);
+}
+
 /* ------------------------------------------------------------------ admission */
 /* Admission checks the KV budget before a request enters running; a request admitted without the
  * blocks to run would be preempted on its first step, a full recompute for nothing. */
@@ -2974,14 +3093,22 @@ replan:
          * after the walk rather than cut at its front. */
         took_.clear();
         size_t at = 0;
+        /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT (batch_rows_): the rows of this step's whole prompts
+         * while the step holds nothing else, -1 once it holds anything else (or the switch is off). */
+        int64_t batch_used = -1;
+        int32_t batch_n = 0;
         while (at < waiting_.size() &&
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
             /* A step planned for one prefill holds that one (span_now_ above). */
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
-            /* Prefill alone: an admission's chunk is never beside another chunk or decode rows. */
-            if (prefill_alone_ && !plan_.e.empty()) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
+            /* Prefill alone: an admission's chunk is never beside another chunk or decode rows, but
+             * for whole prompts admitted together into a step of nothing else (batch_fits; never
+             * with the switch off). */
+            const bool batched = prefill_alone_ && !plan_.e.empty();
+            if (batched && !batch_fits(s, batch_used, budget)) break;
+            const bool fresh = s.req->state != ReqState::Preempted && s.req->n_computed == 0;
             /* Generation reserves one position after the prompt. An embedding consumes just
              * the prompt, so its exact context boundary fits without a generation slot.
              * close_request removes a refused input from waiting_, so `at` names the next one. */
@@ -3001,11 +3128,13 @@ replan:
              * (busy_cap). Embed inputs are whole-or-nothing, so a share could only turn their
              * admission into a refusal. */
             const int64_t areserve =
-                share_step && !s.req->embed && at + 1 < waiting_.size() &&
+                share_step && !batched && !s.req->embed && at + 1 < waiting_.size() &&
                 (int64_t)plan_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
                     ? share_tok : 0;
             admit_full_ = 0;
-            const int as = admit_one(s, budget, areserve);
+            /* A prompt joining a batch is planned on the batch's rows left, whole (batch_fits). */
+            const int as = admit_one(s, batched ? std::min(budget, batch_rows_ - batch_used) : budget,
+                                     areserve);
             if (as == kAdmitWait) { ++at; continue; }
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
@@ -3061,6 +3190,33 @@ replan:
             budget -= s.sched_tokens;
             took_.push_back(at);
             ++at;
+            /* The batch: opened by a whole short prompt that is the step's first entry (the running
+             * requests planned nothing), grown by each prompt batch_fits let in. One that did not
+             * come out whole (it cannot: batch_fits planned its chunk as admit_one did) closes it. */
+            if (batch_rows_ > 0) {
+                const bool whole = batch_whole(s, fresh) && e.ckpt_restore < 0 && e.ckpt_slot < 0 &&
+                                   s.sched_tokens <= batch_rows_;
+                if (!batched) {
+                    batch_used = plan_.e.size() == 1 && whole ? s.sched_tokens : -1;
+                } else if (whole && batch_used + s.sched_tokens <= batch_rows_) {
+                    batch_used += s.sched_tokens;
+                    ++batch_n;
+                } else {
+                    RAD_WARN("batch admission: request %llu joined a batch as %d tokens at %d of a %lld-token "
+                             "sequence, not whole; the batch ends here",
+                             (unsigned long long)r.id, (int)s.sched_tokens, (int)e.ctx_len,
+                             (long long)s.seq_len());
+                    batch_used = -1;
+                }
+            }
+        }
+        if (batch_n > 0) {
+            /* A step of batch_n + 1 whole prompts (the counters' and the debug line's view). */
+            ++m_.batch_admit_steps;
+            m_.batch_admit_prompts += batch_n + 1;
+            m_.batch_admit_rows += plan_.n_tok;
+            RAD_DEBUG("batch admission: step %d admits %d whole prompts together, %lld rows",
+                      step_, (int)batch_n + 1, (long long)plan_.n_tok);
         }
         if (!took_.empty()) {
             for (size_t i : took_) queue_insert(running_, waiting_[i]);

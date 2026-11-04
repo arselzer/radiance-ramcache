@@ -144,6 +144,7 @@ struct Engine::PrefillHashJob {
         int64_t            n = 0;             /* positions the prompt wrote */
         int32_t            row = -1;          /* its logits row */
         int64_t            cut = 0;           /* StepEntry::consumer_end */
+        bool               shared = false;    /* its whole prefill in this step, beside other sequences */
         std::vector<Group> groups;
     };
     int              step = -1;

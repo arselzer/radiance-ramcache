@@ -989,13 +989,27 @@ EOF2
   local d0 d1 t0 t1 rc temp
   d0=$(awk '{print $10}' /sys/block/nvme0n1/stat 2>/dev/null); t0=$(date +%s%N)
   # ARM_TIMEOUT: the arm's per-request timeout (the arm loop sets it for a receipt of long prompts).
+  # F5's first phase is fully joined before the main phase, on this same server. The original
+  # request runner saves it separately, including its replies/waves and complete /stats snapshots.
+  local before_args=()
+  if [[ -n "${ARM_BEFORE_PROMPTS:-}" ]]; then
+    before_args=(--before "$ARM_BEFORE_PROMPTS" "$ARM_BEFORE_N" "$ARM_BEFORE_CONC")
+    log "arm $name: first phase $ARM_BEFORE_PROMPTS ($ARM_BEFORE_N requests, concurrency $ARM_BEFORE_CONC); main ${ARM_PROMPTS:-$PROMPTS} ($n requests, concurrency ${ARM_CONC:-${AB_CONCURRENCY:-1}})"
+  fi
   env AB_CONCURRENCY=${ARM_CONC:-${AB_CONCURRENCY:-1}} ${ARM_TIMEOUT:+AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT} \
-    python3 -I "$HERE/ab_requests.py" "${ARM_PROMPTS:-$PROMPTS}" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
+    python3 -I "$HERE/ab_requests.py" "${before_args[@]}" "${ARM_PROMPTS:-$PROMPTS}" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
   rc=$?
   log "arm $name: requests exit $rc"
   d1=$(awk '{print $10}' /sys/block/nvme0n1/stat 2>/dev/null); t1=$(date +%s%N)
   temp=$(cat /sys/class/nvme/nvme0/hwmon*/temp1_input 2>/dev/null | head -1)
   [[ -n "$d0" && -n "$d1" ]] && log "arm $name: NVMe busy $(( (d1 - d0) * 100000000 / (t1 - t0 + 1) ))% of the requests' $(( (t1 - t0) / 1000000 )) ms${temp:+, drive at $(( temp / 1000 )) C}"
+  if [[ -n "${ARM_BEFORE_PROMPTS:-}" && "$rc" != 0 ]]; then
+    log "arm $name: a sequence phase failed; the whole arm is unmeasured (all phase files retained)"
+    stop_server
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    [[ -f "$OUT/$name.before.json" ]] && mv "$OUT/$name.before.json" "$OUT/$name.before.unmeasured.json"
+    return 1
+  fi
   # Lq: the quality harness, after the timed requests (which it leaves as every other arm sends
   # them). The window's first Lq arm of a prompt set records the reference (free-running, logprobs)
   # unless LQ_REF names one; every Lq arm then decodes teacher-forced along it (ab_requests.py).
@@ -1189,7 +1203,7 @@ EOF2
   # slices. A Tb arm that sent requests together (CK, K > 1) and split no step did not do what its
   # name says: its results are set aside as <arm>.unmeasured.json.
   grep -E 'two-batch overlap: [0-9]+ (decode steps|routed layers)' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
-  if [[ -n "${ARM_TB:-}" && "${ARM_CONC:-${AB_CONCURRENCY:-1}}" -gt 1 ]] &&
+  if [[ -n "${ARM_TB:-}" && "${ARM_OBS_CONC:-${ARM_CONC:-${AB_CONCURRENCY:-1}}}" -gt 1 ]] &&
      ! grep -qE 'rank 0: two-batch overlap: [1-9][0-9]* decode steps' "$OUT/$name.server.log"; then
     log "arm $name: Tb, but rank 0 split no decode step; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
@@ -1197,7 +1211,7 @@ EOF2
   # Ba: the steps that admitted whole prompts together (the scheduler's shutdown line). A Ba arm that
   # sent requests together (CK, K > 1) and batched no step did not do what its name says: set aside.
   grep -E 'batch admission: [0-9]+ steps admitted' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
-  if [[ -n "${ARM_BA:-}" && "${ARM_CONC:-${AB_CONCURRENCY:-1}}" -gt 1 ]] &&
+  if [[ -n "${ARM_BA:-}" && "${ARM_OBS_CONC:-${ARM_CONC:-${AB_CONCURRENCY:-1}}}" -gt 1 ]] &&
      ! grep -qE 'batch admission: [1-9][0-9]* steps admitted' "$OUT/$name.server.log"; then
     log "arm $name: Ba, but no step admitted two prompts together; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
@@ -2462,6 +2476,7 @@ for a in $ARMS; do
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
+  f5="" ARM_BEFORE_PROMPTS= ARM_BEFORE_N= ARM_BEFORE_CONC= ARM_OBS_CONC=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   fn128=""
   arm_checkpoint_interval=2048
@@ -2668,6 +2683,9 @@ for a in $ARMS; do
       U?*)     [[ -n "$upart" ]] && { log "arm $a: $p after U$upart (one receipt an arm); the arm is skipped"; skip=1; }
                upart=${p#U} ARM_PROMPTS=$EXTRA_PROMPTS/${p#U}-receipt.json ARM_N=999
                [[ -f $ARM_PROMPTS ]] || { log "arm $a: no prompts $ARM_PROMPTS; the arm is skipped"; skip=1; } ;;
+      F5post|F5warm)
+               [[ -n "$f5" ]] && { log "arm $a: duplicate F5 sequence part; the arm is skipped"; skip=1; }
+               f5=$p ;;
       Rt)      mkdir -p "$OUT/rtrace-$a"   # the routing trace, exact (rtrace.py reads it)
                rt=1; env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=$(cd "$OUT" && pwd)/rtrace-$a/rt) ;;
       Lq)      ARM_LQ=1 ;;                 # the quality harness after the timed requests
@@ -3170,6 +3188,40 @@ for a in $ARMS; do
   # at 100 tokens/s with an Lc part (355-537 tok/s measured) or 25 without (36 on the filled 32K at
   # 16-token passes), at least 600 (ab_requests.py's default). A window's AB_REQUEST_TIMEOUT_S wins.
   ARM_TIMEOUT=${AB_REQUEST_TIMEOUT_S:-}
+  # Two explicit F5 protocols, rather than rewriting or combining receipts. Post: original
+  # Ulong48k at C1, then the original held-out eight at C8. Warm: held-out C8, then Ulong8k C1.
+  # Prefix-cache, instrumentation and unrelated secondary clients are kept out of these quiet
+  # residency comparisons; Kh is checked on separate cold arms.
+  if [[ -n "$f5" ]]; then
+    if [[ "$nseq" != 8 || -z "$lc" || -z "$p1" || -n "$pc$kh$rt$kld$ARM_LQ$ds$dk" ]]; then
+      log "arm $a: F5 sequences need N8, Lc and P1, without Pc/Kh/Rt/Kld/Lq/Ds/Dk; the arm is skipped"; skip=1
+    fi
+    case $f5 in
+      F5post)
+        [[ -n "$upart" || -n "$ARM_CONC" && "$ARM_CONC" != 8 ]] && {
+          log "arm $a: F5post needs the held-out main set at C8 (no U part); the arm is skipped"; skip=1; }
+        ARM_BEFORE_PROMPTS=$EXTRA_PROMPTS/long48k-receipt.json ARM_BEFORE_N=1 ARM_BEFORE_CONC=1
+        ARM_N=8 ARM_CONC=8 ;;
+      F5warm)
+        [[ "$upart" != long8k || -n "$ARM_CONC" && "$ARM_CONC" != 1 ]] && {
+          log "arm $a: F5warm needs Ulong8k at C1; the arm is skipped"; skip=1; }
+        ARM_BEFORE_PROMPTS=$PROMPTS ARM_BEFORE_N=8 ARM_BEFORE_CONC=8
+        ARM_N=1 ARM_CONC=1 ;;
+    esac
+    ARM_OBS_CONC=8
+    [[ -f "$ARM_BEFORE_PROMPTS" ]] || { log "arm $a: no first-phase prompts $ARM_BEFORE_PROMPTS; the arm is skipped"; skip=1; }
+    if [[ "$f5" == F5post && -f "$ARM_BEFORE_PROMPTS" ]]; then
+      if ! f5mct=$(python3 -I -c 'import json, sys
+v = json.load(open(sys.argv[1])).get("max_context_tokens")
+if type(v) is not int or v <= 0: raise ValueError("positive max_context_tokens required")
+print(v)' "$ARM_BEFORE_PROMPTS" 2>&1); then
+        log "arm $a: F5post: unreadable long48k context requirement ($f5mct); the arm is skipped"; skip=1
+      elif ! [[ $arm_ctx =~ ^[0-9]{1,9}$ ]] || (( 10#$arm_ctx < f5mct )); then
+        log "arm $a: F5post first phase needs $f5mct tokens of context, more than the arm's --max-model-len $arm_ctx; the arm is skipped"; skip=1
+      fi
+    fi
+    ARM_TIMEOUT=${AB_REQUEST_TIMEOUT_S:-900}
+  fi
   if [[ -n "$upart" && -z "$kld" && -f "$ARM_PROMPTS" ]]; then
     if ! umct=$(python3 -I -c 'import json, sys
 v = json.load(open(sys.argv[1])).get("max_context_tokens")
@@ -3265,6 +3317,16 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   power_restore
 done
 [[ -n "$ARMS" ]] && python3 -I "$HERE/ab_requests.py" --compare "$OUT" $ARMS | tee -a "$OUT/window.log"
+# F5's first-phase originals are compared separately. They never enter main-phase rates or the
+# main prompt-set groups; ROOT also checks both phases against the qualified external references.
+before_arms=""
+for a in $ARMS; do
+  [[ -f "$OUT/$a.before.json" ]] && before_arms+="$a.before "
+done
+if [[ -n "$before_arms" ]]; then
+  log "first-phase replies and rates (separate from the main phases)"
+  python3 -I "$HERE/ab_requests.py" --compare "$OUT" $before_arms | tee -a "$OUT/window.log"
+fi
 # Lq arms: each teacher-forced run against its reference (KL, top-1, by prompt family).
 compgen -G "$OUT/*.lpforce.json" >/dev/null && python3 -I "$HERE/ab_requests.py" --kl-dir "$OUT" | tee -a "$OUT/window.log"
 # Arms by their prompts (the U part; none: the held-out set). Where a window mixes prompt sets, each

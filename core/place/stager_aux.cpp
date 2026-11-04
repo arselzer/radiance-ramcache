@@ -1,6 +1,7 @@
 /* stager_aux.cpp -- the file stager's part of the aux expert worker (aux_expert_worker.h): the unit set's
- * candidates, the rows a job relaunches, the load, the warm-up and the binding. With no binding (aux_ null)
- * none of this runs. */
+ * candidates, the rows a job relaunches, the load, the warm-up, and the per-layer hooks hx_choose /
+ * hx_submit / hx_finish / hx_drain call (stager.h, "the aux expert worker's per-layer state"). With no
+ * binding (aux_ null) none of this runs. */
 #include "place/stager.h"
 #include "ds41_host_experts.h"
 #include "rad_internal.h"
@@ -428,6 +429,193 @@ void FileStager::aux_unbind() {
     aux_take_ = false;
 }
 
+/* ---- the per-layer hooks ------------------------------------------------------------------------------ */
+
+int FileStager::aux_prepare(int* appended) {
+    *appended = 0;
+    aux_cmp_.T = 0;
+    if (hx_li_ < 0 || (size_t)hx_li_ >= hx_ops_.size()) return RAD_E_STATE;
+    const HxOps& o = hx_ops_[(size_t)hx_li_];
+    uint8_t worker[ds41aux::kExperts] = {};
+    for (int32_t u : aux_list_) {
+        const int32_t e = plan_->units[(size_t)u].expert;
+        if (e >= 0 && e < ds41aux::kExperts) worker[e] = 1;
+    }
+    const int rc = ds41aux::compact(hx_idx_, hx_idx_ + hx_sorted_max(), (int)layer_rows(hx_li_), (int)o.top_k,
+                                    (int)o.n_expert, worker, counts_host_, (int)counts_cap_, &aux_cmp_);
+    if (rc == ds41aux::kCompactShape) {
+        RAD_ERR("host experts: layer %d: the aux worker's compaction refused a pass of %lld rows",
+                layers_[(size_t)hx_li_].layer, (long long)layer_rows(hx_li_));
+        return RAD_E_STATE;
+    }
+    if (rc < 0) {
+        const int e = -rc - 1;
+        RAD_ERR("host experts: layer %d expert %d's rows in the sorted order disagree with its count %d (the aux "
+                "worker's compaction)", layers_[(size_t)hx_li_].layer, e, e < counts_cap_ ? counts_host_[e] : -1);
+        return RAD_E_STATE;
+    }
+    if (!aux_verify_) {
+        for (int j = 0; j < aux_cmp_.T; ++j) hx_rows_.push_back(aux_cmp_.row_of[j]);
+        *appended = aux_cmp_.T;
+    }
+    return RAD_OK;
+}
+
+void FileStager::aux_submit() {
+    aux_job_ = kAuxNone;
+    if (aux_cmp_.T <= 0 || hx_li_ < 0 || (size_t)hx_li_ >= aux_rows_.size()) return;
+    const int32_t li = hx_li_;
+    const AuxRows& R = aux_rows_[(size_t)li];
+    const int AR = (int)layer_rows(li), T = aux_cmp_.T;
+    aux::Job j;
+    j.AR = AR;
+    j.T = T;
+    j.x = hx_x_;
+    j.sorted = aux_cmp_.sorted;
+    j.off = aux_cmp_.off;
+    j.gu = launch_of(AR < (int)R.gu.size() ? R.gu[(size_t)AR] : nullptr);
+    j.sw = launch_of(T < (int)R.sw.size() ? R.sw[(size_t)T] : nullptr);
+    j.dn = launch_of(AR < (int)R.dn.size() ? R.dn[(size_t)AR] : nullptr);
+    j.gu_w = R.gu_w;
+    j.dn_w = R.dn_w;
+    j.gu_w.data = (size_t)li < aux_view_->gu_tab.size() ? const_cast<void*>(aux_view_->gu_tab[(size_t)li]) : nullptr;
+    j.dn_w.data = (size_t)li < aux_view_->dn_tab.size() ? const_cast<void*>(aux_view_->dn_tab[(size_t)li]) : nullptr;
+    j.rank = plan_->rank;
+    j.world = plan_->world_size;
+    ++aux_seq_;
+    ++aux_stats_.jobs;
+    aux_stats_.units += aux_list_.size();
+    aux_stats_.rows += (uint64_t)T;
+    const int64_t t0 = aux_now_ns();
+    const int rc = aux_->submit(j);
+    aux_stats_.submit_ns += (uint64_t)(aux_now_ns() - t0);
+    if (rc < 0) {   /* the lane said why, once; the CPU computes the rows at the gather */
+        ++aux_stats_.failed;
+        aux_job_ = kAuxFailed;
+        return;
+    }
+    aux_t0_ns_ = t0;
+    aux_job_ = aux_force_late_ > 0 && aux_seq_ % (uint64_t)aux_force_late_ == 0 ? kAuxForced : kAuxPending;
+}
+
+int FileStager::aux_finish() {
+    const int job = aux_job_;
+    aux_job_ = kAuxNone;
+    if (job == kAuxNone) return RAD_OK;
+    const int64_t t_pool = aux_now_ns();
+    const int T = aux_cmp_.T;
+    int got = -1;
+    if (job == kAuxPending) {
+        /* Late only if still pending at the later of the deadline from the submit and a short grace after
+         * the pool's rows are in: a pool slower than the deadline must not abandon a finished job. The wait
+         * queries at least once. */
+        const int64_t deadline = std::max(aux_t0_ns_ + aux_deadline_ns_, t_pool + ds41aux::kGraceUs * 1000);
+        got = aux_->wait(deadline);
+        const int64_t t = aux_now_ns();
+        aux_stats_.wait_ns += (uint64_t)(t - t_pool);
+        if (got == 1) {
+            const uint64_t rt = (uint64_t)(t - aux_t0_ns_);
+            aux_stats_.rt_sum_ns += rt;
+            aux_stats_.rt_max_ns = std::max(aux_stats_.rt_max_ns, rt);
+            ++aux_stats_.rt_n;
+        } else if (got < 0) {
+            ++aux_stats_.failed;
+        }
+    } else if (job == kAuxForced) {
+        got = 0;
+        ++aux_stats_.forced_late;
+    }
+    if (got == 1) {
+        const uint16_t* rows = aux_->rows();
+        const int64_t rb = kHxEmbd * (int64_t)sizeof(uint16_t);
+        if (!aux_verify_) {
+            for (int j = 0; j < T; ++j)
+                std::memcpy(hx_out_ + (int64_t)aux_cmp_.row_of[j] * kHxEmbd, rows + (int64_t)j * kHxEmbd, (size_t)rb);
+            aux_stats_.placed += (uint64_t)T;
+            return RAD_OK;
+        }
+        /* Verify: only rows the CPU wrote (a unit it borrowed or read as a miss); any other's hx_out_ row is
+         * stale. */
+        uint8_t have[ds41aux::kMaxSlots] = {};
+        for (int32_t i : hx_rows_)
+            if (i >= 0 && i < ds41aux::kMaxSlots) have[i] = 1;
+        for (int j = 0; j < T; ++j) {
+            const int32_t i = aux_cmp_.row_of[j];
+            if (i < 0 || i >= ds41aux::kMaxSlots || !have[i]) {
+                ++aux_stats_.not_compared;
+                continue;
+            }
+            int first = -1;
+            const uint16_t* a = hx_out_ + (int64_t)i * kHxEmbd;
+            const uint16_t* c = rows + (int64_t)j * kHxEmbd;
+            const int bad = ds41aux::row_diff(a, c, kHxEmbd, &first);
+            ++aux_stats_.verified;
+            if (!bad) continue;
+            aux_stats_.differ_values += (uint64_t)bad;
+            if (++aux_stats_.differ_rows <= 8) {
+                int e = 0;
+                while (e < ds41aux::kExperts - 1 && aux_cmp_.off[e + 1] <= j) ++e;
+                const int32_t u = (size_t)hx_li_ < hx_unit_of_.size() ? hx_unit_of_[(size_t)hx_li_][(size_t)e] : -1;
+                RAD_WARN("aux experts: rank %d layer %d unit %d expert %d sorted row %d: %d of %d values differ from "
+                         "the CPU's (first at %d: 0x%04x on the CPU, 0x%04x on the extra card)", plan_->rank,
+                         layers_[(size_t)hx_li_].layer, u, e, i, bad, (int)kHxEmbd, first, a[first], c[first]);
+            }
+        }
+        return RAD_OK;
+    }
+    if (got == 0) {   /* late: the lane stays busy until it completes, then backs off */
+        aux_->abandon(true);
+        ++aux_stats_.late;
+    }
+    if (aux_verify_) {
+        aux_stats_.not_compared += (uint64_t)T;
+        return RAD_OK;
+    }
+    return aux_fallback();
+}
+
+/* The worker's units on the CPU, from the kept leases: hx_submit's jobs (urgent: the gather waits for them)
+ * under a ticket of their own, which hx_drain also waits for. Their rows are in hx_rows_ already. */
+int FileStager::aux_fallback() {
+    const int64_t t0 = aux_now_ns();
+    aux_fb_jobs_.clear();
+    uint64_t units = 0;
+    for (int k = 0; k < aux_n_; ++k) {
+        const Mover::HostUnit& hu = aux_units_[k];
+        if (!hu.n) continue;
+        HostExpertPool::Job proto;
+        const int g = hu.bytes[0] == HostExpertPool::kGuBytes ? 0 : 1;
+        proto.gu = hu.host[g];
+        proto.dn = hu.host[1 - g];
+        if (hu.packed) {
+            proto.packed = true;
+            proto.gu_bytes = hu.slot[g];
+            proto.dn_bytes = hu.slot[1 - g];
+        }
+        proto.urgent = true;
+        const int n = hx_jobs_into(plan_->units[(size_t)hu.unit].expert, proto, &aux_fb_jobs_, nullptr);
+        if (n < 0) return n;
+        ++units;
+    }
+    if (!aux_fb_jobs_.empty()) {
+        int64_t cost = 0;
+        for (const HostExpertPool::Job& j : aux_fb_jobs_) cost += j.cost;
+        hx_pool_->reserve(cost);   /* the submit takes the reservation over */
+        const int rc = hx_pool_->submit(aux_fb_jobs_.data(), (int)aux_fb_jobs_.size(), &aux_ticket_);
+        if (rc < 0) {
+            hx_pool_->unreserve(cost);
+            return rc;
+        }
+        aux_fb_ = true;
+        hx_pool_->wait(&aux_ticket_);
+        aux_fb_ = false;
+    }
+    aux_stats_.fallback_units += units;
+    aux_stats_.fallback_rows += (uint64_t)aux_cmp_.T;
+    aux_stats_.fallback_ns += (uint64_t)(aux_now_ns() - t0);
+    return RAD_OK;
+}
+
 void FileStager::aux_abandon() {
     if (aux_fb_ && hx_pool_) {
         hx_pool_->wait(&aux_ticket_);
@@ -440,6 +628,32 @@ void FileStager::aux_abandon() {
     aux_n_ = 0;
     aux_list_.clear();
     aux_take_ = false;
+}
+
+void FileStager::aux_guard(int32_t op, const RadArgs* a, int (*launch)(const RadArgs*, RadStream)) {
+    if (aux_guard_bad_ || !a) return;
+    const int32_t code = aux_op_[(size_t)op];
+    const size_t li = (size_t)(code / 3);
+    const int k = code % 3;
+    if (li >= aux_rows_.size() || !aux_rows_[li].ok) return;
+    const int64_t rows = layer_rows((int32_t)li);
+    if (rows < 1 || rows > ds41aux::kMaxRows) return;   /* a height the worker never takes */
+    const AuxRows& R = aux_rows_[li];
+    const std::vector<const Resolved*>& v = k == 0 ? R.gu : k == 1 ? R.sw : R.dn;
+    const int64_t M = k == 1 ? (a->n_t >= 2 ? a->t[1].shape[0] : -1) : rows;
+    const Resolved* r = M >= 1 && M < (int64_t)v.size() ? v[(size_t)M] : nullptr;
+    bool ok = r && r->row && r->row->info && launch == r->row->info->launch && a->p == r->geom.params();
+    if (ok && k != 1) {   /* the weight-table operand the worker builds is the one the rank issued */
+        const RadTensor& m = k == 0 ? R.gu_w : R.dn_w;
+        const RadTensor& t = a->t[1];
+        ok = a->n_t >= 2 && t.dtype == m.dtype && t.rank == m.rank;
+        for (uint32_t d = 0; ok && d < t.rank; ++d) ok = t.shape[d] == m.shape[d] && t.stride[d] == m.stride[d];
+    }
+    if (ok) return;
+    aux_guard_bad_ = true;
+    RAD_WARN("aux experts: rank %d: routed layer %d's %s launched another row or operand form than the worker "
+             "resolved (M %lld); this rank's worker takes no more jobs", plan_ ? plan_->rank : -1,
+             layers_[li].layer, aux_op_name(k), (long long)M);
 }
 
 }  // namespace rad

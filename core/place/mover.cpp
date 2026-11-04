@@ -1044,6 +1044,7 @@ int Mover::pack_unit_for_ring(const HostPlanes& p, uint8_t* dst, int64_t cap, bo
 }
 
 bool Mover::borrow_host_unit(int32_t u, HostUnit* out, bool touch) {
+    if (borrow_hook_.borrow) return borrow_hook_.borrow(borrow_hook_.context, u, out, touch);   /* a host test's */
     if (!out || out->n != 0 || !plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 ||
         (size_t)u >= unit_.size())
         return false;

@@ -889,4 +889,14 @@ uint64_t host_pinned_devices(const void* p) {
     return r.kind == RAD_MEM_HOST_PINNED || r.kind == RAD_MEM_HOST_MAPPED ? r.devices : 0;
 }
 
+int64_t host_live_allocs(int kind, int device) {
+    if (device < 0 || device >= 64) return 0;
+    const bool pinned = kind == RAD_MEM_HOST_PINNED || kind == RAD_MEM_HOST_MAPPED;
+    std::lock_guard<std::mutex> lk(alloc_mutex());
+    int64_t n = 0;
+    for (const auto& kv : alloc_table())
+        if (kv.second.kind == kind && (pinned ? kv.second.devices == (1ull << device) : kv.second.device == device)) ++n;
+    return n;
+}
+
 }  /* namespace rad */

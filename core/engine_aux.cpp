@@ -14,6 +14,13 @@ namespace rad {
 void Engine::aux_off(const std::string& why, bool warn) {
     for (auto& r : ranks_)
         if (r) r->fstager.aux_unbind();
+    /* The process line, as at exit: whether every lane drained, or which are left to the process exit with the
+     * arena (a load or warm-up whose copies did not complete leaves them queued). */
+    if (aux_) {
+        const std::string line = aux_->finish(0, 0, 0);
+        if (aux_->drained()) RAD_INFO("%s", line.c_str());
+        else RAD_WARN("%s", line.c_str());
+    }
     aux_.reset();
     if (warn) RAD_WARN("%s%s", ds41aux::kLogOff, why.c_str());
     else RAD_INFO("%s%s", ds41aux::kLogOff, why.c_str());

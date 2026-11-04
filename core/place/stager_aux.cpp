@@ -205,9 +205,15 @@ int FileStager::aux_load(aux::Worker* w, int r, const std::vector<int32_t>& list
     char* bounce = (char*)dev_alloc_pinned_on(L.stride, { w->device() });
     char* back = (char*)dev_alloc_pinned_on(L.stride, { w->device() });
     std::vector<uint8_t> scratch;
+    /* Copies queued and not seen complete (a wait that timed out or failed): the queue may still read bounce
+     * and write back, so both are left to the process exit, and the lane stays not drained (sync_bounded), so
+     * the arena it writes stays too (work/aux/SPEC.md §7.5). */
+    bool in_flight = false;
     auto done = [&](int rc) {
-        if (bounce) rad_dev_free(bounce, RAD_MEM_HOST_PINNED);
-        if (back) rad_dev_free(back, RAD_MEM_HOST_PINNED);
+        if (!in_flight) {
+            if (bounce) rad_dev_free(bounce, RAD_MEM_HOST_PINNED);
+            if (back) rad_dev_free(back, RAD_MEM_HOST_PINNED);
+        }
         return rc;
     };
     if (!bounce || !back) {
@@ -269,15 +275,25 @@ int FileStager::aux_load(aux::Worker* w, int r, const std::vector<int32_t>& list
         char* const slot = w->slot(first + k);
         std::memcpy(bounce, src[0], (size_t)n[0]);
         std::memcpy(bounce + L.dn_off, src[1], (size_t)n[1]);
-        int rc = rad_memcpy_async(slot, bounce, n[0], s);
-        if (rc >= 0) rc = rad_memcpy_async(slot + L.dn_off, bounce + L.dn_off, n[1], s);
-        if (rc >= 0) rc = rad_memcpy_async(back, slot, n[0], s);
-        if (rc >= 0) rc = rad_memcpy_async(back + L.dn_off, slot + L.dn_off, n[1], s);
-        const int ok = rc >= 0 ? lane->sync_bounded(10'000'000'000LL) : rc;
-        if (ok != 1) {
-            if (cached) mover_->release_host_unit(&hu);
-            *why = fmt("rank %d unit %d: the copies to and from device %d %s", r, u, w->device(),
-                       ok == 0 ? "did not complete in 10 s" : "failed");
+        struct Copy { void* dst; const void* src; int64_t n; };
+        const Copy copies[4] = { { slot, bounce, n[0] }, { slot + L.dn_off, bounce + L.dn_off, n[1] },
+                                 { back, slot, n[0] }, { back + L.dn_off, slot + L.dn_off, n[1] } };
+        int queued = 0, rc = RAD_OK;
+        for (const Copy& c : copies) {
+            if ((rc = rad_memcpy_async(c.dst, c.src, c.n, s)) < 0) break;
+            ++queued;
+        }
+        const std::string qerr = rc < 0 ? rad_dev_last_error() : "";
+        /* A bounded wait for whatever was queued: the four copies, or those before one that was refused. */
+        const int synced = queued ? lane->sync_bounded(w->load_wait_ns()) : 1;
+        if (rc < 0 || synced != 1) {
+            in_flight = synced != 1;
+            if (cached) mover_->release_host_unit(&hu);   /* the copies read bounce, never the lease */
+            *why = fmt("rank %d unit %d: the copies to and from device %d %s%s", r, u, w->device(),
+                       rc < 0 ? fmt("could not be queued (%s)", qerr.c_str()).c_str()
+                       : synced == 0 ? fmt("did not complete in %g s", (double)w->load_wait_ns() * 1e-9).c_str()
+                                     : "failed",
+                       in_flight ? " (its pinned bounce and read-back buffers are left to the process exit)" : "");
             return done(RAD_E_DEVICE);
         }
         for (int i = 0; i < 2; ++i) {

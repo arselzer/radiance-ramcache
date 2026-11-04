@@ -1019,6 +1019,9 @@ private:
     int  hx_mw_rc_ = 0, hx_mw_rows_ = 0;
     int  hx_fetch(int32_t li, RadStream s);
     void hx_choose(int32_t li);
+    /* hx_keep_ := the layer's units the card does not compute (the pool's leases, the aux worker's, the misses),
+     * which start_ep_routed aliases so the gather reads the rows hx_finish copies over. */
+    void hx_cpu_units();
     int  hx_submit();
     int  hx_jobs_for(int e, const HostExpertPool::Job& proto);
     /* hx_jobs_for into other vectors: `rows` null appends no row (the aux fallback's rows are in hx_rows_). */

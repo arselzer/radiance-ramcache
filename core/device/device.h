@@ -410,6 +410,9 @@ bool    dev_faulted(int device);
 /* The host backend's record of a pinned allocation's devices, a bit per ordinal (0: not a pinned
  * allocation of that backend): for tests (aux_stager_test) of the pin set without a card. */
 uint64_t host_pinned_devices(const void* p);
+/* The host backend's live allocations of `kind` on `device` (device memory: made with it current; a pinned
+ * kind: mapped on it alone): for tests (aux_stager_test) of what is freed and what is left. */
+int64_t host_live_allocs(int kind, int device);
 
 /* The current backend's recorded passes; RAD_E_UNSUPPORTED (or null) from one that has none. */
 bool    tape_supported();

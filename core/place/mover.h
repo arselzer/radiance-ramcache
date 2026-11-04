@@ -473,8 +473,10 @@ struct MoverCounters {
 
 /* ------------------------------------------------------------------ the mover */
 struct NativeMappedMoverHostTest;
+struct AuxStagerProbe;
 class Mover {
     friend struct NativeMappedMoverHostTest; //private HOST-only fixture seam
+    friend struct AuxStagerProbe; //tests/aux_stager_test.cpp: borrow_hook_ only
     friend class Engine; //drain mapped source consumers before Engine tears down arenas/events
 public:
     ~Mover();
@@ -1140,6 +1142,12 @@ private:
         int (*sync)(void*,RadEvent) = nullptr;
         int (*drain)(void*,RadStream) = nullptr;
     } mapped_copy_hooks_; //only the friend fixture can change these; default real device API
+    /* A host test's packed RAM cache (tests/aux_stager_test.cpp, through its friend): set, borrow_host_unit
+     * answers from it instead of the mapped cache. The engine never sets it. */
+    struct BorrowHook {
+        void* context = nullptr;
+        bool (*borrow)(void*, int32_t, HostUnit*, bool) = nullptr;
+    } borrow_hook_;
     static bool mapped_file_eligible(const WeightInfo& w);
     int mapped_file_drain();
     int retire_file_window(int window);

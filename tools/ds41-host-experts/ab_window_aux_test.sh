@@ -13,10 +13,19 @@
 #   3. aux_find on fabricated KFD topologies: the rank cards skipped, another ISA, no VRAM, no PCI location, two
 #      candidates (the root rule, AUX_UUID, AUX_BDF), VRAM then the BDF on independent roots, a mask of three,
 #      rank cards of two ISAs; its outputs (the UUID of a unique_id above 2^63, BDF, gpu_id, drm directory);
-#   4. aux_clients, aux_clients_gate and aux_clients_after on fabricated KFD process entries;
-#   5. aux_exit_gate and aux_arm_exit (the margin, AXV_OK, results set aside) on the engine's exit lines;
-#   6. the DEVICE_CHECKS=aux section with stub checks and a stub docker: it passes, and each way it must not;
-#   7. the aux_any line before the loop leaves the loop the first `for a in $ARMS; do` (the other tests' anchor).
+#   4. aux_clients, aux_clients_gate and aux_clients_after on fabricated KFD process entries (the stopped server's
+#      own entry and a gone process's left out, the wait for the server's entry bounded);
+#   5. aux_exit_gate and aux_arm_exit (the margin, AXV_OK, results set aside, a client arriving) on the engine's
+#      exit lines;
+#   6. the DEVICE_CHECKS=aux section with stub checks and a stub docker: it passes, and each way it must not (the
+#      shared extra card's clients and free VRAM included: no check runs then);
+#   7. the aux_any line before the loop leaves the loop the first `for a in $ARMS; do` (the other tests' anchor);
+#   8. kld_finish's aux gates (aux_kld_check): a Kld arm's records are compared only when the worker ran on every
+#      rank with its arm's values, no launch failure, no row differing and no client arriving; an Ax arm is never
+#      the reference; Ax0 and plain arms as before;
+#   9. the loop skips an Ax / Axv part beside Kld when the arm's step is over 16 rows (Lc, BT32), and launches it on
+#      the 16-token base;
+#  10. arm(): the aux startup lines logged before the switch table can return, the server's pid kept for the exit.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -137,7 +146,7 @@ window() {   # the window's state as the script has it when the loop starts; out
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  AX: ${ARM_AX}|${ARM_AXV}|${ARM_AXF}|${ARM_AXVIS}|${ARM_AXSUM}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  AX: ${ARM_AX}|${ARM_AXV}|${ARM_AXF}|${ARM_AXVIS}|${ARM_AXSUM}"; echo "  ARGS: ${ARGS[*]}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE AUX_MIB AUX_DEADLINE_US AUX_BACKOFF AUX_HEADROOM_MIB AUX_ALLOW_CLIENTS AUX_FOREIGN_MAX_MIB
@@ -306,10 +315,10 @@ launched "$L13" "$C2-Ax0" "Ax0 in 24576 MiB" 0 "" "" 2000 1024 64 0 "$VIS"
 # ---- 2. arm()'s startup-line guards, as its heredoc and its "on:" check expand them
 row_ax=$(grep -m1 -F 'Ax${ARM_AX:-}|${ARM_AX:-}|' "$W")
 row_axv=$(grep -m1 -F 'Axv|${ARM_AXV:-}|' "$W")
-want_def=$(grep -m1 -F 'local ax_want=' "$W" | sed 's/^ *local //')
+want_src=$(grep -cF 'ax_want=$(aux_want)' "$W")
 [[ "$row_ax" == Ax* ]] || bad "no Ax row in arm()'s switch table"
 [[ "$row_axv" == Axv* ]] || bad "no Axv row in arm()'s switch table"
-[[ -n "$want_def" ]] || bad "no ax_want in arm()"
+[[ "$want_src" == 1 ]] || bad "arm() does not take its 'on:' values from aux_want ($want_src)"
 SERVE=$(on_line serve 2000 64 1024 26000 0)
 VERIFY=$(on_line verify 2000 64 1024 26000 0)
 OFFL="I aux experts: off: no candidate beyond the rank cards"
@@ -332,7 +341,7 @@ if [[ -z "$on" ]] && grep -qE "$pat" <<< "$SERVE"; then ok "guard: an arm withou
 else bad "guard: an arm without Ax does not flag the line (on '$on')"; fi
 want() {   # ARM_AX ARM_AXV ARM_AXF ARM_AXDL ARM_AXBO ARM_AXHR, line, want 1 / 0, what
   local ARM_AX=$1 ARM_AXV=$2 ARM_AXF=$3 ARM_AXDL=$4 ARM_AXBO=$5 ARM_AXHR=$6 ax_want n
-  eval "$want_def"
+  ax_want=$( eval "$FUNCS"; aux_want )
   n=$(grep -cF -- "$ax_want" <<< "$7")
   if [[ "$n" == "$8" ]]; then ok "on: $9"; else bad "on: $9 ('$ax_want', $n matches)"; fi
 }
@@ -420,13 +429,35 @@ mkclient "$CS" "$CP" 444 python3 "$XGID" 104857600
 gate "a client not allowed" 'aux_clients_gate a7 26000' 1 "python3 (pid 444) holds 100 MiB and is not allowed (AUX_ALLOW_CLIENTS=^whisper)"
 gate "the client allowed" "AUX_ALLOW_CLIENTS='^(whisper|python3\$)'; aux_clients_gate a8 26000" 0 ""
 rm -rf "$CS/class/kfd/kfd/proc/444" "$CP/444"
-got=$(clients "after, none new" 'aux_clients_gate b1 26000 >/dev/null; echo "{}" > $OUT/b1.json; aux_clients_after b1; s=$?; ls $OUT | grep "^b1\.\(json\|unmeasured\.json\)$"; (exit $s)')
-if [[ "$got" == *$'b1.json\nrc=0' ]]; then ok "aux_clients_after: no new client keeps the results"; else bad "aux_clients_after (none new): '$got'"; fi
-got=$(clients "after, one new" "aux_clients_gate b2 26000 >/dev/null; echo '{}' > \$OUT/b2.json; mkdir -p $CS/class/kfd/kfd/proc/555 $CP/555; echo 1048576000 > $CS/class/kfd/kfd/proc/555/vram_$XGID; echo boltzgen > $CP/555/comm; aux_clients_after b2; s=\$?; ls \$OUT | grep '^b2\.\(json\|unmeasured\.json\)$'; (exit \$s)")
-if [[ "$got" == *"gained clients during the arm: boltzgen (pid 555, 1000 MiB)"* && "$got" == *$'b2.unmeasured.json\nrc=1' ]]; then
-  ok "aux_clients_after: a client arriving sets the results aside"
+got=$(clients "after, none new" 'aux_clients_gate b1 26000 >/dev/null; aux_clients_after b1; s=$?; echo "new=[$AUX_NEW_CLIENTS]"; (exit $s)')
+if [[ "$got" == *$'new=[]\nrc=0' ]]; then ok "aux_clients_after: no new client"; else bad "aux_clients_after (none new): '$got'"; fi
+got=$(clients "after, one new" "aux_clients_gate b2 26000 >/dev/null; mkdir -p $CS/class/kfd/kfd/proc/555 $CP/555; echo 1048576000 > $CS/class/kfd/kfd/proc/555/vram_$XGID; echo boltzgen > $CP/555/comm; aux_clients_after b2; s=\$?; echo \"new=[\$AUX_NEW_CLIENTS]\"; (exit \$s)")
+if [[ "$got" == *$'new=[ boltzgen (pid 555, 1000 MiB)]\nrc=1' ]]; then ok "aux_clients_after: a client arriving is new"
 else bad "aux_clients_after (one new): '$got'"; fi
 rm -rf "$CS/class/kfd/kfd/proc/555" "$CP/555"
+# The stopped server's own KFD entry (its pid given) is not a new client, nor is an entry whose process is gone: the
+# driver drops both only after the last reference goes. Both appear after the start list (the server's whole life
+# is the arm) and are still in the after-list as read.
+during="mkdir -p $CS/class/kfd/kfd/proc/556 $CP/556 $CS/class/kfd/kfd/proc/557; echo 2147483648 > $CS/class/kfd/kfd/proc/556/vram_$XGID; echo radiance > $CP/556/comm; echo 1048576 > $CS/class/kfd/kfd/proc/557/vram_$XGID"
+got=$(clients "after, the server's entry and a gone process" "aux_clients_gate b3 26000 >/dev/null; $during; AUX_KFD_WAIT_DS=0; aux_clients_after b3 556; s=\$?; echo \"new=[\$AUX_NEW_CLIENTS] listed=\$(grep -c . \$OUT/b3.aux-clients-after)\"; (exit \$s)")
+rm -rf "$CS/class/kfd/kfd/proc/556" "$CP/556" "$CS/class/kfd/kfd/proc/557"
+if [[ "$got" == *$'new=[] listed=3\nrc=0' ]]; then ok "aux_clients_after: the stopped server's entry and a gone process's are left out"
+else bad "aux_clients_after (server entry, gone process): '$got'"; fi
+got=$(clients "after, the server's entry not named" "aux_clients_gate b4 26000 >/dev/null; $during; AUX_KFD_WAIT_DS=0; aux_clients_after b4 ''; s=\$?; echo \"new=[\$AUX_NEW_CLIENTS]\"; (exit \$s)")
+rm -rf "$CS/class/kfd/kfd/proc/556" "$CP/556" "$CS/class/kfd/kfd/proc/557"
+if [[ "$got" == *$'new=[ radiance (pid 556, 2048 MiB)]\nrc=1' ]]; then ok "aux_clients_after: a live process unnamed is new (the gone one still left out)"
+else bad "aux_clients_after (server pid not given): '$got'"; fi
+# The server's entry is waited for (bounded) before the list is read.
+mkdir -p "$CS/class/kfd/kfd/proc/558" "$CP/558"
+echo 1048576 > "$CS/class/kfd/kfd/proc/558/vram_$XGID"; echo radiance > "$CP/558/comm"
+got=$(clients "after, waits for the server's entry" "aux_clients_gate b5 26000 >/dev/null; ( sleep 0.3; rm -rf $CS/class/kfd/kfd/proc/558 ) & aux_clients_after b5 558; s=\$?; wait; echo \"listed558=\$(grep -c '^558 ' \$OUT/b5.aux-clients-after)\"; (exit \$s)")
+if [[ "$got" == *$'listed558=0\nrc=0' ]]; then ok "aux_clients_after: waits for the stopped server's KFD entry to go"
+else bad "aux_clients_after (wait): '$got'"; fi
+got=$(clients "after, the wait is bounded" "aux_clients_gate b6 26000 >/dev/null; mkdir -p $CS/class/kfd/kfd/proc/558; echo 1 > $CS/class/kfd/kfd/proc/558/vram_$XGID; AUX_KFD_WAIT_DS=3; t0=\$(date +%s%N); aux_clients_after b6 558; s=\$?; echo \"waited=\$(( (\$(date +%s%N) - t0) / 100000000 ))\"; (exit \$s)")
+if [[ "$got" =~ waited=([0-9]+) ]] && (( BASH_REMATCH[1] >= 2 && BASH_REMATCH[1] <= 20 )) && [[ "$got" == *"rc=0" ]]; then
+  ok "aux_clients_after: the wait for the server's entry is bounded (AUX_KFD_WAIT_DS)"
+else bad "aux_clients_after (bounded wait): '$got'"; fi
+rm -rf "$CS/class/kfd/kfd/proc/558" "$CP/558"
 
 # ---- 5. the worker's exit lines
 EX=$T/exit; mkdir -p "$EX"
@@ -477,10 +508,28 @@ arm_exit() {   # name, ARM_AX, ARM_AXV, ARM_AXF, server log source, aux-vram lin
     cp "$5" "$OUT/$1.server.log"
     [[ -n "$6" ]] && printf '%s\n' "$6" > "$OUT/$1.aux-vram"
     ARM_AXVIS=$MASK,$XUUID ARM_AX=$2 ARM_AXV=$3 ARM_AXF=$4 ARM_AXSUM=$SUM AXV_OK="" AXV_SUM=""
-    aux_arm_exit "$1"; echo "rc=$?"
+    eval "${7:-:}"   # during the arm (a client arriving)
+    aux_arm_exit "$1" "${8:-}"; echo "rc=$?"
     echo "AXV=$AXV_OK|$AXV_SUM"
     ls "$OUT" | grep -E "^$1\.(json|unmeasured\.json)$" ) 2>&1
 }
+newcl="mkdir -p $CS/class/kfd/kfd/proc/555 $CP/555; echo 1048576000 > $CS/class/kfd/kfd/proc/555/vram_$XGID; echo boltzgen > $CP/555/comm"
+got=$(arm_exit c1 26000 "" "" "$EX/serve.log" "" "$newcl")
+rm -rf "$CS/class/kfd/kfd/proc/555" "$CP/555"
+if [[ "$got" == *"arm c1: the extra card gained clients during the arm: boltzgen (pid 555, 1000 MiB); not measured (results kept as c1.unmeasured.json)"* &&
+      "$got" == *"rc=1"* && "$got" == *"c1.unmeasured.json"* ]]; then ok "aux_arm_exit: a client arriving sets the results aside"
+else bad "aux_arm_exit (a new client): '$got'"; fi
+got=$(arm_exit c2 26000 1 "" "$EX/differ.log" "" "$newcl")
+rm -rf "$CS/class/kfd/kfd/proc/555" "$CP/555"
+if [[ "$got" == *"gained clients during the arm: boltzgen (pid 555, 1000 MiB); AUX VERIFY FAIL: 3 of 4 ranks"* && "$got" == *"AXV=|"* ]]; then
+  ok "aux_arm_exit: a new client and a differing row, both said"
+else bad "aux_arm_exit (a new client and a differing row): '$got'"; fi
+srv="mkdir -p $CS/class/kfd/kfd/proc/559 $CP/559; echo 2147483648 > $CS/class/kfd/kfd/proc/559/vram_$XGID; echo radiance > $CP/559/comm; AUX_KFD_WAIT_DS=0"
+got=$(arm_exit c3 26000 "" "" "$EX/serve.log" "" "$srv" 559)
+rm -rf "$CS/class/kfd/kfd/proc/559" "$CP/559"
+if [[ "$got" == *"rc=0"* && "$got" == *"c3.json"* && "$got" != *"gained clients"* ]]; then
+  ok "aux_arm_exit: the stopped server's own KFD entry is not a new client"
+else bad "aux_arm_exit (the server's entry): '$got'"; fi
 got=$(arm_exit m1 26000 "" "" "$EX/serve.log" "12:00:00 34359738368 5368709120
 12:00:02 34359738368 33822867456
 12:00:04 34359738368 6442450944")
@@ -546,7 +595,8 @@ EOF
     ( set +u; log() { echo "LOG: $*"; }; eval "$FUNCS"; eval "$VPASS"
       OUT=$T/dc-$what; mkdir -p "$OUT"; cp "$LIB" "$OUT/lib.so"
       DEVICE_CHECKS=aux AUX_CHECK=$B/auxcheck VPACK_CHECK=$B/vpack AUX_LIBR4D=$OUT/lib.so DOCKER=("$B/docker") NAME=qfn
-      SILU=$T/silu.bin RHOME=$H AUX_UUID=$XUUID AUX_BDF=$XBDF AUX_DRM=$T/nodrm AUX_WHY=test
+      SILU=$T/silu.bin RHOME=$H AUX_UUID=$XUUID AUX_BDF=$XBDF AUX_WHY=test
+      AUX_SYSFS=$CS AUX_PROC=$CP AUX_GPUID=$XGID AUX_DRM=$CS/class/drm/card5/device   # whisper, 27648 MiB free
       export FAKE_RUNS=$OUT/runs FAKE_XUUID=$XUUID FAKE_SILU=$T/silu.bin ROCR_VISIBLE_DEVICES=$MASK
       unset RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL TALL_CHECK
       AUX_OK="" AUX_LIB="" AUX_SUM="" AUX_CHECK_WHY=""
@@ -591,6 +641,30 @@ EOF
   got=$(dcheck nobin AUX_CHECK=/nonexistent/check)
   if [[ "$got" == *"AUX=||"* && "$got" == *"is not an executable"* ]]; then ok "aux checks: no check binary"
   else bad "aux checks (no binary): '$got'"; fi
+  # The shared extra card: the checks start only beside the clients the arms allow, with room for their allocations.
+  got=$(dcheck pass2)
+  if [[ "$got" == *"AUX=1|"* && "$got" == *"aux device checks: the extra card's clients: 111 whisper-server 4404019200;"* ]]; then
+    ok "aux checks: whisper alone and room enough: they run, the clients logged first"
+  else bad "aux checks (the clients' line): '$got'"; fi
+  mkdir -p "$CS/class/kfd/kfd/proc/777" "$CP/777"
+  echo 104857600 > "$CS/class/kfd/kfd/proc/777/vram_$XGID"; echo python3 > "$CP/777/comm"
+  got=$(dcheck client)
+  if [[ "$got" == *"AUX=||"* &&
+        "$got" == *"WHY=refused: the extra card is not free for its checks (its clients: 111 whisper-server 4404019200;777 python3 104857600;): python3 (pid 777) holds 100 MiB and is not allowed"* &&
+        "$got" != *"aux card"* ]]; then ok "aux checks: a client not allowed refuses them, with the clients listed (no check ran)"
+  else bad "aux checks (a client not allowed): '$got'"; fi
+  got=$(dcheck allowed "AUX_ALLOW_CLIENTS=^(whisper|python3\$)")
+  if [[ "$got" == *"AUX=1|"* && "$got" == *"aux card $XUUID/0"* ]]; then ok "aux checks: the client allowed, they run"
+  else bad "aux checks (the client allowed): '$got'"; fi
+  rm -rf "$CS/class/kfd/kfd/proc/777" "$CP/777"
+  got=$(dcheck lowfree AUX_CHECK_FREE_MIB=30000)
+  if [[ "$got" == *"AUX=||"* && "$got" == *"it has 27648 MiB free, under AUX_CHECK_FREE_MIB=30000"* && "$got" != *"aux card"* ]]; then
+    ok "aux checks: too little free VRAM on the extra card refuses them (no check ran)"
+  else bad "aux checks (too little free VRAM): '$got'"; fi
+  got=$(dcheck foreign AUX_FOREIGN_MAX_MIB=4000)
+  if [[ "$got" == *"AUX=||"* && "$got" == *"its clients hold 4200 MiB, above AUX_FOREIGN_MAX_MIB=4000"* && "$got" != *"aux card"* ]]; then
+    ok "aux checks: too many foreign MiB on the extra card refuse them"
+  else bad "aux checks (too many foreign MiB): '$got'"; fi
 fi
 
 # ---- 7. the aux_any line before the loop: not the loop the other tests find, and it sees the Ax parts
@@ -604,6 +678,100 @@ for spec in "$C2-Ax|1" "$C2-Axv24000|1" "$C2-Ax0|1" "$C2-Axf|" "$C2|"; do
   got=$( ARMS="$C2 $a"; aux_any=""; eval "$anyl"; echo "$aux_any" )
   if [[ "$got" == "$want" ]]; then ok "aux_any for ${a#$C2-}: '${want}'"; else bad "aux_any for ${a#$C2-}: '$got', want '$want'"; fi
 done
+
+# ---- 8. a Kld arm's aux gates (kld_finish -> aux_kld_check), every action stubbed: the records are compared only
+# when the worker demonstrably ran (its "on:" values, every rank's jobs, no launch failure, the clients unchanged)
+KF=$(sed -n '/^kld_finish() {/,/^}/p' "$W")
+[[ -n "$KF" ]] || bad "no kld_finish in $W"
+kld() {   # name, ARM_AX, ARM_AXV, ARM_AXF, server log, KLD_REF ("" none), a command during the run ("" none)
+  ( set +u; log() { echo "LOG: $*"; }; eval "$FUNCS"; eval "$KF"
+    kill() { return 1; }; wait() { return 0; }; python3() { echo "COMPARED $*"; return 0; }
+    n128_server_gate() { return 0; }; xt_check() { return 0; }; lcp_check() { return 0; }
+    vp_server_gate() { return 0; }; qsp_gate() { return 0; }
+    OUT=$T/kout; mkdir -p "$OUT"; HERE=$T; ARGS=()
+    AUX_SYSFS=$CS AUX_PROC=$CP AUX_GPUID=$XGID AUX_DRM=$CS/class/drm/card5/device AUX_KFD_WAIT_DS=0
+    aux_clients > "$OUT/$1.aux-clients"
+    cp "$5" "$OUT/$1.server.log"
+    ARM_AX=$2 ARM_AXV=$3 ARM_AXF=$4 ARM_AXDL=2000 ARM_AXHR=1024 ARM_AXBO=64 ARM_AXVIS=""
+    [[ -n $4 ]] && ARM_AXBO=0
+    [[ -n $2 ]] && ARM_AXVIS=$MASK,$XUUID
+    ARM_XT= ARM_LC= ARM_N128= ARM_AR_ROWS= ARM_AG_ROWS= ARM_VP= ARM_QSP=
+    KLD_REF=$6 SERVER_PID=4242
+    eval "${7:-:}"
+    kld_finish "$1"; echo "rc=$?" ) 2>&1
+}
+KL=$T/kld; mkdir -p "$KL"
+{ on_line serve 2000 64 1024 26000 0; for r in 0 1 2 3; do rank_line $r 120 0 0 0 0; done; } > "$KL/served.log"
+{ on_line serve 2000 64 1024 26000 0; for r in 0 1 2 3; do rank_line $r 0 0 0 0 0; done; } > "$KL/idle.log"
+echo "I aux experts: off: no usable device beyond the ranks: too little free VRAM" > "$KL/off.log"
+{ on_line serve 2000 64 1024 24000 0; for r in 0 1 2 3; do rank_line $r 120 0 0 0 0; done; } > "$KL/cap.log"
+{ on_line verify 2000 64 1024 26000 0; rank_line 0 120 0 500 1 0; for r in 1 2 3; do rank_line $r 120 0 500 0 0; done; } > "$KL/differ.log"
+{ on_line verify 2000 64 1024 26000 0; for r in 0 1 2 3; do rank_line $r 120 0 500 0 0; done; } > "$KL/verify.log"
+{ on_line serve 2000 64 1024 26000 0; rank_line 0 120 3 0 0 0; for r in 1 2 3; do rank_line $r 120 0 0 0 0; done; } > "$KL/fail.log"
+echo "I device: AQL backend, 5 device(s)" > "$KL/ax0.log"
+{ echo "I device: AQL backend, 5 device(s)"; echo "I aux experts: off: the switch read as 0"; } > "$KL/ax0aux.log"
+echo "I device: AQL backend, 4 device(s)" > "$KL/plain.log"
+kcase() {   # what, want rc, words in the output ("" none), compared (1 / ""), then kld's arguments
+  local what=$1 want=$2 words=$3 cmp=$4 got; shift 4
+  got=$(kld "$@")
+  if [[ "$got" != *"rc=$want" ]]; then bad "kld_finish: $what: '$got'"; return; fi
+  if [[ -n "$words" && "$got" != *"$words"* ]]; then bad "kld_finish: $what: no '$words' in '$got'"; return; fi
+  if [[ -n "$cmp" && "$got" != *"COMPARED "*"--kld-compare $T/ref $T/kout/kld-$1"* ]] || [[ -z "$cmp" && "$got" == *"COMPARED"* ]]; then
+    bad "kld_finish: $what: compared '$cmp' expected ('$got')"; return
+  fi
+  ok "kld_finish: $what"
+}
+kcase "Ax, the worker served on every rank: compared" 0 "" 1 k1 26000 "" "" "$KL/served.log" "$T/ref"
+kcase "Ax, no rank ran a layer job: not compared" 1 "arm k2: 0 of 4 ranks ran layer jobs on the extra card; Kld not measured" "" \
+  k2 26000 "" "" "$KL/idle.log" "$T/ref"
+kcase "Ax, the worker off: not compared, the reason said" 1 \
+  "arm k3: Ax, but the worker did not start (I aux experts: off: no usable device beyond the ranks: too little free VRAM); Kld not measured" "" \
+  k3 26000 "" "" "$KL/off.log" "$T/ref"
+kcase "Ax, the 'on:' line with another cap: not compared" 1 "does not state 'policy serve, deadline 2000 us, backoff 64, headroom 1024 MiB, cap 26000 MiB, forced lateness 0 '" "" \
+  k4 26000 "" "" "$KL/cap.log" "$T/ref"
+kcase "Axv, a row differs: not compared" 1 "AUX VERIFY FAIL: 3 of 4 ranks compared rows with 0 differing; Kld not measured" "" \
+  k5 26000 1 "" "$KL/differ.log" "$T/ref"
+kcase "Axv, none differ: compared" 0 "" 1 k6 26000 1 "" "$KL/verify.log" "$T/ref"
+kcase "Ax, launch failures: not compared" 1 "1 rank(s) had launch failures; Kld not measured" "" k7 26000 "" "" "$KL/fail.log" "$T/ref"
+kcase "Ax, a client arriving during the run: not compared" 1 \
+  "arm k8: the extra card gained clients during the arm: boltzgen (pid 555, 1000 MiB); Kld not measured" "" \
+  k8 26000 "" "" "$KL/served.log" "$T/ref" "$newcl"
+rm -rf "$CS/class/kfd/kfd/proc/555" "$CP/555"
+kcase "Ax, the window's first Kld arm: never the reference" 1 "an Xt, Lc, Fn128, Ar, Ag or Ax arm cannot be the window's kld reference" "" \
+  k9 26000 "" "" "$KL/served.log" ""
+kcase "Ax0, five devices and no aux line: compared" 0 "" 1 k10 0 "" "" "$KL/ax0.log" "$T/ref"
+kcase "Ax0 with an aux line: not compared" 1 "Ax0, but the server did not see five devices or logged an aux line; Kld not measured" "" \
+  k11 0 "" "" "$KL/ax0aux.log" "$T/ref"
+kcase "no Ax part, the worker on: not compared" 1 "no Ax part, but the worker ran (the switch set for the window?); Kld not measured" "" \
+  k12 "" "" "" "$KL/served.log" "$T/ref"
+kcase "no Ax part: compared" 0 "" 1 k13 "" "" "" "$KL/plain.log" "$T/ref"
+kcase "no Ax part, the first Kld arm: the reference" 0 "the window's kld reference" "" k14 "" "" "" "$KL/plain.log" ""
+
+# ---- 9. the arm loop: an Ax / Axv part with Kld only in passes of at most 16 rows (KL mode is prefill only)
+R16=all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Rb-Vp
+L14=$T/loop14.txt
+ARMS="$R-Ax-Kld $R16-Ax-Kld $R16-Axv-Kld $R16-BT32-Ax-Kld $R-Ax0-Kld $R16-Kld"
+( set +u; window "$T/out14"; loop ) > "$L14" 2>&1
+skipped "$L14" "$R-Ax-Kld" "Ax with Kld needs passes of at most 16 rows, not Lc2048's" "Ax-Kld beside Lc2048"
+skipped "$L14" "$R16-BT32-Ax-Kld" "Ax with Kld needs passes of at most 16 rows, not BT32's" "Ax-Kld beside BT32"
+launched "$L14" "$R16-Ax-Kld" "Ax-Kld on the 16-token base" 26000 "$XBDF" "" 2000 1024 64 0 "$VIS"
+launched "$L14" "$R16-Axv-Kld" "Axv-Kld on the 16-token base" 26000 "$XBDF" verify 2000 1024 64 0 "$VIS"
+launched "$L14" "$R-Ax0-Kld" "Ax0-Kld beside Lc2048 (the worker off)" 0 "" "" 2000 1024 64 0 "$VIS"
+launched "$L14" "$R16-Kld" "the 16-token Kld reference" 0 "" "" 2000 1024 64 0 ""
+if grep -qF -- "--kld-record $T/out14/kld-$R16-Ax-Kld" "$L14"; then ok "Ax-Kld on the 16-token base: records the corpus"
+else bad "Ax-Kld on the 16-token base: no --kld-record"; fi
+
+# ---- 10. arm(): the worker's startup lines (an off line's reason) reach window.log before the switch table can
+# return, and the stopped server's pid goes to the exit gates (its KFD entry may outlive the reap)
+ARMSRC=$(sed -n '/^arm() {/,/^}/p' "$W")
+g=$(grep -nF "grep -E 'aux experts: (off|device|on): '" <<< "$ARMSRC" | head -1 | cut -d: -f1)
+r=$(grep -nF 'if [[ -n "$sw_bad" ]]; then' <<< "$ARMSRC" | head -1 | cut -d: -f1)
+if [[ -n "$g" && -n "$r" ]] && (( g < r )); then ok "arm(): the aux startup lines are logged before the switch table's return"
+else bad "arm(): the aux startup grep (line ${g:-none}) is not before the switch table's return (line ${r:-none})"; fi
+seq=$(grep -A2 -F 'local spid=$SERVER_PID' <<< "$ARMSRC" | sed 's/^ *//')
+if [[ "$seq" == *$'\nstop_server\naux_arm_exit "$name" "$spid"'* ]]; then
+  ok "arm(): the server's pid is kept across stop_server for aux_arm_exit"
+else bad "arm(): aux_arm_exit does not get the stopped server's pid"; fi
 
 (( fail == 0 )) && echo "PASS ab_window_aux_test" || echo "FAIL ab_window_aux_test (loop outputs: $T)"
 (( fail == 0 )) || trap - EXIT

@@ -14,8 +14,10 @@
  *                          their sorted slots and, after the pool's submit, queues the lane's job;
  *                          hx_finish places the rows (or compares them, verify mode) or has the CPU compute
  *                          them from the kept leases when the job is late or failed
- *   Worker::~Worker        after every stager is unbound: each lane drained for at most 2 s, then streams,
- *                          events, pinned buffers and the arena freed (left to the process exit otherwise)
+ *   Worker::~Worker        after every stager is unbound: each lane drained for at most 2 s (its job, then a
+ *                          probe behind everything queued, an idle lane's too), then streams, events, pinned
+ *                          buffers and the arena freed (left to the process exit otherwise: a queue that never
+ *                          answers is not destroyed, since rad_stream_destroy's host wait has no bound)
  *
  * ---- exactness ----------------------------------------------------------------------------------
  *
@@ -92,7 +94,10 @@ public:
     /* The job in flight is given up: the lane stays busy until it completes (its rows are never read),
      * then declines `backoff` layer jobs when asked. */
     virtual void abandon(bool backoff) = 0;
-    /* Teardown: polls the job in flight for at most timeout_ns. True when nothing is left running. */
+    /* Teardown: polls the job in flight, then a probe recorded behind everything queued (an idle lane's too: a
+     * card that hung after its last job, with no fault the host sees, completes nothing), for at most
+     * timeout_ns (the probe at least 100 ms). True when the probe completed: nothing is left on the queue and
+     * it may be destroyed; false leaves the lane to the process exit. */
     virtual bool drain(int64_t timeout_ns) = 0;
     /* Why the lane died ("" while alive). */
     virtual std::string why_dead() const = 0;
@@ -163,6 +168,11 @@ public:
     int64_t              units() const;
     /* The process line at exit (ds41aux::kLogDevice), and the lanes drained (at most 2 s each). */
     std::string          finish(uint64_t jobs, uint64_t rows, uint64_t late);
+    /* finish() saw every lane drained: the streams and the arena may be freed. */
+    bool                 drained() const { return drained_; }
+    /* The loader's bound on each wait for its copies (FileStager::aux_load, load_tables): 10 s. */
+    int64_t              load_wait_ns() const { return load_wait_ns_; }
+    void                 set_load_wait_ns(int64_t ns) { load_wait_ns_ = ns; }   /* a host test's shorter bound */
 
 private:
     Config cfg_;
@@ -180,6 +190,7 @@ private:
     std::vector<RankView> views_;
     bool    drained_ = true;   /* finish() found every lane idle: streams and arena may be freed */
     bool    finished_ = false;
+    int64_t load_wait_ns_ = 10'000'000'000LL;
 };
 
 /* A rank's lane on the extra card: an AQL queue, a host-waitable event, the pinned record and output rows
@@ -203,7 +214,10 @@ public:
     RadStream stream() const { return s_; }
     RadEvent  event() const { return ev_; }
     /* Records the event behind everything queued and polls it for at most timeout_ns: 1 done, 0 timed out,
-     * < 0 failed. */
+     * < 0 failed. A wait that did not see the event complete leaves the lane not idle: timed out, what it
+     * waited for stays the lane's work in flight (drain() polls this same event, and a lane it does not see
+     * drain is left to the process exit with the arena); a failed record or wait retires the lane (dead: never
+     * drained). The caller frees what those copies read or write only after a 1 (work/aux/SPEC.md §7.5). */
     int  sync_bounded(int64_t timeout_ns);
     /* Leaves the queue, event and buffers to the process exit (a lane that did not drain). */
     void leak() { leaked_ = true; }

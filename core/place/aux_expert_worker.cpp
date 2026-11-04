@@ -260,29 +260,54 @@ void DeviceLane::abandon(bool backoff) {
 
 bool DeviceLane::drain(int64_t timeout_ns) {
     if (dead_) return false;
-    if (!pending_) return true;
-    if (!job_ok_) return false;
+    if (!s_) return true;     /* no queue was made: nothing ever ran on it */
+    if (!ev_) return false;   /* a queue that cannot be probed is left to the process exit */
     const int64_t end = now_ns() + timeout_ns;
-    for (;;) {
-        const int q = rad_event_query(ev_);
-        if (q == 1) {
-            pending_ = false;
-            return true;
+    auto poll = [&](int64_t until) {
+        for (;;) {
+            const int q = rad_event_query(ev_);
+            if (q == 1) return 1;
+            if (q < 0 || dev_faulted(dev_)) return -1;
+            if (now_ns() >= until) return 0;
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
-        if (q < 0 || dev_faulted(dev_) || now_ns() >= end) return false;
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    };
+    /* The job (or the loader's copies) in flight: its own event first. */
+    if (pending_) {
+        if (!job_ok_ || poll(end) != 1) return false;
+        pending_ = false;
+        abandoned_ = false;
     }
+    /* Then a probe behind everything queued, an idle lane's too. The lane's last job completing says nothing
+     * of the queue now: a card that hung since (another tenant, a scheduler hang) with no fault the host sees
+     * would block rad_stream_destroy's host wait for ever, and only a fault ends it. The probe gets at least
+     * 100 ms whatever the job took; one that does not complete leaves the lane (its queue still has work). */
+    if (rad_event_record(ev_, s_) < 0) return false;
+    if (poll(std::max<int64_t>(end, now_ns() + 100'000'000)) != 1) {
+        pending_ = job_ok_ = abandoned_ = true;
+        backoff_after_ = false;
+        return false;
+    }
+    return true;
 }
 
 int DeviceLane::sync_bounded(int64_t timeout_ns) {
     if (dead_) return RAD_E_DEVICE;
-    if (rad_event_record(ev_, s_) < 0) return RAD_E_DEVICE;
+    /* The copies queued before this call are never seen complete unless the event says so. */
+    const int rc = rad_event_record(ev_, s_);
+    if (rc < 0) return retire("a loader wait's event record", rc);
     const int64_t end = now_ns() + timeout_ns;
     for (;;) {
         const int q = rad_event_query(ev_);
         if (q == 1) return 1;
-        if (q < 0 || dev_faulted(dev_)) return RAD_E_DEVICE;
-        if (now_ns() >= end) return 0;
+        if (q < 0 || dev_faulted(dev_)) return retire("a loader wait", q < 0 ? q : RAD_E_DEVICE);
+        if (now_ns() >= end) {
+            /* Still queued: the lane is not idle. drain() polls this same event (2 s at teardown), and a lane it
+             * does not see drain is left to the process exit with the arena its copies write. */
+            pending_ = job_ok_ = abandoned_ = true;
+            backoff_after_ = false;
+            return 0;
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 }
@@ -400,6 +425,7 @@ int Worker::load_tables(std::string* why) {
     uint64_t* host = (uint64_t*)dev_alloc_pinned_on(bytes, { card_.ord });
     uint64_t* back = (uint64_t*)dev_alloc_pinned_on(bytes, { card_.ord });
     int rc = host && back ? RAD_OK : RAD_E_NOMEM;
+    bool in_flight = false;   /* copies queued and not seen complete: host and back stay theirs */
     if (rc < 0) *why = fmt("the tables' pinned staging: %s", rad_dev_last_error());
     if (rc >= 0) {
         std::memset(host, 0, (size_t)bytes);
@@ -416,11 +442,20 @@ int Worker::load_tables(std::string* why) {
                     (which ? views_[(size_t)r].dn_tab : views_[(size_t)r].gu_tab)[(size_t)li] = table(r, li, which);
                 }
         std::memset(back, 0xa5, (size_t)bytes);
-        if ((rc = rad_memcpy_async(tables_, host, bytes, l->stream())) < 0 ||
-            (rc = rad_memcpy_async(back, tables_, bytes, l->stream())) < 0)
-            *why = fmt("the tables' copies: %s", rad_dev_last_error());
-        else if ((rc = l->sync_bounded(10'000'000'000LL)) != 1) {
-            *why = rc == 0 ? "the tables' copies did not complete in 10 s" : "the tables' copies failed";
+        int queued = 0;
+        if ((rc = rad_memcpy_async(tables_, host, bytes, l->stream())) >= 0) {
+            ++queued;
+            if ((rc = rad_memcpy_async(back, tables_, bytes, l->stream())) >= 0) ++queued;
+        }
+        const std::string qerr = rc < 0 ? rad_dev_last_error() : "";
+        /* A bounded wait for whatever was queued (both copies, or the first before the second was refused). */
+        const int synced = queued ? l->sync_bounded(load_wait_ns_) : 1;
+        in_flight = synced != 1;
+        if (rc < 0) {
+            *why = fmt("the tables' copies could not be queued: %s", qerr.c_str());
+        } else if (synced != 1) {
+            *why = synced == 0 ? fmt("the tables' copies did not complete in %g s", (double)load_wait_ns_ * 1e-9)
+                               : std::string("the tables' copies failed");
             rc = RAD_E_DEVICE;
         } else if (std::memcmp(host, back, (size_t)bytes) != 0) {
             *why = "the tables read back differ from what was written";
@@ -428,9 +463,14 @@ int Worker::load_tables(std::string* why) {
         } else {
             rc = RAD_OK;
         }
+        if (in_flight) *why += " (their pinned staging is left to the process exit)";
     }
-    if (host) rad_dev_free(host, RAD_MEM_HOST_PINNED);
-    if (back) rad_dev_free(back, RAD_MEM_HOST_PINNED);
+    /* Freed only once their copies were seen complete: a queue that still holds them would read and write
+     * pages given back (work/aux/SPEC.md §7.5). */
+    if (!in_flight) {
+        if (host) rad_dev_free(host, RAD_MEM_HOST_PINNED);
+        if (back) rad_dev_free(back, RAD_MEM_HOST_PINNED);
+    }
     return rc;
 }
 

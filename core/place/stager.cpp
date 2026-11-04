@@ -1086,12 +1086,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     mover_->alias_file_units(skip_, buf_[b], &staged_[b]);
     bool cpu_aliased = false;
     if (hx_li_ == li && hx_policy_ != kHxVerify) {
-        hx_keep_.clear();
-        for (int k = 0; k < hx_n_; ++k)
-            if (hx_units_[k].n) hx_keep_.push_back(hx_units_[k].unit);
-        for (int k = 0; k < aux_n_; ++k)   /* the aux worker's units: aliased as the CPU's */
-            if (aux_units_[k].n) hx_keep_.push_back(aux_units_[k].unit);
-        for (const auto& p : hx_miss_) hx_keep_.push_back(p->unit);
+        hx_cpu_units();
         mover_->alias_file_units(hx_keep_, buf_[b], &staged_[b]);
         cpu_aliased = !hx_keep_.empty();
     }
@@ -2549,6 +2544,15 @@ void FileStager::hx_choose(int32_t li) {
     }
     hx_li_ = li;
     hx_stage_ = 1;
+}
+
+void FileStager::hx_cpu_units() {
+    hx_keep_.clear();
+    for (int k = 0; k < hx_n_; ++k)
+        if (hx_units_[k].n) hx_keep_.push_back(hx_units_[k].unit);
+    for (int k = 0; k < aux_n_; ++k)   /* the aux worker's units: aliased as the CPU's */
+        if (aux_units_[k].n) hx_keep_.push_back(aux_units_[k].unit);
+    for (const auto& p : hx_miss_) hx_keep_.push_back(p->unit);
 }
 
 /* The pass's token rows, sorted order and expert offsets to the host, queued behind the counts

@@ -76,6 +76,9 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    /* work/aux-dyn/SPEC.md: the aux worker's control thread stops before anything below reads its counters or
+     * tears the worker down (idempotent; null without its switches). */
+    aux_ctl_stop();
     // Startup failure/normal teardown: free the immutable host image while rank owners live.
     if (draft_bank_loan_) (void)draft_bank_lend_close();
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
@@ -182,7 +185,8 @@ Engine::~Engine() {
                      (unsigned long long)hx.miss_units, (unsigned long long)hx.miss_rows,
                      (double)hx.miss_read_ns / 1e6);
         /* RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS (place/aux_expert_worker.h): this rank's jobs. */
-        if (r->fstager.aux_bound()) RAD_INFO("%s", aux::stats_line(r->index, r->fstager.aux_stats()).c_str());
+        if (r->fstager.aux_bound())
+            RAD_INFO("%s", aux::stats_line(r->index, r->fstager.aux_stats(), aux_ctl_ && aux_cfg_.controller()).c_str());
         if (hx.d_waits[0] || hx.d_waits[1])
             RAD_INFO("host experts, one-token passes: %llu gathers without a miss waited %.1f ms for the "
                      "CPU's rows (%.1f us each), %llu with one %.1f ms (%.1f us each)",
@@ -477,6 +481,13 @@ Engine::~Engine() {
         for (auto& r : ranks_)
             if (r) r->fstager.aux_unbind();
         RAD_INFO("%s", aux_->finish(jobs, rows, late).c_str());
+        /* The control thread's lines (card sharing, the online set), its state file's last word, then it goes
+         * before the worker it points into. */
+        if (aux_ctl_) {
+            for (const std::string& l : aux_ctl_->report()) RAD_INFO("%s", l.c_str());
+            aux_ctl_->write_final("stopped", aux_->drained() ? "the server exits" : "the server exits; the arena was held to the end");
+            aux_ctl_.reset();
+        }
         aux_.reset();
     }
     /* The route trace's files: everything the ranks and the step loop recorded is written before
@@ -981,6 +992,9 @@ void Engine::rank_loop(int index) {
 
 /* ------------------------------------------------------------------ the scheduler thread */
 int Engine::prepare_release(const RadBatch* b) {
+    /* The aux worker's step boundary (work/aux-dyn/SPEC.md §3.2): its views, flips and gate change here only,
+     * every rank parked. Null without its switches. */
+    if (aux_ctl_) aux_ctl_->boundary(false);
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
@@ -1147,6 +1161,7 @@ int Engine::step_loop() {
             tier_tick();
             expire_tick(rad_mono_ns());
             loan_tick(/*idle=*/true);
+            if (aux_ctl_) aux_ctl_->boundary(true);   /* an idle server releases, reopens and fills too */
             if (idle < 200) ++idle;
             std::this_thread::sleep_for(std::chrono::microseconds(idle * 5));
             continue;
@@ -2761,6 +2776,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    aux_ctl_stop();   /* no boundary and no rank uses the worker from here on */
     xstats_close();
     const int bank_close = draft_bank_loan_ ? draft_bank_lend_close() : RAD_OK;
     draft_vram_close();

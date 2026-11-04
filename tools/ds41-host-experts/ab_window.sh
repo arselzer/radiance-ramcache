@@ -222,13 +222,43 @@ idle_for() {   # seconds of continuous idleness required, give up after $2 secon
 
 SERVER_PID=
 stop_server() {
-  [[ -n "$SERVER_PID" ]] || return 0
+  [[ -n "$SERVER_PID" ]] || { aux_tenant_cleanup; return 0; }
   kill -INT "$SERVER_PID" 2>/dev/null
   local t=0
   while kill -0 "$SERVER_PID" 2>/dev/null && (( t < 180 )); do sleep 1; t=$((t + 1)); done
   if kill -0 "$SERVER_PID" 2>/dev/null; then log "server $SERVER_PID still up after ${t}s; SIGKILL"; kill -KILL "$SERVER_PID"; fi
   wait "$SERVER_PID" 2>/dev/null
   SERVER_PID=
+  aux_tenant_cleanup
+}
+# AxF's simulated tenants (work/aux-dyn/SPEC.md §8.4): this harness's own helper processes only, stopped with the
+# server (or when an arm ends early). AUX_TENANT_LIVE: the pids still to stop (the phases' subshell and tenant 1).
+AUX_TENANT_LIVE=""
+aux_tenant_cleanup() {
+  local p
+  for p in $AUX_TENANT_LIVE; do kill -TERM "$p" 2>/dev/null; done
+  for p in $AUX_TENANT_LIVE; do wait "$p" 2>/dev/null; done
+  AUX_TENANT_LIVE=""
+}
+aux_tenant_start() {   # arm, phase, MiB, HOLD_S, WAIT_S: AUX_TENANT_PID (its log $OUT/<arm>.tenant<phase>.log)
+  ( exec env ROCR_VISIBLE_DEVICES="$AUX_UUID" HIP_VISIBLE_DEVICES=0 "$AUX_TENANT" "$3" "$4" "$5" ) \
+    > "$OUT/$1.tenant$2.log" 2>&1 &
+  AUX_TENANT_PID=$!
+  AUX_TENANT_LIVE+=" $AUX_TENANT_PID"
+}
+aux_tenant_phases() {   # arm, the first tenant's pid (in the background: its own log lines, then tenant 2's exit)
+  local a=$1 t1=$2
+  sleep 20
+  echo "$(date -u +%T.%3N) the first tenant stopped" >> "$OUT/$a.tenant-phases"
+  kill -TERM "$t1" 2>/dev/null
+  sleep 40
+  echo "$(date -u +%T.%3N) the second tenant starts" >> "$OUT/$a.tenant-phases"
+  ( exec env ROCR_VISIBLE_DEVICES="$AUX_UUID" HIP_VISIBLE_DEVICES=0 "$AUX_TENANT" "$ARM_AXTEN" 20 30 ) \
+    > "$OUT/$a.tenant2.log" 2>&1 &
+  local t2=$!
+  trap 'kill -TERM "$t2" 2>/dev/null; wait "$t2" 2>/dev/null; echo "tenant2 stopped early" >> "$OUT/$a.tenant2.log"; exit 0' TERM
+  wait "$t2"
+  echo "tenant2 exit $?" >> "$OUT/$a.tenant2.log"
 }
 
 # Power settings a Q arm changes for its own run: g the performance CPU governor, n no NVMe power
@@ -615,6 +645,21 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   local name=$1; shift
   local n=${ARM_N:-${AB_REQUESTS:-8}}; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
   log "arm $name: $*"
+  # AxF (work/aux-dyn/SPEC.md §8.4): the first simulated tenant takes its memory on the extra card before the server
+  # starts (the server then starts released), and holds it until 20 s after "serving" (aux_tenant_phases).
+  local tenant1="" tenant_helper=""
+  AUX_TENANT_FAIL=""
+  if [[ -n "${ARM_AXTEN:-}" ]]; then
+    aux_tenant_start "$name" 1 "$ARM_AXTEN" 0 60
+    tenant1=$AUX_TENANT_PID
+    local tw=0
+    until grep -q 'aux_tenant: room after' "$OUT/$name.tenant1.log" 2>/dev/null || ! kill -0 "$tenant1" 2>/dev/null || (( tw > 600 )); do
+      sleep 0.1; tw=$((tw + 1))
+    done
+    grep -q 'aux_tenant: room after' "$OUT/$name.tenant1.log" 2>/dev/null ||
+      AUX_TENANT_FAIL+=" the first tenant got no room ($(tail -1 "$OUT/$name.tenant1.log" 2>/dev/null));"
+    log "arm $name: AxF: the first tenant (pid $tenant1): $(grep -m1 'aux_tenant: room after' "$OUT/$name.tenant1.log" 2>/dev/null)"
+  fi
   env "$@" RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS=1 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1 \
       RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1 \
     "$BIN" --radiance-home "${ARM_HOME:-$RHOME}" --kernels libr4d,libref --model "$MODEL" \
@@ -636,21 +681,32 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       echo "$(date -u +%T) $avail" >> "$OUT/$name.mem"
       sleep 5
     done ) &
-  # An arm with the extra card visible: its VRAM sampled every 2 s (the margin its other tenants keep).
+  # An arm with the extra card visible: its VRAM sampled every 2 s (the margin its other tenants keep); every 0.5 s in
+  # AxT / AxF arms, so a release shows.
   if [[ -n "${ARM_AXVIS:-}" && -n "${AUX_DRM:-}" ]]; then
+    local vram_s=2; [[ -n "${ARM_AXTOG:-}${ARM_AXTEN:-}" ]] && vram_s=0.5
     ( while kill -0 "$SERVER_PID" 2>/dev/null; do
         echo "$(date -u +%T) $(cat "$AUX_DRM/mem_info_vram_total" 2>/dev/null) $(cat "$AUX_DRM/mem_info_vram_used" 2>/dev/null)" >> "$OUT/$name.aux-vram"
-        sleep 2
+        sleep $vram_s
       done ) &
   fi
   if [[ -n "${ARM_KLD:-}" ]]; then kld_finish "$name"; return; fi
   local t=0
   until curl -s -m 3 "http://127.0.0.1:$PORT/stats" >/dev/null 2>&1; do
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then log "arm $name: server exited during startup"; SERVER_PID=; return 1; fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then log "arm $name: server exited during startup"; SERVER_PID=; aux_tenant_cleanup; return 1; fi
     sleep 2; t=$((t + 2))
     if (( t > 600 )); then log "arm $name: no server after 600 s"; stop_server; return 1; fi
   done
   log "arm $name: serving after ${t}s"
+  # AxF: the first tenant leaves 20 s after "serving" (the server acquires 5 s later); 60 s after "serving" a second
+  # one asks for its memory (the server releases) and holds it 20 s (the server reacquires 5 s after it leaves).
+  if [[ -n "$tenant1" ]]; then
+    aux_tenant_phases "$name" "$tenant1" &
+    tenant_helper=$!
+    AUX_TENANT_LIVE+=" $tenant_helper"
+  fi
+  # AxS / AxO: the controller's and the online set's startup lines.
+  grep -E 'aux experts: (sharing: policy|online set: |released at start: )' "$OUT/$name.server.log" | cut -c1-400 | tee -a "$OUT/window.log"
   # A Pc arm: the prefix cache's startup lines (the snapshot store, the interval, the resume rule).
   [[ -z "${ARM_NOPC---no-prefix-cache}" ]] && \
     grep -E 'host headroom|chunk geometry|prefix resume|prefix cache|checkpoint slots|end-of-request snapshots|snapshot store|kv tiers' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
@@ -718,6 +774,13 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   # A row a switch: the part, set when the arm has it, the line's pattern.
   local sw_bad="" sw_part sw_on sw_pat sw_n pi_n=${ARM_PSC:+${ARM_PRS:-12}}
   local ARM_AX=${ARM_AX:-}; [[ "$ARM_AX" == 0 ]] && ARM_AX=   # Ax0: the worker off, no startup line
+  # AxF: the server starts beside the first tenant, released ("released at start:" with the six values instead of
+  # "on:"); every other Ax arm serves from its start.
+  local ax_on='aux experts: on: [1-9][0-9]* units' axv_on='aux experts: on: .*policy verify'
+  if [[ -n "${ARM_AXTEN:-}" ]]; then
+    ax_on='aux experts: (on: [1-9][0-9]* units|released at start: )'
+    axv_on='aux experts: (on|released at start): .*policy verify'
+  fi
   pi_n=${pi_n:-[0-9]+}   # a Pi arm's rescore count; any, for the line no other arm may have
   while IFS='|' read -r sw_part sw_on sw_pat; do
     sw_n=$(grep -cE "$sw_pat" "$OUT/$name.server.log")
@@ -731,8 +794,10 @@ Ns${ARM_NS:-}|${ARM_NS:-}|side store: the planes of up to [0-9]+ units a rank
 Pv|${ARM_PV:-}|router predictor: every posted router input is recorded to
 Tb|${ARM_TB:-}|two-batch overlap \(RADIANCE_EXPERIMENTAL_SCHED_TBO=1\): a decode step
 Ba${ARM_BA:-}|${ARM_BA:-}|batch admission: on \(RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=${ARM_BA:-[0-9]+}\)
-Ax${ARM_AX:-}|${ARM_AX:-}|aux experts: on: [1-9][0-9]* units
-Axv|${ARM_AXV:-}|aux experts: on: .*policy verify
+Ax${ARM_AX:-}|${ARM_AX:-}|$ax_on
+Axv|${ARM_AXV:-}|$axv_on
+AxS|${ARM_AXS:-}|aux experts: sharing: policy ${ARM_AXS:-[a-z]+}
+AxO|${ARM_AXO:-}|aux experts: online set: ${ARM_AXO_STR:-[0-9.]+} swaps a token
 EOF2
   # Ax / Axv / AxfN: the worker's startup lines (an off line's reason with them), before any return below.
   grep -E 'aux experts: (off|device|on): ' "$OUT/$name.server.log" | cut -c1-400 | tee -a "$OUT/window.log"
@@ -987,12 +1052,27 @@ EOF2
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
+  # AxT (work/aux-dyn/SPEC.md §8.3): the control file written off / auto every N/2 s over the requests, through a temp
+  # file and rename (a reader never sees it half written), each write logged with its time.
+  local toggler=""
+  if [[ -n "${ARM_AXTOG:-}" && -n "${ARM_AXCTL:-}" ]]; then
+    aux_toggler "$ARM_AXCTL" "$ARM_AXTOG" "$OUT/$name.aux-toggles" &
+    toggler=$!
+  fi
   d0=$(awk '{print $10}' /sys/block/nvme0n1/stat 2>/dev/null); t0=$(date +%s%N)
   # ARM_TIMEOUT: the arm's per-request timeout (the arm loop sets it for a receipt of long prompts).
   env AB_CONCURRENCY=${ARM_CONC:-${AB_CONCURRENCY:-1}} ${ARM_TIMEOUT:+AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT} \
     python3 -I "$HERE/ab_requests.py" "${ARM_PROMPTS:-$PROMPTS}" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
   rc=$?
   log "arm $name: requests exit $rc"
+  if [[ -n "$toggler" ]]; then
+    kill "$toggler" 2>/dev/null; wait "$toggler" 2>/dev/null
+    log "arm $name: AxT: $(wc -l < "$OUT/$name.aux-toggles" 2>/dev/null || echo 0) control-file writes over the requests"
+  fi
+  if [[ -n "$tenant_helper" ]]; then   # AxF: its phases end within 110 s of "serving"; at most 60 s more
+    local hw=0
+    while kill -0 "$tenant_helper" 2>/dev/null && (( hw < 600 )); do sleep 0.1; hw=$((hw + 1)); done
+  fi
   d1=$(awk '{print $10}' /sys/block/nvme0n1/stat 2>/dev/null); t1=$(date +%s%N)
   temp=$(cat /sys/class/nvme/nvme0/hwmon*/temp1_input 2>/dev/null | head -1)
   [[ -n "$d0" && -n "$d1" ]] && log "arm $name: NVMe busy $(( (d1 - d0) * 100000000 / (t1 - t0 + 1) ))% of the requests' $(( (t1 - t0) / 1000000 )) ms${temp:+, drive at $(( temp / 1000 )) C}"
@@ -1769,9 +1849,76 @@ aux_clients_after() {   # arm, the stopped server's pid (""): 0, or 1 with the n
   aux_clients > "$OUT/$a.aux-clients-after"
   while read -r pid comm v; do
     [[ -n $pid && $pid != "$spid" && -d ${AUX_PROC:-/proc}/$pid ]] || continue
+    [[ -n "${ARM_AXTEN:-}" && $comm == aux_tenant ]] && continue   # AxF: the arm's own simulated tenants
     grep -q "^$pid " "$OUT/$a.aux-clients" 2>/dev/null || AUX_NEW_CLIENTS+=" $comm (pid $pid, $((v >> 20)) MiB)"
   done < "$OUT/$a.aux-clients-after"
   [[ -z $AUX_NEW_CLIENTS ]]
+}
+# AxT (work/aux-dyn/SPEC.md §8.3): writes off, then auto, then off ... into the control file every PERIOD/2 s (through
+# a temp file and rename), one line a write into LOG ("<time> <word>"). Runs until killed.
+aux_toggler() {   # control file, period s, log
+  local f=$1 half w=off
+  half=$(awk -v n="$2" 'BEGIN { printf "%.3f", n / 2 }')
+  while :; do
+    printf '%s\n' "$w" > "$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"
+    echo "$(date -u +%T.%3N) $w" >> "$3"
+    sleep "$half"
+    if [[ $w == off ]]; then w=auto; else w=off; fi
+  done
+}
+# The toggler's timeline against a request phase of S seconds (no clock: its arithmetic): the releases and acquires
+# an AxT arm of period P can show, assuming each acquire serves within ACQ s of its auto write. "releases acquires".
+aux_toggle_plan() {   # period s, request phase s, acquire latency s
+  awk -v p="$1" -v s="$2" -v a="$3" 'BEGIN {
+    h = p / 2; r = 0; q = 0
+    for (t = 0; t < s; t += h) { k = int(t / h + 0.5); if (k % 2 == 0) r++; else if (t + a <= s && a < h) q++ }
+    print r, q }'
+}
+# AxF: tenant 1 must have held its room and freed it; tenant 2 must have got its room within AUX_TENANT_ROOM_MS
+# (3000) and freed it; the server must have started released and acquired, then released for tenant 2 and acquired
+# again, in that order. Appends to AUX_TENANT_FAIL ("" when all hold).
+aux_tenant_check() {   # arm
+  local a=$1 f=$OUT/$1.server.log room
+  grep -q 'aux_tenant: freed' "$OUT/$a.tenant1.log" 2>/dev/null || AUX_TENANT_FAIL+=" the first tenant did not free its memory;"
+  if ! grep -q 'tenant2 exit 0' "$OUT/$a.tenant2.log" 2>/dev/null; then
+    AUX_TENANT_FAIL+=" the second tenant did not exit 0 ($(tail -1 "$OUT/$a.tenant2.log" 2>/dev/null));"
+  else
+    room=$(grep -oE 'aux_tenant: room after [0-9]+ ms' "$OUT/$a.tenant2.log" | grep -oE '[0-9]+' | head -1)
+    log "arm $a: AxF: the second tenant's room after ${room:-?} ms (at most ${AUX_TENANT_ROOM_MS:-3000})"
+    [[ -n $room ]] && (( room <= ${AUX_TENANT_ROOM_MS:-3000} )) ||
+      AUX_TENANT_FAIL+=" the second tenant's room came after ${room:-?} ms, over AUX_TENANT_ROOM_MS=${AUX_TENANT_ROOM_MS:-3000};"
+  fi
+  # the order: released at start, serving again, releasing (foreign: aux_tenant ...), serving again
+  local order
+  order=$(grep -oE 'aux experts: (released at start: |serving again in |releasing \(foreign: aux_tenant)' "$f" |
+          sed -E 's/.*released at start: /S/; s/.*serving again in /A/; s/.*releasing \(foreign: aux_tenant/R/' | tr -d '\n')
+  [[ $order =~ ^SA.*R.*A ]] || AUX_TENANT_FAIL+=" the server's lines are not released at start, serving again, releasing for aux_tenant, serving again (${order:-none});"
+}
+# The dynamic parts' exit lines (work/aux-dyn/SPEC.md §8.2): "" when they hold, else why. AxS (any sharing part): no
+# dead line, the sharing shutdown line; AxO: the online shutdown line with swaps > 0, 0 read-backs differing, not
+# stopped (AxOd: dry); AxT: at least 2 releases and 2 acquires.
+aux_dyn_gate() {   # server log
+  local f=$1 l n
+  if [[ -n "${ARM_AXS:-}" ]]; then
+    l=$(grep -m1 'aux experts: dead: ' "$f")
+    [[ -z $l ]] || { echo "the worker went dead (${l:0:240})"; return 1; }
+    grep -qE 'aux experts: sharing: [0-9]+ releases' "$f" || { echo "no 'aux experts: sharing: N releases' shutdown line"; return 1; }
+  fi
+  if [[ -n "${ARM_AXO:-}" ]]; then
+    l=$(grep -m1 -E 'aux experts: online: [0-9]+ decisions' "$f")
+    [[ -n $l ]] || { echo "no 'aux experts: online: N decisions' shutdown line"; return 1; }
+    [[ $l =~ decisions,\ ([0-9]+)\ swaps ]] && (( BASH_REMATCH[1] > 0 )) || { echo "the online set made no swap"; return 1; }
+    [[ $l =~ read\ back\ \(0\ differ\) ]] || { echo "AUX ONLINE FAIL: a read-back differed (${l:0:300})"; return 1; }
+    [[ $l == *"; stopped: "* ]] && { echo "the online set stopped (${l##*; stopped: })"; return 1; }
+    if [[ -n "${ARM_AXOD:-}" && $l != *"dry (no flip)"* ]]; then echo "AxOd, but the online line does not say dry"; return 1; fi
+  fi
+  if [[ -n "${ARM_AXTOG:-}" ]]; then
+    n=$(grep -c 'aux experts: released in ' "$f")
+    (( n >= 2 )) || { echo "$n releases logged (AxT needs at least 2)"; return 1; }
+    n=$(grep -c 'aux experts: serving again in ' "$f")
+    (( n >= 2 )) || { echo "$n acquires logged (AxT needs at least 2)"; return 1; }
+  fi
+  return 0
 }
 aux_exit_gate() {   # server log, cap ("" none, 0 Ax0), verify (1 or ""), forced N ("" none): "" when measured, else why
   local f=$1 cap=$2 verify=$3 forced=$4 n jobs=0 fails=0 cmp=0 forced_n=0 l
@@ -1809,9 +1956,15 @@ aux_arm_check() {   # arm name, the stopped server's pid
     [[ -n $min ]] && (( min < ${AUX_MARGIN_MIB:-1024} )) &&
       log "arm $name: AUX MARGIN LOW: the extra card's free VRAM went down to $min MiB, under AUX_MARGIN_MIB=${AUX_MARGIN_MIB:-1024} (its other tenants)"
   fi
+  if [[ -n "${ARM_AXCTL:-}" ]]; then   # AxS: the state file's last word (the server's teardown wrote it)
+    log "arm $name: aux state file: $(head -c 300 "$ARM_AXCTL.state" 2>/dev/null)"
+  fi
+  [[ -n "${ARM_AXTEN:-}" ]] && aux_tenant_check "$name"
   if [[ -n "${ARM_AX:-}" && "${ARM_AX}" != 0 ]]; then
-    grep -E 'aux experts: (rank [0-3]|device)' "$OUT/$name.server.log" | cut -c1-600 | tee -a "$OUT/window.log"
+    grep -E 'aux experts: (rank [0-3]|device|sharing: [0-9]|online: [0-9]+ decisions)' "$OUT/$name.server.log" | cut -c1-600 | tee -a "$OUT/window.log"
     g=$(aux_exit_gate "$OUT/$name.server.log" "$ARM_AX" "${ARM_AXV:-}" "${ARM_AXF:-}") || why+="${why:+; }$g"
+    g=$(aux_dyn_gate "$OUT/$name.server.log") || why+="${why:+; }$g"
+    [[ -n "${AUX_TENANT_FAIL:-}" ]] && why+="${why:+; }AxF:$AUX_TENANT_FAIL"
   fi
   AUX_ARM_WHY=$why
   [[ -z $why ]]
@@ -1827,6 +1980,15 @@ aux_arm_exit() {   # arm name, the stopped server's pid: aux_arm_check, the resu
   if [[ -n "${ARM_AXV:-}" && -f "$OUT/$name.json" ]]; then
     AXV_OK=1 AXV_SUM=${ARM_AXSUM:-}
     log "arm $name: Axv: every rank compared the worker's rows with the CPU's and none differ; Ax arms on this library may run"
+    # work/aux-dyn/SPEC.md §8.5: per feature, a verify arm with it gates the serve arms with it.
+    if [[ -n "${ARM_AXO:-}" ]]; then
+      AXV_OK_O=1 AXV_SUM_O=${ARM_AXSUM:-}
+      log "arm $name: Axv with AxO: swaps and rows compared, none differ; AxO arms on this library may run"
+    fi
+    if [[ -n "${ARM_AXS:-}" ]]; then
+      AXV_OK_T=1 AXV_SUM_T=${ARM_AXSUM:-}
+      log "arm $name: Axv with a sharing part: releases and acquires with rows compared, none differ; AxS / AxT / AxF arms on this library may run"
+    fi
   fi
   return 0
 }
@@ -1896,6 +2058,9 @@ AUX_OK="" AUX_LIB="" AUX_SUM="" AXV_OK="" AXV_SUM=""
 AUX_CHECK_WHY="no aux device check in this window (DEVICE_CHECKS=aux with AUX_CHECK or TALL_CHECK, VPACK_CHECK and an extra card)"
 aux_any=""
 for aux_a in $ARMS; do [[ "-$aux_a-" =~ -Ax(v|0)?[0-9]*- ]] && aux_any=1; done
+AUX_SWAP_OK="" AUX_SWAP_SUM="" AUX_SWAP_WHY="" AXV_OK_O="" AXV_SUM_O="" AXV_OK_T="" AXV_SUM_T=""
+aux_dyn_any=""
+for aux_a in $ARMS; do [[ "-$aux_a-" =~ -Ax(S|Sa|Sx|O[0-9]*|Od|T[0-9]*|F[0-9]*)- ]] && aux_dyn_any=1; done
 if [[ " ${DEVICE_CHECKS:-1} " == *" aux "* || -n "$aux_any" ]]; then
   if aux_find; then log "aux card: $AUX_WHY"; else log "aux card: none: $AUX_WHY"; fi
 fi
@@ -1956,6 +2121,22 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" aux "* ]]; then
     else
       AUX_CHECK_WHY="the aux device checks did not pass on $AL:$aux_bad"
       log "$AUX_CHECK_WHY no Ax / Axv arm runs"
+    fi
+    # work/aux-dyn/SPEC.md §9: with an AxS / AxO / AxT / AxF part in the window, `auxswap` on the extra card -- slot
+    # swaps on a second queue beside running jobs -- gates those arms (AUX_SWAP_OK, on the same library).
+    if [[ -n "$AUX_OK" && -n "$aux_dyn_any" ]]; then
+      ( export ROCR_VISIBLE_DEVICES=$AUX_UUID HIP_VISIBLE_DEVICES=0 RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=$aux_tail
+        timeout 1800 "$AC" "$AL" auxswap >"$OUT/devcheck-auxswap.log" 2>&1
+        echo "auxswap exit $?" >>"$OUT/devcheck-auxswap.log" )
+      grep -E '^(PASS|FAIL)|exit' "$OUT/devcheck-auxswap.log" | tail -4 | tee -a "$OUT/window.log"
+      if grep -qx 'auxswap exit 0' "$OUT/devcheck-auxswap.log" && grep -q '^PASS: auxswap: ' "$OUT/devcheck-auxswap.log" &&
+         ! grep -q '^FAIL' "$OUT/devcheck-auxswap.log" && [[ "$(sha256sum "$AL" | cut -d' ' -f1)" == "$aux_sum0" ]]; then
+        AUX_SWAP_OK=1 AUX_SWAP_SUM=$aux_sum0
+        log "aux device check auxswap passed on $AL: AxS / AxO arms on it may run"
+      else
+        AUX_SWAP_WHY="the auxswap device check did not pass on $AL ($(tail -1 "$OUT/devcheck-auxswap.log"))"
+        log "$AUX_SWAP_WHY; no AxS / AxO arm runs"
+      fi
     fi
   fi
   [[ -n "$AUX_OK" ]] || log "aux device checks: $AUX_CHECK_WHY"
@@ -2460,6 +2641,7 @@ for a in $ARMS; do
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
+  axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -2715,6 +2897,28 @@ for a in $ARMS; do
                  log "arm $a: $p: forced lateness takes 1-1000000; the arm is skipped"; skip=1; axf=1
                fi
                axf=$((10#$axf)) ;;
+      AxS|AxSa|AxSx)                                                   # card sharing: allow (whisper) / exclusive
+               [[ -n "$axs" ]] && { log "arm $a: two AxS parts; the arm is skipped"; skip=1; }
+               axs=allow; [[ $p == AxSx ]] && axs=exclusive ;;
+      AxO|AxO[0-9]*|AxOd)                                              # the online unit set (AxOd: copies, no flip)
+               [[ -n "$axo" ]] && { log "arm $a: two AxO parts; the arm is skipped"; skip=1; }
+               if [[ $p == AxOd ]]; then axo=200; axod=1; else axo=${p#AxO}; axo=${axo:-200}; fi
+               if ! [[ $axo =~ ^[0-9]+$ ]] || (( 10#$axo < 1 || 10#$axo > 1600 )); then
+                 log "arm $a: $p: the swap rate is 1-1600 a 100 tokens; the arm is skipped"; skip=1; axo=200
+               fi
+               axo=$((10#$axo)) ;;
+      AxT|AxT[0-9]*)                                                   # the control file toggled every N/2 s (4)
+               axt=${p#AxT}; axt=${axt:-4}
+               if ! [[ $axt =~ ^[0-9]+$ ]] || (( 10#$axt < 2 || 10#$axt > 600 )); then
+                 log "arm $a: $p: the toggle period is 2-600 s; the arm is skipped"; skip=1; axt=4
+               fi
+               axt=$((10#$axt)) ;;
+      AxF|AxF[0-9]*)                                                   # a simulated tenant of N MiB (12000)
+               axten=${p#AxF}; axten=${axten:-12000}
+               if ! [[ $axten =~ ^[0-9]+$ ]] || (( 10#$axten < 1024 || 10#$axten > 30000 )); then
+                 log "arm $a: $p: the tenant takes 1024-30000 MiB; the arm is skipped"; skip=1; axten=12000
+               fi
+               axten=$((10#$axten)) ;;
       *)     log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
@@ -3250,6 +3454,54 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
         RADIANCE_EXPERIMENTAL_DS41_AUX_BACKOFF=$ARM_AXBO RADIANCE_EXPERIMENTAL_DS41_AUX_FORCE_LATE=${axf:-0})
   [[ -n "$ARM_AXVIS" ]] && env+=("ROCR_VISIBLE_DEVICES=$ARM_AXVIS")
   ARM_AXSUM=${axsum:-}
+  # AxS / AxSx / AxO / AxOd / AxT / AxF (work/aux-dyn/SPEC.md §8): card sharing with a control file
+  # ($OUT/<arm>.aux-ctl, its holders and state beside it) and the online unit set. AxT (the control file toggled) and
+  # AxF (a simulated tenant) imply AxS. Every arm states every new switch, empty without its part, so a window's
+  # VAR=val cannot turn one on; the window's AUX_SHARE_* / AUX_ONLINE_* set the sub-switches of the arms that have
+  # the part. A serve arm needs an Axv arm of this window with the same feature on the same library (AXV_OK_O for
+  # AxO, AXV_OK_T for the sharing parts) and the auxswap device check (AUX_SWAP_OK).
+  [[ -n "$axt$axten" && -z "$axs" ]] && axs=allow
+  if [[ -n "$axs$axo" ]] && [[ -z "$ax" || "$ax" == 0 ]]; then
+    log "arm $a: an AxS / AxT / AxF / AxO part needs an Ax or Axv part; the arm is skipped"; skip=1
+  fi
+  if [[ -n "$axs$axo" && -n "$kld" ]]; then
+    log "arm $a: AxS / AxO with Kld (a prefill-only corpus: no decode token to count, nothing to toggle); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$axten" && ( -z "${AUX_TENANT:-}" || ! -x "${AUX_TENANT:-/nonexistent}" ) ]]; then
+    log "arm $a: AxF needs AUX_TENANT (the aux_tenant binary of the window's device checks); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$axs$axo" && -n "$ax" && "$ax" != 0 && -z "$skip" ]]; then
+    if [[ -z "${AUX_SWAP_OK:-}" || "$axsum" != "${AUX_SWAP_SUM:-}" ]]; then
+      log "arm $a: AxS / AxO refused: ${AUX_SWAP_WHY:-no auxswap device check passed on this library (DEVICE_CHECKS=aux with an AxS / AxO arm)}"; skip=1
+    elif [[ -z "$axv" && -n "$axo" && ( -z "${AXV_OK_O:-}" || "$axsum" != "${AXV_SUM_O:-}" ) ]]; then
+      log "arm $a: AxO refused: no Axv arm of this window with AxO compared the worker's rows on this library (run one first)"; skip=1
+    elif [[ -z "$axv" && -n "$axs" && ( -z "${AXV_OK_T:-}" || "$axsum" != "${AXV_SUM_T:-}" ) ]]; then
+      log "arm $a: AxS / AxT / AxF refused: no Axv arm of this window with a sharing part compared the worker's rows on this library (run one first)"; skip=1
+    fi
+  fi
+  ARM_AXS=$axs ARM_AXO=$axo ARM_AXOD=$axod ARM_AXTOG=$axt ARM_AXTEN=$axten ARM_AXCTL=""
+  ARM_AXO_STR=""; [[ -n "$axo" ]] && ARM_AXO_STR=$(awk -v r="$axo" 'BEGIN { printf "%.2f", r / 100 }')
+  [[ -n "$axs" ]] && ARM_AXCTL=$OUT/$a.aux-ctl
+  ax_reacq=${AUX_SHARE_REACQUIRE_S:-}; [[ -n "$axt" ]] && ax_reacq=0; [[ -n "$axten" ]] && ax_reacq=5
+  env+=(RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE=$axs RADIANCE_EXPERIMENTAL_DS41_AUX_CONTROL=$ARM_AXCTL
+        "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_ALLOW=$([[ $axs == allow ]] && echo "${AUX_SHARE_ALLOW:-^whisper}")"
+        RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_FOREIGN_MIB=$([[ $axs == allow ]] && echo "${AUX_SHARE_FOREIGN_MIB:-6144}")
+        RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_MIN_MIB=${axs:+${AUX_SHARE_MIN_MIB:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_FLOOR_MIB=${axs:+${AUX_SHARE_FLOOR_MIB:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_POLL_MS=${axs:+${AUX_SHARE_POLL_MS:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_RELEASE_POLLS=${axs:+${AUX_SHARE_RELEASE_POLLS:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_REACQUIRE_S=${axs:+$ax_reacq}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_FILL_MBPS=${axs:+${AUX_SHARE_FILL_MBPS:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE=${axo:+1} RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_RATE=${axo}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_MAX=${axo:+${AUX_ONLINE_MAX:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_EVERY=${axo:+${AUX_ONLINE_EVERY:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_HALFLIFE=${axo:+${AUX_ONLINE_HALFLIFE:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_PRIOR=${axo:+${AUX_ONLINE_PRIOR:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_MARGIN=${axo:+${AUX_ONLINE_MARGIN:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_SPARE=${axo:+${AUX_ONLINE_SPARE:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_MBPS=${axo:+${AUX_ONLINE_MBPS:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_CHECK=${axo:+${AUX_ONLINE_CHECK:-}}
+        RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_DRY=${axod})
   [[ -n "$skip" ]] && continue
   # The extra card's clients at the arm's start (it is shared): only allowed tenants, and room for the cap.
   if [[ -n "$ax" ]] && ! aux_clients_gate "$a" "$ax"; then continue; fi

@@ -72,6 +72,32 @@ struct Job {
     int rank = 0, world = 1;
 };
 
+/* Card sharing's gate (work/aux-dyn/SPEC.md §3.3): the control thread shuts it before it drains the lanes and
+ * frees the arena; a rank holds its in_lane entry from hx_choose's decision to the layer's last lane call (a
+ * Dekker pair: seq_cst on both stores and both loads), and the step boundary holds it on a parked rank's behalf
+ * while it polls the lane. Made only with a controller (Config::controller()); null otherwise. */
+constexpr int kMaxGateRanks = 8;
+struct Gate {
+    std::atomic<bool>    closed{ false };
+    std::atomic<uint8_t> in_lane[kMaxGateRanks]{};
+    /* The rank side: false (nothing held) when the gate is shut. */
+    bool enter(int r) {
+        in_lane[r].store(1, std::memory_order_seq_cst);
+        if (closed.load(std::memory_order_seq_cst)) {
+            in_lane[r].store(0, std::memory_order_seq_cst);
+            return false;
+        }
+        return true;
+    }
+    void leave(int r) { in_lane[r].store(0, std::memory_order_release); }
+    /* The control side, after closed.store(true): whether any rank still holds its lane. */
+    bool busy(int n) const {
+        for (int r = 0; r < n && r < kMaxGateRanks; ++r)
+            if (in_lane[r].load(std::memory_order_seq_cst)) return true;
+        return false;
+    }
+};
+
 /* A rank's queue on the extra card (DeviceLane), or a fake in the tests. One job in flight at most: one
  * routed layer is in flight per rank, and the queue is in order. */
 class Lane {
@@ -101,6 +127,12 @@ public:
     virtual bool drain(int64_t timeout_ns) = 0;
     /* Why the lane died ("" while alive). */
     virtual std::string why_dead() const = 0;
+    /* A release's drain (work/aux-dyn/SPEC.md A.5): as drain(), and a lane retired by a host-side refusal (a job's
+     * shape, a copy or launch the queue refused, with no fault seen) is probed too, so a release can free the
+     * arena; a lane that faulted (a failed query, a device fault) is never drained. */
+    virtual bool drain_release(int64_t timeout_ns) { return drain(timeout_ns); }
+    /* The lane died of a device fault or a failed query (not drainable). */
+    virtual bool faulted() const { return false; }
 };
 
 /* One rank's part of the worker: which of its plan units are resident, their slots, and the layer tables. */
@@ -126,9 +158,11 @@ struct Stats {
     uint64_t uncached = 0, late = 0, forced_late = 0, fallback_units = 0, fallback_rows = 0, fallback_ns = 0;
     uint64_t failed = 0, wait_ns = 0, submit_ns = 0, rt_sum_ns = 0, rt_max_ns = 0, rt_n = 0;
     uint64_t verified = 0, differ_rows = 0, differ_values = 0, not_compared = 0;
+    uint64_t declined_released = 0;   /* card sharing: a layer whose rank found the gate shut */
 };
-/* The shutdown line of rank r (ds41aux::kLogRank). */
-std::string stats_line(int r, const Stats& s);
+/* The shutdown line of rank r (ds41aux::kLogRank); `released`: with a controller, the declines while released
+ * ("..., L while released" after "... after it failed"). */
+std::string stats_line(int r, const Stats& s, bool released = false);
 
 class DeviceLane;
 
@@ -144,8 +178,33 @@ public:
      * of at least the headroom after it. The caller's current device is restored. < 0 with *why: off. */
     int  reserve(int restore_device, std::string* why);
     /* The arena's regions for `ranks` x `layers` and `slots` units of `L`'s stride, and a lane per rank (on
-     * the extra card; the caller's device restored). < 0 with *why: off. */
+     * the extra card; the caller's device restored). < 0 with *why: off. carve() then make_lanes(). */
     int  build(int layers, int64_t slots, const ds41aux::Layout& L, int restore_device, std::string* why);
+    /* work/aux-dyn/SPEC.md §3.6. carve: the regions of the arena (reserve()d) and the views' tables; the lanes made
+     * already get their workspaces (set_ws: their queues idle, the gate shut). make_lanes: a lane per rank (queues,
+     * events, pinned record and rows: nothing in the arena; a lane made without an arena has no workspace until
+     * a carve). release_arena: every lane and the swap queue drained (the caller's word), the arena freed with the
+     * extra card bound (then restore_device bound, when >= 0); the lanes keep their queues. has_arena: an arena is
+     * held. */
+    int  carve(int layers, int64_t slots, const ds41aux::Layout& L, std::string* why);
+    /* A released start (no arena): the shape carve() will use at the first acquire, and the views (no unit, no
+     * table); then make_lanes(). */
+    void plan(int layers, int64_t slots, const ds41aux::Layout& L);
+    int  make_lanes(int restore_device, std::string* why);
+    void release_arena(int restore_device = -1);   /* -1: the extra card stays the current device */
+    bool has_arena() const { return arena_ != nullptr; }
+    /* The tables written from `image` (the control thread's mirror: ranks x layers x 2 x kExperts words), read back
+     * and compared, as load_tables() does from the views. */
+    int  load_tables_image(const uint64_t* image, std::string* why);
+    /* The views' entries as a table image (the control thread's mirror after the startup load). */
+    std::vector<uint64_t> table_image() const;
+    int  layers() const { return layers_; }
+    /* The control thread's teardown: its swap queue did not drain, so the arena stays (finish() says so). */
+    void set_swap_undrained() { swap_undrained_ = true; }
+    /* The units held, as the control thread counts them (-1: the views' count, the merged worker's). */
+    void set_units_held(int64_t n) { units_held_.store(n, std::memory_order_relaxed); }
+    /* finish() with a controller: lanes retired by a refusal are probed (Lane::drain_release). */
+    void set_release_drain(bool on) { release_drain_ = on; }
     /* The tables of every rank (the views' entries) to the card, read back and compared. */
     int  load_tables(std::string* why);
     /* A free-VRAM check on the extra card against the headroom (after the lanes' code objects loaded). */
@@ -191,6 +250,9 @@ private:
     bool    drained_ = true;   /* finish() found every lane idle: streams and arena may be freed */
     bool    finished_ = false;
     int64_t load_wait_ns_ = 10'000'000'000LL;
+    bool    swap_undrained_ = false, release_drain_ = false;
+    std::atomic<int64_t> units_held_{ -1 };
+    int  load_tables_with(void (*fill)(const Worker*, const void*, uint64_t*), const void* ctx, std::string* why);
 };
 
 /* A rank's lane on the extra card: an AQL queue, a host-waitable event, the pinned record and output rows
@@ -210,6 +272,10 @@ public:
     void abandon(bool backoff) override;
     bool drain(int64_t timeout_ns) override;
     std::string why_dead() const override { return why_dead_; }
+    bool drain_release(int64_t timeout_ns) override;
+    bool faulted() const override { return dead_ && fault_; }
+    /* A new workspace (an acquire's arena; null at a release): the lane idle, the gate shut. */
+    void set_ws(char* ws) { ws_ = ws; }
     /* The loader's use of the queue (FileStager::aux_load): copies on it and a bounded wait for them. */
     RadStream stream() const { return s_; }
     RadEvent  event() const { return ev_; }
@@ -224,7 +290,9 @@ public:
     bool dead() const { return dead_; }
 
 private:
-    int  retire(const char* step, int rc);
+    /* `fault`: a failed query or a device fault (the queue's state unknown: never drained); otherwise a host-side
+     * refusal, which drain_release probes. */
+    int  retire(const char* step, int rc, bool fault = false);
     int  dev_, rank_;
     char* ws_;                  /* VRAM: in (ds41aux::ws()'s record layout), gu_out, act, dn_out */
     RadStream s_ = nullptr;
@@ -235,7 +303,7 @@ private:
     bool      job_ok_ = false;  /* its every step succeeded, its record included */
     bool      abandoned_ = false, backoff_after_ = false;
     int64_t   backoff_ = 0, backoff_left_ = 0;
-    bool      dead_ = false, leaked_ = false;
+    bool      dead_ = false, leaked_ = false, fault_ = false;
     std::string why_dead_;
 };
 

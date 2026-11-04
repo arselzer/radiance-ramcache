@@ -4764,7 +4764,7 @@ int Engine::start() {
             if (aux_) dev_bytes -= aux_ledger_;
             dev_count -= 1;
             RAD_INFO("device allocations on the aux worker's card: its arena of %s%s", humanb(aux_ledger_).c_str(),
-                     aux_ ? "" : " (freed: the worker is off)");
+                     !aux_ ? " (freed: the worker is off)" : !aux_->has_arena() ? " (freed: the card was released)" : "");
         }
         RAD_INFO("device allocations: %lld totalling %s, of which %s is the two pools -- the rest "
                  "is the activation arena and the step staging. Anything on the card past this is "

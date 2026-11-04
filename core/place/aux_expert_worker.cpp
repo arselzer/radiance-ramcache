@@ -380,16 +380,18 @@ int Worker::reserve(int restore_device, std::string* why) {
         return RAD_E_NOMEM;
     }
     RadDeviceProps p{};
-    free_after_ = rad_dev_props(card_.ord, &p) >= 0 ? p.vram_free : -1;
-    if (free_after_ < (cfg_.headroom_mib << 20)) {
+    const int64_t free_after = rad_dev_props(card_.ord, &p) >= 0 ? p.vram_free : -1;
+    free_after_.store(free_after, std::memory_order_relaxed);
+    if (free_after < (cfg_.headroom_mib << 20)) {
         *why = fmt("after the arena of %lld MiB device %d has %s free, under the headroom of %lld MiB",
-                   (long long)cfg_.cap_mib, card_.ord, humanb(free_after_ < 0 ? 0 : free_after_).c_str(),
+                   (long long)cfg_.cap_mib, card_.ord, humanb(free_after < 0 ? 0 : free_after).c_str(),
                    (long long)cfg_.headroom_mib);
         rad_dev_free(arena_, RAD_MEM_DEVICE);
         arena_ = nullptr;
         (void)rad_dev_set(restore_device);
         return RAD_E_NOMEM;
     }
+    arena_present_.store(true, std::memory_order_release);
     (void)rad_dev_set(restore_device);
     return RAD_OK;
 }
@@ -472,7 +474,8 @@ void Worker::release_arena(int restore_device) {
         if (restore_device >= 0) (void)rad_dev_set(restore_device);
     }
     arena_ = tables_ = ws_ = slots_ = nullptr;
-    free_after_ = -1;
+    free_after_.store(-1, std::memory_order_relaxed);
+    arena_present_.store(false, std::memory_order_release);
 }
 
 char* Worker::table(int r, int li, int which) const {

@@ -139,7 +139,10 @@ int fake_dn(const RadArgs* a, RadStream s) {
 int job_errors(const JobCtx& c, std::string* first) {
     int bad = 0;
     for (int i = 0; i < c.n; ++i) {
-        const bool ok = c.got[i * 4 + 0] == c.want_entry[i] && c.got[i * 4 + 2] == c.want_tag[i] &&
+        const uint64_t want_dn = (uint64_t)(uintptr_t)ds41p1::mark(c.slot[i] + ds41aux::layout(kGu, kDn).dn_off,
+                                                                   ds41p1::kMarkPacked);
+        const bool ok = c.got[i * 4 + 0] == c.want_entry[i] && c.got[i * 4 + 1] == want_dn &&
+                        c.got[i * 4 + 2] == c.want_tag[i] &&
                         c.got[i * 4 + 3] == (c.want_tag[i] | 1);
         if (!ok && first->empty())
             *first = rad::fmt("rank %d expert %d: entry 0x%llx (want 0x%llx), tags 0x%llx / 0x%llx (want 0x%llx)", c.r,
@@ -178,8 +181,10 @@ struct Rig {
     std::atomic<int> warmups{ 0 }, leases{ 0 };
     int64_t slots = 56, quota = 12;
     std::string ctl_path;
+    bool started_released = false;
 
-    explicit Rig(bool controller, const std::string& name) {
+    explicit Rig(bool controller, const std::string& name, bool released_start = false)
+        : started_released(released_start) {
         cfg.on = true;
         cfg.cap_mib = 16;
         cfg.headroom_mib = 0;
@@ -206,10 +211,21 @@ struct Rig {
         card.name = "fake";
         w.reset(new rad::aux::Worker(cfg, card, { 0, 1, 2, 3 }));
         std::string why;
-        MUST((w->reserve(0, &why)) >= 0);
-        MUST((w->build(kLayers, slots, L, 0, &why)) >= 0);
+        if (released_start) {
+            MUST(controller);
+            w->plan(kLayers, slots, L);
+            MUST((w->make_lanes(0, &why)) >= 0);
+            /* Exercise the real busy/off-start path: no aux_load has sized or populated these views. */
+            for (int r = 0; r < kR; ++r) {
+                MUST(w->view(r).resident.empty());
+                MUST(w->view(r).slot.empty());
+            }
+        } else {
+            MUST((w->reserve(0, &why)) >= 0);
+            MUST((w->build(kLayers, slots, L, 0, &why)) >= 0);
+        }
         /* The startup set: each rank's first `quota` candidates (unit order is the share order here). */
-        for (int r = 0; r < kR; ++r) {
+        for (int r = 0; !released_start && r < kR; ++r) {
             rad::aux::RankView& v = w->view(r);
             v.resident.assign(kPlan, 0);
             v.slot.assign(kPlan, -1);
@@ -229,7 +245,7 @@ struct Rig {
                 v.share += (double)(kPlan - u) * 1e-3;
             }
         }
-        MUST((w->load_tables(&why)) >= 0);
+        if (!released_start) MUST((w->load_tables(&why)) >= 0);
         ctl.reset(new rad::aux::Control(cfg, card, kR));
         if (controller) MUST((ctl->init_share(fake_roots(name), (long)::getpid(), &why)) >= 0);
         std::vector<rad::aux::RankUnits> units(kR);
@@ -275,7 +291,8 @@ struct Rig {
         };
         h.guard_tripped = [](int) { return false; };
         h.kfd_available = [] { return (int64_t)-1; };
-        MUST((ctl->attach(w.get(), std::move(h), std::move(units), kLayers, slots, L, false, "", &why)) >= 0);
+        MUST((ctl->attach(w.get(), std::move(h), std::move(units), kLayers, slots, L, released_start,
+                         released_start ? "the card was busy at startup" : "", &why)) >= 0);
     }
     void mode(const char* m) { MUST(ds41aux::share::write_atomic(ctl_path, std::string(m) + "\n")); }
     std::string state() { return slurp(ctl_path + ".state"); }
@@ -284,6 +301,7 @@ struct Rig {
 /* Four rank threads and a scheduler in lockstep for `seconds`; `tick` runs on the scheduler between passes. */
 struct Run {
     int errors = 0, jobs = 0, late = 0, declined = 0, view_changes = 0;
+    int jobs_by_rank[kR] = {}, jobs_after_reacquire[kR] = {};
     std::string first;
 };
 Run run_passes(Rig& g, double seconds, uint32_t seed, const std::function<void(int64_t)>& tick) {
@@ -368,6 +386,8 @@ Run run_passes(Rig& g, double seconds, uint32_t seed, const std::function<void(i
                         const int got = lane->wait(now_ns() + (hold ? 100'000 : 2'000'000'000LL));
                         std::lock_guard<std::mutex> lk(mu);
                         ++out.jobs;
+                        ++out.jobs_by_rank[r];
+                        if (g.started_released && g.ctl->snapshot().acquires >= 2) ++out.jobs_after_reacquire[r];
                         if (got == 1) {
                             out.errors += job_errors(*c, &out.first);
                         } else {
@@ -514,6 +534,99 @@ TEST(online_alone_swaps_without_a_gate) {
     CHECK(s.swaps > 0);
     CHECK_EQ(s.differ, (uint64_t)0);
     CHECK(run.view_changes == 0);
+    CHECK(g.w->drained());
+    g.ctl.reset();
+    g.w.reset();
+}
+
+TEST(a_released_start_publishes_units_and_executes_jobs_after_reacquiring) {
+    Rig g(/*controller=*/true, "fence-released", /*released_start=*/true);
+    CHECK(!g.w->has_arena());
+    for (int r = 0; r < kR; ++r) {
+        CHECK_EQ(g.w->view(r).resident.size(), (size_t)kPlan);
+        CHECK_EQ(g.w->view(r).slot.size(), (size_t)kPlan);
+        CHECK_EQ(g.w->view(r).units, (int64_t)0);
+    }
+    REQUIRE(g.ctl->gate() != nullptr);
+    CHECK(g.ctl->gate()->closed.load());
+    g.mode("on");
+    g.ctl->start();
+    int phase = 0;
+    int64_t next = now_ns() + 600'000'000LL;
+    const Run run = run_passes(g, 2.5, 11, [&](int64_t t) {
+        if (phase >= 2 || t < next) return;
+        g.mode(phase++ == 0 ? "off" : "on");
+        next = t + 600'000'000LL;
+    });
+    const rad::aux::Control::Snapshot s = g.ctl->snapshot();
+    if (!run.first.empty()) std::fprintf(stderr, "first error: %s\n", run.first.c_str());
+    CHECK_EQ(run.errors, 0);
+    CHECK_EQ(run.view_changes, 0);
+    CHECK(s.releases >= 1);
+    CHECK(s.acquires >= 2);
+    CHECK(s.readbacks > 0);
+    CHECK_EQ(s.differ, (uint64_t)0);
+    CHECK(!contains(s.state, "dead"));
+    for (int r = 0; r < kR; ++r) {
+        CHECK(run.jobs_by_rank[r] > 0);
+        CHECK(run.jobs_after_reacquire[r] > 0);
+        CHECK(g.w->view(r).units > 0);
+    }
+    (void)g.w->finish((uint64_t)run.jobs, 0, (uint64_t)run.late);
+    CHECK(g.w->drained());
+    g.ctl.reset();
+    g.w.reset();
+}
+
+TEST(online_alone_keeps_a_bad_table_arena_until_rank_shutdown) {
+    Rig g(/*controller=*/false, "fence-bad-table");
+    REQUIRE(g.ctl->gate() == nullptr);
+    /* Expert 255 is outside this fixture's candidate set (0..19): no job or unit copy touches this word. Only the
+     * real periodic whole-table read-back detects it, without introducing an unrelated unit-copy failure. */
+    const uint64_t corrupt = 0xBAD0000000000001ull;
+    std::memcpy(g.w->table(0, 0, 0) + (ds41aux::kExperts - 1) * 8, &corrupt, sizeof corrupt);
+    g.ctl->start();
+    int phase = 0;
+    bool saw_stopped_live = false, saw_cleared_live = false;
+    int64_t next = now_ns();
+    const Run run = run_passes(g, 6.0, 19, [&](int64_t t) {
+        const rad::aux::Control::Snapshot s = g.ctl->snapshot();
+        if (s.online_stopped) {
+            saw_stopped_live = true;
+            /* All rank threads still exist here; the online-only controller has no gate to own their lanes. */
+            MUST(g.w->has_arena());
+            bool clear = true;
+            for (int r = 0; r < kR; ++r) clear = clear && g.w->view(r).units == 0;
+            saw_cleared_live = saw_cleared_live || clear;
+            return;
+        }
+        if (t < next) return;
+        next = t + 20'000'000LL;
+        /* Churn the hot set through the existing hit hand-off until the production 1000-swap table-check threshold.
+         * A small stationary fake workload would settle and never exercise that failure path. */
+        for (int r = 0; r < kR; ++r) {
+            g.tok[(size_t)r] += 32;
+            for (int i = 0; i < (int)g.quota; ++i)
+                g.hits[(size_t)r][(size_t)((phase * 13 + i) % kPlan)] += 1'000'000;
+        }
+        ++phase;
+    });
+    const rad::aux::Control::Snapshot s = g.ctl->snapshot();
+    for (const std::string& l : g.ctl->report()) std::fprintf(stderr, "%s\n", l.c_str());
+    if (!run.first.empty()) std::fprintf(stderr, "first error: %s\n", run.first.c_str());
+    CHECK(s.swaps >= 1000);
+    CHECK(s.online_stopped);
+    CHECK(saw_stopped_live);
+    CHECK(saw_cleared_live);
+    CHECK(g.w->has_arena());
+    CHECK_EQ(run.errors, 0);
+    CHECK_EQ(run.view_changes, 0);
+    CHECK(run.jobs > 0);
+    bool table_failure = false;
+    for (const std::string& l : g.ctl->report())
+        table_failure = table_failure || contains(l, "stopped: the tables read back differ");
+    CHECK(table_failure);
+    (void)g.w->finish((uint64_t)run.jobs, 0, (uint64_t)run.late);
     CHECK(g.w->drained());
     g.ctl.reset();
     g.w.reset();

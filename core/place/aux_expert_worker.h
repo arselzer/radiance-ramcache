@@ -192,7 +192,7 @@ public:
     void plan(int layers, int64_t slots, const ds41aux::Layout& L);
     int  make_lanes(int restore_device, std::string* why);
     void release_arena(int restore_device = -1);   /* -1: the extra card stays the current device */
-    bool has_arena() const { return arena_ != nullptr; }
+    bool has_arena() const { return arena_present_.load(std::memory_order_acquire); }
     /* The tables written from `image` (the control thread's mirror: ranks x layers x 2 x kExperts words), read back
      * and compared, as load_tables() does from the views. */
     int  load_tables_image(const uint64_t* image, std::string* why);
@@ -215,7 +215,7 @@ public:
     int                  device() const { return card_.ord; }
     int                  n_ranks() const { return (int)ranks_.size(); }
     int64_t              arena_bytes() const { return arena_bytes_; }
-    int64_t              free_after() const { return free_after_; }
+    int64_t              free_after() const { return free_after_.load(std::memory_order_relaxed); }
     const ds41aux::Layout& layout() const { return layout_; }
     char*                slot(int64_t k) const { return slots_ + k * layout_.stride; }
     int64_t              n_slots() const { return n_slots_; }
@@ -238,7 +238,11 @@ private:
     ds41aux::Card card_;
     std::vector<int> ranks_;
     char*   arena_ = nullptr;
-    int64_t arena_bytes_ = 0, free_after_ = -1;
+    int64_t arena_bytes_ = 0;
+    /* Logging can observe the startup watch/control thread giving the card back. The pointers themselves remain
+     * owned under the startup hand-off or the closed/drained gate; observers use these status snapshots only. */
+    std::atomic<bool> arena_present_{ false };
+    std::atomic<int64_t> free_after_{ -1 };
     int     layers_ = 0;
     ds41aux::Layout layout_{};
     char*   tables_ = nullptr;

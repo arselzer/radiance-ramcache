@@ -259,9 +259,20 @@ int Control::attach(Worker* w, Hooks hooks, std::vector<RankUnits> units, int la
     inbox_.tok.assign((size_t)R_, 0);
     for (int r = 0; r < R_; ++r) {
         const RankUnits& u = units_[(size_t)r];
-        if (u.li.size() != u.cands.size()) {
+        if (u.n_plan_units < 0 || u.li.size() != u.cands.size()) {
             *err = "the control thread's candidates";
             return RAD_E_STATE;
+        }
+        if (released) {
+            /* A busy/off startup used Worker::plan(), never aux_load(), so its fresh views have no plan-unit
+             * domain yet. Size it before the stagers run: later boundary flips must be able to publish units. */
+            RankView& v = w_->view(r);
+            v.resident.assign((size_t)u.n_plan_units, 0);
+            v.slot.assign((size_t)u.n_plan_units, -1);
+            v.gu_tab_entries.assign((size_t)layers_ * ds41aux::kExperts, nullptr);
+            v.dn_tab_entries.assign((size_t)layers_ * ds41aux::kExperts, nullptr);
+            v.units = 0;
+            v.share = 0;
         }
         cidx_[(size_t)r].assign((size_t)u.n_plan_units, -1);
         for (size_t i = 0; i < u.cands.size(); ++i) {
@@ -450,10 +461,11 @@ void Control::poll_share(int64_t now) {
     const Mode m = h.empty() ? fm : Mode::kOff;
     const std::string src = !h.empty() ? (h.size() == 1 ? "holder " + h[0] : fmt("%zu holders", h.size()))
                                        : cfg_.control.empty() ? "default" : "control file";
+    std::unique_lock<std::mutex> lk(start_mu_);
+    /* attach() publishes the startup state under this mutex too; its mode/source reads must not race a poll. */
     const bool mode_changed = m != mode_ || src != mode_src_;
     mode_ = m;
     mode_src_ = src;
-    std::unique_lock<std::mutex> lk(start_mu_);
     const St s0 = fsm_.state();
     const bool serving_like = s0 == St::kServing || s0 == St::kLoading || s0 == St::kStarting || s0 == St::kDraining;
     sh::Poll p = probe_.poll(now, cfg_.min_mib << 20);
@@ -1009,7 +1021,7 @@ bool Control::service(int64_t) {
     const int64_t now_ns = mono_ns();
     take_reports();
     const St s = ctl_ ? fsm_.state() : St::kServing;
-    const bool arena = w_->has_arena() && (s == St::kServing || s == St::kLoading);
+    const bool arena = dead_word_.empty() && w_->has_arena() && (s == St::kServing || s == St::kLoading);
     if (online_) merge_and_plan(now_ns);
     if (arena && filling_ && !await_open_) plan_fills(now_ns);
     bool busy = arena && executor_step(now_ns);
@@ -1377,6 +1389,13 @@ bool Control::executor_step(int64_t now_ns) {
             stop_online(tables ? "the tables read back differ" : "a read-back differs");
             if (tables) {
                 /* A table the jobs read may be wrong: the CPU path from here on. */
+                if (!gate_) {
+                    /* Online alone has no card-sharing gate: the rank threads still own their lanes. Ask the
+                     * next boundary to clear every view and retain the arena until teardown after ranks join;
+                     * this thread cannot drain/free it concurrently with their submissions. */
+                    dead(false, "the tables read back differ from what was written");
+                    return false;
+                }
                 int64_t g = 0, l = 0, s = 0;
                 std::string dw;
                 const bool dr = drain_for_release(&dw, &g, &l, &s);

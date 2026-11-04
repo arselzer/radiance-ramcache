@@ -1,8 +1,7 @@
-# radiance-ramcache: DeepSeek-V4.1-Flash at full precision on four RX 9070 XT
+# radiance-ramcache: DeepSeek-V4.1-Flash with native MXFP4 experts on four RX 9070 XT
 
 This is a fork of [radiance](https://codeberg.org/StillDeadcode/radiance) tuned for one job: serving
-DeepSeek-V4.1-Flash (ds41) at its released precision (FP8 dense weights, MXFP4 routed experts, nothing
-quantized further) on a workstation with four 16 GB Radeon RX 9070 XT cards (gfx1201, tensor parallel 4)
+DeepSeek-V4.1-Flash (ds41) with its native MXFP4 routed experts on a workstation with four 16 GB Radeon RX 9070 XT cards (gfx1201, tensor parallel 4)
 and an AMD EPYC 7443 (Zen 3 "Milan", 24 cores) with 256 GB of DDR4-2666. The routed experts (about
 289 GB) do not fit in the cards' 64 GB, so the hottest experts stay in VRAM, most of the rest sit in a
 192 GiB packed RAM cache whose experts the CPU computes, and the remainder is read from NVMe. Every
@@ -10,6 +9,13 @@ optimization is exact: replies stay byte-identical to the base engine's, which e
 checks by comparing replies, prefill hashes and logits. [RAMCACHE.md](RAMCACHE.md) lists what the fork
 adds; [tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md) has the configuration,
 the switches and every measurement. Below the line is upstream's README, unchanged.
+
+**Checkpoint precision:** the model used for these results preserves the official 1017 release's
+MXFP4 expert codes/scales, but uses ISTA IQ4_NL Engram tables and BF16/F32 conversions of other
+official neural weights. It is a hybrid, not an entirely untouched official-precision checkpoint.
+The IQ2_XS supplement supplies integer Engram controls only, not IQ2 neural weights. Exactness
+checks compare with this same imported baseline; a complete original-source audit of nonexpert
+conversions remains outstanding. Restoring official FP8 Engram requires a new qualified baseline.
 
 Latest numbers (November 2026): the recommended configuration on the `ds41-stable` branch (radiance
 1.15 base). On the cards, `main` (radiance 1.16) matched that line with identical replies and logits at

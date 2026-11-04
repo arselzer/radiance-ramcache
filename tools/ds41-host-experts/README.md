@@ -741,8 +741,19 @@ deadline 2000 us, backoff 64, headroom 1024 MiB.
 - Every 4th job forced late (`Axf`, backoff 0): 584-648 forced misses a rank, 813-954 rows a rank recomputed on the CPU,
   replies identical, 49.58 tok/s at 4 streams.
 
-Caveats: one window; the held-out prompts only; the unit set is static, from the decode profile, so traffic that routes
-differently gains less; BoltzGen idle (the extra card had no compute client but whisper-server).
+**Window F2** (ab-20261104T064211Z, the stable build of this branch, libr4d 92bd7719 with its own `DEVICE_CHECKS=aux` pass
+and an `Axv` arm, 0 rows differ): every reply identical with the worker on and off (8 held-out = the base engine's, 16
+chat prompts, 13 harness turns).
+- **Chat prompts** (the 16 of `Uchat`, 8 streams with batch admission, A-B-B-A): 38.90 and 38.39 tok/s without, 45.82
+  and 46.48 with the worker (+19.4%); wave 30.79 and 29.82 s against 27.26 and 25.77 s.
+- **Harness turns** (the 13 of `Uharness` with `Pc-Pce-Pcg16` at `Lm32768`, one stream, A-B-B-A): decode 25.31 and
+  26.08 tok/s without, 29.42 and 29.55 with it (+14.7%); summed time to first token 76.35 / 72.20 against 71.96 /
+  72.89 s (unchanged: prefill passes of more than 16 rows stay on their usual path); all 13 turns 125.38 / 119.74
+  against 114.00 / 114.65 s.
+
+Caveats: two windows; the unit set is static, from the decode profile, so traffic that routes differently gains less
+(chat +19% against +24% on the held-out prompts at 8 streams); BoltzGen idle (the extra card had no compute client
+but whisper-server).
 
 Startup lines `aux experts: device D (BDF, name, arch): ...` and `aux experts: on: N units ...` (or
 `aux experts: off: <why>`); shutdown lines `aux experts: rank R: ...` (layer jobs, units and rows on the extra card of

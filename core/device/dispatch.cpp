@@ -607,6 +607,10 @@ bool dev_faulted(int device) {
     const auto f = dev()->device_faulted;
     return f && f(device) > 0;
 }
+int64_t dev_card_available(int device) {
+    const auto f = dev()->card_available;
+    return f ? f(device) : -1;
+}
 
 }  /* namespace rad */
 

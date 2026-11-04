@@ -40,6 +40,7 @@
 #include "format/dspark_rad_banks.h"
 #include "place/vram_packed.h"
 #include "place/aux_expert_worker.h"
+#include "place/aux_control.h"
 #include "place/draft_vram.h"
 #include "place/draft_bank_lend.h"
 #include "lora/adapter.h"
@@ -799,6 +800,15 @@ private:
     int  aux_discover(const std::vector<int>& devs);
     int  aux_start();
     void aux_off(const std::string& why, bool warn);
+    /* work/aux-dyn/SPEC.md: the control thread (card sharing, manual control, the online set), only when a switch
+     * asks for it (Config::control_thread()); null otherwise, and then nothing below runs. Declared after aux_ so
+     * an implicit destruction ends it first. aux_ctl_stop: the thread stopped (idempotent), before the worker's
+     * teardown. aux_released_why_: why discovery left the card released (a released start). */
+    std::unique_ptr<aux::Control> aux_ctl_;
+    std::string                   aux_released_why_;
+    void aux_ctl_stop() {
+        if (aux_ctl_) aux_ctl_->stop();
+    }
     /* Syscall-only facts (diag::probe_process), read once at the first report: the memlock limit
      * cannot change under a running process, and the io_uring probe need not repeat per
      * /diagnostics request. */

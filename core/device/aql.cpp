@@ -4432,6 +4432,7 @@ void* a_alloc_pinned_on(int64_t bytes, const int* ords, int n) {
 
 /* rad::dev_faulted (device.h): a device outside a restricting pin set faulted (its own faults). */
 int a_device_faulted(int device) { return scoped_faulted(device) ? 1 : 0; }
+int64_t a_card_available(int device) { return card_available(device); }
 
 /* Every free invalidates locate()'s cache first. */
 void (*g_hip_free)(void*, int) = nullptr;
@@ -4584,6 +4585,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.pin_devices = a_pin_devices;
         g_aql.alloc_pinned_on = a_alloc_pinned_on;
         g_aql.device_faulted = a_device_faulted;
+        g_aql.card_available = a_card_available;
         return &g_aql;
     }();
     return b;

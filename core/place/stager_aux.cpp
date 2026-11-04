@@ -181,7 +181,7 @@ int FileStager::aux_resolve(std::string* why) {
 /* ---- loading (work/aux/SPEC.md §6) ---------------------------------------------------------------- */
 
 int FileStager::aux_load(aux::Worker* w, int r, const std::vector<int32_t>& list, int64_t first, int64_t quota,
-                         AuxLoadStats* st, std::string* why) {
+                         AuxLoadStats* st, std::string* why, const std::atomic<bool>* abort) {
     *st = AuxLoadStats{};
     aux::DeviceLane* lane = w->device_lane(r);
     if (!lane || !plan_ || !mover_) {
@@ -224,6 +224,7 @@ int FileStager::aux_load(aux::Worker* w, int r, const std::vector<int32_t>& list
     int64_t k = 0;
     for (int32_t u : list) {
         if (k >= quota) break;
+        if (abort && abort->load(std::memory_order_acquire)) break;   /* card sharing: released during the load */
         const MoveUnit& mu = plan_->units[(size_t)u];
         const int32_t li = (size_t)u < li_of.size() ? li_of[(size_t)u] : -1;
         const int e = mu.expert;
@@ -348,6 +349,28 @@ int FileStager::aux_warm(aux::Worker* w, int r, std::string* why) {
         }
     }
     if (u < 0) return RAD_OK;   /* nothing resident and cached on this rank: its lane takes no job anyway */
+    return aux_warm_job(lane, u, li, &hu, v.gu_tab[(size_t)li], v.dn_tab[(size_t)li], r, why);
+}
+
+int FileStager::aux_warm_unit(aux::Lane* lane, int32_t u, int32_t li, const void* gu_tab, const void* dn_tab,
+                              std::string* why) {
+    if (!lane || !hx_pool_ || !plan_ || li < 0 || (size_t)li >= aux_rows_.size() || !aux_rows_[(size_t)li].ok) {
+        *why = fmt("rank %d has no lane, pool or usable rows for routed layer %d", plan_ ? plan_->rank : -1, li);
+        return RAD_E_STATE;
+    }
+    Mover::HostUnit hu;
+    if (!mover_->borrow_host_unit(u, &hu, /*touch=*/false)) return RAD_OK;   /* evicted since its copy: none */
+    if (hu.n != 2 || !hu.packed) {
+        mover_->release_host_unit(&hu);
+        return RAD_OK;
+    }
+    return aux_warm_job(lane, u, li, &hu, gu_tab, dn_tab, plan_->rank, why);
+}
+
+/* One token row on unit u's expert, against the CPU pool's rows from the same lease (`hu`, given back here). */
+int FileStager::aux_warm_job(aux::Lane* lane, int32_t u, int32_t li, Mover::HostUnit* hup, const void* gu_tab,
+                             const void* dn_tab, int r, std::string* why) {
+    Mover::HostUnit& hu = *hup;
     const int e = plan_->units[(size_t)u].expert;
     std::vector<uint16_t> x((size_t)ds41aux::kEmbd), cpu((size_t)ds41aux::kEmbd);
     uint32_t s = 0x9e3779b9u ^ (uint32_t)u * 2654435761u;
@@ -372,8 +395,8 @@ int FileStager::aux_warm(aux::Worker* w, int r, std::string* why) {
     j.dn = launch_of(R.dn[1]);
     j.gu_w = R.gu_w;
     j.dn_w = R.dn_w;
-    j.gu_w.data = const_cast<void*>(v.gu_tab[(size_t)li]);
-    j.dn_w.data = const_cast<void*>(v.dn_tab[(size_t)li]);
+    j.gu_w.data = const_cast<void*>(gu_tab);
+    j.dn_w.data = const_cast<void*>(dn_tab);
     j.rank = plan_->rank;
     j.world = plan_->world_size;
     int rc = lane->submit(j);
@@ -443,6 +466,75 @@ void FileStager::aux_unbind() {
     aux_view_ = nullptr;
     aux_pass_ = false;
     aux_take_ = false;
+    aux_gate_ = nullptr;
+    aux_in_lane_ = false;
+    aux_online_ = false;
+}
+
+void FileStager::aux_set_dynamic(aux::Gate* gate, int rank, const std::vector<uint8_t>* cand) {
+    aux_gate_ = gate;
+    aux_gate_rank_ = rank;
+    aux_in_lane_ = false;
+    aux_online_ = cand != nullptr && plan_ != nullptr;
+    if (aux_online_) {
+        aux_cand_ = *cand;
+        aux_cand_.resize(plan_->units.size(), 0);
+        aux_hits_.assign(plan_->units.size(), 0);
+    } else {
+        aux_cand_.clear();
+        aux_hits_.clear();
+    }
+    aux_hit_tok_ = 0;
+}
+
+/* The gate's rank side (work/aux-dyn/SPEC.md §3.3), a Dekker pair with the control thread's closed.store(true) and
+ * its scan of in_lane: false (nothing held) when the gate is shut. */
+bool FileStager::aux_lane_enter() {
+    if (!aux_gate_) return true;
+    if (aux_in_lane_) return true;
+    if (!aux_gate_->enter(aux_gate_rank_)) return false;
+    aux_in_lane_ = true;
+    return true;
+}
+
+uint64_t FileStager::aux_swap_hits(std::vector<uint32_t>* empty) {
+    if (!aux_online_ || !empty) return 0;
+    if (empty->size() != aux_hits_.size()) {   /* the hand-off's arrays are allocated to the plan's size */
+        RAD_ERR("aux experts: rank %d: the hit hand-off's array holds %zu units, the stager's %zu; not swapped",
+                plan_ ? plan_->rank : -1, empty->size(), aux_hits_.size());
+        return 0;
+    }
+    empty->swap(aux_hits_);
+    const uint64_t t = aux_hit_tok_;
+    aux_hit_tok_ = 0;
+    return t;
+}
+
+std::vector<int32_t> FileStager::aux_layer_index() const {
+    std::vector<int32_t> li(plan_ ? plan_->units.size() : 0, -1);
+    for (size_t l = 0; l < layers_.size(); ++l)
+        for (int32_t u : layers_[l].units)
+            if (u >= 0 && (size_t)u < li.size()) li[(size_t)u] = (int32_t)l;
+    return li;
+}
+
+bool FileStager::aux_source(int32_t u, const ds41aux::Layout& L, Mover::HostUnit* hu, const uint8_t** gu,
+                            int64_t* gu_n, const uint8_t** dn, int64_t* dn_n) {
+    if (!mover_ || !hu || !mover_->borrow_host_unit(u, hu, /*touch=*/false)) return false;
+    const int g = hu->bytes[0] == HostExpertPool::kGuBytes ? 0 : 1;
+    ds41hx::Mx v;
+    if (!hu->packed || hu->n != 2 || hu->bytes[g] != HostExpertPool::kGuBytes ||
+        hu->bytes[1 - g] != HostExpertPool::kDnBytes || hu->slot[g] > L.gu_slot || hu->slot[1 - g] > L.dn_slot ||
+        !ds41hx::packed_view(hu->host[g], (size_t)hu->slot[g], ds41aux::kGuN, ds41aux::kEmbd, &v) ||
+        !ds41hx::packed_view(hu->host[1 - g], (size_t)hu->slot[1 - g], ds41aux::kEmbd, ds41aux::kFf, &v)) {
+        mover_->release_host_unit(hu);
+        return false;
+    }
+    *gu = hu->host[g];
+    *gu_n = hu->slot[g];
+    *dn = hu->host[1 - g];
+    *dn_n = hu->slot[1 - g];
+    return true;
 }
 
 /* ---- the per-layer hooks ------------------------------------------------------------------------------ */
@@ -548,6 +640,7 @@ int FileStager::aux_finish() {
             for (int j = 0; j < T; ++j)
                 std::memcpy(hx_out_ + (int64_t)aux_cmp_.row_of[j] * kHxEmbd, rows + (int64_t)j * kHxEmbd, (size_t)rb);
             aux_stats_.placed += (uint64_t)T;
+            aux_lane_leave();   /* the rows placed: the lane is the control thread's again (card sharing) */
             return RAD_OK;
         }
         /* Verify: only rows the CPU wrote (a unit it borrowed or read as a miss); any other's hx_out_ row is
@@ -577,12 +670,14 @@ int FileStager::aux_finish() {
                          layers_[(size_t)hx_li_].layer, u, e, i, bad, (int)kHxEmbd, first, a[first], c[first]);
             }
         }
+        aux_lane_leave();
         return RAD_OK;
     }
     if (got == 0) {   /* late: the lane stays busy until it completes, then backs off */
         aux_->abandon(true);
         ++aux_stats_.late;
     }
+    aux_lane_leave();   /* before the CPU fallback, which touches no lane */
     if (aux_verify_) {
         aux_stats_.not_compared += (uint64_t)T;
         return RAD_OK;
@@ -639,6 +734,7 @@ void FileStager::aux_abandon() {
     }
     if (aux_ && (aux_job_ == kAuxPending || aux_job_ == kAuxForced)) aux_->abandon(false);
     aux_job_ = kAuxNone;
+    aux_lane_leave();
     if (aux_units_)
         for (int k = 0; k < aux_n_; ++k) mover_->release_host_unit(&aux_units_[k]);
     aux_n_ = 0;

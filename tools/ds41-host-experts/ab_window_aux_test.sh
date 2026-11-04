@@ -62,8 +62,9 @@ on_line() {   # policy deadline backoff headroom cap forced
   printf "I $ONFMT\n" "aux experts: on: " 1513 "25.4 GiB" 4 "rank 0 380, rank 1 378, rank 2 377, rank 3 378" 0.4123 \
     0.9 15360 61.2 1500 13 0 16 "$1" "$2" "$3" "$4" "$5" "$6"
 }
-rank_line() {   # rank, layer jobs, launch failures, rows compared, rows differing, forced misses
-  printf "I $RANKFMT\n" "aux experts: rank " "$1" "$2" $(( $2 * 3 )) 900 2000 16 0 0 0 3 0 0 1.5 310.2 1900.0 \
+rank_line() {   # rank, layer jobs, launch failures, rows compared, rows differing, forced misses[, released text]
+  # The 7th: what a controller adds after "... after it failed" (", L while released"); "" as the merged worker prints.
+  printf "I $RANKFMT\n" "aux experts: rank " "$1" "$2" $(( $2 * 3 )) 900 2000 16 0 0 0 3 0 "${7:-}" 0 1.5 310.2 1900.0 \
     "$6" "$6" 4 9 2.0 "$3" "$4" "$5" $(( $5 * 2 )) 0
 }
 
@@ -323,8 +324,10 @@ SERVE=$(on_line serve 2000 64 1024 26000 0)
 VERIFY=$(on_line verify 2000 64 1024 26000 0)
 OFFL="I aux experts: off: no candidate beyond the rank cards"
 DEVL="I aux experts: device 4 (0000:c3:00.0, AMD Radeon AI PRO R9700): ..."
-guard() {   # row, ARM_AX, ARM_AXV, line, want: 1 (a match) or 0, what
-  local ARM_AX=$2 ARM_AXV=$3 r part on pat n
+guard() {   # row, ARM_AX, ARM_AXV, line, want: 1 (a match) or 0, what[, ARM_AXTEN]
+  local ARM_AX=$2 ARM_AXV=$3 ARM_AXTEN=${7:-} r part on pat n
+  # arm()'s own patterns for the Ax / Axv rows (an AxF arm may start released), as it sets them
+  eval "$(sed -n "/^  local ax_on='/,/^  fi$/p" "$W")"
   eval "r=\"$1\""
   IFS='|' read -r part on pat <<< "$r"
   n=$(grep -cE "$pat" <<< "$4")
@@ -336,6 +339,7 @@ guard "$row_ax" 26000 "" "$OFFL" 0 "the Ax row's pattern does not take the off l
 guard "$row_ax" 26000 "" "$DEVL" 0 "the Ax row's pattern does not take the device line"
 guard "$row_axv" 26000 "" "$SERVE" 0 "the Axv row's pattern does not take the serve line"
 guard "$row_axv" 26000 1 "$VERIFY" 1 "the Axv row's pattern matches the verify line"
+ARM_AXTEN=""; eval "$(sed -n "/^  local ax_on='/,/^  fi$/p" "$W" | sed 's/^  local /  /')"   # arm()'s patterns, unscoped
 r=""; ARM_AX=""; eval "r=\"$row_ax\""; IFS='|' read -r part on pat <<< "$r"
 if [[ -z "$on" ]] && grep -qE "$pat" <<< "$SERVE"; then ok "guard: an arm without Ax flags the line (the switch set for the window)"
 else bad "guard: an arm without Ax does not flag the line (on '$on')"; fi
@@ -772,6 +776,206 @@ seq=$(grep -A2 -F 'local spid=$SERVER_PID' <<< "$ARMSRC" | sed 's/^ *//')
 if [[ "$seq" == *$'\nstop_server\naux_arm_exit "$name" "$spid"'* ]]; then
   ok "arm(): the server's pid is kept across stop_server for aux_arm_exit"
 else bad "arm(): aux_arm_exit does not get the stopped server's pid"; fi
+
+# ---- 11. card sharing and the online set (work/aux-dyn/SPEC.md §8): AxS / AxSx / AxO / AxON / AxOd / AxT / AxF
+# The engine's format strings the guards and gates key on.
+SHFMT=$(cfmt "$SRC/core/place/aux_control.cpp" 'clients from %lld MiB' fmt)
+OLFMT=$(cfmt "$SRC/core/place/aux_control.cpp" 'swaps a token, at most' fmt)
+OSFMT=$(cfmt "$SRC/core/place/aux_control.cpp" 'decisions, %llu swaps' fmt)
+SSFMT=$(cfmt "$SRC/core/place/aux_control.cpp" 'releases (%llu foreign' fmt)
+RLFMT=$(cfmt "$SRC/core/engine_aux.cpp" 'nothing loaded on device' RAD_INFO)
+[[ "$SHFMT" == "%spolicy %s, clients from"* ]] && ok "fmt: the sharing startup line" || bad "fmt: no sharing startup format ('$SHFMT')"
+[[ "$OLFMT" == "%s%.2f swaps a token, at most"* ]] && ok "fmt: the online-set startup line" || bad "fmt: no online-set format ('$OLFMT')"
+[[ "$OSFMT" == *"read back (%llu differ)"* && "$OSFMT" == *"%s%s" ]] && ok "fmt: the online shutdown line" || bad "fmt: the online shutdown format ('$OSFMT')"
+[[ "$SSFMT" == "%s%llu releases ("* ]] && ok "fmt: the sharing shutdown line" || bad "fmt: the sharing shutdown format ('$SSFMT')"
+[[ "$RLFMT" == *"forced lateness %lld (0 off)" ]] && ok "fmt: the released-at-start line states the six values" || bad "fmt: '$RLFMT'"
+SHL=$(printf "I $SHFMT\n" "aux experts: sharing: " "allow (^whisper, foreign at most 6144 MiB)" 1 1024 100 2 60 3000 \
+      "/x/a.aux-ctl (holders /x/a.aux-ctl.d, state /x/a.aux-ctl.state)" 50005)
+OLL=$(printf "I $OLFMT\n" "aux experts: online set: " 2.00 16 1 512 256 100 16 1497 1513 3000 "every 16th swap" "")
+RLL=$(printf "I $RLFMT\n" "aux experts: released at start: " "free 15000 MiB, under cap 26000 + headroom 1024 + 512 MiB" 4 1513 4000 1.2 16 serve 2000 64 1024 26000 0)
+on_sh() {   # swaps, read-back differ, the tail (dry / stopped)
+  printf "I $OSFMT\n" "aux experts: online: " 300 "$1" 1.2 2.1 3.0 140.0 260.0 0 12 0 "$1" "$2" 2 1497 26.2 0.71 0.98 0.52 "$1" "$3" ""
+}
+# The switch table's new rows and the Ax / Axv rows of an AxF arm (released at start).
+row_axs=$(grep -m1 -F 'AxS|${ARM_AXS:-}|' "$W")
+row_axo=$(grep -m1 -F 'AxO|${ARM_AXO:-}|' "$W")
+gdyn() {   # row, ARM_AXS, ARM_AXO_STR, line, want, what
+  local ARM_AXS=$2 ARM_AXO=$3 ARM_AXO_STR=$3 r part on pat n
+  eval "r=\"$1\""
+  IFS='|' read -r part on pat <<< "$r"
+  n=$(grep -cE "$pat" <<< "$4")
+  if [[ "$n" == "$5" ]]; then ok "guard: $6"; else bad "guard: $6 (on '$on', pattern '$pat', $n matches)"; fi
+}
+gdyn "$row_axs" allow "" "$SHL" 1 "AxS's row takes the allow line"
+gdyn "$row_axs" exclusive "" "$SHL" 0 "AxSx's row does not take an allow line"
+gdyn "$row_axs" "" "" "$SHL" 1 "an arm without AxS flags a sharing line (its pattern takes any policy)"
+gdyn "$row_axo" "" 2.00 "$OLL" 1 "AxO's row takes the online line at 2.00 a token"
+gdyn "$row_axo" "" 4.00 "$OLL" 0 "AxO400's row does not take a line at 2.00"
+gdyn "$row_axo" "" "" "$OLL" 1 "an arm without AxO flags an online line"
+guard "$row_ax" 26000 "" "$RLL" 1 "an AxF arm's Ax row takes the released-at-start line" 12000
+guard "$row_ax" 26000 "" "$RLL" 0 "another Ax arm's row does not take it (it must serve from its start)"
+want 26000 "" "" 2000 64 1024 "$RLL" 1 "the released-at-start line states the arm's six values"
+# The arm loop: launches, every new switch stated, the window's sub-switches, skips.
+TEN=$T/aux_tenant_stub
+printf '#!/bin/sh\nexit 0\n' > "$TEN"; chmod +x "$TEN"
+L15=$T/loop15.txt
+ARMS="$C2 $C2-Ax $C2-Axv-AxO $C2-Axv-AxT $C2-Ax-AxO $C2-Ax-AxO400 $C2-Ax-AxOd $C2-Ax-AxS $C2-Ax-AxSx $C2-Ax-AxT6"
+ARMS+=" $C2-Ax-AxF $C2-Ax-AxF8000 $C2-AxO $C2-Ax0-AxS $C2-Ax-AxO0 $C2-Ax-AxO2000 $C2-Ax-AxT1 $C2-Ax-AxF500"
+ARMS+=" $C2-Ax-AxS-AxSx $C2-Ax-AxO-AxOd"
+( set +u; window "$T/out15"; AUX_SWAP_OK=1 AUX_SWAP_SUM=$SUM AXV_OK_O=1 AXV_SUM_O=$SUM AXV_OK_T=1 AXV_SUM_T=$SUM
+  AUX_TENANT=$TEN AUX_SHARE_FLOOR_MIB=512 AUX_ONLINE_SPARE=32; loop ) > "$L15" 2>&1
+dyn() {   # loop file, arm, what, then SHARE CONTROL(1: the arm's file) ALLOW FOREIGN REACQUIRE FLOOR ONLINE RATE DRY SPARE
+  local sec v
+  sec=$(section "$1" "$2")
+  if [[ -z "$sec" ]]; then bad "$3 not launched: $(grep "arm $2: " "$1" | head -3 | tr '\n' ' ')"; return; fi
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE "$4"
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_CONTROL "$([[ -n $5 ]] && echo "$T/out15/$2.aux-ctl")"
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_ALLOW "$6"
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_FOREIGN_MIB "$7"
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_REACQUIRE_S "$8"
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_FLOOR_MIB "$9"
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE "${10}"
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_RATE "${11}"
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_DRY "${12}"
+  has "$3" "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_SPARE "${13}"
+  local missing=""
+  for v in SHARE SHARE_ALLOW SHARE_FOREIGN_MIB SHARE_MIN_MIB SHARE_FLOOR_MIB SHARE_POLL_MS SHARE_RELEASE_POLLS \
+           SHARE_REACQUIRE_S SHARE_FILL_MBPS CONTROL ONLINE ONLINE_RATE ONLINE_MAX ONLINE_EVERY ONLINE_HALFLIFE \
+           ONLINE_PRIOR ONLINE_MARGIN ONLINE_SPARE ONLINE_MBPS ONLINE_CHECK ONLINE_DRY; do
+    grep -q "^    RADIANCE_EXPERIMENTAL_DS41_AUX_$v=" <<< "$sec" || missing+=" $v"
+  done
+  if [[ -z "$missing" ]]; then ok "$3: states every new aux switch"; else bad "$3: does not state$missing"; fi
+}
+dyn "$L15" "$C2" "no Ax part" "" "" "" "" "" "" "" "" "" ""
+dyn "$L15" "$C2-Ax" "Ax alone" "" "" "" "" "" "" "" "" "" ""
+dyn "$L15" "$C2-Axv-AxO" "Axv-AxO" "" "" "" "" "" "" 1 200 "" 32
+dyn "$L15" "$C2-Axv-AxT" "Axv-AxT (implies AxS)" allow 1 "^whisper" 6144 0 512 "" "" "" ""
+dyn "$L15" "$C2-Ax-AxO" "Ax-AxO" "" "" "" "" "" "" 1 200 "" 32
+dyn "$L15" "$C2-Ax-AxO400" "Ax-AxO400" "" "" "" "" "" "" 1 400 "" 32
+dyn "$L15" "$C2-Ax-AxOd" "Ax-AxOd" "" "" "" "" "" "" 1 200 1 32
+dyn "$L15" "$C2-Ax-AxS" "Ax-AxS" allow 1 "^whisper" 6144 "" 512 "" "" "" ""
+dyn "$L15" "$C2-Ax-AxSx" "Ax-AxSx" exclusive 1 "" "" "" 512 "" "" "" ""
+dyn "$L15" "$C2-Ax-AxT6" "Ax-AxT6" allow 1 "^whisper" 6144 0 512 "" "" "" ""
+dyn "$L15" "$C2-Ax-AxF" "Ax-AxF (implies AxS, reacquire 5 s)" allow 1 "^whisper" 6144 5 512 "" "" "" ""
+dyn "$L15" "$C2-Ax-AxF8000" "Ax-AxF8000" allow 1 "^whisper" 6144 5 512 "" "" "" ""
+skipped "$L15" "$C2-AxO" "needs an Ax or Axv part" "AxO alone"
+skipped "$L15" "$C2-Ax0-AxS" "needs an Ax or Axv part" "AxS beside Ax0"
+skipped "$L15" "$C2-Ax-AxO0" "the swap rate is 1-1600" "AxO0"
+skipped "$L15" "$C2-Ax-AxO2000" "the swap rate is 1-1600" "AxO2000"
+skipped "$L15" "$C2-Ax-AxT1" "the toggle period is 2-600 s" "AxT1"
+skipped "$L15" "$C2-Ax-AxF500" "the tenant takes 1024-30000 MiB" "AxF500"
+skipped "$L15" "$C2-Ax-AxS-AxSx" "two AxS parts" "AxS twice"
+skipped "$L15" "$C2-Ax-AxO-AxOd" "two AxO parts" "AxO twice"
+# arm() sees the parts (the toggler, the tenant, the guards read them).
+sec=$(section "$L15" "$C2-Ax-AxT6")
+grep -q "^    RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_REACQUIRE_S=0$" <<< "$sec" && ok "AxT: reacquire at once" || bad "AxT: reacquire not 0"
+# Gating: the auxswap check, per-feature Axv, the tenant binary, Kld.
+L16=$T/loop16.txt
+ARMS="$C2-Axv-AxO $C2-Ax-AxO $C2-Ax-AxS"
+( set +u; window "$T/out16"; AUX_TENANT=$TEN; loop ) > "$L16" 2>&1
+skipped "$L16" "$C2-Axv-AxO" "no auxswap device check passed" "Axv-AxO without AUX_SWAP_OK"
+skipped "$L16" "$C2-Ax-AxS" "no auxswap device check passed" "AxS without AUX_SWAP_OK"
+L17=$T/loop17.txt
+ARMS="$C2-Axv-AxO $C2-Ax-AxO $C2-Ax-AxT $C2-Ax-AxF $C2-Ax-AxO-Kld"
+( set +u; window "$T/out17"; AUX_SWAP_OK=1 AUX_SWAP_SUM=$SUM; unset AUX_TENANT; loop ) > "$L17" 2>&1
+dyn "$L17" "$C2-Axv-AxO" "Axv-AxO without AXV_OK_O (a verify arm needs none)" "" "" "" "" "" "" 1 200 "" ""
+skipped "$L17" "$C2-Ax-AxO" "no Axv arm of this window with AxO" "serve AxO without AXV_OK_O"
+skipped "$L17" "$C2-Ax-AxT" "no Axv arm of this window with a sharing part" "serve AxT without AXV_OK_T"
+skipped "$L17" "$C2-Ax-AxF" "AxF needs AUX_TENANT" "AxF without the tenant binary"
+skipped "$L17" "$C2-Ax-AxO-Kld" "AxS / AxO with Kld" "AxO beside Kld"
+L18=$T/loop18.txt
+ARMS="$C2-Ax-AxO"
+( set +u; window "$T/out18"; AUX_SWAP_OK=1 AUX_SWAP_SUM=$SUM AXV_OK_O=1 AXV_SUM_O=$OTHER; loop ) > "$L18" 2>&1
+skipped "$L18" "$C2-Ax-AxO" "no Axv arm of this window with AxO" "AXV_OK_O on another library"
+# The exit gates of the dynamic parts (aux_dyn_gate) on lines in the engine's formats.
+EX=$T/exitdyn
+mkdir -p "$EX"
+dyng() {   # log text, ARM_AXS ARM_AXO ARM_AXOD ARM_AXTOG, want rc (0 / 1), what[, words in the reason]
+  local got rc
+  printf '%s\n' "$1" > "$EX/s.log"
+  got=$( ARM_AXS=$2 ARM_AXO=$3 ARM_AXOD=$4 ARM_AXTOG=$5; eval "$FUNCS"; aux_dyn_gate "$EX/s.log" ); rc=$?
+  if [[ "$rc" == "$6" && "$got" == *"${8:-}"* ]]; then ok "dyn gate: $7"; else bad "dyn gate: $7 (rc $rc, '$got')"; fi
+}
+SH_OK=$(printf "I $SSFMT\n" "aux experts: sharing: " 2 0 0 0 0 2 2 0 0 50.1 20.2 0.1 1.0 12.0 30.0 15.0 40.0 0.5 3.1 9000 0)
+dyng "$(on_sh 120 0 "")" "" 200 "" "" 0 "AxO: swaps, none differing"
+dyng "$(on_sh 0 0 "")" "" 200 "" "" 1 "AxO: no swap" "no swap"
+dyng "$(on_sh 120 1 "")" "" 200 "" "" 1 "AxO: a read-back differing" "AUX ONLINE FAIL"
+dyng "$(on_sh 120 0 "; stopped: a copy on the swap queue failed")" "" 200 "" "" 1 "AxO: stopped" "stopped"
+dyng "$(on_sh 120 0 "")" "" 200 1 "" 1 "AxOd: the line must say dry" "dry"
+dyng "$(on_sh 120 0 "; dry (no flip)")" "" 200 1 "" 0 "AxOd: dry"
+dyng "$SH_OK"$'\n'"I aux experts: released in 3.0 ms"$'\n'"I aux experts: serving again in 0.4 s"$'\n'"I aux experts: released in 2.0 ms" \
+  allow "" "" 4 1 "AxT: two releases, one acquire" "1 acquires"
+dyng "$SH_OK"$'\n'"I aux experts: released in 3.0 ms"$'\n'"I aux experts: serving again in 0.4 s"$'\n'"I aux experts: released in 2.0 ms"$'\n'"I aux experts: serving again in 0.5 s" \
+  allow "" "" 4 0 "AxT: two of each"
+dyng "$SH_OK"$'\n'"W aux experts: dead: the swap queue did not drain; the CPU path computes every row from here on" \
+  allow "" "" "" 1 "AxS: a dead line" "went dead"
+dyng "I aux experts: rank 0: ..." allow "" "" "" 1 "AxS: no sharing shutdown line" "no 'aux experts: sharing"
+# The toggler: its timeline against a 16 s request phase (an acquire in about 1 s), then a short real run.
+plan=$( eval "$FUNCS"; aux_toggle_plan 4 16 1 )
+read -r tr ta <<< "$plan"
+(( tr >= 2 && ta >= 2 )) && ok "toggler: AxT4 over 16 s of requests: $tr releases, $ta acquires" || bad "toggler: AxT4 over 16 s: '$plan'"
+plan=$( eval "$FUNCS"; aux_toggle_plan 6 16 1 )
+read -r tr ta <<< "$plan"
+(( tr >= 2 && ta >= 2 )) && ok "toggler: AxT6 over 16 s: $tr releases, $ta acquires" || bad "toggler: AxT6 over 16 s: '$plan'"
+plan=$( eval "$FUNCS"; aux_toggle_plan 4 16 2.5 )
+[[ $plan == "4 0" ]] && ok "toggler: AxT4 with acquires of 2.5 s shows no acquire (the period must exceed twice the acquire)" || bad "toggler: '$plan'"
+TG=$T/tog
+mkdir -p "$TG"
+( eval "$FUNCS"; aux_toggler "$TG/ctl" 0.4 "$TG/log" ) & tp=$!
+sleep 1.1; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
+nw=$(wc -l < "$TG/log" 2>/dev/null || echo 0)
+if (( nw >= 4 )) && [[ "$(awk '{ print $2 }' "$TG/log" | head -2 | tr '\n' ' ')" == "off auto " ]] &&
+   [[ "$(cat "$TG/ctl")" =~ ^(off|auto)$ ]] && ! compgen -G "$TG/ctl.tmp.*" >/dev/null; then
+  ok "toggler: $nw writes, off then auto, each through a temp file and rename"
+else bad "toggler: $nw writes ($(tr '\n' ';' < "$TG/log" 2>/dev/null)), control file '$(cat "$TG/ctl" 2>/dev/null)'"; fi
+# The tenant's checks (aux_tenant_check) and its exemption from the client after-check.
+TN=$T/tenant
+mkdir -p "$TN"
+tcheck() {   # tenant1 log, tenant2 log, server log, want: "" or words, what
+  printf '%s\n' "$1" > "$TN/a.tenant1.log"
+  printf '%s\n' "$2" > "$TN/a.tenant2.log"
+  printf '%s\n' "$3" > "$TN/a.server.log"
+  local got
+  got=$( OUT=$TN; log() { :; }; eval "$FUNCS"; AUX_TENANT_FAIL=""; aux_tenant_check a; echo "$AUX_TENANT_FAIL" )
+  if [[ -z "$4" && -z "$got" ]] || [[ -n "$4" && "$got" == *"$4"* ]]; then ok "tenant: $5"; else bad "tenant: $5 ('$got')"; fi
+}
+T1=$'aux_tenant: open 1\naux_tenant: room after 10 ms, holding 12000 MiB\naux_tenant: freed'
+T2=$'aux_tenant: open 2\naux_tenant: room after 1200 ms, holding 12000 MiB\naux_tenant: freed\ntenant2 exit 0'
+SV=$'I aux experts: released at start: x\nI aux experts: serving again in 0.5 s\nI aux experts: releasing (foreign: aux_tenant (pid 9) 64 MiB)\nI aux experts: serving again in 0.4 s'
+tcheck "$T1" "$T2" "$SV" "" "both tenants, the server's lines in order"
+tcheck "$T1" "${T2/1200/4000}" "$SV" "over AUX_TENANT_ROOM_MS" "the second tenant's room too late"
+tcheck "$T1" "${T2/exit 0/exit 2}" "$SV" "did not exit 0" "the second tenant failed"
+tcheck "${T1/freed/}" "$T2" "$SV" "did not free" "the first tenant did not free"
+tcheck "$T1" "$T2" $'I aux experts: on: 1513 units\nI aux experts: releasing (foreign: aux_tenant (pid 9) 64 MiB)\nI aux experts: serving again in 0.4 s' \
+  "not released at start" "a server that did not start released"
+LS11=$T/lsys11 LP11=$T/lproc11
+extra "$LS11"
+mkclient "$LS11" "$LP11" 111 whisper-server "$XGID" 4404019200
+O3=$T/out19; mkdir -p "$O3"
+got=$( set +u; OUT=$O3; log() { :; }; eval "$FUNCS"; AUX_SYSFS=$LS11 AUX_PROC=$LP11 AUX_GPUID=$XGID AUX_KFD_WAIT_DS=1
+       aux_clients > "$O3/a.aux-clients"; mkclient "$LS11" "$LP11" 444 aux_tenant "$XGID" 67108864
+       ARM_AXTEN=12000; aux_clients_after a "" && echo "none" || echo "new:$AUX_NEW_CLIENTS"
+       ARM_AXTEN=""; aux_clients_after a "" && echo "none" || echo "new:$AUX_NEW_CLIENTS" )
+[[ "$got" == $'none\nnew: aux_tenant (pid 444, 64 MiB)' ]] && ok "clients after: an AxF arm's tenant exempt, another arm's not" ||
+  bad "clients after: '$got'"
+# aux_yield.sh against a fake server state: no server, released after the holder, dead held, a timeout.
+AY=$(dirname "$W")/aux_yield.sh
+YD=$T/yield; mkdir -p "$YD"
+out=$("$AY" "$YD/c1" 5 -- echo ran 2>&1); [[ "$out" == *"no server"*ran* ]] && ok "aux_yield: no server: runs" || bad "aux_yield: no server: '$out'"
+( exec 7>"$YD/c2.lock"; flock -x 7; sleep 8 ) & lp=$!
+sleep 0.2
+echo "dead held 26112 1 pid 1 1 mode auto (default) a lane faulted" > "$YD/c2.state"
+out=$("$AY" "$YD/c2" 5 -- echo ran 2>&1); rc=$?
+[[ $rc == 3 && "$out" != *ran* ]] && ok "aux_yield: dead held: refuses (exit 3)" || bad "aux_yield: dead held: rc $rc '$out'"
+echo "serving 1 pid 1 1 mode auto (default)" > "$YD/c2.state"
+out=$("$AY" "$YD/c2" 1 -- echo ran 2>&1); rc=$?
+[[ $rc == 4 && "$out" != *ran* ]] && ok "aux_yield: serving past the timeout: refuses (exit 4)" || bad "aux_yield: timeout: rc $rc '$out'"
+( sleep 0.5; t=${EPOCHREALTIME//[!0-9]/}; printf 'released %s pid 1 1 mode off (holder x) manual\n' "$(( 10#$t / 1000 + 1000 ))" > "$YD/c2.state" ) &
+out=$("$AY" "$YD/c2" 5 -- sh -c 'ls "$0"/c2.d | grep -c "^job-"' "$YD" 2>&1); rc=$?
+[[ $rc == 0 && "$out" == *"given back (released)"*1* ]] && ok "aux_yield: released after its holder: runs, the holder in place" ||
+  bad "aux_yield: released: rc $rc '$out'"
+[[ -z "$(ls "$YD/c2.d")" ]] && ok "aux_yield: the holder removed after the command" || bad "aux_yield: holder left: $(ls "$YD/c2.d")"
+wait "$lp" 2>/dev/null
 
 (( fail == 0 )) && echo "PASS ab_window_aux_test" || echo "FAIL ab_window_aux_test (loop outputs: $T)"
 (( fail == 0 )) || trap - EXIT

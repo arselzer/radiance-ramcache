@@ -82,11 +82,12 @@ std::string selector_bdf(const Config& cfg, const std::string& sysfs) {
 
 /* ------------------------------------------------------------------ the shutdown line */
 
-std::string stats_line(int r, const Stats& s) {
+std::string stats_line(int r, const Stats& s, bool released) {
     const double rt = s.rt_n ? (double)s.rt_sum_ns / (double)s.rt_n * 1e-3 : 0.0;
+    const std::string rel = released ? fmt(", %llu while released", (unsigned long long)s.declined_released) : "";
     return fmt("%s%d: %llu layer jobs, %llu units, %llu rows on the extra card of %llu rows the CPU path met in passes "
                "of up to %d rows; declined: %llu taller, %llu draft, %llu without usable kernel rows, %llu while the "
-               "lane was busy or backing off, %llu after it failed; %llu worker units not cached (CPU miss path); "
+               "lane was busy or backing off, %llu after it failed%s; %llu worker units not cached (CPU miss path); "
                "waited %.1f ms beyond the CPU's rows, round trip %.1f us mean, %.1f us max; %llu deadline misses "
                "(%llu forced; %llu units, %llu rows recomputed on the CPU in %.1f ms), %llu launch failures; verify: "
                "%llu rows compared, %llu differ (%llu values), %llu not compared",
@@ -94,7 +95,7 @@ std::string stats_line(int r, const Stats& s) {
                (unsigned long long)s.placed, (unsigned long long)s.eligible_rows, ds41aux::kMaxRows,
                (unsigned long long)s.declined_tall, (unsigned long long)s.declined_draft,
                (unsigned long long)s.declined_rows, (unsigned long long)s.declined_busy,
-               (unsigned long long)s.declined_dead, (unsigned long long)s.uncached, (double)s.wait_ns * 1e-6, rt,
+               (unsigned long long)s.declined_dead, rel.c_str(), (unsigned long long)s.uncached, (double)s.wait_ns * 1e-6, rt,
                (double)s.rt_max_ns * 1e-3, (unsigned long long)s.late, (unsigned long long)s.forced_late,
                (unsigned long long)s.fallback_units, (unsigned long long)s.fallback_rows,
                (double)s.fallback_ns * 1e-6, (unsigned long long)s.failed, (unsigned long long)s.verified,
@@ -136,8 +137,9 @@ int DeviceLane::init(std::string* why) {
     return RAD_OK;
 }
 
-int DeviceLane::retire(const char* step, int rc) {
+int DeviceLane::retire(const char* step, int rc, bool fault) {
     job_ok_ = false;
+    fault_ = fault_ || fault;
     if (!dead_) {
         dead_ = true;
         why_dead_ = fmt("%s failed (%d): %s", step, rc, rad_dev_last_error());
@@ -157,7 +159,7 @@ Lane::State DeviceLane::state() {
             abandoned_ = false;
             if (backoff_after_) backoff_left_ = backoff_;
         } else if (q < 0 || dev_faulted(dev_)) {
-            retire("an abandoned job", q < 0 ? q : RAD_E_DEVICE);
+            retire("an abandoned job", q < 0 ? q : RAD_E_DEVICE, true);
             return kDead;
         } else {
             return kBusy;
@@ -243,7 +245,7 @@ int DeviceLane::wait(int64_t deadline_ns) {
             pending_ = false;
             return 1;
         }
-        if (q < 0 || dev_faulted(dev_)) return retire("the job's completion", q < 0 ? q : RAD_E_DEVICE);
+        if (q < 0 || dev_faulted(dev_)) return retire("the job's completion", q < 0 ? q : RAD_E_DEVICE, true);
         const int64_t t = now_ns();
         if (t >= deadline_ns) return 0;
         /* As HostExpertPool::wait: a short spin, then yield. */
@@ -291,6 +293,32 @@ bool DeviceLane::drain(int64_t timeout_ns) {
     return true;
 }
 
+bool DeviceLane::drain_release(int64_t timeout_ns) {
+    if (!dead_) return drain(timeout_ns);
+    if (fault_ || !s_ || !ev_) return !s_;   /* a fault (or no event to probe with): never drained */
+    /* Retired by a host-side refusal: whatever the queue took of the job (its record copy, a launch) completes
+     * before a probe recorded behind it, so a completed probe means nothing is left that reads or writes the
+     * arena. The lane stays retired: it takes no more jobs. */
+    const int64_t end = now_ns() + std::max<int64_t>(timeout_ns, 100'000'000);
+    if (rad_event_record(ev_, s_) < 0) {
+        fault_ = true;
+        return false;
+    }
+    for (;;) {
+        const int q = rad_event_query(ev_);
+        if (q == 1) {
+            pending_ = abandoned_ = false;
+            return true;
+        }
+        if (q < 0 || dev_faulted(dev_)) {
+            fault_ = true;
+            return false;
+        }
+        if (now_ns() >= end) return false;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
+
 int DeviceLane::sync_bounded(int64_t timeout_ns) {
     if (dead_) return RAD_E_DEVICE;
     /* The copies queued before this call are never seen complete unless the event says so. */
@@ -300,7 +328,7 @@ int DeviceLane::sync_bounded(int64_t timeout_ns) {
     for (;;) {
         const int q = rad_event_query(ev_);
         if (q == 1) return 1;
-        if (q < 0 || dev_faulted(dev_)) return retire("a loader wait", q < 0 ? q : RAD_E_DEVICE);
+        if (q < 0 || dev_faulted(dev_)) return retire("a loader wait", q < 0 ? q : RAD_E_DEVICE, true);
         if (now_ns() >= end) {
             /* Still queued: the lane is not idle. drain() polls this same event (2 s at teardown), and a lane it
              * does not see drain is left to the process exit with the arena its copies write. */
@@ -337,6 +365,7 @@ Worker::~Worker() {
 }
 
 int Worker::reserve(int restore_device, std::string* why) {
+    if (arena_) return RAD_OK;   /* held already */
     arena_bytes_ = cfg_.cap_mib << 20;
     if (rad_dev_set(card_.ord) < 0) {
         *why = fmt("device %d could not be selected: %s", card_.ord, rad_dev_last_error());
@@ -367,6 +396,18 @@ int Worker::reserve(int restore_device, std::string* why) {
 
 int Worker::build(int layers, int64_t slots, const ds41aux::Layout& L, int restore_device, std::string* why) {
     const int R = (int)ranks_.size();
+    views_.assign((size_t)R, RankView{});
+    for (int r = 0; r < R; ++r) {
+        views_[(size_t)r].gu_tab.assign((size_t)(layers > 0 ? layers : 0), nullptr);
+        views_[(size_t)r].dn_tab.assign((size_t)(layers > 0 ? layers : 0), nullptr);
+    }
+    const int rc = carve(layers, slots, L, why);
+    if (rc < 0) return rc;
+    return make_lanes(restore_device, why);
+}
+
+int Worker::carve(int layers, int64_t slots, const ds41aux::Layout& L, std::string* why) {
+    const int R = (int)ranks_.size();
     const ds41aux::Ws w = ds41aux::ws();
     const int64_t tb = ds41aux::tables_bytes(R, layers);
     if (!arena_ || layers <= 0 || slots < 0 || tb + R * w.bytes + slots * L.stride > arena_bytes_) {
@@ -381,11 +422,31 @@ int Worker::build(int layers, int64_t slots, const ds41aux::Layout& L, int resto
     ws_ = arena_ + tb;
     slots_ = ws_ + R * w.bytes;
     n_slots_ = slots;
+    if (views_.size() != (size_t)R) views_.assign((size_t)R, RankView{});
+    for (int r = 0; r < R; ++r) {
+        views_[(size_t)r].gu_tab.resize((size_t)layers, nullptr);
+        views_[(size_t)r].dn_tab.resize((size_t)layers, nullptr);
+    }
+    for (size_t r = 0; r < lanes_.size(); ++r)
+        if (lanes_[r]) lanes_[r]->set_ws(ws_ + (int64_t)r * w.bytes);
+    return RAD_OK;
+}
+
+void Worker::plan(int layers, int64_t slots, const ds41aux::Layout& L) {
+    const int R = (int)ranks_.size();
+    layers_ = layers;
+    layout_ = L;
+    n_slots_ = slots;
     views_.assign((size_t)R, RankView{});
     for (int r = 0; r < R; ++r) {
-        views_[(size_t)r].gu_tab.assign((size_t)layers, nullptr);
-        views_[(size_t)r].dn_tab.assign((size_t)layers, nullptr);
+        views_[(size_t)r].gu_tab.assign((size_t)(layers > 0 ? layers : 0), nullptr);
+        views_[(size_t)r].dn_tab.assign((size_t)(layers > 0 ? layers : 0), nullptr);
     }
+}
+
+int Worker::make_lanes(int restore_device, std::string* why) {
+    const int R = (int)ranks_.size();
+    const ds41aux::Ws w = ds41aux::ws();
     if (rad_dev_set(card_.ord) < 0) {
         *why = fmt("device %d could not be selected: %s", card_.ord, rad_dev_last_error());
         (void)rad_dev_set(restore_device);
@@ -393,12 +454,25 @@ int Worker::build(int layers, int64_t slots, const ds41aux::Layout& L, int resto
     }
     int rc = RAD_OK;
     for (int r = 0; r < R && rc >= 0; ++r) {
-        lanes_.emplace_back(new DeviceLane(card_.ord, r, ws_ + r * w.bytes, cfg_.backoff));
+        lanes_.emplace_back(new DeviceLane(card_.ord, r, ws_ ? ws_ + r * w.bytes : nullptr, cfg_.backoff));
         rc = lanes_.back()->init(why);
     }
     /* Later bring-up takes the current device (pinned memory's NUMA node, among others): rank 0's again. */
     (void)rad_dev_set(restore_device);
     return rc;
+}
+
+void Worker::release_arena(int restore_device) {
+    for (auto& l : lanes_)
+        if (l) l->set_ws(nullptr);
+    if (arena_) {
+        /* The per-device free convention: the arena's own card bound (as ~Worker). */
+        (void)rad_dev_set(card_.ord);
+        rad_dev_free(arena_, RAD_MEM_DEVICE);
+        if (restore_device >= 0) (void)rad_dev_set(restore_device);
+    }
+    arena_ = tables_ = ws_ = slots_ = nullptr;
+    free_after_ = -1;
 }
 
 char* Worker::table(int r, int li, int which) const {
@@ -414,7 +488,41 @@ int64_t Worker::units() const {
     return n;
 }
 
+namespace {
+/* The views' entries into a table image (load_tables, table_image). */
+void image_from_views(const std::vector<RankView>& views, int layers, uint64_t* host) {
+    for (size_t r = 0; r < views.size(); ++r)
+        for (int li = 0; li < layers; ++li)
+            for (int which = 0; which < 2; ++which) {
+                const std::vector<const void*>& src = which ? views[r].dn_tab_entries : views[r].gu_tab_entries;
+                uint64_t* dst = host + (((int64_t)r * layers + li) * 2 + which) * ds41aux::kExperts;
+                for (int e = 0; e < ds41aux::kExperts; ++e) {
+                    const size_t k = (size_t)li * ds41aux::kExperts + (size_t)e;
+                    dst[e] = k < src.size() ? (uint64_t)(uintptr_t)src[k] : 0;
+                }
+            }
+}
+}  // namespace
+
+std::vector<uint64_t> Worker::table_image() const {
+    std::vector<uint64_t> img((size_t)(ds41aux::tables_bytes((int)ranks_.size(), layers_) / 8), 0);
+    image_from_views(views_, layers_, img.data());
+    return img;
+}
+
 int Worker::load_tables(std::string* why) {
+    return load_tables_with([](const Worker* w, const void*, uint64_t* host) {
+        image_from_views(w->views_, w->layers_, host);
+    }, nullptr, why);
+}
+
+int Worker::load_tables_image(const uint64_t* image, std::string* why) {
+    return load_tables_with([](const Worker* w, const void* ctx, uint64_t* host) {
+        std::memcpy(host, ctx, (size_t)((int64_t)w->ranks_.size() * w->layers_ * 2 * ds41aux::kExperts * 8));
+    }, image, why);
+}
+
+int Worker::load_tables_with(void (*fill)(const Worker*, const void*, uint64_t*), const void* ctx, std::string* why) {
     const int R = (int)ranks_.size();
     const int64_t bytes = ds41aux::tables_bytes(R, layers_);
     DeviceLane* l = device_lane(0);
@@ -429,18 +537,11 @@ int Worker::load_tables(std::string* why) {
     if (rc < 0) *why = fmt("the tables' pinned staging: %s", rad_dev_last_error());
     if (rc >= 0) {
         std::memset(host, 0, (size_t)bytes);
+        fill(this, ctx, host);
         for (int r = 0; r < R; ++r)
             for (int li = 0; li < layers_; ++li)
-                for (int which = 0; which < 2; ++which) {
-                    const std::vector<const void*>& src = which ? views_[(size_t)r].dn_tab_entries
-                                                                : views_[(size_t)r].gu_tab_entries;
-                    uint64_t* dst = host + (((int64_t)r * layers_ + li) * 2 + which) * ds41aux::kExperts;
-                    for (int e = 0; e < ds41aux::kExperts; ++e) {
-                        const size_t k = (size_t)li * ds41aux::kExperts + (size_t)e;
-                        dst[e] = k < src.size() ? (uint64_t)(uintptr_t)src[k] : 0;
-                    }
+                for (int which = 0; which < 2; ++which)
                     (which ? views_[(size_t)r].dn_tab : views_[(size_t)r].gu_tab)[(size_t)li] = table(r, li, which);
-                }
         std::memset(back, 0xa5, (size_t)bytes);
         int queued = 0;
         if ((rc = rad_memcpy_async(tables_, host, bytes, l->stream())) >= 0) {
@@ -487,14 +588,17 @@ std::string Worker::finish(uint64_t jobs, uint64_t rows, uint64_t late) {
     finished_ = true;
     int stuck = 0;
     for (auto& l : lanes_)
-        if (l && !l->drain(2'000'000'000LL)) ++stuck;
-    drained_ = stuck == 0;
+        if (l && !(release_drain_ ? l->drain_release(2'000'000'000LL) : l->drain(2'000'000'000LL))) ++stuck;
+    drained_ = stuck == 0 && !swap_undrained_;
+    const int64_t held = units_held_.load(std::memory_order_relaxed);
     return fmt("%s%d (%s): %lld units held; %llu jobs, %llu rows over all ranks; %llu deadline misses; %s",
-               ds41aux::kLogDevice, card_.ord, card_.bdf.c_str(), (long long)units(), (unsigned long long)jobs,
-               (unsigned long long)rows, (unsigned long long)late,
+               ds41aux::kLogDevice, card_.ord, card_.bdf.c_str(), (long long)(held >= 0 ? held : units()),
+               (unsigned long long)jobs, (unsigned long long)rows, (unsigned long long)late,
                drained_ ? "lanes drained at exit"
-                        : fmt("%d lane(s) not drained in 2 s (or dead): their queues, events and the arena are left to "
-                              "the process exit", stuck).c_str());
+               : swap_undrained_ && !stuck
+                   ? "the swap queue not drained in 2 s: its buffers and the arena are left to the process exit"
+                   : fmt("%d lane(s) not drained in 2 s (or dead)%s: their queues, events and the arena are left to "
+                         "the process exit", stuck, swap_undrained_ ? ", nor the swap queue" : "").c_str());
 }
 
 }  // namespace aux

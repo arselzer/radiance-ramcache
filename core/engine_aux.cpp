@@ -5,6 +5,9 @@
 #include "rad_internal.h"
 #include "device/device.h"
 
+#include <unistd.h>
+
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -12,6 +15,7 @@
 namespace rad {
 
 void Engine::aux_off(const std::string& why, bool warn) {
+    aux_ctl_stop();   /* the control thread first: it touches the lanes and the arena */
     for (auto& r : ranks_)
         if (r) r->fstager.aux_unbind();
     /* The process line, as at exit: whether every lane drained, or which are left to the process exit with the
@@ -20,6 +24,12 @@ void Engine::aux_off(const std::string& why, bool warn) {
         const std::string line = aux_->finish(0, 0, 0);
         if (aux_->drained()) RAD_INFO("%s", line.c_str());
         else RAD_WARN("%s", line.c_str());
+    }
+    if (aux_ctl_) {   /* the state file's last word: the worker is off for the process's life */
+        const bool held = aux_ && !aux_->drained() && aux_->has_arena();
+        aux_ctl_->write_final(held ? fmt("dead held %lld", (long long)aux_cfg_.cap_mib) : std::string("dead freed"),
+                              "the worker is off: " + why);
+        aux_ctl_.reset();
     }
     aux_.reset();
     if (warn) RAD_WARN("%s%s", ds41aux::kLogOff, why.c_str());
@@ -83,6 +93,49 @@ int Engine::aux_discover(const std::vector<int>& devs) {
     for (const ds41aux::Card& x : cards)
         if (x.ord == d.ord) c = &x;
     auto w = std::make_unique<aux::Worker>(aux_cfg_, *c, ranks);
+    if (aux_cfg_.controller()) {
+        /* Card sharing or manual control (work/aux-dyn/SPEC.md A.5): the controller decides before any reserve
+         * (the mode, the holders, the probe), writes `starting` and watches from then on, so a job started through
+         * aux_yield.sh during the load finds the card given back. A busy card starts released. */
+        aux_ctl_ = std::make_unique<aux::Control>(aux_cfg_, *c, (int)ranks.size());
+        if (aux_ctl_->init_share(aux::Roots{}, (long)::getpid(), &why) < 0) {
+            RAD_ERR("%s", why.c_str());
+            aux_ctl_.reset();
+            return RAD_E_INVAL;
+        }
+        std::string busy = d.released ? d.why : std::string();
+        bool held = !d.released && aux_ctl_->may_reserve(&busy);
+        if (held) {
+            aux_ctl_->watch(w.get(), /*reserving=*/true);
+            const int rc = w->reserve(devs[0], &why);
+            std::string early;
+            if (!aux_ctl_->reserved(rc >= 0)) {
+                if (rc >= 0) {   /* the watch asked for the card back during the reserve */
+                    w->release_arena(devs[0]);
+                    busy = "released during the reserve";
+                } else {
+                    busy = why;
+                }
+                held = false;
+            }
+        }
+        if (!held) aux_ctl_->watch(w.get(), /*reserving=*/false);
+        if (held) aux_ledger_ = w->arena_bytes();
+        aux_released_why_ = held ? std::string() : busy;
+        if (held)
+            RAD_INFO("%s%d (%s, %s, %s): %s free of %s; reserved %lld MiB (headroom %lld MiB, %s free after); %s; "
+                     "pinned host memory maps to the %zu rank cards only", ds41aux::kLogDevice, c->ord, c->bdf.c_str(),
+                     c->name.c_str(), c->arch.c_str(), humanb(c->vram_free).c_str(), humanb(c->vram_bytes).c_str(),
+                     (long long)aux_cfg_.cap_mib, (long long)aux_cfg_.headroom_mib, humanb(w->free_after()).c_str(),
+                     d.topology.c_str(), ranks.size());
+        else
+            RAD_INFO("%s%d (%s, %s, %s): %s free of %s; released at start (%s): nothing reserved; %s; pinned host "
+                     "memory maps to the %zu rank cards only", ds41aux::kLogDevice, c->ord, c->bdf.c_str(),
+                     c->name.c_str(), c->arch.c_str(), humanb(c->vram_free).c_str(), humanb(c->vram_bytes).c_str(),
+                     busy.c_str(), d.topology.c_str(), ranks.size());
+        aux_ = std::move(w);
+        return RAD_OK;
+    }
     if (w->reserve(devs[0], &why) < 0) {
         aux_off(why, true);
         return RAD_OK;
@@ -160,8 +213,27 @@ int Engine::aux_start() {
                     humanb(ds41aux::fixed_bytes(R, layers)).c_str()), true);
         return RAD_OK;
     }
-    const std::vector<int64_t> q = ds41aux::quotas(all, N, R);
-    if (aux_->build(layers, N, L, ranks_[0]->device, &why) < 0) {
+    /* The online set keeps `spare` slots free for its copies (work/aux-dyn/SPEC.md §3.4): the set holds N - spare
+     * units; without it spare is 0 and the quotas are the merged ones. */
+    const int64_t spare = aux_cfg_.online ? aux_cfg_.spare : 0;
+    if (spare > 0 && spare >= N) {
+        RAD_ERR("%s=%lld refused: the arena holds %lld unit slots, and %s=%lld keeps that many or more free",
+                ds41aux::kEnv, (long long)aux_cfg_.cap_mib, (long long)N, ds41aux::kOnlineSpareEnv, (long long)spare);
+        return RAD_E_INVAL;
+    }
+    const std::vector<int64_t> q = ds41aux::quotas(all, N - spare, R);
+    /* Card sharing: a released start loads nothing (the arena was never reserved, or the controller's watch gave
+     * it back before the load); its lanes are made, and the first acquire carves the arena they work in. */
+    bool released = !aux_->has_arena();
+    std::string rel_why = aux_released_why_;
+    if (!released && aux_ctl_ && !aux_ctl_->claim(&rel_why)) released = true;
+    if (released) {
+        aux_->plan(layers, N, L);
+        if (aux_->make_lanes(ranks_[0]->device, &why) < 0) {
+            aux_off(why, true);
+            return RAD_OK;
+        }
+    } else if (aux_->build(layers, N, L, ranks_[0]->device, &why) < 0) {
         aux_off(why, true);
         return RAD_OK;
     }
@@ -175,43 +247,125 @@ int Engine::aux_start() {
     std::vector<FileStager::AuxLoadStats> st((size_t)R);
     std::vector<std::string> err((size_t)R);
     std::vector<int> rc((size_t)R, RAD_OK);
-    {
-        std::vector<std::thread> th;
-        int64_t first = 0;
-        for (int r = 0; r < R; ++r) {
-            th.emplace_back([&, r, first] {
-                rc[(size_t)r] = ranks_[(size_t)r]->fstager.aux_load(aux_.get(), r, lists[(size_t)r], first,
-                                                                    q[(size_t)r], &st[(size_t)r], &err[(size_t)r]);
-            });
-            first += q[(size_t)r];
+    const std::atomic<bool>* abort = aux_ctl_ ? aux_ctl_->load_abort() : nullptr;
+    if (!released) {
+        {
+            std::vector<std::thread> th;
+            int64_t first = 0;
+            for (int r = 0; r < R; ++r) {
+                th.emplace_back([&, r, first] {
+                    rc[(size_t)r] = ranks_[(size_t)r]->fstager.aux_load(aux_.get(), r, lists[(size_t)r], first,
+                                                                        q[(size_t)r], &st[(size_t)r], &err[(size_t)r],
+                                                                        abort);
+                });
+                first += q[(size_t)r];
+            }
+            for (auto& t : th) t.join();
         }
-        for (auto& t : th) t.join();
+        for (int r = 0; r < R; ++r)
+            if (rc[(size_t)r] < 0) {
+                aux_off(fmt("the load failed: %s", err[(size_t)r].c_str()), true);
+                return RAD_OK;
+            }
+        if (abort && abort->load(std::memory_order_acquire)) {
+            /* The controller's watch asked for the card back during the load: every loader synced its copies, so
+             * the lanes drain at once; the arena goes and the worker starts released. */
+            for (int r = 0; r < R; ++r)
+                if (aux::Lane* l = aux_->lane(r); l && !l->drain(2'000'000'000LL)) {
+                    aux_off(fmt("released during the load, but rank %d's lane did not drain", r), true);
+                    return RAD_OK;
+                }
+            aux_->release_arena(ranks_[0]->device);
+            for (int r = 0; r < R; ++r) {
+                aux::RankView& v = aux_->view(r);
+                std::fill(v.resident.begin(), v.resident.end(), (uint8_t)0);
+                std::fill(v.slot.begin(), v.slot.end(), -1);
+                std::fill(v.gu_tab_entries.begin(), v.gu_tab_entries.end(), nullptr);
+                std::fill(v.dn_tab_entries.begin(), v.dn_tab_entries.end(), nullptr);
+                v.units = 0;
+                v.share = 0;
+            }
+            released = true;
+            rel_why = "released during the load";
+        }
     }
-    for (int r = 0; r < R; ++r)
-        if (rc[(size_t)r] < 0) {
-            aux_off(fmt("the load failed: %s", err[(size_t)r].c_str()), true);
+    if (!released) {
+        if (aux_->units() <= 0) {
+            aux_off("no unit loaded", true);
             return RAD_OK;
         }
-    if (aux_->units() <= 0) {
-        aux_off("no unit loaded", true);
-        return RAD_OK;
-    }
-    if (aux_->load_tables(&why) < 0) {
-        aux_off(why, true);
-        return RAD_OK;
-    }
-    /* A warm-up job a lane, against the CPU pool's rows: libr4d's code object loads on the extra card here,
-     * not in a rank thread's first launch, and its VRAM is in the headroom check below. */
-    for (int r = 0; r < R; ++r)
-        if (ranks_[(size_t)r]->fstager.aux_warm(aux_.get(), r, &why) < 0) {
+        if (aux_->load_tables(&why) < 0) {
             aux_off(why, true);
             return RAD_OK;
         }
-    if (aux_->check_headroom(&why) < 0) {
-        aux_off(why, true);
-        return RAD_OK;
+        /* A warm-up job a lane, against the CPU pool's rows: libr4d's code object loads on the extra card here,
+         * not in a rank thread's first launch, and its VRAM is in the headroom check below. */
+        for (int r = 0; r < R; ++r)
+            if (ranks_[(size_t)r]->fstager.aux_warm(aux_.get(), r, &why) < 0) {
+                aux_off(why, true);
+                return RAD_OK;
+            }
+        if (aux_->check_headroom(&why) < 0) {
+            aux_off(why, true);
+            return RAD_OK;
+        }
     }
-    for (int r = 0; r < R; ++r) ranks_[(size_t)r]->fstager.aux_bind(aux_->lane(r), &aux_->view(r), aux_cfg_);
+    /* The control thread (work/aux-dyn/SPEC.md §3), when a switch asks for it: the gate (card sharing) and the
+     * online set's candidates go to each stager with its binding. */
+    std::vector<std::vector<uint8_t>> cand_bits((size_t)R);
+    if (aux_cfg_.control_thread() && !aux_ctl_) aux_ctl_ = std::make_unique<aux::Control>(aux_cfg_, aux_->card(), R);
+    for (int r = 0; r < R; ++r) {
+        FileStager& fs = ranks_[(size_t)r]->fstager;
+        fs.aux_bind(aux_->lane(r), &aux_->view(r), aux_cfg_);
+        if (aux_ctl_) {
+            if (aux_cfg_.online) {
+                cand_bits[(size_t)r].assign(fs.aux_layer_index().size(), 0);
+                for (const ds41aux::Cand& c : per[(size_t)r])
+                    if (c.unit >= 0 && (size_t)c.unit < cand_bits[(size_t)r].size()) cand_bits[(size_t)r][(size_t)c.unit] = 1;
+            }
+            fs.aux_set_dynamic(aux_ctl_->gate(), r, aux_cfg_.online ? &cand_bits[(size_t)r] : nullptr);
+        }
+    }
+    if (aux_ctl_) {
+        std::vector<aux::RankUnits> units((size_t)R);
+        for (int r = 0; r < R; ++r) {
+            const std::vector<int32_t> li = ranks_[(size_t)r]->fstager.aux_layer_index();
+            aux::RankUnits& u = units[(size_t)r];
+            u.cands = per[(size_t)r];
+            u.quota = q[(size_t)r];
+            u.n_plan_units = (int32_t)li.size();
+            for (const ds41aux::Cand& c : u.cands) u.li.push_back(c.unit >= 0 && (size_t)c.unit < li.size() ? li[(size_t)c.unit] : -1);
+        }
+        aux::Hooks h;
+        h.source = [this, L](int r, int32_t u, aux::Hooks::Source* s) {
+            auto* hu = new Mover::HostUnit();
+            if (!ranks_[(size_t)r]->fstager.aux_source(u, L, hu, &s->gu, &s->gu_n, &s->dn, &s->dn_n)) {
+                delete hu;
+                return false;
+            }
+            s->lease = hu;
+            return true;
+        };
+        h.release = [this](int r, aux::Hooks::Source* s) {
+            if (auto* hu = (Mover::HostUnit*)s->lease) {
+                ranks_[(size_t)r]->mover.release_host_unit(hu);
+                delete hu;
+            }
+            s->lease = nullptr;
+        };
+        h.warm = [this](int r, int32_t u, int32_t li, const void* g, const void* d, std::string* w) {
+            return ranks_[(size_t)r]->fstager.aux_warm_unit(aux_->lane(r), u, li, g, d, w);
+        };
+        h.hit_tokens = [this](int r) { return ranks_[(size_t)r]->fstager.aux_hit_tokens(); };
+        h.swap_hits = [this](int r, std::vector<uint32_t>* e) { return ranks_[(size_t)r]->fstager.aux_swap_hits(e); };
+        h.guard_tripped = [this](int r) { return ranks_[(size_t)r]->fstager.aux_guard_tripped(); };
+        const int dev = aux_->device();
+        h.kfd_available = [dev] { return dev_card_available(dev); };
+        if (aux_ctl_->attach(aux_.get(), std::move(h), std::move(units), layers, N, L, released, rel_why, &why) < 0) {
+            aux_off("the control thread: " + why, true);
+            return RAD_OK;
+        }
+    }
     (void)rad_dev_set(ranks_[0]->device);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     int64_t cached = 0, packed = 0, skipped = 0;
@@ -224,6 +378,15 @@ int Engine::aux_start() {
         share += st[(size_t)r].share;
         per_rank += fmt("%srank %d %lld", r ? ", " : "", r, (long long)st[(size_t)r].loaded);
     }
+    if (released)
+        RAD_INFO("%s%s; nothing loaded on device %d (%lld slots, %zu candidate units, profile share %.4f); "
+                 "passes of up to %d rows, policy %s, deadline %lld us, backoff %lld, headroom %lld MiB, cap %lld MiB, "
+                 "forced lateness %lld (0 off)",
+                 ds41aux::kLogReleased, rel_why.c_str(), aux_->device(), (long long)N, all.size(), share_all,
+                 ds41aux::kMaxRows, aux_cfg_.verify ? "verify" : "serve", (long long)aux_cfg_.deadline_us,
+                 (long long)aux_cfg_.backoff, (long long)aux_cfg_.headroom_mib, (long long)aux_cfg_.cap_mib,
+                 (long long)aux_cfg_.force_late);
+    else
     RAD_INFO("%s%lld units (%s) resident on device %d: %s; profile share %.4f of the ranks' %.4f over %zu candidate "
              "units; loaded in %.1f s (%lld from the packed RAM cache, %lld packed from the container, %lld skipped), "
              "read back identical; warm-up rows equal the CPU pool's; passes of up to %d rows, policy %s, deadline "
@@ -233,6 +396,10 @@ int Engine::aux_start() {
              (long long)skipped, ds41aux::kMaxRows, aux_cfg_.verify ? "verify" : "serve",
              (long long)aux_cfg_.deadline_us, (long long)aux_cfg_.backoff, (long long)aux_cfg_.headroom_mib,
              (long long)aux_cfg_.cap_mib, (long long)aux_cfg_.force_late);
+    if (aux_ctl_) {
+        for (const std::string& l : aux_ctl_->startup_lines()) RAD_INFO("%s", l.c_str());
+        aux_ctl_->start();
+    }
     return RAD_OK;
 }
 

@@ -18,6 +18,9 @@
  */
 #pragma once
 #include <dirent.h>
+#include <regex.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -53,6 +56,43 @@ constexpr const char* kDeadlineEnv  = "RADIANCE_EXPERIMENTAL_DS41_AUX_DEADLINE_U
 constexpr const char* kBackoffEnv   = "RADIANCE_EXPERIMENTAL_DS41_AUX_BACKOFF";
 constexpr const char* kForceLateEnv = "RADIANCE_EXPERIMENTAL_DS41_AUX_FORCE_LATE";
 
+/* ---- card sharing and the online unit set (work/aux-dyn/SPEC.md §2) ------------------------------
+ *
+ * Read only with kEnv on, after the six above. A sub-switch set (non-empty) while its master is off refuses
+ * startup naming both, so an arm never runs without what its name says:
+ *   kShareEnv          "" or always: today's worker (no watch); exclusive: serve only while no other process
+ *                      is a client of the extra card; allow: serve while every other client's comm matches
+ *                      kShareAllowEnv and together they hold at most kShareForeignEnv MiB.
+ *   kShareAllowEnv, kShareForeignEnv           master: kShareEnv=allow.
+ *   kShareMinEnv                                master: kShareEnv exclusive or allow.
+ *   kShareFloorEnv, kSharePollEnv, kShareRelPollsEnv, kShareReacqEnv, kShareFillEnv
+ *                                               master: a controller (kShareEnv exclusive or allow, or
+ *                                               kControlEnv set).
+ *   kControlEnv        a path: the manual control file (on / off / auto), its holders directory <path>.d and
+ *                      the state file <path>.state (work/aux-dyn/SPEC.md A.4). Its own master.
+ *   kOnlineEnv         "", 0 off; 1: the online unit set (part B). Master of every kOnline*Env. */
+constexpr const char* kShareEnv         = "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE";
+constexpr const char* kShareAllowEnv    = "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_ALLOW";
+constexpr const char* kShareForeignEnv  = "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_FOREIGN_MIB";
+constexpr const char* kShareMinEnv      = "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_MIN_MIB";
+constexpr const char* kShareFloorEnv    = "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_FLOOR_MIB";
+constexpr const char* kSharePollEnv     = "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_POLL_MS";
+constexpr const char* kShareRelPollsEnv = "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_RELEASE_POLLS";
+constexpr const char* kShareReacqEnv    = "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_REACQUIRE_S";
+constexpr const char* kShareFillEnv     = "RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE_FILL_MBPS";
+constexpr const char* kControlEnv       = "RADIANCE_EXPERIMENTAL_DS41_AUX_CONTROL";
+constexpr const char* kOnlineEnv        = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE";
+constexpr const char* kOnlineRateEnv    = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_RATE";
+constexpr const char* kOnlineMaxEnv     = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_MAX";
+constexpr const char* kOnlineEveryEnv   = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_EVERY";
+constexpr const char* kOnlineHalfEnv    = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_HALFLIFE";
+constexpr const char* kOnlinePriorEnv   = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_PRIOR";
+constexpr const char* kOnlineMarginEnv  = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_MARGIN";
+constexpr const char* kOnlineSpareEnv   = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_SPARE";
+constexpr const char* kOnlineMbpsEnv    = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_MBPS";
+constexpr const char* kOnlineCheckEnv   = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_CHECK";
+constexpr const char* kOnlineDryEnv     = "RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_DRY";
+
 constexpr int64_t kCapMinMib = 1024, kCapMaxMib = 1048576;
 constexpr int64_t kHeadroomMin = 256, kHeadroomMax = 65536, kHeadroomDef = 1024;
 constexpr int64_t kDeadlineMin = 100, kDeadlineMax = 1000000, kDeadlineDef = 2000;
@@ -60,6 +100,9 @@ constexpr int64_t kBackoffMin = 0, kBackoffMax = 65536, kBackoffDef = 64;
 constexpr int64_t kForceLateMin = 0, kForceLateMax = 1000000;
 /* After the pool's rows are in, a job still pending gets at least this long before it is late. */
 constexpr int64_t kGraceUs = 50;
+
+enum Share : int { kShareAlways = 0, kShareExclusive = 1, kShareAllow = 2 };
+inline const char* share_name(int s) { return s == kShareExclusive ? "exclusive" : s == kShareAllow ? "allow" : "always"; }
 
 struct Config {
     bool        on = false;
@@ -71,6 +114,21 @@ struct Config {
     int64_t     deadline_us = kDeadlineDef;
     int64_t     backoff = kBackoffDef;
     int64_t     force_late = 0;
+    /* Card sharing (work/aux-dyn/SPEC.md part A). */
+    int         share = kShareAlways;
+    std::string allow = "^whisper";
+    int64_t     foreign_mib = 6144, min_mib = 1, floor_mib = 1024, poll_ms = 100, release_polls = 2;
+    int64_t     reacquire_s = 60, fill_mbps = 3000;
+    std::string control;           /* the control file's path, "" none */
+    /* The online unit set (part B). */
+    bool        online = false;
+    int64_t     rate = 200, omax = 16, every = 1, halflife = 512, prior = 256, margin = 100, spare = 16;
+    int64_t     mbps = 3000, check = 16;
+    bool        dry = false;       /* copies and read-backs run, flips never happen (a diagnostic) */
+    /* A controller (its thread, probe, gate, state file) exists: sharing or manual control. */
+    bool controller() const { return on && (share != kShareAlways || !control.empty()); }
+    /* The control thread runs: a controller, or the online set alone. */
+    bool control_thread() const { return controller() || (on && online); }
 };
 
 /* A decimal number of digits only (no sign, space or suffix), at most 9 digits. */
@@ -121,6 +179,109 @@ inline std::string uuid_of(uint64_t unique_id) {
     return b;
 }
 
+/* The control file's directory exists and is writable (the state file and the holders' directory go beside it);
+ * the path is not a directory. */
+inline bool control_path_ok(const std::string& path, std::string* why) {
+    if (path.empty() || path.back() == '/') {
+        if (why) *why = "a file path, not empty and not ending in /";
+        return false;
+    }
+    struct stat st{};
+    if (::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (why) *why = "a file path, not a directory";
+        return false;
+    }
+    const size_t k = path.rfind('/');
+    const std::string dir = k == std::string::npos ? "." : k == 0 ? "/" : path.substr(0, k);
+    if (::stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (why) *why = "its directory " + dir + " does not exist";
+        return false;
+    }
+    if (::access(dir.c_str(), W_OK) != 0) {
+        if (why) *why = "its directory " + dir + " is not writable (the state file goes there)";
+        return false;
+    }
+    return true;
+}
+
+/* The sharing and online switches (work/aux-dyn/SPEC.md §2), after the merged six: 1 on, -1 with *why. */
+template <class Get>
+int parse_dynamic(Get&& get, Config* c, std::string* why) {
+    auto bad = [&](const char* name, const char* val, const std::string& want) {
+        if (why) *why = std::string(name) + "=" + val + ": " + want;
+        return -1;
+    };
+    auto set = [&](const char* name) -> const char* {
+        const char* v = get(name);
+        return v && *v ? v : nullptr;
+    };
+    if (const char* s = set(kShareEnv)) {
+        if (!std::strcmp(s, "always")) c->share = kShareAlways;
+        else if (!std::strcmp(s, "exclusive")) c->share = kShareExclusive;
+        else if (!std::strcmp(s, "allow")) c->share = kShareAllow;
+        else return bad(kShareEnv, s, "empty or always (no watch), exclusive, or allow");
+    }
+    if (const char* p = set(kControlEnv)) {
+        std::string w;
+        if (!control_path_ok(p, &w)) return bad(kControlEnv, p, w);
+        c->control = p;
+    }
+    if (const char* o = set(kOnlineEnv)) {
+        if (!std::strcmp(o, "1")) c->online = true;
+        else if (std::strcmp(o, "0")) return bad(kOnlineEnv, o, "empty or 0 (off), or 1");
+    }
+    const bool ctl = c->share != kShareAlways || !c->control.empty();
+    struct Num { const char* name; int64_t lo, hi; int64_t* dst; int master; };
+    /* master: 1 kShareEnv=allow, 2 exclusive or allow, 3 a controller, 4 kOnlineEnv=1 */
+    const Num nums[] = { { kShareForeignEnv, 0, 65536, &c->foreign_mib, 1 },
+                         { kShareMinEnv, 0, 65536, &c->min_mib, 2 },
+                         { kShareFloorEnv, 0, 65536, &c->floor_mib, 3 },
+                         { kSharePollEnv, 50, 5000, &c->poll_ms, 3 },
+                         { kShareRelPollsEnv, 1, 100, &c->release_polls, 3 },
+                         { kShareReacqEnv, 0, 86400, &c->reacquire_s, 3 },
+                         { kShareFillEnv, 100, 20000, &c->fill_mbps, 3 },
+                         { kOnlineRateEnv, 1, 1600, &c->rate, 4 },
+                         { kOnlineMaxEnv, 1, 256, &c->omax, 4 },
+                         { kOnlineEveryEnv, 1, 64, &c->every, 4 },
+                         { kOnlineHalfEnv, 16, 65536, &c->halflife, 4 },
+                         { kOnlinePriorEnv, 0, 65536, &c->prior, 4 },
+                         { kOnlineMarginEnv, 100, 400, &c->margin, 4 },
+                         { kOnlineSpareEnv, 1, 256, &c->spare, 4 },
+                         { kOnlineMbpsEnv, 100, 20000, &c->mbps, 4 },
+                         { kOnlineCheckEnv, 0, 65536, &c->check, 4 } };
+    auto master_ok = [&](int m) {
+        return m == 1 ? c->share == kShareAllow : m == 2 ? c->share != kShareAlways : m == 3 ? ctl : c->online;
+    };
+    auto master_name = [&](int m) {
+        return std::string(m == 1 ? std::string(kShareEnv) + "=allow"
+                           : m == 2 ? std::string(kShareEnv) + "=exclusive or allow"
+                           : m == 3 ? std::string(kShareEnv) + "=exclusive or allow, or " + kControlEnv
+                                    : std::string(kOnlineEnv) + "=1");
+    };
+    if (const char* a = set(kShareAllowEnv)) {
+        if (!master_ok(1)) return bad(kShareAllowEnv, a, "set without " + master_name(1));
+        regex_t re;
+        if (regcomp(&re, a, REG_EXTENDED | REG_NOSUB) != 0) return bad(kShareAllowEnv, a, "not a POSIX extended regular expression");
+        regfree(&re);
+        c->allow = a;
+    }
+    for (const Num& m : nums) {
+        const char* s = set(m.name);
+        if (!s) continue;
+        if (!master_ok(m.master)) return bad(m.name, s, "set without " + master_name(m.master));
+        int64_t x = 0;
+        if (!parse_uint(s, &x) || x < m.lo || x > m.hi)
+            return bad(m.name, s, "a whole number from " + std::to_string(m.lo) + " to " + std::to_string(m.hi));
+        *m.dst = x;
+    }
+    if (const char* d = set(kOnlineDryEnv)) {
+        if (!master_ok(4)) return bad(kOnlineDryEnv, d, "set without " + master_name(4));
+        if (!std::strcmp(d, "1")) c->dry = true;
+        else if (std::strcmp(d, "0")) return bad(kOnlineDryEnv, d, "empty or 0 (off), or 1");
+    }
+    return 1;
+}
+
 /* Reads the switches through `get` (std::getenv's shape). 0: off (nothing else read); 1: on; -1: a value
  * is malformed (*why names the variable and the value). */
 template <class Get>
@@ -167,7 +328,7 @@ int parse(Get&& get, Config* c, std::string* why) {
         }
         *m.dst = x;
     }
-    return 1;
+    return parse_dynamic(get, c, why);
 }
 
 /* ---- topology ---------------------------------------------------------------------------------- */
@@ -280,6 +441,7 @@ struct Card {
 
 struct Decision {
     bool        on = false;
+    bool        released = false;  /* with a controller: chosen though short of free VRAM (a released start; why) */
     bool        warn = false;      /* the reason is a WARN (a mixed TP set), not an INFO */
     int         ord = -1;          /* the chosen card */
     std::string why;               /* off: why */
@@ -339,8 +501,8 @@ inline Decision decide(const std::vector<Card>& cards, const std::vector<int>& r
     }
     /* 4. Filters: the first failing one's reason, per candidate. */
     const int64_t need = (cfg.cap_mib + cfg.headroom_mib) << 20;
-    std::vector<const Card*> ok;
-    std::string rejected;
+    std::vector<const Card*> ok, busy;   /* busy: a controller's candidates short only of free VRAM */
+    std::string rejected, busy_why;
     for (const Card* c : cand) {
         std::string why;
         if (c->arch != r0->arch) why = "wrong ISA (" + c->arch + "; the ranks' " + r0->arch + ")";
@@ -352,8 +514,18 @@ inline Decision decide(const std::vector<Card>& cards, const std::vector<int>& r
             ok.push_back(c);
             continue;
         }
+        if (cfg.controller() && c->arch == r0->arch && !c->integrated) {   /* work/aux-dyn/SPEC.md A.5 */
+            busy.push_back(c);
+            if (busy_why.empty()) busy_why = why;
+            continue;
+        }
         rejected += (rejected.empty() ? "" : "; ") + std::string("device ") + std::to_string(c->ord) + " (" +
                     (c->bdf.empty() ? "?" : c->bdf) + ", " + c->name + "): " + why;
+    }
+    if (ok.empty() && !busy.empty()) {   /* the card is busy now: a released start, acquired later */
+        ok = busy;
+        d.released = true;
+        d.why = busy_why;
     }
     if (ok.empty()) {
         d.why = "no usable device beyond the ranks': " + rejected;
@@ -561,5 +733,11 @@ constexpr const char* kLogOff    = "aux experts: off: ";
 constexpr const char* kLogDevice = "aux experts: device ";
 constexpr const char* kLogOn     = "aux experts: on: ";
 constexpr const char* kLogRank   = "aux experts: rank ";
+/* work/aux-dyn/SPEC.md A.6 / B.8: the controller's startup line, the released start, the online set's startup
+ * line and its running / shutdown lines. */
+constexpr const char* kLogSharing  = "aux experts: sharing: ";
+constexpr const char* kLogReleased = "aux experts: released at start: ";
+constexpr const char* kLogOnlineOn = "aux experts: online set: ";
+constexpr const char* kLogOnline   = "aux experts: online: ";
 
 }  /* namespace ds41aux */

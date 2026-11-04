@@ -24,7 +24,11 @@
  *  - hx_choose -> hx_submit -> hx_finish in serve mode with that cache: a resident cached unit leased into
  *    aux_units_ (slot code -3) with the base's admit, no pool reservation, kept off want_ and among the units
  *    start_ep_routed aliases (hx_cpu_units); a resident unit not cached left to the CPU's way; a layer of worker
- *    units only still runs (the job, the aliases); the gather's rows equal the same pass's without the worker. */
+ *    units only still runs (the job, the aliases); the gather's rows equal the same pass's without the worker;
+ *  - the dynamic worker (work/aux-dyn/SPEC.md §7.4): with its switches unset no gate, no count, no hit array; a
+ *    shut gate declines without asking the lane (declined_released, the base's rows), an open one is held from
+ *    the decision to hx_finish (and hx_drain) and left; the online count (rows by candidate, passes the worker can
+ *    take only, whatever the lane) and the hand-off (two in a row, another size refused); flips between passes. */
 #include "rad_test.h"
 
 #include "rad_internal.h"
@@ -107,12 +111,15 @@ struct Packed {
 struct FakeLane final : rad::aux::Lane {
     State st = kReady;
     int submit_rc = 0, wait_rc = 1;
-    int submits = 0, waits = 0, abandons = 0, abandons_backoff = 0, declines = 0;
+    int submits = 0, waits = 0, abandons = 0, abandons_backoff = 0, declines = 0, states = 0;
     int64_t last_deadline = 0, last_wait_at = 0;
     rad::aux::Job job;
     std::vector<int32_t> sorted, off;
     std::vector<uint16_t> out = std::vector<uint16_t>((size_t)ds41aux::kMaxSlots * ds41aux::kEmbd, 0x7777);
-    State state() override { return st; }
+    State state() override {
+        ++states;
+        return st;
+    }
     void declined() override { ++declines; }
     int submit(const rad::aux::Job& j) override {
         ++submits;
@@ -770,6 +777,236 @@ struct AuxStagerProbe {
         rad_dev_free(y, RAD_MEM_DEVICE);
     }
 
+    /* ---- the dynamic worker (work/aux-dyn/SPEC.md §7.4) ---- */
+
+    /* No aux_set_dynamic (every new switch unset): no gate, no counting, the lane asked as the merged worker asks
+     * it, the hit array never made. */
+    void dynamic_switch_off_identity() {
+        const std::vector<int32_t> want = { 3, 17, 40 };
+        for (int e = 0; e < 96; ++e) counts[(size_t)e] = 0;
+        for (int32_t u : want) counts[(size_t)u] = 2;
+        FakeLane lane;
+        fs.aux_bind(&lane, &view, aux::Config{});
+        fs.aux_pass_ = true;
+        view.resident[17] = 1;
+        (void)choose(4, want);
+        CHECK(fs.aux_gate_ == nullptr);
+        CHECK(!fs.aux_online_);
+        CHECK(!fs.aux_in_lane_);
+        CHECK(fs.aux_hits_.empty());
+        CHECK_EQ(fs.aux_hit_tok_, (uint64_t)0);
+        CHECK_EQ(lane.states, 1);
+        CHECK_EQ(fs.aux_stats_.declined_released, (uint64_t)0);
+        std::vector<uint32_t> e(96, 0);
+        CHECK_EQ(fs.aux_swap_hits(&e), (uint64_t)0);   /* not counting: nothing to hand off, nothing swapped */
+        CHECK(e == std::vector<uint32_t>(96, 0));
+        view.resident[17] = 0;
+        fs.aux_unbind();
+    }
+
+    /* The gate shut (a release): hx_choose declines without asking the lane, counts the decline, holds no entry;
+     * the gather's rows are the pass's without the worker. Open: the rank holds its entry from the decision to the
+     * layer's last lane call (hx_finish), and leaves it. */
+    void a_shut_gate_declines_without_the_lane() {
+        const std::vector<int32_t> sel = { 5, 6, 7, 8, 12, 13, 14, 15, 19, 20, 21, 22, 26, 27, 28, 29 };
+        if (experts.size() < 4) experts.resize(4);
+        for (size_t k = 0; k < 4; ++k)
+            if (experts[k].gu.empty()) REQUIRE_OK(experts[k].make(2000 + (uint32_t)k) ? 0 : -1);
+        cache_on({ 5, 12, 13, 20 }, { &experts[0], &experts[1], &experts[2], &experts[3] });
+        RadStream s = nullptr;
+        RadEvent ev = nullptr;
+        REQUIRE_OK(rad_stream_create(&s, 0));
+        REQUIRE_OK(rad_event_create(&ev));
+        fs.hx_out_ev_ = ev;
+        uint16_t* y = (uint16_t*)rad_dev_alloc(24 * 5120 * 2, RAD_MEM_DEVICE);
+        REQUIRE(y);
+        Layer base;
+        layer(sel, nullptr, s, y, &base);
+        view.resident[12] = view.resident[20] = 1;
+        aux::Gate gate;
+        gate.closed.store(true);
+        FakeLane lane;
+        /* layer() binds the lane itself; the gate goes on after its bind, as aux_start does it. */
+        pass(4, 5, 4);
+        fs.hx_li_ = -1;
+        fs.hx_stage_ = 0;
+        fs.want_ = sel;
+        fs.aux_bind(&lane, &view, aux::Config{});
+        fs.aux_set_dynamic(&gate, 1, nullptr);
+        fs.aux_pass_ = true;
+        fs.hx_choose(0);
+        CHECK(!fs.aux_take_);
+        CHECK_EQ(lane.states, 0);   /* the lane never asked */
+        CHECK_EQ(fs.aux_stats_.declined_released, (uint64_t)1);
+        CHECK_EQ(gate.in_lane[1].load(), 0);
+        CHECK(!fs.aux_in_lane_);
+        fs.hx_drain();
+        fs.aux_unbind();
+        /* the same layer through hx_submit / hx_finish with the gate shut: the base's rows */
+        Layer shut;
+        pass(4, 5, 4);
+        fs.hx_li_ = -1;
+        fs.hx_stage_ = 0;
+        fs.want_ = sel;
+        fs.hx_stats_ = FileStager::HostStats{};
+        fs.aux_bind(&lane, &view, aux::Config{});
+        fs.aux_set_dynamic(&gate, 1, nullptr);
+        fs.aux_pass_ = true;
+        fs.hx_choose(0);
+        REQUIRE_EQ(fs.hx_stage_, 1);
+        fs.hx_cpu_units();
+        REQUIRE_OK(fs.hx_submit());
+        for (int i = 0; i < 24 * 5120; ++i) y[i] = 0x5555;
+        fs.hx_confirmed_ = true;
+        RadTensor Y{};
+        Y.data = y;
+        Y.dtype = RAD_BF16;
+        Y.rank = 2;
+        Y.shape[0] = 24;
+        Y.shape[1] = 5120;
+        Y.stride[0] = 5120;
+        Y.stride[1] = 1;
+        REQUIRE_OK(fs.hx_finish(s, &Y, 1));
+        REQUIRE_OK(rad_stream_sync(s));
+        shut.out.assign(fs.hx_out_, fs.hx_out_ + 24 * 5120);
+        shut.y.assign(y, y + 24 * 5120);
+        CHECK_EQ(lane.submits, 0);
+        CHECK(shut.out == base.out);
+        CHECK(shut.y == base.y);
+        fs.aux_unbind();
+        /* open: taken, the entry held through hx_submit, left by hx_finish */
+        gate.closed.store(false);
+        pass(4, 5, 4);
+        fs.hx_li_ = -1;
+        fs.hx_stage_ = 0;
+        fs.want_ = sel;
+        fs.aux_bind(&lane, &view, aux::Config{});
+        fs.aux_set_dynamic(&gate, 1, nullptr);
+        fs.aux_pass_ = true;
+        fs.hx_choose(0);
+        CHECK(fs.aux_take_);
+        CHECK_EQ(gate.in_lane[1].load(), 1);
+        fs.hx_cpu_units();
+        REQUIRE_OK(fs.hx_submit());
+        CHECK_EQ(gate.in_lane[1].load(), 1);   /* the job in flight: still the rank's */
+        REQUIRE(cpu_rows_of_compacted(lane.out.data()));
+        fs.hx_confirmed_ = true;
+        REQUIRE_OK(fs.hx_finish(s, &Y, 1));
+        REQUIRE_OK(rad_stream_sync(s));
+        CHECK_EQ(gate.in_lane[1].load(), 0);
+        CHECK(!fs.aux_in_lane_);
+        CHECK_EQ(lane.submits, 1);
+        CHECK(std::equal(fs.hx_out_, fs.hx_out_ + 24 * 5120, base.out.begin()));
+        /* hx_drain leaves it too (a layer given up) */
+        pass(4, 5, 4);
+        fs.hx_li_ = -1;
+        fs.hx_stage_ = 0;
+        fs.want_ = sel;
+        fs.hx_choose(0);
+        CHECK_EQ(gate.in_lane[1].load(), 1);
+        fs.hx_drain();
+        CHECK_EQ(gate.in_lane[1].load(), 0);
+        fs.aux_unbind();
+        view.resident[12] = view.resident[20] = 0;
+        mover.borrow_hook_ = {};
+        fs.hx_out_rec_ = false;
+        fs.hx_out_ev_ = nullptr;
+        rad_event_destroy(ev);
+        rad_stream_destroy(s);
+        rad_dev_free(y, RAD_MEM_DEVICE);
+    }
+
+    /* The online set's count (B.2): rows routed to each selected candidate, in passes the worker could take only;
+     * the hand-off swaps arrays of the plan's size (two in a row), and refuses another size. */
+    void online_counting_and_the_hand_off() {
+        for (int e = 0; e < 96; ++e) counts[(size_t)e] = 0;
+        counts[3] = 2;
+        counts[17] = 3;
+        counts[40] = 1;
+        std::vector<uint8_t> cand(96, 0);
+        cand[17] = cand[40] = 1;
+        FakeLane lane;
+        lane.st = aux::Lane::kBusy;
+        fs.aux_bind(&lane, &view, aux::Config{});
+        fs.aux_set_dynamic(nullptr, 0, &cand);
+        REQUIRE_EQ(fs.aux_hits_.size(), (size_t)96);
+        fs.aux_pass_ = true;
+        const std::vector<int32_t> want = { 3, 17, 40 };
+        (void)choose(4, want);
+        CHECK_EQ(fs.aux_hits_[17], 3u);
+        CHECK_EQ(fs.aux_hits_[40], 1u);
+        CHECK_EQ(fs.aux_hits_[3], 0u);   /* not a candidate */
+        (void)choose(17, want);          /* taller than 16 rows: not counted */
+        fs.aux_pass_ = false;            /* a draft or sliced pass */
+        (void)choose(4, want);
+        fs.aux_pass_ = true;
+        fs.aux_rows_[0].ok = false;      /* a layer the worker cannot take */
+        (void)choose(4, want);
+        fs.aux_rows_[0].ok = true;
+        CHECK_EQ(fs.aux_hits_[17], 3u);
+        CHECK_EQ(fs.aux_hits_[40], 1u);
+        /* counting goes on whatever the lane or the gate: the lane was busy throughout */
+        (void)choose(4, want);
+        CHECK_EQ(fs.aux_hits_[17], 6u);
+        /* the hand-off: the stager's array for the inbox's zeroed one, its tokens with it */
+        fs.aux_hit_tok_ = 5;
+        std::vector<uint32_t> inbox(96, 0);
+        CHECK_EQ(fs.aux_swap_hits(&inbox), (uint64_t)5);
+        CHECK_EQ(inbox[17], 6u);
+        CHECK_EQ(inbox[40], 2u);
+        CHECK_EQ(fs.aux_hit_tok_, (uint64_t)0);
+        CHECK(fs.aux_hits_ == std::vector<uint32_t>(96, 0));
+        /* the control thread zeroes what it merged; the next hand-off swaps it back */
+        std::fill(inbox.begin(), inbox.end(), 0u);
+        (void)choose(4, want);
+        fs.aux_hit_tok_ = 4;
+        CHECK_EQ(fs.aux_swap_hits(&inbox), (uint64_t)4);
+        CHECK_EQ(inbox[17], 3u);
+        CHECK(fs.aux_hits_ == std::vector<uint32_t>(96, 0));
+        std::vector<uint32_t> small(10, 0);
+        CHECK_EQ(fs.aux_swap_hits(&small), (uint64_t)0);   /* another size: not swapped */
+        CHECK_EQ(small.size(), (size_t)10);
+        CHECK_EQ(fs.aux_hits_.size(), (size_t)96);
+        fs.aux_unbind();
+    }
+
+    /* A boundary's flips (the view changing between passes): a unit flipped out is in no later job, one flipped in
+     * is; the gather's rows stay the CPU path's. */
+    void flips_follow_the_view() {
+        const std::vector<int32_t> sel = { 5, 6, 7, 8, 12, 13, 14, 15, 19, 20, 21, 22, 26, 27, 28, 29 };
+        if (experts.size() < 4) experts.resize(4);
+        for (size_t k = 0; k < 4; ++k)
+            if (experts[k].gu.empty()) REQUIRE_OK(experts[k].make(2000 + (uint32_t)k) ? 0 : -1);
+        cache_on({ 5, 12, 13, 20 }, { &experts[0], &experts[1], &experts[2], &experts[3] });
+        RadStream s = nullptr;
+        RadEvent ev = nullptr;
+        REQUIRE_OK(rad_stream_create(&s, 0));
+        REQUIRE_OK(rad_event_create(&ev));
+        fs.hx_out_ev_ = ev;
+        uint16_t* y = (uint16_t*)rad_dev_alloc(24 * 5120 * 2, RAD_MEM_DEVICE);
+        REQUIRE(y);
+        Layer base, a, b;
+        layer(sel, nullptr, s, y, &base);
+        view.resident[12] = 1;
+        FakeLane la;
+        layer(sel, &la, s, y, &a);
+        CHECK(a.aux_list == std::vector<int32_t>({ 12 }));
+        view.resident[12] = 0;   /* flipped out */
+        view.resident[20] = 1;   /* flipped in */
+        FakeLane lb;
+        layer(sel, &lb, s, y, &b);
+        CHECK(b.aux_list == std::vector<int32_t>({ 20 }));
+        CHECK(a.out == base.out && b.out == base.out);
+        CHECK(a.y == base.y && b.y == base.y);
+        view.resident[20] = 0;
+        mover.borrow_hook_ = {};
+        fs.hx_out_rec_ = false;
+        fs.hx_out_ev_ = nullptr;
+        rad_event_destroy(ev);
+        rad_stream_destroy(s);
+        rad_dev_free(y, RAD_MEM_DEVICE);
+    }
+
     /* aux_load and Worker::load_tables on the host backend's fifth device (work/aux/SPEC.md §6.3, §7.5). */
     void a_load_frees_nothing_in_flight() {
         if (experts.empty()) experts.resize(1);
@@ -1171,6 +1408,28 @@ TEST(hx_choose_serve_leases_resident_cached_units_without_a_reservation) {
     if (!pool()) SKIP("no AVX2 or no CPU pool");
     AuxStagerProbe p;
     p.serve_leases_through_hx_choose();
+}
+
+TEST(dynamic_switches_unset_change_nothing_in_hx_choose) {
+    AuxStagerProbe p;
+    p.dynamic_switch_off_identity();
+}
+
+TEST(a_shut_gate_declines_without_asking_the_lane) {
+    if (!pool()) SKIP("no AVX2: the CPU pool cannot run");
+    AuxStagerProbe p;
+    p.a_shut_gate_declines_without_the_lane();
+}
+
+TEST(online_counting_and_the_hit_hand_off) {
+    AuxStagerProbe p;
+    p.online_counting_and_the_hand_off();
+}
+
+TEST(flips_between_passes_follow_the_view) {
+    if (!pool()) SKIP("no AVX2: the CPU pool cannot run");
+    AuxStagerProbe p;
+    p.flips_follow_the_view();
 }
 
 TEST(aux_load_and_load_tables_free_nothing_their_queued_copies_use) {

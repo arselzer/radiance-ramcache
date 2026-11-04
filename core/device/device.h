@@ -395,6 +395,10 @@ struct DeviceBackend {
     int     (*pin_devices)(const int* ords, int n);
     void*   (*alloc_pinned_on)(int64_t bytes, const int* ords, int n);
     int     (*device_faulted)(int device);
+    /* What the driver will still allocate on `device` (AMDKFD_IOC_AVAILABLE_MEMORY, the figure its allocation check
+     * uses), -1 when it will not say; the aux worker's control thread asks it before an acquire (work/aux-dyn/SPEC.md
+     * A.1). Null on a backend without it. */
+    int64_t (*card_available)(int device);
 };
 
 
@@ -407,6 +411,8 @@ int     dev_pin_devices(const std::vector<int>& ords);
 bool    dev_pin_restricted();
 void*   dev_alloc_pinned_on(int64_t bytes, const std::vector<int>& ords);
 bool    dev_faulted(int device);
+/* DeviceBackend::card_available, -1 without it. */
+int64_t dev_card_available(int device);
 /* The host backend's record of a pinned allocation's devices, a bit per ordinal (0: not a pinned
  * allocation of that backend): for tests (aux_stager_test) of the pin set without a card. */
 uint64_t host_pinned_devices(const void* p);

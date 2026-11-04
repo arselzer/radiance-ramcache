@@ -143,6 +143,27 @@ instead of 279. Every held-out reply was identical to the base engine. The decod
 `..._VRAM_PACKED` and `..._ROUTER_BF16` measured 38.7 / 42.9 at 4 / 8 streams (ab-20261030T231526Z, before the
 upstream sync; not re-measured).
 
+**Long-prefill admission with a 192 GiB expert cache** (opt-in, four RX 9070 XT, C2 at 2,048-token chunks): add
+`RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all` and `RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=64`. Every expert unit a
+chunk selects can then enter the existing bounded RAM cache, instead of only units selected by its last 128 rows.
+Later chunks reuse those bytes rather than reading them again. Weights, routing and arithmetic are unchanged.
+On the unchanged stable runtime f84b23db / libr4d 92bd7719, with a fixed 131,072-token reservation:
+
+- A fresh 6,817-token prompt took 13.24 s to first token against 17.16 s with default admission, a quiet single-pair
+  screen (ab-20261104T115653Z; the separate startup control and hash-instrumented arms are retained).
+- Quiet 47,917-token prompts in OFF/ON/ON/OFF order took 100.68 / 62.04 / 61.53 / 99.83 s, a 38.4% reduction by
+  pair means (ab-20261104T121517Z). Each was followed on the same server by the original eight held-out requests at
+  concurrency eight: mean total decode 46.67 versus 47.16 tok/s, wave time 14.08 versus 14.00 s, no measured regression.
+- After a fresh held-out wave at concurrency eight, the 6,817-token prompt took 13.33 / 11.74 / 12.02 / 12.82 s in
+  the same OFF/ON/ON/OFF order, 9.1% less time by pair means. All warming requests and observer snapshots are retained.
+- All 80 replies and original prompt/generated counts across these two windows matched their qualified references;
+  all five captured full prefill digests matched too. Every admit-all rank reported zero insert-cap drops. Some
+  experts were evicted, which is why the post-prefill decode guard is required.
+
+This recommendation is scoped to the tested 192 GiB cache and 6.8K/48K workloads. Keep default admission (`128`) for
+smaller or changing RAM budgets until separately measured; admit-all can thrash a smaller cache. The 100K and
+prefix-cached agent-harness extensions are not yet measured with admit-all. This does not change the engine default.
+
 **4,096-token chunks** (opt-in, exact; for one stream prefilling uncached prompts well above 2,048 tokens, not for
 concurrent decode): `..._LCP=4096` with `--max-num-batched-tokens 4096`, `..._MISSES=4096` and
 `--checkpoint-interval 4096` (Phase 1 refuses an interval below the chunk; the default is 2048); window parts `M4096`

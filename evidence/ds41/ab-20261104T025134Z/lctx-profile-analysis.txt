@@ -1,0 +1,237 @@
+# long-context decode profile (work/lctx-profile/analyze.py), short held-out prompts vs after 99,987 tokens
+== inputs (per decode step everywhere below; ms unless marked)
+short /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261104T025134Z/all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ct4
+      8 requests (0 errors), 485 tokens out, 37.67 ms a decode step (harness rate 26.99 tok/s), 477 decode steps, decode floor best/recent 34.3/34.3 ms; prompts 8 of 32..46
+      live chain (dump only): 485 passes issued live (477 decode), 119 traced, one decode pass in 4
+      trace: 119 passes, 119 used (100.0% of their launches stamped, 100.0% in every packet), 1628 launches and 1889 stamped kernels a pass
+long  /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261104T025134Z/all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ulong100k-Ct4
+      1 requests (0 errors), 66 tokens out, 53.43 ms a decode step (harness rate 19.01 tok/s), 65 decode steps, decode floor best/recent 52.3/52.3 ms; prompts 99987
+      live chain (dump only): 115 passes issued live (65 decode), 16 traced, one decode pass in 4
+      trace: 16 passes, 16 used (100.0% of their launches stamped, 100.0% in every packet), 1628 launches and 1901 stamped kernels a pass
+
+== card 0, compute queue (lane 0), per decode step                         short     long     diff
+   span: the pass's first to its last kernel                          36.88    48.67   +11.79
+     busy (union of its kernels)                                      19.89    25.56    +5.67
+     idle inside the pass (the card waiting)                          16.99    23.10    +6.12
+   span, median pass                                                  36.46    47.29   +10.83
+   other queues busy beside it (lane 1: on-die weight reads)           3.91     3.92    +0.01
+   decode step (the server's mean, this arm's JSON)                   37.67    53.43   +15.76
+   step - span: host work between passes (+ trace overhead)            0.79     4.77    +3.97
+
+== per component (device time sums every kernel of both lanes; idle is lane 0's)
+                                                              device time (kernels)     |     lane-0 idle before it |    total
+                                                                 short     long     diff |    short     long     diff |     diff
+   issue-path kernels (copies, fills, blits)                      0.31     0.33    +0.02 |    10.78    15.75    +4.97 |    +4.98
+   indexer: score, candidates, top-k                              0.12     2.80    +2.69 |     0.07     0.10    +0.03 |    +2.72
+   collectives (incl. waits for peers)                           10.18    12.67    +2.49 |     0.65     0.64    -0.00 |    +2.49
+   engram                                                         0.12     0.12    +0.00 |     0.21     1.28    +1.07 |    +1.07
+   attention projections, rope, norms                             2.70     2.90    +0.21 |     1.54     1.56    +0.02 |    +0.23
+   routed experts (router, scatter, card experts, gather)         3.05     3.15    +0.10 |     1.60     1.63    +0.03 |    +0.13
+   sparse attention                                               0.52     0.61    +0.09 |     0.15     0.16    +0.00 |    +0.09
+   hyper-connections and norms                                    1.18     1.22    +0.05 |     1.07     1.06    -0.01 |    +0.04
+   shared expert                                                  0.93     0.96    +0.03 |     0.50     0.50    -0.00 |    +0.03
+   on-die weight reads (lane 1)                                   3.91     3.92    +0.01 |        -        -    +0.00 |    +0.01
+   indexer: query and weight projections                          0.12     0.12    +0.00 |     0.12     0.12    +0.00 |    +0.01
+   window key store                                               0.06     0.06    +0.00 |     0.15     0.16    +0.00 |    +0.00
+   compressor and key stores                                      0.08     0.08    -0.01 |     0.11     0.11    +0.00 |    -0.00
+   other                                                          0.01     0.01    +0.00 |     0.02     0.02    -0.00 |    +0.00
+   head (logits)                                                  0.52     0.52    +0.00 |     0.01     0.01    -0.00 |    +0.00
+
+== per op, all layers (top 25 by |total diff|; xN: launches a step)
+                                                              device time (kernels)     |     lane-0 idle before it |    total
+                                                                 short     long     diff |    short     long     diff |     diff
+   (issue path) _ZN12_GLOBAL__N_113aql_copy_linkEPKDv4_jPS0_m     0.21     0.22    +0.01 |    10.49    15.44    +4.96 |    +4.97
+   index_score(index_score) x8                                    0.09     2.63    +2.54 |     0.03     0.03    +0.00 |    +2.54
+   all_reduce(ffn_normed) x40                                     9.77    12.27    +2.50 |     0.32     0.32    -0.00 |    +2.50
+   cast(engram_rows_dev) x2                                       0.01     0.01    +0.00 |     0.17     1.23    +1.07 |    +1.07
+   index_topk(index_sel) x8                                       0.02     0.13    +0.11 |     0.03     0.07    +0.03 |    +0.15
+   attn_sparse_sink(attn_sinks) x40                               0.52     0.61    +0.09 |     0.15     0.16    +0.00 |    +0.09
+   gemm_nt_bf16f8(attn_output_b) x40                              0.49     0.56    +0.07 |     0.15     0.15    +0.00 |    +0.08
+   gemm_nt_bf16f8(attn_output_a.g1) x40                           0.36     0.41    +0.05 |     0.16     0.17    +0.01 |    +0.05
+   gemm_nt_bf16f8(attn_output_a.g0) x40                           0.37     0.42    +0.05 |     0.15     0.15    +0.00 |    +0.05
+   all_gather(engram_kv) x2                                       0.10     0.06    -0.04 |     0.02     0.02    -0.00 |    -0.04
+   index_candidates(index_keep) x1                                0.00     0.04    +0.03 |     0.00     0.00    +0.00 |    +0.03
+   moe_gemm_ggml(ffn_down_exps.0) x40                             0.84     0.87    +0.03 |     0.17     0.17    +0.00 |    +0.03
+   gemm_nt_f32bf16(glm_router) x40                                0.19     0.22    +0.03 |     0.15     0.15    +0.00 |    +0.03
+   all_reduce(attn_out) x40                                       0.30     0.33    +0.03 |     0.29     0.29    +0.00 |    +0.03
+   moe_gather(ffn_normed) x40                                     0.11     0.12    +0.00 |     0.34     0.37    +0.03 |    +0.03
+   moe_gemm_ggml(ffn_gate_up_exps.0) x40                          1.52     1.55    +0.03 |     0.31     0.31    -0.00 |    +0.03
+   gemm_nt_bf16f8(ffn_gate_up_shexp) x40                          0.57     0.59    +0.02 |     0.16     0.16    -0.00 |    +0.02
+   mhc_post_collapse_rmsnorm(attn_norm) x37                       0.23     0.24    +0.01 |     0.15     0.15    -0.00 |    +0.01
+   mhc_post_collapse_rmsnorm(ffn_norm) x40                        0.24     0.25    +0.01 |     0.15     0.15    +0.00 |    +0.01
+   gemm_nt_bf16f8(ffn_down_shexp) x40                             0.32     0.33    +0.01 |     0.16     0.17    +0.00 |    +0.01
+   router_scored_topk(glm_router.correction) x40                  0.22     0.23    +0.01 |     0.15     0.15    +0.00 |    +0.01
+   mhc_mix(hc_ffn_fn) x40                                         0.34     0.35    +0.01 |     0.34     0.35    +0.00 |    +0.01
+   gemm_nt_bf16f8(attn_kv) x40                                    0.26     0.26    +0.01 |     0.15     0.15    +0.00 |    +0.01
+   gemm_nt_bf16f8(attn_q_a) x40                                   0.49     0.50    +0.01 |     0.15     0.15    +0.00 |    +0.01
+   gemm_nt_bf16f8(attn_q_b) x40                                   0.38     0.38    +0.01 |     0.15     0.15    +0.00 |    +0.01
+   per call, the ops above with the largest device-time diff (us a launch, short -> long):
+     index_score(index_score)                                     11.4 ->    329.1 us (+317.6), x8
+     all_reduce(ffn_normed)                                      244.2 ->    306.7 us (+62.5), x40
+     index_candidates(index_keep)                                  2.7 ->     35.5 us (+32.8), x1
+     all_gather(engram_kv)                                        51.1 ->     30.3 us (-20.8), x2
+     index_topk(index_sel)                                         2.6 ->     16.7 us (+14.2), x8
+     attn_sparse_sink(attn_sinks)                                 12.9 ->     15.2 us (+2.3), x40
+     gemm_nt_bf16f8(attn_output_b)                                12.1 ->     14.0 us (+1.9), x40
+     qsa_work(comp_stage)                                          3.4 ->      1.8 us (-1.6), x3
+   components: attention projections, rope, norms = ds41_rope_rows, gemm_nt_bf16f8, rmsnorm, rmsnorm_rope_roundtrip, rope_rows_roundtrip; collectives (incl. waits for peers) = all_gather, all_reduce; compressor and key stores = entry_store, gemm_nt, gemm_nt_f32bf16, qsa_tail_store, qsa_work, rmsnorm, rope_rows_roundtrip, softmax_pool; engram = cast, embed_lookup, gemm_nt_bf16f8, ngram_ids, stream_gate_add, token_map; head (logits) = gather_rows, logits_gemm; hyper-connections and norms = cast, fill, mhc_collapse_rmsnorm, mhc_mix, mhc_post, mhc_post_collapse_rmsnorm; indexer: query and weight projections = gemm_nt, gemm_nt_bf16f8, rmsnorm_rope_roundtrip, rope_rows_roundtrip; indexer: score, candidates, top-k = index_candidates, index_score, index_topk; issue-path kernels (copies, fills, blits) = _ZN12_GLOBAL__N_113aql_copy_linkEPKDv4_jPS0_m, _ZN12_GLOBAL__N_114rad_wtab_patchEN3rad9WtabP..., _ZN12_GLOBAL__N_19aql_copy1EPKhPhm; on-die weight reads (lane 1) = prefetch; other = rope_table; routed experts (router, scatter, card experts, gather) = gemm_nt_f32bf16, moe_gather, moe_gemm_ggml, moe_scatter, router_scored_topk, swiglu_clamped; shared expert = fill, gemm_nt_bf16f8; sparse attention = attn_sparse_sink; window key store = kv_store
+
+== per kind of layer (lane-0 device time + idle before, summed over the kind's layers)
+   kind                                     layers    short     long     diff   layers
+   indexer                                       4     3.81     6.78    +2.96   [24, 28, 32, 36]
+   kv source+indexer                             3     2.95     4.62    +1.67   [2, 8, 14]
+   kv source+indexer+candidates                  1     0.92     1.39    +0.48   [20]
+   other                                        32    29.13    35.80    +6.67   32 of 0..39
+
+== the 12 layers that changed most (lane 0)
+   layer  kind                      dev s    dev l     diff |   idle s   idle l     diff
+   24     indexer                    0.51     1.23    +0.72 |     0.33     0.81    +0.48
+   0      other                      0.53     0.51    -0.03 |     0.55     1.73    +1.18
+   32     indexer                    0.49     0.86    +0.38 |     0.51     0.79    +0.28
+   14     kv source+indexer          0.60     1.19    +0.59 |     0.44     0.47    +0.03
+   28     indexer                    0.50     1.02    +0.52 |     0.44     0.48    +0.04
+   36     indexer                    0.55     1.16    +0.61 |     0.49     0.43    -0.06
+   10     other                      0.60     0.45    -0.15 |     0.31     1.00    +0.69
+   2      kv source+indexer          0.50     0.68    +0.18 |     0.45     0.80    +0.35
+   8      kv source+indexer          0.52     0.97    +0.45 |     0.44     0.52    +0.08
+   35     other                      0.56     0.63    +0.07 |     0.32     0.76    +0.43
+   29     other                      0.43     0.68    +0.26 |     0.40     0.64    +0.24
+   5      other                      0.47     0.97    +0.50 |     0.35     0.34    -0.01
+
+== rank 0, host side, one-token passes (shutdown report), per decode step    short     long     diff
+   waiting for the card at the routers (EP staging)                            16.54    24.00    +7.46
+   counts wait at early-issued gathers (its own clock, overlaps the above)     19.30    25.13    +5.82
+   waiting at gathers for the CPU's rows                                        9.96    13.42    +3.47
+     gathers with CPU rows a step (count)                                      19.38    22.78    +3.40
+     one-token miss reads a step (count)                                        0.25     0.75    +0.50
+   CPU pool: a submit's first tile after it (us)                               256.8    229.6    -27.2
+   CPU pool: its 24th tile (us)                                                287.5    262.3    -25.2
+   EP decision: counts to the CPU's work submitted (us a layer)                 15.6     16.2     +0.6
+   waiting for the step's ids at its end (read back)                            0.49     0.49    -0.00
+   (steps: 477 short, 65 long, from the one-token layers / 40)
+
+== summary
+   the decode step is +15.76 ms longer at the long context (37.67 -> 53.43 ms in these traced arms)
+   card 0's pass span +11.79 ms: its kernels' busy time +5.67, the card idle inside the pass +6.12; host work between passes +3.97
+   device time up by component: indexer: score, candidates, top-k +2.69; collectives (incl. waits for peers) +2.49; attention projections, rope, norms +0.21; routed experts (router, scatter, card experts, gather) +0.10; sparse attention +0.09
+   card idle up before: (issue path) _ZN12_GLOBAL__N_113aql_copy_linkEPKDv4_jPS0_m +4.96; cast(engram_rows_dev) +1.07; index_topk(index_sel) +0.03; moe_gather(ffn_normed) +0.03
+   (device time sums both lanes' kernels; only lane 0's busy time is in the span)
+
+# same, the 1,899-token same-text control (Ulong2k) vs after 99,987 tokens
+== inputs (per decode step everywhere below; ms unless marked)
+short /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261104T025134Z/all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ulong2k-Ct4
+      1 requests (0 errors), 74 tokens out, 52.60 ms a decode step (harness rate 19.27 tok/s), 73 decode steps, decode floor best/recent 54.2/54.2 ms; prompts 1899
+      live chain (dump only): 74 passes issued live (73 decode), 18 traced, one decode pass in 4
+      trace: 18 passes, 18 used (100.0% of their launches stamped, 100.0% in every packet), 1628 launches and 1893 stamped kernels a pass
+long  /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261104T025134Z/all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ulong100k-Ct4
+      1 requests (0 errors), 66 tokens out, 53.43 ms a decode step (harness rate 19.01 tok/s), 65 decode steps, decode floor best/recent 52.3/52.3 ms; prompts 99987
+      live chain (dump only): 115 passes issued live (65 decode), 16 traced, one decode pass in 4
+      trace: 16 passes, 16 used (100.0% of their launches stamped, 100.0% in every packet), 1628 launches and 1901 stamped kernels a pass
+
+== card 0, compute queue (lane 0), per decode step                         short     long     diff
+   span: the pass's first to its last kernel                          49.92    48.67    -1.26
+     busy (union of its kernels)                                      25.58    25.56    -0.02
+     idle inside the pass (the card waiting)                          24.34    23.10    -1.24
+   span, median pass                                                  49.22    47.29    -1.93
+   other queues busy beside it (lane 1: on-die weight reads)           3.90     3.92    +0.01
+   decode step (the server's mean, this arm's JSON)                   52.60    53.43    +0.83
+   step - span: host work between passes (+ trace overhead)            2.68     4.77    +2.09
+
+== per component (device time sums every kernel of both lanes; idle is lane 0's)
+                                                              device time (kernels)     |     lane-0 idle before it |    total
+                                                                 short     long     diff |    short     long     diff |     diff
+   collectives (incl. waits for peers)                           15.61    12.67    -2.94 |     0.65     0.64    -0.00 |    -2.95
+   indexer: score, candidates, top-k                              0.14     2.80    +2.66 |     0.07     0.10    +0.03 |    +2.69
+   issue-path kernels (copies, fills, blits)                      0.34     0.33    -0.00 |    17.93    15.75    -2.18 |    -2.18
+   engram                                                         0.12     0.12    -0.00 |     0.26     1.28    +1.02 |    +1.01
+   attention projections, rope, norms                             2.76     2.90    +0.14 |     1.55     1.56    +0.01 |    +0.15
+   sparse attention                                               0.59     0.61    +0.02 |     0.15     0.16    +0.00 |    +0.02
+   shared expert                                                  0.94     0.96    +0.02 |     0.51     0.50    -0.00 |    +0.02
+   on-die weight reads (lane 1)                                   3.90     3.92    +0.01 |        -        -    +0.00 |    +0.01
+   routed experts (router, scatter, card experts, gather)         3.07     3.15    +0.08 |     1.72     1.63    -0.09 |    -0.01
+   hyper-connections and norms                                    1.21     1.22    +0.02 |     1.09     1.06    -0.03 |    -0.01
+   other                                                          0.01     0.01    -0.00 |     0.03     0.02    -0.00 |    -0.00
+   indexer: query and weight projections                          0.12     0.12    +0.00 |     0.12     0.12    +0.00 |    +0.00
+   compressor and key stores                                      0.08     0.08    +0.00 |     0.11     0.11    +0.00 |    +0.00
+   window key store                                               0.06     0.06    +0.00 |     0.15     0.16    +0.00 |    +0.00
+   head (logits)                                                  0.52     0.52    -0.00 |     0.01     0.01    -0.00 |    -0.00
+
+== per op, all layers (top 25 by |total diff|; xN: launches a step)
+                                                              device time (kernels)     |     lane-0 idle before it |    total
+                                                                 short     long     diff |    short     long     diff |     diff
+   all_reduce(ffn_normed) x40                                    15.17    12.27    -2.90 |     0.32     0.32    +0.00 |    -2.90
+   index_score(index_score) x8                                    0.10     2.63    +2.53 |     0.03     0.03    +0.00 |    +2.53
+   (issue path) _ZN12_GLOBAL__N_113aql_copy_linkEPKDv4_jPS0_m     0.23     0.22    -0.01 |    17.63    15.44    -2.19 |    -2.19
+   cast(engram_rows_dev) x2                                       0.01     0.01    +0.00 |     0.21     1.23    +1.02 |    +1.02
+   index_topk(index_sel) x8                                       0.04     0.13    +0.10 |     0.03     0.07    +0.03 |    +0.13
+   moe_gather(ffn_normed) x40                                     0.11     0.12    +0.00 |     0.45     0.37    -0.08 |    -0.08
+   gemm_nt_bf16f8(attn_output_b) x40                              0.50     0.56    +0.06 |     0.15     0.15    -0.00 |    +0.06
+   all_gather(engram_kv) x2                                       0.11     0.06    -0.05 |     0.02     0.02    +0.00 |    -0.05
+   index_candidates(index_keep) x1                                0.00     0.04    +0.03 |     0.00     0.00    +0.00 |    +0.03
+   gemm_nt_bf16f8(attn_output_a.g1) x40                           0.39     0.41    +0.02 |     0.16     0.17    +0.01 |    +0.03
+   moe_gemm_ggml(ffn_gate_up_exps.0) x40                          1.52     1.55    +0.03 |     0.31     0.31    -0.00 |    +0.03
+   gemm_nt_bf16f8(attn_output_a.g0) x40                           0.39     0.42    +0.03 |     0.15     0.15    -0.00 |    +0.03
+   attn_sparse_sink(attn_sinks) x40                               0.59     0.61    +0.02 |     0.15     0.16    +0.00 |    +0.02
+   moe_gemm_ggml(ffn_down_exps.0) x40                             0.85     0.87    +0.02 |     0.17     0.17    +0.00 |    +0.02
+   gemm_nt_f32bf16(glm_router) x40                                0.20     0.22    +0.02 |     0.16     0.15    -0.01 |    +0.01
+   gemm_nt_bf16f8(ffn_gate_up_shexp) x40                          0.58     0.59    +0.01 |     0.16     0.16    +0.00 |    +0.01
+   cast(streams) x6                                               0.01     0.01    -0.00 |     0.03     0.02    -0.01 |    -0.01
+   gemm_nt_bf16f8(ffn_down_shexp) x40                             0.32     0.33    +0.01 |     0.16     0.17    +0.00 |    +0.01
+   (issue path) _ZN12_GLOBAL__N_114rad_wtab_patchEN3rad9WtabP        -     0.00    +0.00 |        -     0.01    +0.01 |    +0.01
+   all_reduce(attn_out) x40                                       0.32     0.33    +0.01 |     0.29     0.29    +0.00 |    +0.01
+   all_reduce(collapsed) x1                                       0.01     0.01    -0.00 |     0.01     0.01    -0.01 |    -0.01
+   gemm_nt_bf16f8(attn_q_b) x40                                   0.38     0.38    +0.01 |     0.15     0.15    +0.00 |    +0.01
+   fill(pre_ffn) x2                                               0.00     0.00    -0.00 |     0.01     0.01    -0.00 |    -0.01
+   fill(shared_one) x40                                           0.04     0.04    +0.00 |     0.18     0.18    -0.01 |    -0.01
+   mhc_post_collapse_rmsnorm(attn_norm) x37                       0.23     0.24    +0.01 |     0.15     0.15    -0.00 |    +0.01
+   per call, the ops above with the largest device-time diff (us a launch, short -> long):
+     index_score(index_score)                                     12.9 ->    329.1 us (+316.1), x8
+     all_reduce(ffn_normed)                                      379.2 ->    306.7 us (-72.5), x40
+     index_candidates(index_keep)                                  2.9 ->     35.5 us (+32.6), x1
+     all_gather(engram_kv)                                        54.8 ->     30.3 us (-24.5), x2
+     index_topk(index_sel)                                         4.5 ->     16.7 us (+12.2), x8
+     embed_lookup(token_embd)                                      9.5 ->      5.8 us (-3.7), x1
+     all_reduce(collapsed)                                        10.3 ->      8.3 us (-2.0), x1
+     gemm_nt_bf16f8(attn_output_b)                                12.4 ->     14.0 us (+1.6), x40
+   components: attention projections, rope, norms = ds41_rope_rows, gemm_nt_bf16f8, rmsnorm, rmsnorm_rope_roundtrip, rope_rows_roundtrip; collectives (incl. waits for peers) = all_gather, all_reduce; compressor and key stores = entry_store, gemm_nt, gemm_nt_f32bf16, qsa_tail_store, qsa_work, rmsnorm, rope_rows_roundtrip, softmax_pool; engram = cast, embed_lookup, gemm_nt_bf16f8, ngram_ids, stream_gate_add, token_map; head (logits) = gather_rows, logits_gemm; hyper-connections and norms = cast, fill, mhc_collapse_rmsnorm, mhc_mix, mhc_post, mhc_post_collapse_rmsnorm; indexer: query and weight projections = gemm_nt, gemm_nt_bf16f8, rmsnorm_rope_roundtrip, rope_rows_roundtrip; indexer: score, candidates, top-k = index_candidates, index_score, index_topk; issue-path kernels (copies, fills, blits) = _ZN12_GLOBAL__N_113aql_copy_linkEPKDv4_jPS0_m, _ZN12_GLOBAL__N_114rad_wtab_patchEN3rad9WtabP..., _ZN12_GLOBAL__N_19aql_copy1EPKhPhm; on-die weight reads (lane 1) = prefetch; other = rope_table; routed experts (router, scatter, card experts, gather) = gemm_nt_f32bf16, moe_gather, moe_gemm_ggml, moe_scatter, router_scored_topk, swiglu_clamped; shared expert = fill, gemm_nt_bf16f8; sparse attention = attn_sparse_sink; window key store = kv_store
+
+== per kind of layer (lane-0 device time + idle before, summed over the kind's layers)
+   kind                                     layers    short     long     diff   layers
+   indexer                                       4     5.17     6.78    +1.61   [24, 28, 32, 36]
+   kv source+indexer                             3     4.46     4.62    +0.17   [2, 8, 14]
+   kv source+indexer+candidates                  1     1.14     1.39    +0.25   [20]
+   other                                        32    39.05    35.80    -3.25   32 of 0..39
+
+== the 12 layers that changed most (lane 0)
+   layer  kind                      dev s    dev l     diff |   idle s   idle l     diff
+   0      other                      0.58     0.51    -0.07 |     0.70     1.73    +1.03
+   24     indexer                    0.56     1.23    +0.67 |     0.90     0.81    -0.10
+   31     other                      0.90     0.39    -0.51 |     0.53     0.49    -0.04
+   28     indexer                    0.61     1.02    +0.41 |     0.38     0.48    +0.11
+   7      other                      0.53     0.39    -0.14 |     0.79     0.50    -0.29
+   36     indexer                    0.82     1.16    +0.34 |     0.34     0.43    +0.09
+   22     other                      0.80     0.46    -0.34 |     0.50     0.42    -0.08
+   11     other                      0.69     0.43    -0.26 |     0.59     0.46    -0.14
+   16     other                      0.71     0.41    -0.30 |     0.49     0.42    -0.07
+   1      other                      0.98     0.49    -0.49 |     0.48     0.62    +0.14
+   15     other                      0.56     0.48    -0.08 |     0.94     0.67    -0.27
+   2      kv source+indexer          0.71     0.68    -0.02 |     0.43     0.80    +0.37
+
+== rank 0, host side, one-token passes (shutdown report), per decode step    short     long     diff
+   waiting for the card at the routers (EP staging)                            23.15    24.00    +0.85
+   counts wait at early-issued gathers (its own clock, overlaps the above)     23.12    25.13    +2.01
+   waiting at gathers for the CPU's rows                                       12.27    13.42    +1.16
+     gathers with CPU rows a step (count)                                      22.40    22.78    +0.39
+     one-token miss reads a step (count)                                        0.78     0.75    -0.03
+   CPU pool: a submit's first tile after it (us)                               181.3    229.6    +48.3
+   CPU pool: its 24th tile (us)                                                214.0    262.3    +48.3
+   EP decision: counts to the CPU's work submitted (us a layer)                 18.0     16.2     -1.8
+   waiting for the step's ids at its end (read back)                            0.46     0.49    +0.03
+   (steps: 73 short, 65 long, from the one-token layers / 40)
+
+== summary
+   the decode step is +0.83 ms longer at the long context (52.60 -> 53.43 ms in these traced arms)
+   card 0's pass span -1.26 ms: its kernels' busy time -0.02, the card idle inside the pass -1.24; host work between passes +2.09
+   device time up by component: indexer: score, candidates, top-k +2.66; attention projections, rope, norms +0.14; routed experts (router, scatter, card experts, gather) +0.08; sparse attention +0.02; shared expert +0.02
+   card idle up before: cast(engram_rows_dev) +1.02; index_topk(index_sel) +0.03
+   (device time sums both lanes' kernels; only lane 0's busy time is in the span)

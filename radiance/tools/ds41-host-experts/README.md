@@ -66,6 +66,7 @@ RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256            # background inserts 
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8             # the read-ahead predictor scores in int8, its best 12 again in bf16
 RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=7                    # up to 7 units a rank the packed cache refuses keep their planes
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1            # pool workers sleep on a futex, woken without a lock
+RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=26000               # optional, only with a fifth card of the rank cards' architecture listed after them in ROCR_VISIBLE_DEVICES: 26000 MiB of its VRAM hold the hottest experts the CPU computes (see "The aux expert worker")
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier --deterministic \
   --expert-ram-cache-total-mib 196608 --host-pool-mib 256 --embedding-placement ram \   # 192 GiB on a 256 GB box (98304 on 128 GB)
@@ -245,11 +246,25 @@ The rest is ab-20261104T003545Z:
   (626 tok/s) at 4,096; 99,987 tokens 221.7 s (451 tok/s) against 165.1 s (606 tok/s), and 224.5 s at 2,048 with the
   hashes off; the 32,768-token fill prompt (a 6,817-token text repeated) 64.2 s.
 - **Decode at a long context**: after the 99,987-token prompt, prefill hashes off, 20.9 tok/s against 29.35 at
-  `Lm131072` on short prompts in the table (−29%; not yet profiled). Arms with prefill hashes decode slower still (12-14 tok/s), an
-  instrumentation cost.
+  `Lm131072` on short prompts in the table, but that gap is the text, not the context. Profiled in ab-20261104T025134Z
+  (part `Ct4`, card 0's kernel times for one decode pass in 4): a 1,899-token head of the same text (`Ulong2k`) decoded at
+  52.60 ms a step against 53.43 ms after the 99,987 tokens (+1.6%), while the 8 held-out prompts took 37.67 ms; the long
+  text sends more experts to the CPU (22.4-22.8 gathers with CPU rows a step against 19.4). The one cost that grows with
+  the context is index_score, 11-13 to 329 us a call on its 8 layers (+2.5 ms of card time a step, mostly hidden behind
+  the CPU's rows). Arms with prefill hashes decode slower still (12-14 tok/s), an instrumentation cost.
 - The prefix cache did not run at these lengths; idle conversations must fit three quarters of the pool (**Long
   contexts** under Prefix caching). Receipts: `make_longctx_receipts.py` (parts `Ufill32k`, `Ulong48k`, `Ulong100k`;
   a receipt's `max_context_tokens` skips an arm with a shorter `--max-model-len` and lengthens its request timeout).
+
+**On a box with a fifth card of the rank cards' architecture** (optional; window F1 ran an R9700, gfx1201 like the
+four RX 9070 XT) add the block's last line, `RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=<MiB>`, and list the extra card
+after the rank cards in `ROCR_VISIBLE_DEVICES`: its VRAM then holds the hottest experts the CPU path computes and serves
+their rows in passes of up to 16 tokens, while the CPU computes the rest. Exact (every row it serves is the CPU path's
+bytes), and in its one window (ab-20261104T051616Z: the block above with batch admission, the 8 held-out prompts, 26000
+MiB of the R9700 beside whisper-server) +24.1% in total at 8 streams (A-B-B-A), +18.1% at 4 and +19.9% at one, every
+reply identical to the base engine. The extra card must have no other compute client (BoltzGen idle); without such a
+card the switch turns itself off with the reason and the server runs as with four cards. Details, switches and
+caveats: "The aux expert worker" below.
 
 **On 256 GB of RAM (8x 32 GB DDR4-2666) with a 192 GiB expert cache** (ab-20261030T194..., replies identical): decode **31.2 tok/s** a stream (19.9 with 96 GiB on 128 GB of DDR4-2133; 20.9 with 96 GiB on the new RAM, so the cache size, not the memory speed, is the gain: rank 0's misses fall 2,073 → 361 on the held-out prompts); **38.7 tok/s in all at 4 streams**; prefill 3,086 tokens in 28.1 s (110 tok/s) and 6,817 in 51.7 s (132 tok/s). 192 and 208 GiB measure the same.
 
@@ -316,6 +331,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=N` (2-16) | not yet measured | the read-ahead in pieces in decode passes of 2..N rows too: DSpark's verify passes (2 rows at cap 1, up to 6) and several sequences' decode rows, which otherwise all go without it (window C's `Ds1`/`Ds2` arms: 0 inputs posted, 0 pieces read). Rank 0 posts every row's router input at the one-token pass's points; the predictor reads layer L+2's router once for all the rows (each row's logits bit for bit the one-row kernel's) and hands every rank the union of the rows' top K (every row's best before any row's second), planned under the same live cap, with the same yields to demand reads, finishing rule (the plane mirror's share for the pass's rows) and epoch check. One-token passes go as without it; prefill chunks, mixed passes and the drafter's own passes never read ahead. Reads only. Refused unless the read-ahead in pieces runs (`..._PREFETCH=pieces`, `..._MISSES` ≥ N). The on-die reads (`Pa`/`PmN`/`Pe`: decode passes of up to 16 rows) and early issue (`Ei`) already covered verify passes (window C's Ds1 arm: on-die reads in all 269 verify passes, 11,640 early layers). Arm part `PmrN` (`Pmr`: 6), with a `PpK` part; startup line `read-ahead: decode passes of 2-N rows read ahead too`; shutdown lines `read-ahead in pieces by pass size` (each rank's planned / used / dropped by the pass's rows) and `router predictor, multi-row decode passes` (the scoring a row) |
 | `RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1` with `--max-num-seqs N` | aggregate decode 16.2 → 20.1 tok/s at N=4 (+24%), 20.6 at N=8; per stream ~1/N | concurrent requests' decode rows run in one step and a prefill chunk runs in a step of its own (the 16-token budget otherwise admits nothing beside a decode row, so N>1 served requests one after another). Every reply identical to running alone. `--max-model-len` must cover N sequences (512 holds four ~110-token requests). Arm parts Pf, NK, CK, LK |
 | `RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=R` (32-256) beside `..._PREFILL_ALONE=1`, `..._LCP` and `--max-num-seqs` above 1, prefix cache off | exact; for a burst of short prompts arriving together +8.3-12.9% in total at 4 streams and +8.5-9.3% at 8 (window ab-20261103T230607Z, four RX 9070 XT, the recommended configuration with prefill alone, `L1024` and `PmrN`, the 8 held-out prompts sent N at a time; one window, below the route-trace replay's estimate of +13-17% / +12-18%). Every reply identical to the base engine (112 of 112: 8 prompts in 14 arms, `ab_requests.py --compare` exit 0), every prefill hash at 8 streams (8 of 8). A-B-B-A at 4 streams: 37.65 / 40.79 / 42.64 / 37.78 tok/s in total (+8.3% and +12.9% against the arm without it beside each), the wave's wall time 16.62 / 16.00 / 15.59 / 16.66 s, prefill steps 8 → 4 / 3, TTFT min / mean / max 0.49 / 1.64 / 2.97 and 0.47 / 1.67 / 3.03 s without it against 0.47 / 1.82 / 2.69 and 1.32 / 1.96 / 2.45 s with it; at 8 streams 41.79 / 45.68 / 45.36 / 41.79 tok/s (+9.3% and +8.5%), wall time 15.37 / 14.11 / 14.22 / 15.26 s, prefill steps 8 → 2, TTFT 0.96 / 3.29 / 5.45 and 1.01 / 3.18 / 5.29 s without against 2.86 / 3.17 / 4.09 and 2.88 / 3.19 / 4.13 s with it (the first token later, the last earlier); the pair with prefill hashes on (`Kh`) 42.75 against 46.31 tok/s. Prompts arriving apart and prompts longer than R are admitted as before. Recommended for such bursts ("For concurrent requests" above) | prompts waiting together are admitted into one prefill-only step instead of one a step, in arrival order, each whole (its prompt one chunk from position 0, the chunk it takes alone), while their rows fit in R (held to the chunk and, under Phase 1, below its threshold: at most 256 rows stays on the activation arena's smallest level, so the lent arena stays lent and the card path is never armed); decode rows wait as under prefill alone. A prompt of at most R rows that the rows left cannot take ends the batch (none behind it is taken ahead of it) and opens the next step's, which the prompts behind it may join. Kept out, each in a step of its own as before: a prompt longer than R, a request back from preemption, media, scored or embedding inputs, an adapter or plugin words. Only step composition changes: under LCP's admission every op gives a row the same bytes at any launch height (the `lcp` card check holds each row launched alone, 16 at a time and whole), and the sequence-aware ops (sparse attention, compressor work list, indexer, Engram ids) read each sequence's own rows, block tables and state through `cu_seqlens`; a shared step runs every layer on every row (the consumer skip cuts only a prompt alone in its step) and admits every unit into the RAM cache. Refused with the reason without prefill alone or LCP, at one sequence, with the prefix cache, KLD modes, `--prefill-span` or R-SWA. Startup line `batch admission: on (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=R)`, shutdown line `batch admission: N steps admitted P whole prompts together`. Gates: replies and Kh against the arm without it at N4 / N8 (`ab_requests.py --hashes` matches prompts that arrived in another order; a prompt run in a shared step is labelled `not cut: shared step` in the hash lines and not counted as cut), steps_prefill. Arm part `Ba` / `BaN` (needs `Pf`, `Lc` and `NK` above 1; skipped beside `Pc` or `Kld`; `claude/ds41-batch-admit`); tests `sched_test` `batch_admission_*`, `ab_window_ba_test.sh` |
+| `RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=<MiB>` (1024-1048576) with `..._HOST_EXPERTS_POLICY=all`, `..._PACKED_CACHE=1`, `..._VRAM_PACKED=1`, `..._FILE_BUFFER_UNITS` set, `--deterministic`, an extra card of the ranks' ISA visible after the rank cards (`ROCR_VISIBLE_DEVICES=<ranks' UUIDs>,<its UUID>`) | exact; +24.1% / +18.1% / +19.9% in total at 8 / 4 / 1 streams (window ab-20261104T051616Z, four RX 9070 XT and an R9700 holding 1,513 units in 26000 MiB, the recommended configuration with batch admission, the 8 held-out prompts; one window). Every reply identical to the base engine (104 of 104), the verify arm's rows 0 differ on every rank, prefill hashes 8 of 8, Kld 3,397 of 3,397. Optional, for a box with such a card ("The aux expert worker" below) | the aux expert worker (`core/place/aux_expert_worker.h`, `work/aux/SPEC.md`; experimental, default off: with the switch unset or 0 no other variable is read and nothing changes). The extra card (by capability, or `..._AUX_DEVICE=<BDF or GPU-UUID>`) holds the hottest CPU-path units it fits (per-rank quotas from the sealed profile's global order, loaded from the packed RAM cache and read back) and computes their rows for routed layer passes of up to 16 rows with the cards' own decode kernels (gemv_vp gate_up, swiglu_clamped, gemv_vp down) on a queue per rank; the CPU computes the rest as before. A job late at max(its start + `..._AUX_DEADLINE_US` (2000), the pool's end + 50 us), failed, or forced (`..._AUX_FORCE_LATE=N`, every Nth) has its units computed by the CPU from the kept leases, and the lane backs off `..._AUX_BACKOFF` (64) layers. `..._AUX_POLICY=verify` computes every row on the CPU and compares the worker's. Pinned host memory keeps mapping to the rank cards only (a pin set), the extra card's faults stay its own, and `..._AUX_HEADROOM_MIB` (1024) must stay free beside its other tenants. Startup lines `aux experts: device ...` and `aux experts: on: N units ...` (or `aux experts: off: <why>`), shutdown lines `aux experts: rank R: ...`. Refused with `..._SCHED_TBO=1`, `..._ROUTE_TRACE` or a dynamic plan. Arm parts `Ax` / `AxN`, `Axv` / `AxvN`, `Ax0`, `AxfN` (`claude/ds41-aux-worker`; an `Ax` / `Axv` part beside `Kld` only on the 16-token base, e.g. `...-M16-...-B1-...-Rb-Vp-Ax-Kld`: KL mode is prefill only and the worker takes passes of up to 16 rows, so an `Lc` or `BT` step above 16 would leave it no row; its run is gated like a serving arm's, at exit too); tests `aux_discovery_test`, `aux_unitset_test`, `aux_compact_test`, `aux_stager_test`, `r4d_emu_ds41aux`, `ab_window_aux_test.sh` |
 | `..._ACCESS_TRACE=<dir>` | | per-rank access traces for `cache_sim.py` |
 | `RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1` | alone 17.40 / 17.80 / 17.35 against 17.37 / 17.65 / 17.69 tok/s (−0.3%), replies identical; with Rb and Vp 17.86 / 17.99 / 17.96 (+2.1%); being separated | Every step is followed by a step issued ahead (`Scheduler::step_next`) before the host has read its tokens, so the step that samples a reply's end-of-generation token gets one more forward pass, for the finished request (max_tokens ends are predicted and get none). On the CPU path issuing a pass waits for the card at every routed layer, so `issue_ahead` returns only once most of that pass has run, and the commit that ends the reply comes after it: the reply, its `predicted_ms` and the next request all wait it out (29 Oct trace: 204-207 of its 240 selections off the card, 103-105 misses). Nothing reads that pass: its token is dropped, the prefix cache publishes a finished sequence up to its last token's position and the pass writes the one after, and its blocks are freed at its commit. With the switch, a step of one sequence that its own token can end (not `ignore_eos`) has its ids read back first (`Engine::peek_outcome`: collect_step's rules without its effects), and `step_next` issues nothing behind a step whose outcome ends every request it carries (commit's own end conditions, `Scheduler::outcome_ends_every_request`). Exact: every pass that runs ran before, and the commits are the same. The cost is the host's turnaround between two such passes, while the card waits: the next step's build, advance and the ranks' release (tens of µs a token). Steps of two or more sequences keep the step issued ahead. Arm part `Ss`; the shutdown's `post-stop passes:` line counts the passes run after a reply's last token and, with the switch, the steps read back, the wait for their ids, the turnaround and the passes withheld |
 | miss reads on kept readers, 2 MiB pages | +4.6%, TTFT −3.6% | on by default; `RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0` starts threads a call and `..._PLANE_HUGEPAGES=0` uses 4 KiB pages, as before (A/B switches) |
@@ -615,6 +631,126 @@ whole design). The Lc2048/P1/lent-arena block holds 627 / 635 block or 665 / 674
 - **Shutdown report.** The mover's report has a `VRAM packed experts` line: residents and weights
   packed, their bytes against block_mxfp4's, weights packed and checked at load, weights over budget
   kept block, the scan.
+
+## The aux expert worker (a fifth card)
+
+`RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=<MiB>` (experimental, opt-in, off by default; `core/place/aux_expert_worker.h`,
+`tools/ds41-host-experts/ds41_aux.h`) is for a box with a card of the rank cards' architecture beyond the `--tp` rank
+cards (gfx1201 here: an R9700, or another RX 9070 XT). That card holds the hottest units the CPU path computes, in the packed
+RAM cache's form, and computes their rows in routed layer passes of up to 16 rows. At each such pass a rank leases the
+worker's units among the experts it hands the CPU, compacts the pass's sorted order to them and queues one job on its
+own queue on the extra card: the token rows and that order in a pinned record mapped to that card only, libr4d's
+decode-band kernels as the rank cards run them (gemv_vp gate_up, swiglu_clamped, gemv_vp down), the rows back into
+pinned memory. The CPU pool computes every other unit as before, and the rank places the worker's rows in the CPU
+path's output before the unchanged copy to its own card. Taller passes and drafter layers are declined. With the switch
+unset, empty or 0 nothing of it runs and no other variable is read; on a box without such a card it turns itself off
+and the server runs as with four cards.
+
+**Exact.** The worker computes only rows the CPU path computes, with the code object the rank cards run, on weights
+that are the RAM cache's packed slots, copied and read back identical. Each output value depends only on its weight
+row, its activation row and K, so a launch over the compacted order gives the full launch's bytes, which are the CPU's
+(the card check `aux` holds both, and gemv_vp to the plain gemv, on the extra card and on a rank card). A job not done by
+its deadline, or failed, has its units computed by the CPU from the leases kept for it, so the output holds the CPU
+path's bytes whatever the timing.
+
+**Switches** (with the first on, a malformed value of any of them refuses startup):
+- `RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=<MiB>` (1024-1048576): the worker's VRAM on the extra card (layer tables, the
+  lanes' workspaces and unit slots), reserved at startup and held, so a tenant arriving during the load cannot take it.
+  Window F1 ran 26000 on a 32 GB card.
+- `..._AUX_DEVICE=<BDF or GPU-UUID>` (empty: by capability) restricts discovery to that card.
+- `..._AUX_POLICY=verify` (default `serve`): the CPU computes every row as without the worker, the worker computes its
+  units too, and the rows are compared (shutdown: `verify: V rows compared, D differ`).
+- `..._AUX_DEADLINE_US` (2000, 100-1000000): a job still pending at max(its submit + D, the pool's end + 50 us) is late,
+  and its rows are the CPU's.
+- `..._AUX_HEADROOM_MIB` (1024, 256-65536): free VRAM the extra card must keep beside the reservation, checked before and
+  after allocating it and after the warm-up.
+- `..._AUX_BACKOFF` (64, 0-65536): layer jobs a lane declines after a deadline miss, once the late job completed.
+- `..._AUX_FORCE_LATE=N` (0): every Nth job of a lane abandoned as if late, to exercise the fallback on real data.
+- It needs `..._HOST_EXPERTS` with `..._POLICY=all`, `..._FILE_BUFFER_UNITS`, `..._PACKED_CACHE=1`, `..._VRAM_PACKED=1`
+  and a static plan (`--deterministic`), all in the recommended block, and is refused with the reason under
+  `RADIANCE_EXPERIMENTAL_SCHED_TBO=1`, `..._ROUTE_TRACE` or a dynamic plan.
+
+**Discovery** (once, right after the devices are chosen; the decision is `ds41aux::decide`). The candidates are the
+visible devices beyond the `--tp` ranks' cards, so list the rank cards first in `ROCR_VISIBLE_DEVICES` and the extra
+card after them; with none it is off. Rank cards of mixed products while a card of their architecture is left over turn
+it off with a warning (the accident where the extra card became rank 0). `..._AUX_DEVICE` keeps only its card (off when
+it names a rank's card or no card). A candidate needs the ranks' ISA, must not be integrated and must have cap + headroom
+free; among those the worker takes one whose PCI root complex no rank card shares, then the one with more free VRAM,
+then the lowest BDF. No product name, ordinal, BDF or memory size is built in; the startup line names the chosen card,
+its root port and every rank card sharing its complex. From the moment the switch parses on, pinned host memory maps to
+the rank cards only (a pin set), so a card left out maps nothing and the extra card's mappings are its own; a fault on
+it is scoped to it (its lanes retire and the CPU computes their rows), which no window has exercised, and a fault the
+driver escalates to a reset still takes the server down. The unit set follows the sealed decode profile's global order
+(profile share, then expert, layer and rank), cut into per-rank quotas at what the cap holds; each rank loads its units
+from the packed RAM cache on its own thread through its own queue (a unit that fails to load is replaced by the rank's
+next), every slot is read back and compared, and a warm-up job on each lane must give the CPU pool's rows before the
+ranks bind. Any failure turns it off with the reason (`aux experts: off: <why>`), and the server runs as with four
+cards.
+
+**Sharing the extra card.** The engine checks the extra card's free VRAM against cap + headroom at startup and does not
+watch its other tenants afterwards. The window harness is stricter: an `Ax` / `Ax0` arm and the aux card checks start
+only while the extra card's KFD clients all match `AUX_ALLOW_CLIENTS` (`^whisper`, the box's permanent tenant), together
+hold at most `AUX_FOREIGN_MAX_MIB` (6144) and leave cap + headroom + 512 MiB free (`AUX_CHECK_FREE_MIB`, 6144, for the
+checks), and a client arriving during an arm sets its results aside. So BoltzGen, which uses the same card, must be
+idle: any other client leaves the worker off in the harness. Serving beside other compute tenants needs a sharing policy
+first.
+
+**Window parts and card checks.** `Ax` / `AxN` (the cap `AUX_MIB`, 26000, or N MiB), `Axv` / `AxvN` (verify), `Ax0` (the
+extra card visible, the switch 0: a fifth visible card's own cost) and `AxfN` (beside `Ax` / `Axv`: every Nth job forced
+late, 4, with the backoff 0). The harness finds the extra card by capability in the KFD topology (`aux_find`;
+`AUX_UUID` / `AUX_BDF` pin it) and appends it to the window's mask of the four rank cards' UUIDs, so ranks 0-3 stay the
+rank cards. `DEVICE_CHECKS=aux`, with `AUX_CHECK` (`ds41_mxfp4_device_check`, `TALL_CHECK` by default) and `VPACK_CHECK`,
+runs after production stopped: `aux` on card 0 and on the extra card (compacted gemv_vp and gemv rows against the full
+launch's at M1/M4/M8/M16; the two cards' outputs must be byte-identical), on the extra card `swiglu` (its SiLU table
+recaptured and compared with `SILU_TABLE`) and `vpack check 48`, then `auxrt` (a job's round trip through HIP, logged
+only). `Ax` / `Axv` arms run only on the libr4d those passed on, and a serve `Ax` arm only after an `Axv` arm of the
+window measured on it. Every arm states the six switches and the startup line must state them back; at exit every rank
+needs layer jobs and 0 launch failures (`Axv`: 0 rows differ; `AxfN`: a forced miss); the extra card's free VRAM is
+sampled every 2 s (`AUX MARGIN LOW` under 1024 MiB). An `Ax` part runs beside `Kld` only on the 16-token base (no `Lc`,
+`BT` at most 16): KL mode is prefill only, and taller passes would leave the worker no row.
+
+**Window F1** (ab-20261104T051616Z, one window): four RX 9070 XT and an R9700 (32 GB, gfx1201; its root complex shared
+with rank 3's card), the recommended block (the configuration above with `Lc2048`, `P1`, the lent arena, `Rb`, `Vp` and
+`Cs`; batch admission and `L1024` `Pmr4` / `Pmr8` at 4 and 8 streams), the 8 held-out prompts; the worker at 26000 MiB,
+deadline 2000 us, backoff 64, headroom 1024 MiB.
+- Card checks passed on card 0 and on the R9700: compacted gemv / gemv_vp rows equal to the full launch's at M1-16
+  (80 cases on each card) and the two cards' outputs byte-identical; on the R9700 the SiLU table recaptured identical to
+  the rank cards' and `vpack check 48` passed. `auxrt`: median round trips of 134-906 us for 1-32 rows.
+- The worker held 1,513 units (25.37 GiB: rank 0 396, rank 1 348, rank 2 377, rank 3 392), 39% of the CPU path's
+  calibration mass (profile share 5.13 of 13.20), loaded in 2.0-2.1 s from the packed RAM cache and read back identical,
+  beside whisper-server's 4.24 GB; at least 2,208 MiB stayed free on the R9700 in every arm.
+- Exact: the verify arm compared every worker row with the CPU's (3,288-3,753 rows a rank) and none differed on any
+  rank; every reply equalled the base engine's (104 of 104: the 8 prompts in 13 arms, the forced-lateness arm
+  included); the prefill hashes at 8 streams equalled the in-window reference without the worker (8 of 8); Kld on the
+  16-token base was identical at 3,397 of 3,397 positions (the worker computed 15-19% of the CPU path's rows there).
+- Speed, in total (N times the mean of the requests' `predicted_per_second`):
+
+  | streams | without | with the worker | |
+  |---|---|---|---|
+  | 8, A-B-B-A | 46.40 and 46.87 tok/s; wave 14.28 and 14.17 s | 57.57 and 58.19 tok/s; wave 11.91 and 11.95 s | +24.1% |
+  | 4 | 43.59 | 51.46 | +18.1% (one pair) |
+  | 1 | 28.30 | 33.92 | +19.9% (the arm without was the window's first) |
+
+  At 8 streams the worker served 28-31% of the rows the CPU path met in passes of up to 16 rows, with mean round trips
+  of 1.3-2.0 ms a job (0.73-0.99 ms at 4 streams, 0.23-0.25 ms at one) hidden behind the CPU's own rows: the ranks
+  waited 34-39 ms beyond them in a wave of about 12 s. Deadline misses: 1 and 0 at 8 streams, 4 at 4 and 7 at one
+  (1-6 rows a rank recomputed on the CPU); 0 launch failures. With prefill hashes on, 8 streams gave 57.32 against
+  46.20 tok/s.
+- The R9700 visible with the worker off (`Ax0`): 43.14 against 43.59 tok/s at 4 streams (noise); serving after 78 s
+  against 76 s; the R9700's used VRAM +4.4 MB.
+- Every 4th job forced late (`Axf`, backoff 0): 584-648 forced misses a rank, 813-954 rows a rank recomputed on the CPU,
+  replies identical, 49.58 tok/s at 4 streams.
+
+Caveats: one window; the held-out prompts only; the unit set is static, from the decode profile, so traffic that routes
+differently gains less; BoltzGen idle (the extra card had no compute client but whisper-server).
+
+Startup lines `aux experts: device D (BDF, name, arch): ...` and `aux experts: on: N units ...` (or
+`aux experts: off: <why>`); shutdown lines `aux experts: rank R: ...` (layer jobs, units and rows on the extra card of
+the rows the CPU path met, declines by reason, round trip mean and max, deadline misses with the forced ones and the
+rows the CPU recomputed, launch failures, verify counts) and
+`aux experts: device D (BDF): N units held; ...; lanes drained at exit`. Tests: `aux_discovery_test`, `aux_unitset_test`,
+`aux_compact_test`, `aux_stager_test` (switch-off identity, the deadline fallback, the pin set on the host backend),
+`r4d_emu_ds41aux` and `r4d_emu_ds41aux_tail` (the compacted launches on the emulator), `ab_window_aux_test.sh`.
 
 ## The lossy track: routing trace and quality harness
 

@@ -1,15 +1,15 @@
 {
-  "commit": "ca5b1a3bfcb5a8bb3f73acc00e31ab49eb6df601",
-  "tree": "9dfe1deaabc426d626bd55041858edd49a683053",
+  "commit": "e69c59929c7aa3da66a4d55a6219983e73e9b545",
+  "tree": "af182c36b868891671c24e09e47196ae1f072f5b",
   "branch": "claude/ds41-decode-impl",
-  "subject": "ds41 README: contexts beyond 32K on fixed KV reservations (windows CQ and CR)",
-  "committed_utc": "2026-11-04T01:46:09Z",
-  "files": 1852,
-  "bytes": 71191109,
+  "subject": "ds41 README: the aux expert worker on a fifth card (window F1), an opt-in for boxes that have one",
+  "committed_utc": "2026-11-04T06:13:49Z",
+  "files": 1863,
+  "bytes": 71562876,
   "executable_files": 67,
   "pins": "docs/ds41/provenance/ENGINE_SOURCE_PINS.json",
-  "pins_sha256": "5869235a4ff18368ce8ab354a50a1761b7cf8d4268b61df711b2dfae2f563983",
-  "export": "git archive --format=tar ca5b1a3bfcb5a8bb3f73acc00e31ab49eb6df601 (tracked files only, modes kept)",
+  "pins_sha256": "ebf09933e759dae37472c76ae266edb3d5433bf9866d9762e087a1b7bc83066e",
+  "export": "git archive --format=tar e69c59929c7aa3da66a4d55a6219983e73e9b545 (tracked files only, modes kept)",
   "upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -17,12 +17,12 @@
       "upstream main (upstream/main, v1.15.0 + 12)": {
         "commit": "b6acbd69e475b064f61c76ef7dbdea4e22956394",
         "contained": true,
-        "commits_after": 412
+        "commits_after": 419
       },
       "pull request 266, deepseek41 (upstream/pr-266 as of 2026-10-28)": {
         "commit": "bd65d4e58f7c4233de09ad5245a82c9510eb8962",
         "contained": true,
-        "commits_after": 591
+        "commits_after": 598
       }
     }
   }

@@ -311,6 +311,9 @@ def build_window(src, dst, keep_server_logs, max_text):
             record["server_log_bytes"] += len(data)
             record["server_log_xz_bytes"] += len(packed)
             continue
+        if name.startswith("chain-") and name.endswith(".csv"):
+            left.append({"path": name, "bytes": size, "reason": "raw per-kernel chain trace (Ct part); its analysis is a text file beside it"})
+            continue
         if name == "window.log" or name.endswith(TEXT_SUFFIXES):
             if size > max_text:
                 left.append({"path": name, "bytes": size, "reason": "over the text size cap"})

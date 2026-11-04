@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "ca5b1a3bfcb5a8bb3f73acc00e31ab49eb6df601",
+  "engine_commit": "e69c59929c7aa3da66a4d55a6219983e73e9b545",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -225,7 +225,9 @@
     "ab-20261103T211924Z",
     "ab-20261103T221104Z",
     "ab-20261103T230607Z",
-    "ab-20261104T003545Z"
+    "ab-20261104T003545Z",
+    "ab-20261104T025134Z",
+    "ab-20261104T051616Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",
@@ -267,7 +269,8 @@
     "ab-20261103T114720Z": "the clean 6,817-token re-measure",
     "ab-20261103T143939Z": "startup cache fill, GPU clocks and memory compaction",
     "ab-20261103T230607Z": "batch admission: scheduler lines and prefill hashes",
-    "ab-20261104T003545Z": "long context: kv budgets, prefill hashes, lsparse card check"
+    "ab-20261104T003545Z": "long context: kv budgets, prefill hashes, lsparse card check",
+    "ab-20261104T051616Z": "aux expert worker: worker lines, verify, deadline and VRAM checks"
   },
   "allowed_emails": [
     "aselzer3@gmail.com",

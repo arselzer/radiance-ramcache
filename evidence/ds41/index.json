@@ -41,7 +41,8 @@
     "ab-20261103T114720Z": "the clean 6,817-token re-measure",
     "ab-20261103T143939Z": "startup cache fill, GPU clocks and memory compaction",
     "ab-20261103T230607Z": "batch admission: scheduler lines and prefill hashes",
-    "ab-20261104T003545Z": "long context: kv budgets, prefill hashes, lsparse card check"
+    "ab-20261104T003545Z": "long context: kv budgets, prefill hashes, lsparse card check",
+    "ab-20261104T051616Z": "aux expert worker: worker lines, verify, deadline and VRAM checks"
   },
   "windows": {
     "ab-20261028T220036Z": {
@@ -4254,6 +4255,265 @@
       "arms_started": 13,
       "qfn_restored": true,
       "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261104T025134Z": {
+      "files": 27,
+      "bytes": 622319,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-11-04T02:51:35Z",
+      "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Kh-Lm8192-Ulong8k.server.log",
+          "bytes": 99059,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba.server.log",
+          "bytes": 94006,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ct4.server.log",
+          "bytes": 100116,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ulong100k-Ct4.server.log",
+          "bytes": 106441,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ulong2k-Ct4.server.log",
+          "bytes": 100053,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs.server.log",
+          "bytes": 96990,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "chain-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ct4.ops.csv",
+          "bytes": 35399704,
+          "reason": "raw per-kernel chain trace (Ct part); its analysis is a text file beside it"
+        },
+        {
+          "path": "chain-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ct4.stamps.csv",
+          "bytes": 27150300,
+          "reason": "raw per-kernel chain trace (Ct part); its analysis is a text file beside it"
+        },
+        {
+          "path": "chain-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ulong100k-Ct4.ops.csv",
+          "bytes": 4740494,
+          "reason": "raw per-kernel chain trace (Ct part); its analysis is a text file beside it"
+        },
+        {
+          "path": "chain-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ulong100k-Ct4.stamps.csv",
+          "bytes": 3651871,
+          "reason": "raw per-kernel chain trace (Ct part); its analysis is a text file beside it"
+        },
+        {
+          "path": "chain-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ulong2k-Ct4.ops.csv",
+          "bytes": 5319862,
+          "reason": "raw per-kernel chain trace (Ct part); its analysis is a text file beside it"
+        },
+        {
+          "path": "chain-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Lm131072-Ulong2k-Ct4.stamps.csv",
+          "bytes": 4073258,
+          "reason": "raw per-kernel chain trace (Ct part); its analysis is a text file beside it"
+        },
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261104T051616Z": {
+      "files": 48,
+      "bytes": 1233097,
+      "server_logs": 15,
+      "server_log_bytes": 1461388,
+      "server_log_xz_bytes": 257200,
+      "started_utc": "2026-11-04T05:16:16Z",
+      "arms_started": 13,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Rb-Vp-Ax-Kld.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Rb-Vp-Ax-Kld.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Rb-Vp-Ax-Kld.aux-vram",
+          "bytes": 2538,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ax.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ax.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ax.aux-vram",
+          "bytes": 1680,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Ax-Axf.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Ax-Axf.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Ax-Axf.aux-vram",
+          "bytes": 1614,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Ax.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Ax.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Ax.aux-vram",
+          "bytes": 1613,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Ax0.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Ax0.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Ax0.aux-vram",
+          "bytes": 1568,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Axv.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Axv.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Axv.aux-vram",
+          "bytes": 1648,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Ax-Kh.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Ax-Kh.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Ax-Kh.aux-vram",
+          "bytes": 1549,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Ax-r1.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Ax-r1.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Ax-r1.aux-vram",
+          "bytes": 1549,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Ax-r2.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Ax-r2.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Ax-r2.aux-vram",
+          "bytes": 1581,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "aux-checks.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "aux-ext.bin",
+          "bytes": 16785316,
+          "reason": "binary capture"
+        },
+        {
+          "path": "aux-xt.bin",
+          "bytes": 16785316,
+          "reason": "binary capture"
+        },
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Rb-Vp-Ax-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Rb-Vp-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "silu_aux.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        },
         {
           "path": "silu_recheck.bin",
           "bytes": 262144,

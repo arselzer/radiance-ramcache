@@ -23,7 +23,7 @@ per-request decode rate.
 | decode, 4 streams, batch admission | 41-44 tok/s | 51.5 tok/s |
 | decode, 8 streams, batch admission | 45-47 tok/s | 57.6-58.2 tok/s |
 | decode, 8 streams, chat prompts | 38.4-38.9 tok/s | 45.8-46.5 tok/s |
-| agent-harness turns (13, prefix cache) | 72-76 s summed time to first token, decode 25-26 tok/s | decode 29.4-29.6 tok/s, all turns about 5-7% less time |
+| agent-harness turns (13, prefix cache) | 61-63 s summed time to first token with Phase 1 read-ahead off (72 s with it on), decode 25-26 tok/s | decode 29.4-29.6 tok/s, all turns about 5-7% less time |
 
 - **Prefill**: a 6,817-token prompt in about 17 s (about 400 tok/s); 47,917 and 99,987 tokens in 115
   and 222 s (416 and 451 tok/s), or 77 and 165 s (626 and 606 tok/s) with 4,096-token chunks.

@@ -8,7 +8,7 @@ trap 'rm -rf "$T"' EXIT
 fail=0
 ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
-for fn in ar_rows_parse ar_rows_server_gate ar_rows_server_check ar_rows_receipt_ok ar_rows_check ar_rows_gate xt_check kld_finish; do
+for fn in serving_cards serving_cards_ok ar_rows_parse ar_rows_server_gate ar_rows_server_check ar_rows_receipt_ok ar_rows_check ar_rows_gate xt_check kld_finish; do
   eval "$(sed -n "/^$fn() {/,/^}/p" "$W")"
   declare -F "$fn" >/dev/null || { bad "missing $fn"; exit 1; }
 done
@@ -70,8 +70,12 @@ SUM=$(sha256sum "$LIB" | cut -d' ' -f1)
 export AR_CALLS=$T/checker.calls
 cat >"$T/checker" <<'EOF'
 #!/usr/bin/env bash
-if [[ -n ${HIP_VISIBLE_DEVICES+x}${ROCR_VISIBLE_DEVICES+x}${CUDA_VISIBLE_DEVICES+x}${R4D_SELFTEST_ONE_CARD+x} ]]; then
-  echo 'FAIL inherited card mask'; exit 1
+if [[ -n ${HIP_VISIBLE_DEVICES+x}${CUDA_VISIBLE_DEVICES+x}${R4D_SELFTEST_ONE_CARD+x} ]]; then
+  echo 'FAIL inherited one-card mask'; exit 1
+fi
+# The window's own mask (the serving cards) reaches the checker unchanged.
+if [[ ${ROCR_VISIBLE_DEVICES-unset} != "${EXPECT_ROCR-unset}" ]]; then
+  echo "FAIL card mask ${ROCR_VISIBLE_DEVICES-unset}, not the window's ${EXPECT_ROCR-unset}"; exit 1
 fi
 [[ $2 == --case && $3 == ds41_ar_rows_exact ]] || exit 2
 echo called >>"$AR_CALLS"
@@ -90,10 +94,12 @@ ar_rows_check "$LIB" >/dev/null && bad 'check outside window' || ok 'checker ref
 AR_ROWS_WINDOW_ACTIVE=1 FAKE_STATE=running
 ar_rows_check "$LIB" >/dev/null && bad 'check beside running container' || ok 'checker requires exited container'
 FAKE_STATE=exited
-export HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 R4D_SELFTEST_ONE_CARD=1
+# The window's four-card mask (the chains' four XT UUIDs) stays; the card-0 checks' one-card settings go.
+export HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 R4D_SELFTEST_ONE_CARD=1
+export ROCR_VISIBLE_DEVICES=GPU-e49179ac81aef5ad,GPU-e770be134869264b,GPU-be0851a556d0f2c1,GPU-23aac62b67afffa9 EXPECT_ROCR=GPU-e49179ac81aef5ad,GPU-e770be134869264b,GPU-be0851a556d0f2c1,GPU-23aac62b67afffa9
 # A stale file at the expected name must be replaced by this window's fresh checker call.
 echo stale >"$OUT/ar-rows-$SUM.log"
-ar_rows_check "$LIB" >/dev/null && ok 'fresh checker clears all card masks and replaces stale log' || bad 'fresh checker failed'
+ar_rows_check "$LIB" >/dev/null && ok 'fresh checker keeps the four-card window mask, drops one-card settings and replaces stale log' || bad 'fresh checker failed'
 ar_rows_check "$LIB" >/dev/null || bad 'same-library cached receipt rejected'
 [[ $(wc -l <"$AR_CALLS") == 1 ]] && ok 'one fresh check per full SHA' || bad 'checker repeated'
 ar_rows_gate good "$LIB" >/dev/null || bad 'valid receipt gate failed'
@@ -116,6 +122,14 @@ ar_rows_gate changed "$LIB" >/dev/null && bad 'accepted changed served SHA' || o
 export MUTATE_AR=1
 ar_rows_check "$LIB" >/dev/null && bad 'accepted library mutation during checker' || ok 'reject pre/post SHA change'
 unset MUTATE_AR
+calls_before=$(wc -l <"$AR_CALLS")
+echo three >"$H/kernels/three.so"
+ROCR_VISIBLE_DEVICES=GPU-e49179ac81aef5ad,GPU-e770be134869264b,GPU-be0851a556d0f2c1 ar_rows_check "$H/kernels/three.so" >/dev/null &&
+  bad 'accepted a mask of three cards' || ok 'refuses a window mask that does not name four cards'
+[[ $(wc -l <"$AR_CALLS") == "$calls_before" ]] && ok 'no checker call for a three-card mask' || bad 'checker ran on a three-card mask'
+echo nomask >"$H/kernels/nomask.so"
+( unset ROCR_VISIBLE_DEVICES EXPECT_ROCR; ar_rows_check "$H/kernels/nomask.so" >/dev/null ) &&
+  ok 'without a window mask the checker sees no mask (every visible card, as the servers)' || bad 'no-mask check failed'
 
 # Arm parsing only: no checker or server. Existing no-Ar helpers need no AR receipt variables.
 ARMS='base base-Ar64-BT128 base-Ar1024-Kld base-Ar0 base-Arfoo base-Ar64-Ar1024'

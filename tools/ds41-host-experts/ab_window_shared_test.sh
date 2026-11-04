@@ -7,7 +7,7 @@ trap 'rm -rf "$T"' EXIT
 fail=0
 ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
-for fn in ar_rows_parse ag_rows_parse ar_ag_shared_arm ar_ag_shared_receipt_ok ar_ag_shared_check ar_ag_shared_gate; do
+for fn in serving_cards serving_cards_ok ar_rows_parse ag_rows_parse ar_ag_shared_arm ar_ag_shared_receipt_ok ar_ag_shared_check ar_ag_shared_gate; do
   eval "$(sed -n "/^$fn() {/,/^}/p" "$W")"
   declare -F "$fn" >/dev/null || { bad "missing $fn"; exit 1; }
 done
@@ -29,8 +29,12 @@ SUM=$(sha256sum "$LIB" | cut -d' ' -f1)
 export SHARED_CALLS=$T/checker.calls
 cat >"$T/checker" <<'EOF'
 #!/usr/bin/env bash
-if [[ -n ${HIP_VISIBLE_DEVICES+x}${ROCR_VISIBLE_DEVICES+x}${CUDA_VISIBLE_DEVICES+x}${R4D_SELFTEST_ONE_CARD+x} ]]; then
-  echo 'FAIL inherited card mask'; exit 1
+if [[ -n ${HIP_VISIBLE_DEVICES+x}${CUDA_VISIBLE_DEVICES+x}${R4D_SELFTEST_ONE_CARD+x} ]]; then
+  echo 'FAIL inherited one-card mask'; exit 1
+fi
+# The window's own mask (the serving cards) reaches the checker unchanged.
+if [[ ${ROCR_VISIBLE_DEVICES-unset} != "${EXPECT_ROCR-unset}" ]]; then
+  echo "FAIL card mask ${ROCR_VISIBLE_DEVICES-unset}, not the window's ${EXPECT_ROCR-unset}"; exit 1
 fi
 [[ $2 == --case && $3 == ds41_ar_ag_shared_exact ]] || exit 2
 echo called >>"$SHARED_CALLS"
@@ -51,9 +55,11 @@ ar_ag_shared_check "$LIB" >/dev/null && bad 'check outside window' || ok 'refuse
 AR_AG_SHARED_WINDOW_ACTIVE=1 FAKE_STATE=running
 ar_ag_shared_check "$LIB" >/dev/null && bad 'check beside running QFN' || ok 'requires stopped QFN'
 FAKE_STATE=exited
-export HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 R4D_SELFTEST_ONE_CARD=1
+# The window's four-card mask (the chains' four XT UUIDs) stays; the card-0 checks' one-card settings go.
+export HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 R4D_SELFTEST_ONE_CARD=1
+export ROCR_VISIBLE_DEVICES=GPU-e49179ac81aef5ad,GPU-e770be134869264b,GPU-be0851a556d0f2c1,GPU-23aac62b67afffa9 EXPECT_ROCR=GPU-e49179ac81aef5ad,GPU-e770be134869264b,GPU-be0851a556d0f2c1,GPU-23aac62b67afffa9
 echo stale >"$OUT/ar-ag-shared-$SUM.log"
-ar_ag_shared_check "$LIB" >/dev/null && ok 'fresh receipt replaces stale data with masks cleared' || bad 'fresh checker failed'
+ar_ag_shared_check "$LIB" >/dev/null && ok 'fresh receipt replaces stale data on the four window cards, one-card settings dropped' || bad 'fresh checker failed'
 ar_ag_shared_check "$LIB" >/dev/null || bad 'same-library receipt rejected'
 [[ $(wc -l <"$SHARED_CALLS") == 1 ]] || bad 'checker repeated within the window'
 ar_ag_shared_gate good "$LIB" >/dev/null || bad 'valid receipt gate failed'
@@ -76,6 +82,14 @@ ar_ag_shared_gate changed "$LIB" >/dev/null && bad 'accepted changed served SHA'
 export MUTATE_SHARED=1
 ar_ag_shared_check "$LIB" >/dev/null && bad 'accepted library mutation' || ok 'reject pre/post library mutation'
 unset MUTATE_SHARED
+calls_before=$(wc -l <"$SHARED_CALLS")
+echo three >"$H/kernels/three.so"
+ROCR_VISIBLE_DEVICES=GPU-e49179ac81aef5ad,GPU-e770be134869264b,GPU-be0851a556d0f2c1 ar_ag_shared_check "$H/kernels/three.so" >/dev/null &&
+  bad 'accepted a mask of three cards' || ok 'refuses a window mask that does not name four cards'
+[[ $(wc -l <"$SHARED_CALLS") == "$calls_before" ]] && ok 'no checker call for a three-card mask' || bad 'checker ran on a three-card mask'
+echo nomask >"$H/kernels/nomask.so"
+( unset ROCR_VISIBLE_DEVICES EXPECT_ROCR; ar_ag_shared_check "$H/kernels/nomask.so" >/dev/null ) &&
+  ok 'without a window mask the checker sees no mask (every visible card, as the servers)' || bad 'no-mask check failed'
 
 # Main arm parsing only. Both independent gates must still run; the mixed gate can only add a refusal.
 ARMS='base base-Ar1280-Ag1024-BT2048 base-Ar1280-Ag1024-BT1024 base-Ar1280-BT2048 base-Ar1280-Ag1024-BT4096 base-Ar1280-Ag1024-BT8192'

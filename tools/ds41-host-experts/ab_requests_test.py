@@ -10,6 +10,7 @@ a perturbed model still follows every forced token (teacher forcing does not dep
 own choice), with KL above 0 and top-1 agreement below 100%.
 """
 import contextlib
+import hashlib
 import http.server
 import io
 import json
@@ -20,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -87,11 +89,14 @@ def serve(model):
             else:
                 out = model.complete(body)
             data = json.dumps(out).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass   # a client that timed out (RequestTimeout) has gone
 
         def log_message(self, *a):
             pass
@@ -382,6 +387,190 @@ class PrefillHashes(unittest.TestCase):
             self.assertIn("alone: 3 of 3 prompts identical (3 of its prefills cut, 2 matched out of order)", text)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class Slow(Model):
+    """The exact toy model, `delay` seconds late, with the server's prompt count in its timings."""
+    def __init__(self, delay=0.0):
+        super().__init__()
+        self.delay = delay
+
+    def complete(self, body):
+        time.sleep(self.delay)
+        out = super().complete(body)
+        out["timings"]["prompt_n"] = len(body["prompt"])
+        return out
+
+
+@contextlib.contextmanager
+def env(**kv):
+    """os.environ with these values (None: unset), restored afterwards."""
+    old = {k: os.environ.get(k) for k in kv}
+    try:
+        for k, v in kv.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class RequestTimeout(unittest.TestCase):
+    """AB_REQUEST_TIMEOUT_S: the timed requests' timeout (600 s by default), which ab_window.sh raises
+    for a receipt of long prompts; the receipt's own prompt counts printed beside the server's."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="abreq-timeout-")
+        self.receipt = os.path.join(self.dir, "long-receipt.json")
+        reqs = [{"name": "long-1", "request": {"prompt": [3, 10, 20, 30], "max_tokens": 4, "temperature": 0}},
+                {"name": "long-2", "request": {"prompt": [5, 11], "max_tokens": 4, "temperature": 0}}]
+        with open(self.receipt, "w") as f:
+            json.dump({"benchmark_requests": reqs, "max_context_tokens": 8,
+                       "provenance": {"requests": [{"name": "long-1", "prompt_tokens": 4},
+                                                   {"name": "long-2", "prompt_tokens": 3}]}}, f)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def run_requests(self, model, **kv):
+        srv, url = serve(model)
+        out, text = os.path.join(self.dir, "arm.json"), io.StringIO()
+        try:
+            with env(**kv), contextlib.redirect_stdout(text):
+                ab_requests.run(self.receipt, url, 9, out)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        with open(out) as f:
+            return json.load(f), text.getvalue()
+
+    def test_the_default_is_600_seconds_and_a_value_must_be_positive(self):
+        with env(AB_REQUEST_TIMEOUT_S=None):
+            self.assertEqual(ab_requests.request_timeout(), 600.0)
+        with env(AB_REQUEST_TIMEOUT_S=""):
+            self.assertEqual(ab_requests.request_timeout(), 600.0)
+        with env(AB_REQUEST_TIMEOUT_S="1302"):
+            self.assertEqual(ab_requests.request_timeout(), 1302.0)
+        for v in ("0", "-5", "10m", "nan", "inf"):
+            with env(AB_REQUEST_TIMEOUT_S=v), self.assertRaises(ValueError, msg=v):
+                ab_requests.request_timeout()
+
+    def test_each_request_gets_the_timeout(self):
+        seen = []
+        real = ab_requests.post
+
+        def post(url, path, body, timeout=900):
+            seen.append(timeout)
+            return real(url, path, body, timeout)
+        ab_requests.post = post
+        try:
+            j, _ = self.run_requests(Slow(), AB_REQUEST_TIMEOUT_S="1302")
+            j0, _ = self.run_requests(Slow(), AB_REQUEST_TIMEOUT_S=None)
+        finally:
+            ab_requests.post = real
+        self.assertEqual(seen, [1302.0, 1302.0, 600.0, 600.0])
+        self.assertEqual((j["request_timeout_s"], j0["request_timeout_s"]), (1302.0, 600.0))
+
+    def test_a_slow_reply_times_out_and_the_next_request_still_runs(self):
+        j, text = self.run_requests(Slow(delay=1.5), AB_REQUEST_TIMEOUT_S="0.3")
+        self.assertIn("requests time out after 0.3 s (AB_REQUEST_TIMEOUT_S)", text)
+        self.assertEqual([r["text"] for r in j["requests"]], [None, None])
+        self.assertTrue(all("timed out" in (r["error"] or "") for r in j["requests"]), j["requests"])
+        j, text = self.run_requests(Slow(delay=0.2), AB_REQUEST_TIMEOUT_S="5")
+        self.assertTrue(all(r["text"] is not None for r in j["requests"]), j["requests"])
+
+    def test_an_invalid_timeout_sends_nothing(self):
+        model = Slow()
+        with self.assertRaises(SystemExit):
+            self.run_requests(model, AB_REQUEST_TIMEOUT_S="10m")
+        self.assertEqual(model.grammars, [])
+
+    def test_the_receipts_prompt_counts_beside_the_servers(self):
+        _, text = self.run_requests(Slow(), AB_REQUEST_TIMEOUT_S=None)
+        self.assertIn("long-1: 4 prompt tokens by the server's count, 4 by the receipt's (same)", text)
+        self.assertIn("long-2: 2 prompt tokens by the server's count, 3 by the receipt's (DIFFERENT)", text)
+
+
+class PrefillHashReference(unittest.TestCase):
+    """--hashes-ref: a window's Kh arms against a reference recorded in another run (a khref file, as
+    make_longctx_receipts.py writes it), and their replies against the reference's."""
+
+    LINES = ("I prefill hash: seq {s}, {n} tokens (not cut), rank 0: kv_window[40]={g:016x} logits={l:016x}\n"
+             "I prefill hash: seq {s} rank 0 kv_window by layer: 0:{g:08x} 1:{l:08x}\n"
+             "I prefill hash: seq {s}, {n} tokens: all ranks {a:016x}\n")
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="abreq-khref-")
+        self.ref = [(32768, 0x71eaab9a74338840, 1, 2, "fill-1", " terms and"), (82, 0x112530d7d4d5b367, 3, 4, "fill-2", "ft licence")]
+        self.write_log("reference", self.ref)
+        recs = ab_requests.hash_log(os.path.join(self.dir, "reference.server.log"))
+        receipt = os.path.join(self.dir, "fill-receipt.json")
+        with open(receipt, "w") as f:
+            json.dump({"benchmark_requests": []}, f)
+        with open(receipt, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        self.khref = os.path.join(self.dir, "fill-khref.json")
+        with open(self.khref, "w") as f:
+            json.dump({"schema": "ds41-prefill-hash-reference-v1", "receipt": "fill-receipt.json",
+                       "receipt_sha256": sha,
+                       "prompts": [dict(r, name=x[4], text=x[5]) for r, x in zip(recs, self.ref)]}, f)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write_log(self, arm, prompts, texts=None):
+        with open(os.path.join(self.dir, arm + ".server.log"), "w") as f:
+            for s, (n, a, g, l, _, _) in enumerate(prompts, 1):
+                f.write(self.LINES.format(s=s, n=n, a=a, g=g, l=l))
+        rows = [{"name": x[4], "text": (texts or {}).get(x[4], x[5])} for x in prompts]
+        with open(os.path.join(self.dir, arm + ".json"), "w") as f:
+            json.dump({"requests": rows}, f)
+
+    def check(self, *arms):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ab_requests.hashes_ref(self.khref, self.dir, list(arms))
+        return rc, out.getvalue()
+
+    def test_identical_hashes_and_replies(self):
+        self.write_log("c2", self.ref)
+        rc, text = self.check("c2")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("c2: 2 of 2 prompts identical", text)
+        self.assertIn("c2: 2 of 2 replies identical to the reference's", text)
+
+    def test_a_different_digest_names_its_group(self):
+        bad = [self.ref[0], (82, 0x2b28b67525bb7f18, 3, 5, "fill-2", "ft licence")]
+        self.write_log("live", bad)
+        rc, text = self.check("live")
+        self.assertEqual(rc, 1, text)
+        self.assertIn("DIFFERS: rank 0 logits; rank 0 window layers 1", text)
+        self.assertIn("live: 1 of 2 prompts identical", text)
+
+    def test_a_different_reply_fails(self):
+        self.write_log("c4", self.ref, {"fill-1": " terms or"})
+        rc, text = self.check("c4")
+        self.assertEqual(rc, 1, text)
+        self.assertIn("fill-1: reply DIFFERS", text)
+        self.assertIn("c4: 1 of 2 replies identical", text)
+
+    def test_a_changed_receipt_makes_the_reference_stale(self):
+        self.write_log("c2", self.ref)
+        with open(os.path.join(self.dir, "fill-receipt.json"), "w") as f:
+            json.dump({"benchmark_requests": [{"name": "other"}]}, f)
+        rc, text = self.check("c2")
+        self.assertEqual(rc, 1, text)
+        self.assertIn("stale", text)
+
+    def test_no_hashes(self):
+        rc, text = self.check("missing")
+        self.assertEqual(rc, 2, text)
 
 
 if __name__ == "__main__":

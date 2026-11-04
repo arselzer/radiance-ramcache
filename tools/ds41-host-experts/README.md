@@ -210,6 +210,47 @@ ab-20261103T110235Z, 0.68 at 4,096 in ab-20261103T090558Z). Time long prompts ov
 Two-batch overlap of concurrent decode steps (`RADIANCE_EXPERIMENTAL_SCHED_TBO=1`, opt-in, exact) loses on 256 GB
 too: 37.4 against 38.7 tok/s in total at 4 streams and 40.7 against 42.9 at 8 (ab-20261030T231526Z). Leave it off.
 
+**For contexts beyond 32K** keep the KV reservation fixed: with the block above (`--deterministic`) the pool is reserved
+at startup for one sequence of `--max-model-len` tokens on every card and paid for in VRAM expert residents (startup's
+`kv:` lines). Use `--max-model-len 131072` (part `Lm131072`) for long-context harness use; the 4,096-token
+chunks above (`..._LCP=4096` with its companions, parts `M4096` `Lc4096` `Pci4096`) when long prompts dominate: they
+prefill 1.34-1.5x faster at 48K-100K tokens, at the cost of the 4- and 8-stream decode deficit described there; and
+`L1024` or another small `--max-model-len` for decode-heavy concurrency. Growing KV is not the route: it refuses Phase
+1, the lent arena and more than one sequence, funds its full maximum at startup anyway, and its re-commit corruption is
+still open (`/home/as/ds41-decode-review-20261028/LONGCTX-FIFTHCARD-20261103.md`, 3.3-3.4). Measured on four RX 9070
+XT with the block above, one run each (ab-20261103T230607Z, the 524,288 row ab-20261104T003545Z; claude/ds41-batch-admit
+f4fe2ff1 and abe09503, libr4d f1b1507a in both):
+
+| `--max-model-len` | KV a card | rank 0: static residents + lent slots | 1 stream, held-out prompts |
+|---|---|---|---|
+| 512 (no `Lm` part) | 21.6 MiB | 667 + 41 | 29.11 tok/s |
+| 65,536 | 287 MiB | 635 + 51 | 29.50 |
+| 131,072 | 487 MiB | 621 + 48 | 29.35 |
+| 262,144 | 887 MiB | 594 + 40 | 28.66 |
+| 524,288 | 1.65 GiB | 525 + 40 | 27.73, against 29.73 at 512 in its window (−6.7%) |
+
+The rest is ab-20261104T003545Z:
+- **At 8 streams** with batch admission (`Ba`, `Pmr8`, the held-out prompts sent 8 at a time) `Lm131072` totalled
+  44.91 / 45.12 against 46.04 / 45.67 tok/s at `L1024` (−1.7%, two runs each).
+- **Exact.** At `Lm131072` with prefill hashes on, the 6,817-token prompt gave its reference prefill hash
+  (8c583a997ef6f1db) and reply; the 32,768-token fill prompt and its 82-token follow-up (`Ufill32k`) gave the hashes
+  71eaab9a74338840 / 112530d7d4d5b367 and both replies of the reference run with plain 16-token passes (M16) on the
+  stable e184 build; at 47,917 and 99,987 tokens (`Ulong48k`, `Ulong100k`; no 16-token reference exists above 32K)
+  2,048- and 4,096-token chunks gave the same prefill hash (87d485202785b186, 53cf0ecb89f99dad) and reply. All 48
+  held-out replies (at 512, 1,024, 131,072 and 524,288) equalled the base engine's. The card check `lsparse`
+  (`DEVICE_CHECKS=lsparse`, with the `TALL_LIBR4D` / `TALL_CHECK` pair): index_score, index_candidates, index_topk and
+  attn_sparse_sink on a 256-row chunk ending at index widths 32,769-524,289 gave 0 differing values against the same
+  rows launched alone, 16 at a time and as suffixes (top-k also against the host). It is logged and gates no arm.
+- **Prefill** at `Lm131072` (prefill hashes on): 47,917 tokens 115.1 s (416 tok/s) at 2,048-token chunks against 76.6 s
+  (626 tok/s) at 4,096; 99,987 tokens 221.7 s (451 tok/s) against 165.1 s (606 tok/s), and 224.5 s at 2,048 with the
+  hashes off; the 32,768-token fill prompt (a 6,817-token text repeated) 64.2 s.
+- **Decode at a long context**: after the 99,987-token prompt, prefill hashes off, 20.9 tok/s against 29.35 at
+  `Lm131072` on short prompts in the table (−29%; not yet profiled). Arms with prefill hashes decode slower still (12-14 tok/s), an
+  instrumentation cost.
+- The prefix cache did not run at these lengths; idle conversations must fit three quarters of the pool (**Long
+  contexts** under Prefix caching). Receipts: `make_longctx_receipts.py` (parts `Ufill32k`, `Ulong48k`, `Ulong100k`;
+  a receipt's `max_context_tokens` skips an arm with a shorter `--max-model-len` and lengthens its request timeout).
+
 **On 256 GB of RAM (8x 32 GB DDR4-2666) with a 192 GiB expert cache** (ab-20261030T194..., replies identical): decode **31.2 tok/s** a stream (19.9 with 96 GiB on 128 GB of DDR4-2133; 20.9 with 96 GiB on the new RAM, so the cache size, not the memory speed, is the gain: rank 0's misses fall 2,073 → 361 on the held-out prompts); **38.7 tok/s in all at 4 streams**; prefill 3,086 tokens in 28.1 s (110 tok/s) and 6,817 in 51.7 s (132 tok/s). 192 and 208 GiB measure the same.
 
 **For single-stream use, add DSpark speculation.** Exact (every draft is verified; replies identical in
@@ -940,7 +981,7 @@ on the held-out prompts). The conversations kept idle must fit three quarters of
 to keep their chains whole (each publish trims the pool to a quarter free, the least recently used
 conversation's end first), or live in the host tier; one larger than that alone stays whole through
 its own turns with `Pce`, not through another session's. Parts: `Lm32768`, `Lm65536` (the `LmN`
-part).
+part). Measured up to 524,288 since: **For contexts beyond 32K** under Configuration.
 
 **The harness receipt** (`make_prefix_receipt.py --harness`, part `Uharness`; `Uharness1` is its
 first session alone): two agent sessions interleaved turn by turn, each turn the whole

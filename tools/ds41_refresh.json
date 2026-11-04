@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "e69c59929c7aa3da66a4d55a6219983e73e9b545",
+  "engine_commit": "e1f037e9575485f4583e545fd97dd149585681c8",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -227,7 +227,8 @@
     "ab-20261103T230607Z",
     "ab-20261104T003545Z",
     "ab-20261104T025134Z",
-    "ab-20261104T051616Z"
+    "ab-20261104T051616Z",
+    "ab-20261104T064211Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",

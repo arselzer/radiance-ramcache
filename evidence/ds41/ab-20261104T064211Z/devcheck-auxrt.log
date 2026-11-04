@@ -1,0 +1,14 @@
+auxrt: 430 jobs for each M and unit count, one every 2.5 ms, 43 a step (HIP, not the engine's AQL lane: indicative only)
+auxrt M 1 units 1 rows  1: round trip median 138.0 us, p90 146.4 us, max 351.1 us; submit median 25.0 us
+auxrt M 1 units 2 rows  2: round trip median 195.2 us, p90 199.7 us, max 403.6 us; submit median 39.0 us
+auxrt M 1 units 3 rows  3: round trip median 221.1 us, p90 234.3 us, max 493.3 us; submit median 28.5 us
+auxrt M 1 units 4 rows  4: round trip median 198.3 us, p90 203.7 us, max 616.2 us; submit median 19.5 us
+auxrt M 4 units 1 rows  4: round trip median 230.5 us, p90 241.0 us, max 453.0 us; submit median 24.0 us
+auxrt M 4 units 2 rows  8: round trip median 353.4 us, p90 358.7 us, max 562.1 us; submit median 14.8 us
+auxrt M 4 units 3 rows 12: round trip median 492.5 us, p90 499.0 us, max 681.2 us; submit median 13.8 us
+auxrt M 4 units 4 rows 16: round trip median 511.6 us, p90 524.4 us, max 759.7 us; submit median 16.1 us
+auxrt M 8 units 1 rows  8: round trip median 341.6 us, p90 347.1 us, max 573.7 us; submit median 26.9 us
+auxrt M 8 units 2 rows 16: round trip median 564.5 us, p90 579.3 us, max 784.1 us; submit median 17.3 us
+auxrt M 8 units 3 rows 24: round trip median 850.1 us, p90 867.0 us, max 5081.4 us; submit median 22.3 us
+auxrt M 8 units 4 rows 32: round trip median 904.8 us, p90 918.6 us, max 1199.1 us; submit median 28.9 us
+auxrt exit 0

@@ -4520,6 +4520,168 @@
           "reason": "binary capture"
         }
       ]
+    },
+    "ab-20261104T064211Z": {
+      "files": 39,
+      "bytes": 4102510,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-11-04T06:42:11Z",
+      "arms_started": 10,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Axv.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Axv.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Axv.aux-vram",
+          "bytes": 1977,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N4-C4-Pmr4-Ba-Axv.server.log",
+          "bytes": 98070,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-Ax-r1.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-Ax-r1.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-Ax-r1.aux-vram",
+          "bytes": 1812,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-Ax-r1.server.log",
+          "bytes": 100997,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-Ax-r2.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-Ax-r2.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-Ax-r2.aux-vram",
+          "bytes": 1779,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-Ax-r2.server.log",
+          "bytes": 100996,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-r1.server.log",
+          "bytes": 97788,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-L1024-Pf-N8-C8-Pmr8-Ba-Uchat-r2.server.log",
+          "bytes": 97792,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Ax-r1.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Ax-r1.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Ax-r1.aux-vram",
+          "bytes": 3263,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Ax-r1.server.log",
+          "bytes": 110165,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Ax-r2.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Ax-r2.aux-clients-after",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Ax-r2.aux-vram",
+          "bytes": 3263,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Ax-r2.server.log",
+          "bytes": 110175,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-r1.server.log",
+          "bytes": 106972,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-r2.server.log",
+          "bytes": 106969,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs.server.log",
+          "bytes": 99064,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "aux-checks.aux-clients",
+          "bytes": 34,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "aux-ext.bin",
+          "bytes": 16785316,
+          "reason": "binary capture"
+        },
+        {
+          "path": "aux-xt.bin",
+          "bytes": 16785316,
+          "reason": "binary capture"
+        },
+        {
+          "path": "silu_aux.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        },
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
     }
   }
 }

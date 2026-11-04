@@ -1885,7 +1885,7 @@ for a in $ARMS; do
 # work (RADIANCE_EXPERIMENTAL_SCHED_TBO; a radiance and deepseek41 from claude/ds41-tbo); Ba / BaN whole
 # prompts waiting together admitted into one prefill-only step of at most 256 / N (32-256) rows instead of
 # one a step (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=N, experimental; needs Pf, Lc, NK above 1 and no Pc
-# part; a radiance from claude/ds41-batch-admit): measured only with the scheduler's startup line
+# or Kld part; a radiance from claude/ds41-batch-admit): measured only with the scheduler's startup line
 # "batch admission: on (...=N)" (every other arm states the switch 0 and must not have it), and a Ba arm
 # that sent requests together but batched no step is set aside; rN a repeat (ignored).
 # the RAM cache's profile-hot units get N second chances before eviction; Ov / Ov2 a launch whose
@@ -2324,14 +2324,16 @@ for a in $ARMS; do
   ARM_TB=$tb
   # Ba / BaN: stated by every arm (0 off), so a window's VAR=val cannot batch another arm's admissions;
   # arm() checks the scheduler's startup line both ways. It acts only beside prefill alone (Pf), large-
-  # chunk prefill (Lc), more than one sequence (NK, or MAX_SEQS) and the prefix cache off (no Pc part):
-  # the scheduler refuses it otherwise, and the arm would run without what its name says.
+  # chunk prefill (Lc), more than one sequence (NK, or MAX_SEQS), the prefix cache off (no Pc part) and
+  # outside KL mode (no Kld part; a Kld arm goes to kld_finish before arm() checks the startup line): the
+  # scheduler refuses it otherwise, and the arm would run without what its name says.
   if [[ -n "$ba" ]]; then
     [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 "* ]] ||
       { log "arm $a: Ba needs Pf (prefill alone); the arm is skipped"; skip=1; }
     [[ -n "$lc" ]] || { log "arm $a: Ba needs an Lc part (large-chunk prefill); the arm is skipped"; skip=1; }
     (( 10#${nseq:-${MAX_SEQS:-1}} > 1 )) || { log "arm $a: Ba needs NK with K above 1; the arm is skipped"; skip=1; }
     [[ -z "$pc" ]] || { log "arm $a: Ba with a Pc part (the scheduler refuses the prefix cache); the arm is skipped"; skip=1; }
+    [[ -z "$kld" ]] || { log "arm $a: Ba with a Kld part (the scheduler refuses batch admission under --kld-record); the arm is skipped"; skip=1; }
   fi
   env+=(RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=${ba:-0})
   ARM_BA=$ba

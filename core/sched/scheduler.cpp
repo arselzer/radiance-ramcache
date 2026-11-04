@@ -2154,12 +2154,12 @@ void Scheduler::preempt_back() {
 }
 
 /* ------------------------------------------------------------------ whole prompts admitted together */
-/* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT (batch_rows_, scheduler.h). Kept out of a batch, each still
- * admitted as before in a step of its own: a request back from preemption (its recompute of prompt and
- * output), one with media (encoder rows), a scored prompt (KLD rows) or an embedding input, one with a
- * LoRA adapter or plugin words (ops issued for some rows of the step only), and any prompt the rows
- * left cannot take whole or whose chunk would write a snapshot (a whole prompt below the checkpoint
- * interval writes none; the interval is a multiple of the chunk under large-chunk prefill). */
+/* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT (batch_rows_, scheduler.h). Kept out of a batch, each in a step
+ * of its own as before: a request back from preemption (its recompute of prompt and output), one with
+ * media (encoder rows), a scored prompt (KLD rows) or an embedding input, one with a LoRA adapter or
+ * plugin words (ops issued for some rows of the step only), a prompt longer than R, and one whose chunk
+ * would write a snapshot (none below the checkpoint interval, a multiple of the chunk under LCP). A whole
+ * prompt of at most R rows that the rows left cannot take ends the batch and opens the next step's. */
 bool Scheduler::batch_fits(const SchedReq& s, int64_t used, int64_t budget) const {
     if (batch_rows_ <= 0 || used < 0 || !s.req) return false;
     const Request& r = *s.req;

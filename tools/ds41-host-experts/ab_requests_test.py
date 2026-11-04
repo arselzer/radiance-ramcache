@@ -296,14 +296,19 @@ class HarnessTurns(unittest.TestCase):
 class PrefillHashes(unittest.TestCase):
     """--hashes: requests sent together reach the server in an order of their own, so an arm's prompts
     are matched to the first arm's by tokens and digest wherever they sit in its log; a real difference
-    (another digest) still fails."""
+    (another digest) still fails, named against the arm's unmatched prompt of that length rather than
+    whichever prompt sits at its position; a prefill run uncut in a shared step is not counted cut."""
 
     @staticmethod
-    def log(d, arm, prompts):
+    def log(d, arm, prompts, label=None):
+        """Each prompt (tokens, digest) or (tokens, digest, window group, logits); rank 0's label is
+        `label`, by default "cut for <tokens>"."""
         with open(os.path.join(d, arm + ".server.log"), "w") as f:
-            for seq, (n, digest) in enumerate(prompts, 1):
-                f.write("I[0] prefill hash: seq %d, %d tokens (cut for %d), rank 0: win[40]=%016x logits=%016x\n"
-                        % (seq, n, n, digest, digest))
+            for seq, p in enumerate(prompts, 1):
+                n, digest = p[0], p[1]
+                win, lg = (p[2], p[3]) if len(p) > 2 else (digest, digest)
+                f.write("I[0] prefill hash: seq %d, %d tokens (%s), rank 0: win[40]=%016x logits=%016x\n"
+                        % (seq, n, label or "cut for %d" % n, win, lg))
                 f.write("I prefill hash: seq %d, %d tokens: all ranks %016x\n" % (seq, n, digest))
 
     def run_hashes(self, d, arms):
@@ -329,6 +334,52 @@ class PrefillHashes(unittest.TestCase):
             self.assertEqual(rc, 1, text)
             self.assertIn("DIFFERS", text)
             self.assertIn("wrong: 3 of 4 prompts identical", text)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_difference_is_named_against_the_unmatched_prompt_of_its_length(self):
+        d = tempfile.mkdtemp(prefix="abreq-hash-")
+        try:
+            a, b, c, x = (46, 1, 1, 1), (40, 2, 2, 2), (39, 3, 3, 3), (40, 4, 4, 4)
+            x2 = (40, 5, 5, 4)      # x with another window group (so another digest), the same logits
+            self.log(d, "alone", [a, b, c, x])
+            self.log(d, "moved", [b, a, x2, c])       # x2 sits where c was, and c where x was
+            rc, text = self.run_hashes(d, ["alone", "moved"])
+            self.assertEqual(rc, 1, text)
+            self.assertIn("moved: prompt 3 (40 tokens, cut for 40; its prompt 2): DIFFERS: rank 0 win[40]\n", text)
+            self.assertNotIn("not the same prompts", text)
+            self.assertIn("moved: 3 of 4 prompts identical", text)
+            # Twins: the first matches the second's record; the second is named against x2, not its twin.
+            self.log(d, "twins", [x, x])
+            self.log(d, "twin2", [x2, x])
+            rc, text = self.run_hashes(d, ["twins", "twin2"])
+            self.assertEqual(rc, 1, text)
+            self.assertIn("twin2: prompt 1 (40 tokens, cut for 40; its prompt 0): DIFFERS: rank 0 win[40]\n", text)
+            # No unmatched prompt of the length left: not the same prompts; none left at all: missing.
+            self.log(d, "other", [a, b, c, (41, 4)])
+            rc, text = self.run_hashes(d, ["alone", "other"])
+            self.assertEqual(rc, 1, text)
+            self.assertIn("other: prompt 3 (40 tokens): no unmatched prompt of that length (41 tokens left)", text)
+            self.log(d, "short", [b, a, c])
+            rc, text = self.run_hashes(d, ["alone", "short"])
+            self.assertEqual(rc, 1, text)
+            self.assertIn("short: prompt 3 (40 tokens) missing", text)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_prompts_run_uncut_in_a_shared_step_are_not_counted_cut(self):
+        d = tempfile.mkdtemp(prefix="abreq-hash-")
+        try:
+            wave = [(46, 1), (40, 2), (39, 3)]
+            self.log(d, "alone", wave)
+            self.log(d, "batched", [wave[1], wave[0], wave[2]], label="not cut: shared step")
+            rc, text = self.run_hashes(d, ["alone", "batched"])
+            self.assertEqual(rc, 0, text)
+            self.assertIn("batched: 3 of 3 prompts identical (0 of its prefills cut, 3 uncut in a shared step, "
+                          "2 matched out of order)", text)
+            rc, text = self.run_hashes(d, ["batched", "alone"])
+            self.assertEqual(rc, 0, text)
+            self.assertIn("alone: 3 of 3 prompts identical (3 of its prefills cut, 2 matched out of order)", text)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

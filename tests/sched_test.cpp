@@ -9680,10 +9680,10 @@ TEST(batch_admission_off_plans_every_step_as_before_and_on_changes_only_the_step
     CHECK(on.out == unset.out);
 }
 
-/* What a batch does not take, each admitted in a step of its own as before: a prompt longer than the
- * rows left (and, in arrival order, every prompt behind it), a prompt longer than R (it opens no
- * batch), a prompt with plugin words or a LoRA adapter (ops issued for some of a step's rows only). A
- * prompt behind a long one forms a batch with the next once the long one has run. */
+/* What a batch does not take: a prompt longer than the rows left ends the batch (none behind it is
+ * taken ahead of it) and is admitted in the next step, a batch's first if it is at most R rows (the
+ * prompts behind it may join); a prompt longer than R (it opens no batch), or with plugin words or a
+ * LoRA adapter (ops issued for some of a step's rows only), runs in a step of its own as before. */
 TEST(batch_admission_keeps_out_what_it_cannot_take_whole) {
     auto start = [](Fixture& f) {
         lcp_fixture(f, 2048, 2048);
@@ -9761,8 +9761,10 @@ TEST(batch_admission_runs_a_shared_step_uncut) {
     const uint64_t a = f.submit(200, 6);
     std::vector<uint64_t> ids = { a };
     uint64_t b = 0, c = 0;
+    BatchBuilder::ConsumerStats s1, s2;   /* the counters before the shared step and after it */
     const BaRun r = batch_run(f, ids, [&](int k) {
-        if (k == 1) { b = f.submit(120, 4); c = f.submit(100, 4); }
+        if (k == 1) { b = f.submit(120, 4); c = f.submit(100, 4); s1 = f.sch.consumer_stats(); }
+        if (k == 2) s2 = f.sch.consumer_stats();
     });
     REQUIRE(r.steps.size() >= 3);
     CHECK(r.steps[0].e == std::vector<BaEntry>({ BaEntry(a, 0, 200, true) }));
@@ -9772,6 +9774,14 @@ TEST(batch_admission_runs_a_shared_step_uncut) {
     const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
     CHECK_EQ(cs.shared, (uint64_t)1);
     CHECK(cs.cut >= 1);
+    /* The shared step: one pass, its 16 layers in full on every row of both prompts (220), none alone
+     * or skipped. */
+    CHECK_EQ(s2.passes - s1.passes, (uint64_t)1);
+    CHECK_EQ(s2.shared - s1.shared, (uint64_t)1);
+    CHECK_EQ(s2.full - s1.full, (uint64_t)16);
+    CHECK_EQ(s2.rows_full - s1.rows_full, (uint64_t)(16 * 220));
+    CHECK_EQ(s2.rows_key, s1.rows_key);
+    CHECK_EQ(s2.rows_skipped, s1.rows_skipped);
 }
 
 /* A cancel: of a prompt still waiting (the batch forms without it), and of one in a batch whose step

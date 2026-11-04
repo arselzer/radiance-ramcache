@@ -834,8 +834,10 @@ def hashes(d, arms):
     """Each arm's prompts against the first arm's, by position: the same tokens and digest, or what
     differs. Requests sent together (CK) reach the server in an order of their own in each arm, so a
     prompt whose position differs is matched to the arm's prompt of the same tokens and digest
-    elsewhere in its log (each used once; counted as reordered). Exit status 1 when anything
-    differs, 2 when an arm has no hashes."""
+    elsewhere in its log (each used once; counted as reordered). A prompt that matches none is then
+    compared with one of the arm's prompts of its length that matched none either (the one at its own
+    position first, each used once), naming the groups, ranks and window layers that differ. Exit
+    status 1 when anything differs, 2 when an arm has no hashes."""
     logs = {}
     for a in arms:
         try:
@@ -856,6 +858,7 @@ def hashes(d, arms):
         same = 0
         moved = 0
         used = [False] * len(got)
+        unmatched = []
         for i, r in enumerate(ref):
             j = i if (i < len(got) and not used[i] and got[i]["tokens"] == r["tokens"] and
                       got[i]["all"] == r["all"]) else None
@@ -866,18 +869,25 @@ def hashes(d, arms):
             if j is not None:
                 used[j] = True
                 same += 1
-                continue
-            if i >= len(got):
-                print("  %s: prompt %d (%d tokens) missing" % (a, i, r["tokens"]))
-                bad += 1
-                continue
-            g = got[i]
-            if g["tokens"] != r["tokens"]:
-                print("  %s: prompt %d is %d tokens, %s's %d: not the same prompts" %
-                      (a, i, g["tokens"], first, r["tokens"]))
-                bad += 1
-                continue
+            else:
+                unmatched.append(i)
+        # What differs, once every match is taken: in a reordered arm the prompt at a position is often
+        # another one, so each unmatched prompt is compared with an unmatched one of its length.
+        for i in unmatched:
+            r = ref[i]
             bad += 1
+            cands = [k for k, g in enumerate(got) if not used[k] and g["tokens"] == r["tokens"]]
+            if not cands:
+                left = [str(g["tokens"]) for k, g in enumerate(got) if not used[k]]
+                if left:
+                    print("  %s: prompt %d (%d tokens): no unmatched prompt of that length (%s tokens "
+                          "left): not the same prompts" % (a, i, r["tokens"], ", ".join(left)))
+                else:
+                    print("  %s: prompt %d (%d tokens) missing" % (a, i, r["tokens"]))
+                continue
+            j = i if i in cands else cands[0]
+            used[j] = True
+            g = got[j]
             diffs = []
             for rank in sorted(r["ranks"]):
                 for name, h in r["ranks"][rank].items():
@@ -887,11 +897,16 @@ def hashes(d, arms):
                 ls = [l for l in lr if lg.get(l) != lr[l]]
                 if ls:
                     diffs.append("rank %d window layers %s" % (rank, ",".join(ls)))
-            print("  %s: prompt %d (%d tokens, %s): DIFFERS: %s" %
-                  (a, i, r["tokens"], g["cut"].get(0, "?"), "; ".join(diffs) or "the digest"))
+            print("  %s: prompt %d (%d tokens, %s%s): DIFFERS: %s" %
+                  (a, i, r["tokens"], g["cut"].get(0, "?"), "" if j == i else "; its prompt %d" % j,
+                   "; ".join(diffs) or "the digest"))
+        # Each prefill as rank 0's line names it: "cut for N", "not cut", or "not cut: shared step" (a
+        # whole prompt admitted beside others into one step, which the consumer skip runs uncut).
         cut = sum(1 for g in got if g["cut"].get(0, "").startswith("cut"))
-        print("  %s: %d of %d prompts identical (%d of its prefills cut%s)" %
-              (a, same, len(ref), cut, ", %d matched out of order" % moved if moved else ""))
+        shared = sum(1 for g in got if g["cut"].get(0, "").startswith("not cut: shared"))
+        print("  %s: %d of %d prompts identical (%d of its prefills cut%s%s)" %
+              (a, same, len(ref), cut, ", %d uncut in a shared step" % shared if shared else "",
+               ", %d matched out of order" % moved if moved else ""))
     return 1 if bad else 0
 
 

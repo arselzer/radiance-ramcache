@@ -136,8 +136,8 @@ struct SchedReq {
     /* The consumer skip's target for this prefill (consumer_skip.h): the first position whose
      * state must be exact, its end or the deepest checkpoint below it; 0 when its prefill is not
      * cut. Set at each admission (Scheduler::consumer_target), carried by its prefill entries
-     * (StepEntry::consumer_end); a checkpoint below it is written only if it is one of
-     * `consumer_ckpts`. */
+     * (StepEntry::consumer_end; a step of several prompts runs uncut whatever they carry); a
+     * checkpoint below it is written only if it is one of `consumer_ckpts`. */
     int64_t  consumer_end = 0;
     /* The checkpoints below that target its cut makes whole (consumer_skip.h, "complete
      * checkpoints"), ascending: those its idle prefill writes that the policy keeps

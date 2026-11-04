@@ -223,9 +223,10 @@ int Engine::aux_start() {
     const std::vector<int64_t> q = ds41aux::quotas(all, N - spare, R);
     /* Card sharing: a released start loads nothing (the arena was never reserved, or the controller's watch gave
      * it back before the load); its lanes are made, and the first acquire carves the arena they work in. */
-    bool released = !aux_->has_arena();
     std::string rel_why = aux_released_why_;
-    if (!released && aux_ctl_ && !aux_ctl_->claim(&rel_why)) released = true;
+    /* claim() transfers the startup arena under start_mu_: the watch may free a reserved arena until then.
+     * Inspecting has_arena() first would race that release. Once claimed, the watch only aborts the load. */
+    bool released = aux_ctl_ ? !aux_ctl_->claim(&rel_why) : !aux_->has_arena();
     if (released) {
         aux_->plan(layers, N, L);
         if (aux_->make_lanes(ranks_[0]->device, &why) < 0) {

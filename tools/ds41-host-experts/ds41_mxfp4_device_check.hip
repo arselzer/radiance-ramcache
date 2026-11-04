@@ -65,10 +65,27 @@
  *                                                      RADIANCE_EXPERIMENTAL_DS41_LCP when that is in
  *                                                      the environment (its heights); sweep0 without
  *                                                      either switch.
+ *   ds41_mxfp4_device_check LIBR4D.so aux OUT [trials] the aux expert worker's launches (ds41_aux.h,
+ *                                                      core/place/aux_expert_worker.h): at M 1/4/8/16 over
+ *                                                      96 gate_up and down experts, gemv_vp's chain over
+ *                                                      the slots ds41aux::compact keeps for subsets of the
+ *                                                      live experts against the full launch's rows byte for
+ *                                                      byte, the full gemv_vp launches (packed and mixed
+ *                                                      tables) against the plain gemv over block_mxfp4,
+ *                                                      and rows against the host chain; every output into
+ *                                                      OUT (fixed seeds and order: two cards' files must be
+ *                                                      identical). Under the window's
+ *                                                      RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL, left as it is.
+ *                                                      Last line "PASS: aux: ..." or "FAIL: aux: ...".
+ *   ds41_mxfp4_device_check LIBR4D.so auxrt [jobs]     the worker's job (pinned record -> card, three
+ *                                                      launches, rows back, an event polled) timed
+ *                                                      through HIP at a decode cadence: "auxrt" lines,
+ *                                                      indicative only.
  *
  * Needs a free card (HIP device 0 unless HIP_VISIBLE_DEVICES says otherwise). Uses the
  * live-tail ranges as the measured runs do (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1), except `tall`,
- * which runs the routed GEMM as the A/B's servers do (without them). */
+ * which runs the routed GEMM as the A/B's servers do (without them), and `aux` / `auxrt`, which keep
+ * the window's setting. */
 #include <hip/hip_runtime.h>
 #include <dlfcn.h>
 
@@ -82,9 +99,11 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "rad_abi.h"
+#include "ds41_aux.h"
 #include "ds41_host_experts.h"
 #include "ds41_p1.h"
 #include "r4d_bf16f8_layout.h"
@@ -133,6 +152,8 @@ struct Lib {
     int (*moe_bal)(const RadArgs*, RadStream, int tall, int bal) = nullptr;
     /* For `p1`: prefill Phase 1's twin and its checker export with the work split forced. */
     Launch moe_p1 = nullptr;
+    /* For `aux` / `auxrt`: the gemv_vp row (moe_gemm_ggml_mxfp4_gemv_vp), the only one the aux expert worker runs. */
+    Launch moe_vp = nullptr;
     int (*moe_p1_opts)(const RadArgs*, RadStream, int, int, int, int) = nullptr;
     int (*count)(void) = nullptr;
     const RadKernelInfo* (*at)(int) = nullptr;
@@ -160,6 +181,7 @@ struct Lib {
         gemm_f8 = (Launch)dlsym(h, "r4d_rad_gemm_bf16f8_m64");
         moe_bal = (int (*)(const RadArgs*, RadStream, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_bal");
         moe_p1 = (Launch)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1");
+        moe_vp = (Launch)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_vp");
         moe_p1_opts = (int (*)(const RadArgs*, RadStream, int, int, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts");
         count = (int (*)(void))dlsym(h, "rad_kernel_count");
         at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
@@ -2076,16 +2098,16 @@ struct P1Bank {
     std::vector<void*> blk, pkd;          /* device addresses */
     int raw_rounds = 0;
 };
-void p1_bank(P1Bank* b, int N, int K, std::mt19937_64& rng) {
+void p1_bank(P1Bank* b, int N, int K, std::mt19937_64& rng, int n_experts = kNe) {
     b->N = N;
     b->K = K;
     const int UK = K / 32, R = (UK + 31) / 32;
     b->bb = (size_t)N * UK * 17;
-    b->blocks.reset(new Dev(b->bb * kNe));
-    b->host.resize(kNe);
+    b->blocks.reset(new Dev(b->bb * n_experts));
+    b->host.resize(n_experts);
     std::uniform_real_distribution<double> u01(0.0, 1.0);
     static const uint8_t edges[] = { 0, 1, 2, 3, 60, 100, 127, 128, 135, 140, 254 };
-    for (int e = 0; e < kNe; ++e) {
+    for (int e = 0; e < n_experts; ++e) {
         /* The release's planes: codes random, e8m0 mostly 120 / 121 as the release's experts have them, a few raw
          * rounds (a block outside any window of four), every 7th expert also e8m0 edges. */
         std::vector<uint8_t> codes((size_t)N * (K / 2)), scales((size_t)N * UK);
@@ -2754,10 +2776,404 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
     return rc;
 }
 
+/* ================================================================== `aux` / `auxrt`: the aux expert worker
+ *
+ * The worker (core/place/aux_expert_worker.h; work/aux/SPEC.md §14.1) relaunches a rank's decode chain for the
+ * rows of the units it holds: gate_up and down by the gemv_vp row over its packed slots (the only row it takes,
+ * aux_resolve), swiglu_clamped between, over the slots ds41aux::compact keeps -- the held experts' live slots in
+ * order, every other expert's range empty, T' rows instead of the pass's tokens * 6 -- with the pass's token rows.
+ * `aux` holds every compacted row to its full launch's byte for byte at M 1/4/8/16, the full gemv_vp launches
+ * (packed and mixed tables) to the plain gemv's over block_mxfp4 (the CPU's bits; a NaN equal to any NaN there,
+ * as the vpack check counts them), and a few rows to the host chain, under the window's
+ * RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL (main leaves it as it is); a compacted launch of all a "local" pass's slots
+ * is whole (T' == M * 6: the live-tail form). */
+
+/* A pass's routing on rank 1: p1_routing's "uniform", "skewed" and "hot"; "edge" the rank's first and last
+ * experts in every token beside random ones; "local" every slot one of the rank's experts. */
+P1Routing aux_routing(const char* kind, int M, std::mt19937_64& rng) {
+    constexpr int rank = 1;
+    if (std::strcmp(kind, "local") && std::strcmp(kind, "edge")) return p1_routing(kind, M, rank, 0, rng);
+    P1Routing r;
+    r.rank = rank;
+    r.name = kind;
+    r.p.resize((size_t)M * kTop);
+    const bool local = !std::strcmp(kind, "local");
+    for (int t = 0; t < M; ++t) {
+        int* pk = &r.p[(size_t)t * kTop];
+        int n = 0;
+        if (!local) { pk[n++] = rank * kNe; pk[n++] = rank * kNe + kNe - 1; }
+        while (n < kTop) {
+            const int e = local ? rank * kNe + (int)(rng() % kNe) : (int)(rng() % (4 * kNe));
+            bool dup = false;
+            for (int j = 0; j < n; ++j) dup |= pk[j] == e;
+            if (!dup) pk[n++] = e;
+        }
+    }
+    return r;
+}
+
+/* gate_up (token order) -> swiglu over the T rows -> down (sorted order), `f` over the tables tg / td, as
+ * DeviceLane::submit launches them (x [AR, K]; sorted [T]; outputs [T, N]). */
+int aux_chain(Launch f, Launch sw, hipStream_t s, void* x, int AR, void* tg, void* td, void* so, void* of, int T,
+              void* gu, void* act, void* dn) {
+    if (run_moe(f, s, x, AR, tg, 2 * kFf, kEmbd, so, of, gu, "token", T) < 0) return -1;
+    if (run_swiglu(sw, s, gu, act, T, kFf) < 0) return -1;
+    if (run_moe(f, s, act, T, td, kEmbd, kFf, so, of, dn, "sorted", T) < 0) return -1;
+    return 0;
+}
+
+/* Rows' values that differ; with `nan_ok` a NaN equal to any NaN (counted in *nans). */
+size_t aux_diff(const uint16_t* a, const uint16_t* b, size_t n, bool nan_ok, size_t* nans) {
+    size_t d = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (a[i] != b[i]) {
+            if (nan_ok && p1_nan(a[i]) && p1_nan(b[i])) ++*nans;
+            else ++d;
+        }
+    return d;
+}
+
+int aux_check(const Lib& lib, const char* out_path, int trials) {
+    if (!lib.moe_vp || !lib.swiglu) {
+        std::fprintf(stderr, "the library lacks r4d_rad_moe_gemm_mxfp4_gemv_vp or r4d_rad_swiglu_clamped\n");
+        return 2;
+    }
+    const char* lt = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL");
+    std::printf("aux: RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL %s (the window's), %d trial(s)\n", lt && *lt ? lt : "unset",
+                trials);
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    std::mt19937_64 rng(20261103);
+    P1Bank gu, dn;
+    p1_bank(&gu, 2 * kFf, kEmbd, rng);
+    p1_bank(&dn, kEmbd, kFf, rng);
+    std::printf("aux: 96 gate_up and 96 down experts, block_mxfp4 and packed (%d and %d raw rounds)\n", gu.raw_rounds,
+                dn.raw_rounds);
+    std::fflush(stdout);
+    /* The tables: every expert block_mxfp4 (the plain row's, the CPU's bits), every one packed (the worker's slots),
+     * and mixed (every third block_mxfp4: a card's residents beside other entries). */
+    std::vector<int> f_blk(kNe, 0), f_pk(kNe, 1), f_mix(kNe);
+    for (int e = 0; e < kNe; ++e) f_mix[(size_t)e] = e % 3 == 2 ? 0 : 1;
+    auto upload = [&](const P1Bank& b, const std::vector<int>& forms) {
+        std::unique_ptr<Dev> d(new Dev(kNe * sizeof(void*)));
+        const std::vector<void*> t = p1_table(b, forms, nullptr);
+        d->put(t.data());
+        return d;
+    };
+    const auto tg_b = upload(gu, f_blk), td_b = upload(dn, f_blk);
+    const auto tg_p = upload(gu, f_pk), td_p = upload(dn, f_pk);
+    const auto tg_m = upload(gu, f_mix), td_m = upload(dn, f_mix);
+    /* This card's silu table, for the host chain's rows. */
+    std::vector<float> silu(65536);
+    {
+        Dev d_t(65536 * 4);
+        silu_capture<<<256, 256, 0, s>>>((float*)d_t.p, kLimit);
+        HC(hipStreamSynchronize(s));
+        d_t.get(silu.data());
+    }
+    FILE* out = std::fopen(out_path, "wb");
+    if (!out) { std::fprintf(stderr, "cannot write %s\n", out_path); return 2; }
+    const int32_t Ms[4] = { 1, 4, 8, 16 };
+    {
+        const char magic[8] = { 'R', '4', 'D', 'A', 'U', 'X', '0', '1' };
+        const uint32_t hdr[3] = { 1u, 4u, 0u };   /* version, the M list's length, then (below) the case count */
+        std::fwrite(magic, 1, 8, out);
+        std::fwrite(hdr, 4, 2, out);
+        std::fwrite(Ms, 4, 4, out);
+        std::fwrite(&hdr[2], 4, 1, out);
+    }
+    /* A record: M, the routing, the launch (0 the full gemv's, 1 the full gemv_vp's over packed, 2.. the compacted
+     * subsets), its rows, then the down rows [rows, 5120] bf16. */
+    auto record = [&](int M, int kind, int launch, int rows, const uint16_t* y) {
+        const int32_t h[4] = { M, kind, launch, rows };
+        std::fwrite(h, 4, 4, out);
+        std::fwrite(y, 2, (size_t)rows * kEmbd, out);
+    };
+    static const char* const kinds[] = { "uniform", "skewed", "hot", "edge", "local" };
+    static const char* const subset_names[] = { "one", "alternate", "all", "last" };
+    size_t bad_vp = 0, bad_mix = 0, bad_cmp = 0, bad_cmp_blk = 0, bad_host = 0, nans = 0, bad_compact = 0;
+    size_t rows_full = 0, rows_cmp = 0, rows_host = 0;
+    int cases = 0, whole = 0, shown = 0;
+    const size_t G = 2 * kFf, A = kFf, E = kEmbd;
+    for (int trial = 0; trial < trials; ++trial)
+        for (int M : Ms)
+            for (int k = 0; k < 5; ++k) {
+                P1Routing r = aux_routing(kinds[k], M, rng);
+                P1Pass full = p1_pass(r, 0, M);
+                for (int redraw = 0; !full.local && redraw < 100; ++redraw) {   /* a pass with no slot here */
+                    r = aux_routing(kinds[k], M, rng);
+                    full = p1_pass(r, 0, M);
+                }
+                const int T = M * kTop, L = full.local;
+                if (!L) continue;
+                std::vector<uint16_t> x((size_t)M * E);
+                for (int t = 0; t < M; ++t) {
+                    const auto row = make_x(kEmbd, rng, t % 5 == 3);
+                    std::copy(row.begin(), row.end(), x.begin() + (size_t)t * E);
+                }
+                std::vector<int> expert_of((size_t)L);
+                std::vector<int> live_e;
+                int32_t counts[kNe];
+                for (int e = 0; e < kNe; ++e) {
+                    counts[e] = full.off[(size_t)e + 1] - full.off[(size_t)e];
+                    for (int i = full.off[(size_t)e]; i < full.off[(size_t)e + 1]; ++i) expert_of[(size_t)i] = e;
+                    if (counts[e]) live_e.push_back(e);
+                }
+                Dev d_x(x.size() * 2), d_so((size_t)T * 4), d_of((kNe + 1) * 4);
+                d_x.put(x.data());
+                d_so.put(full.sorted.data());
+                d_of.put(full.off.data());
+                /* The full launches: plain gemv over block_mxfp4, gemv_vp over packed, gemv_vp over mixed. */
+                std::vector<uint16_t> Gf[3], Af[3], Yf[3];
+                const Launch fl[3] = { lib.moe, lib.moe_vp, lib.moe_vp };
+                void* const tgs[3] = { tg_b->p, tg_p->p, tg_m->p };
+                void* const tds[3] = { td_b->p, td_p->p, td_m->p };
+                for (int v = 0; v < 3; ++v) {
+                    Dev dg((size_t)T * G * 2), da((size_t)T * A * 2), dy((size_t)T * E * 2);
+                    HC(hipMemset(dg.p, 0xAA, dg.n));
+                    HC(hipMemset(da.p, 0xAA, da.n));
+                    HC(hipMemset(dy.p, 0xAA, dy.n));
+                    if (aux_chain(fl[v], lib.swiglu, s, d_x.p, M, tgs[v], tds[v], d_so.p, d_of.p, T, dg.p, da.p, dy.p)) {
+                        std::printf("FAIL aux M=%d %s: a full launch was refused\n", M, kinds[k]);
+                        ++bad_vp;
+                        continue;
+                    }
+                    HC(hipStreamSynchronize(s));
+                    Gf[v].resize((size_t)T * G);
+                    Af[v].resize((size_t)T * A);
+                    Yf[v].resize((size_t)T * E);
+                    dg.get(Gf[v].data());
+                    da.get(Af[v].data());
+                    dy.get(Yf[v].data());
+                }
+                if (Yf[0].empty() || Yf[1].empty() || Yf[2].empty()) continue;
+                size_t d_vp = 0, d_mix = 0;
+                for (int i = 0; i < L; ++i) {
+                    for (int v = 1; v < 3; ++v) {
+                        const size_t d = aux_diff(&Gf[v][(size_t)i * G], &Gf[0][(size_t)i * G], G, true, &nans) +
+                                         aux_diff(&Af[v][(size_t)i * A], &Af[0][(size_t)i * A], A, true, &nans) +
+                                         aux_diff(&Yf[v][(size_t)i * E], &Yf[0][(size_t)i * E], E, true, &nans);
+                        if (d && shown++ < 8)
+                            std::printf("  aux M=%d %s row %d (expert %d): gemv_vp over %s differs from gemv in %zu values\n",
+                                        M, kinds[k], i, expert_of[(size_t)i], v == 1 ? "packed" : "mixed", d);
+                        (v == 1 ? d_vp : d_mix) += d;
+                    }
+                }
+                rows_full += (size_t)L;
+                bad_vp += d_vp;
+                bad_mix += d_mix;
+                /* The host chain on a few rows, from the block_mxfp4 planes: the CPU path's bits. */
+                size_t d_host = 0;
+                for (int q = 0; q < 2; ++q) {
+                    const int i = (int)(rng() % (uint64_t)L), e = expert_of[(size_t)i], f = full.sorted[(size_t)i];
+                    Mx WG, WD;
+                    WG.N = 2 * kFf; WG.K = kEmbd; WG.blocks = gu.host[(size_t)e].data();
+                    WD.N = kEmbd; WD.K = kFf; WD.blocks = dn.host[(size_t)e].data();
+                    std::vector<uint16_t> hg(G), ha(A), hy(E);
+                    gemv_avx2(WG, &x[(size_t)(f / kTop) * E], hg.data(), 0, (int)G);
+                    swiglu(silu.data(), hg.data(), ha.data(), kFf, kLimit);
+                    gemv_avx2(WD, ha.data(), hy.data(), 0, (int)E);
+                    /* A NaN equal to any NaN, as the other host comparisons count them (an e8m0 edge can overflow). */
+                    d_host += aux_diff(hg.data(), &Gf[0][(size_t)i * G], G, true, &nans) +
+                              aux_diff(ha.data(), &Af[0][(size_t)i * A], A, true, &nans) +
+                              aux_diff(hy.data(), &Yf[0][(size_t)i * E], E, true, &nans);
+                    ++rows_host;
+                }
+                bad_host += d_host;
+                std::vector<uint16_t> live_rows((size_t)L * E);
+                for (int v = 0; v < 2; ++v) {
+                    std::memcpy(live_rows.data(), Yf[v].data(), live_rows.size() * 2);
+                    record(M, k, v, L, live_rows.data());
+                }
+                /* The compacted launches: gemv_vp over the packed table, as the worker's job. */
+                std::vector<std::vector<int>> subsets(4);
+                subsets[0] = { live_e.front() };
+                for (size_t i = 0; i < live_e.size(); i += 2) subsets[1].push_back(live_e[i]);
+                subsets[2] = live_e;
+                subsets[3] = { live_e.back() };
+                size_t d_cmp = 0, d_cmp_blk = 0;
+                int launches = 0;
+                std::string shapes;
+                for (int si = 0; si < 4; ++si) {
+                    uint8_t mask[kNe] = {};
+                    for (int e : subsets[(size_t)si]) mask[e] = 1;
+                    ds41aux::Compact c;
+                    const int rc = ds41aux::compact(full.sorted.data(), full.off.data(), M, kTop, kNe, mask, counts, kNe, &c);
+                    if (rc != 0 || c.T < 1) {
+                        std::printf("FAIL aux M=%d %s %s: ds41aux::compact returned %d (T' %d)\n", M, kinds[k],
+                                    subset_names[si], rc, c.T);
+                        ++bad_compact;
+                        continue;
+                    }
+                    const int Tc = c.T;
+                    whole += Tc == T;
+                    Dev c_so((size_t)Tc * 4), c_of((kNe + 1) * 4), cg((size_t)Tc * G * 2), ca((size_t)Tc * A * 2),
+                        cy((size_t)Tc * E * 2);
+                    c_so.put(c.sorted);
+                    c_of.put(c.off);
+                    HC(hipMemset(cg.p, 0xAA, cg.n));
+                    HC(hipMemset(ca.p, 0xAA, ca.n));
+                    HC(hipMemset(cy.p, 0xAA, cy.n));
+                    if (aux_chain(lib.moe_vp, lib.swiglu, s, d_x.p, M, tg_p->p, td_p->p, c_so.p, c_of.p, Tc, cg.p, ca.p,
+                                  cy.p)) {
+                        std::printf("FAIL aux M=%d %s %s: a compacted launch was refused\n", M, kinds[k], subset_names[si]);
+                        ++bad_compact;
+                        continue;
+                    }
+                    HC(hipStreamSynchronize(s));
+                    std::vector<uint16_t> Gc((size_t)Tc * G), Ac((size_t)Tc * A), Yc((size_t)Tc * E);
+                    cg.get(Gc.data());
+                    ca.get(Ac.data());
+                    cy.get(Yc.data());
+                    for (int j = 0; j < Tc; ++j) {
+                        const int i = c.row_of[j];
+                        /* The same kernel on the same row: every byte, NaN payloads included. */
+                        const size_t d = aux_diff(&Gc[(size_t)j * G], &Gf[1][(size_t)i * G], G, false, &nans) +
+                                         aux_diff(&Ac[(size_t)j * A], &Af[1][(size_t)i * A], A, false, &nans) +
+                                         aux_diff(&Yc[(size_t)j * E], &Yf[1][(size_t)i * E], E, false, &nans);
+                        const size_t db = aux_diff(&Yc[(size_t)j * E], &Yf[0][(size_t)i * E], E, true, &nans);
+                        if ((d || db) && shown++ < 8)
+                            std::printf("  aux M=%d %s %s: compacted row %d (sorted row %d, expert %d) differs in %zu "
+                                        "values from the full gemv_vp launch, %zu from the gemv's\n", M, kinds[k],
+                                        subset_names[si], j, i, expert_of[(size_t)i], d, db);
+                        d_cmp += d;
+                        d_cmp_blk += db;
+                    }
+                    rows_cmp += (size_t)Tc;
+                    ++cases;
+                    ++launches;
+                    shapes += (shapes.empty() ? "" : "/") + std::to_string(Tc);
+                    record(M, k, 2 + si, Tc, Yc.data());
+                }
+                bad_cmp += d_cmp;
+                bad_cmp_blk += d_cmp_blk;
+                std::printf("aux M=%-2d %-7s %3d rows of %2zu experts: gemv_vp packed %zu / mixed %zu values differ from "
+                            "gemv, host %zu; %d compacted launches (T' %s of %d) %zu differ (%zu from gemv)\n", M,
+                            kinds[k], L, live_e.size(), d_vp, d_mix, d_host, launches, shapes.c_str(), T, d_cmp,
+                            d_cmp_blk);
+                std::fflush(stdout);
+            }
+    const long hpos = 8 + 8 + 16;
+    const uint32_t nc = (uint32_t)cases;
+    const bool wrote = std::fseek(out, hpos, SEEK_SET) == 0 && std::fwrite(&nc, 4, 1, out) == 1;
+    const bool closed = std::fclose(out) == 0;
+    std::printf("aux: %d compacted launches (%d whole: T' = M * 6), %zu rows; %zu full-launch rows; %zu host rows; "
+                "%zu NaN pairs between gemv and gemv_vp; outputs in %s\n", cases, whole, rows_cmp, rows_full, rows_host,
+                nans, out_path);
+    const bool ok = wrote && closed && !bad_vp && !bad_mix && !bad_cmp && !bad_cmp_blk && !bad_host && !bad_compact &&
+                    cases > 0 && whole > 0;
+    if (ok)
+        std::printf("PASS: aux: compacted gemv_vp and gemv rows equal the full launch's at M1/M4/M8/M16 (%d cases)\n",
+                    cases);
+    else
+        std::printf("FAIL: aux: values differing: gemv_vp packed %zu, mixed %zu, compacted %zu (from gemv %zu), host "
+                    "%zu; %zu launches refused or not compacted; %d whole%s\n", bad_vp, bad_mix, bad_cmp, bad_cmp_blk,
+                    bad_host, bad_compact, whole, wrote && closed ? "" : "; the output file was not written");
+    return ok ? 0 : 1;
+}
+
+/* `auxrt [jobs]`: the worker's job shape timed through HIP (indicative only: the engine's lane runs on the AQL
+ * backend): the record (sorted, off, M token rows) written into pinned memory and copied onto the card, gemv_vp
+ * gate_up, swiglu, gemv_vp down over u packed experts with every token's row on each (T' = u * M), the rows back
+ * into pinned memory, an event the host polls (a 20 us spin, then yield, as DeviceLane::wait). One job every
+ * 2.5 ms, 43 a step, 20 ms between steps; `jobs` (430) for each M of 1/4/8 and u of 1-4: the median, p90 and max
+ * round trip from the record's write to the host seeing the event. */
+int aux_rt(const Lib& lib, int jobs) {
+    if (!lib.moe_vp || !lib.swiglu) {
+        std::fprintf(stderr, "the library lacks r4d_rad_moe_gemm_mxfp4_gemv_vp or r4d_rad_swiglu_clamped\n");
+        return 2;
+    }
+    jobs = std::max(43, jobs);
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    hipEvent_t ev;
+    HC(hipEventCreateWithFlags(&ev, hipEventDisableTiming));
+    std::mt19937_64 rng(7);
+    P1Bank gu, dn;
+    p1_bank(&gu, 2 * kFf, kEmbd, rng, 4);
+    p1_bank(&dn, kEmbd, kFf, rng, 4);
+    std::vector<void*> tg(kNe), td(kNe);
+    for (int e = 0; e < kNe; ++e) {
+        tg[(size_t)e] = (void*)((uintptr_t)gu.pkd[(size_t)(e % 4)] | ds41p1::kMarkPacked);
+        td[(size_t)e] = (void*)((uintptr_t)dn.pkd[(size_t)(e % 4)] | ds41p1::kMarkPacked);
+    }
+    Dev d_tg(kNe * sizeof(void*)), d_td(kNe * sizeof(void*));
+    d_tg.put(tg.data());
+    d_td.put(td.data());
+    const ds41aux::Ws w = ds41aux::ws();
+    Dev ws((size_t)w.bytes);
+    char* rec = nullptr;
+    char* outp = nullptr;
+    HC(hipHostMalloc((void**)&rec, (size_t)w.rec, hipHostMallocDefault));
+    HC(hipHostMalloc((void**)&outp, (size_t)w.out, hipHostMallocDefault));
+    std::vector<uint16_t> x((size_t)ds41aux::kMaxRows * kEmbd);
+    for (auto& v : x) v = f32_to_bf16(std::normal_distribution<float>(0.f, 0.5f)(rng));
+    char* const W = (char*)ws.p;
+    using clk = std::chrono::steady_clock;
+    auto us = [](clk::duration d) { return std::chrono::duration<double, std::micro>(d).count(); };
+    auto job = [&](int M, int u, double* rt, double* sub) {
+        const int Tc = u * M;
+        int32_t so[ds41aux::kMaxSlots], of[kNe + 1];
+        of[0] = 0;
+        for (int e = 0; e < kNe; ++e) of[e + 1] = of[e] + (e < u ? M : 0);
+        for (int e = 0; e < u; ++e)
+            for (int t = 0; t < M; ++t) so[e * M + t] = t * kTop + e;
+        const auto t0 = clk::now();
+        std::memcpy(rec + w.sorted, so, (size_t)Tc * 4);
+        std::memcpy(rec + w.off, of, sizeof of);
+        std::memcpy(rec + w.x, x.data(), (size_t)M * kEmbd * 2);
+        HC(hipMemcpyAsync(W, rec, (size_t)w.x + (size_t)M * kEmbd * 2, hipMemcpyHostToDevice, s));
+        if (aux_chain(lib.moe_vp, lib.swiglu, s, W + w.x, M, d_tg.p, d_td.p, W + w.sorted, W + w.off, Tc, W + w.gu_out,
+                      W + w.act, W + w.dn_out)) {
+            std::fprintf(stderr, "auxrt: a launch was refused\n");
+            std::exit(2);
+        }
+        HC(hipMemcpyAsync(outp, W + w.dn_out, (size_t)Tc * kEmbd * 2, hipMemcpyDeviceToHost, s));
+        HC(hipEventRecord(ev, s));
+        const auto t1 = clk::now();
+        for (;;) {
+            const hipError_t q = hipEventQuery(ev);
+            if (q == hipSuccess) break;
+            if (q != hipErrorNotReady) { std::fprintf(stderr, "auxrt: %s\n", hipGetErrorString(q)); std::exit(2); }
+            if (clk::now() - t1 < std::chrono::microseconds(20)) continue;
+            std::this_thread::yield();
+        }
+        *rt = us(clk::now() - t0);
+        *sub = us(t1 - t0);
+    };
+    double rt, sub;
+    for (int i = 0; i < 100; ++i) job(4, 2, &rt, &sub);   /* warm: code objects, clocks */
+    std::printf("auxrt: %d jobs for each M and unit count, one every 2.5 ms, 43 a step (HIP, not the engine's AQL lane: "
+                "indicative only)\n", jobs);
+    for (int M : { 1, 4, 8 })
+        for (int u = 1; u <= 4; ++u) {
+            std::vector<double> rts, subs;
+            auto next = clk::now();
+            for (int i = 0; i < jobs; ++i) {
+                next += std::chrono::microseconds(i && i % 43 == 0 ? 20000 : 2500);
+                std::this_thread::sleep_until(next);
+                job(M, u, &rt, &sub);
+                rts.push_back(rt);
+                subs.push_back(sub);
+            }
+            std::sort(rts.begin(), rts.end());
+            std::sort(subs.begin(), subs.end());
+            std::printf("auxrt M %d units %d rows %2d: round trip median %.1f us, p90 %.1f us, max %.1f us; submit median "
+                        "%.1f us\n", M, u, u * M, rts[rts.size() / 2], rts[rts.size() * 9 / 10], rts.back(),
+                        subs[subs.size() / 2]);
+            std::fflush(stdout);
+        }
+    (void)hipHostFree(rec);
+    (void)hipHostFree(outp);
+    (void)hipEventDestroy(ev);
+    (void)hipStreamDestroy(s);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxrt [jobs]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
@@ -2789,6 +3205,9 @@ int main(int argc, char** argv) {
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_LCP");
     }
+    else if (!std::strcmp(argv[2], "aux") || !std::strcmp(argv[2], "auxrt")) {
+        /* The aux expert worker's launches as the window's servers run them: its live tail, whatever it is. */
+    }
     else setenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL", "1", 1);
     /* The draft check's served entry runs under the switch, read once at the first draft-shaped call. */
     if (!std::strcmp(argv[2], "draft")) setenv("RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV", "1", 1);
@@ -2796,6 +3215,8 @@ int main(int argc, char** argv) {
     if (!std::strcmp(argv[2], "draft")) return draft_check(lib, argc > 3 ? std::atoi(argv[3]) : 36);
     if (!std::strcmp(argv[2], "check")) return check(lib, argc > 3 ? std::atoi(argv[3]) : 24, argc > 4 ? argv[4] : "silu_table.bin");
     if (!std::strcmp(argv[2], "swiglu")) return swiglu_proof(lib, argc > 3 ? argv[3] : "silu_table.bin");
+    if (!std::strcmp(argv[2], "aux")) return aux_check(lib, argc > 3 ? argv[3] : "aux.bin", argc > 4 ? std::max(1, std::atoi(argv[4])) : 1);
+    if (!std::strcmp(argv[2], "auxrt")) return aux_rt(lib, argc > 3 ? std::atoi(argv[3]) : 430);
     if (!std::strcmp(argv[2], "ptime")) {
         /* ptime T[:P] ...; PTIME_LIB2=<libr4d.so> also runs and compares a second plugin */
         const char* l2 = std::getenv("PTIME_LIB2");

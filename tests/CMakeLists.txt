@@ -808,6 +808,39 @@ if(R4D_EMU_BUILT)
   set_tests_properties(r4d_emu_ds41p1_quick PROPERTIES LABELS "r4d_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
+# The aux expert worker's launches (core/place/aux_expert_worker.h, work/aux/SPEC.md §15.5) on the emulator: gemv_vp
+# over the slots tools/ds41-host-experts/ds41_aux.h's compact keeps, at M 1/4/8/16, equal byte for byte to the full
+# launch's rows and to the plain gemv's, and the compacted gate_up -> swiglu_clamped -> down chain to the host
+# experts'; again with the live-tail ranges on (the whole compacted launches take the tail branch). Built like ds41p1
+# (the engine's packer linked in), in whichever arm built the emulator above.
+if(R4D_EMU_BUILT)
+  if(TARGET r4d_emu_kernels)
+    add_executable(r4d_emu_ds41aux ${R4D_EMU}/test_ds41aux.cpp ${R4D_EMU_HX_SRC})
+    target_link_libraries(r4d_emu_ds41aux PRIVATE r4d_emu_kernels ${CMAKE_DL_LIBS})
+    target_include_directories(r4d_emu_ds41aux PRIVATE ${R4D_EMU_HX_DIR})
+    target_compile_options(r4d_emu_ds41aux PRIVATE -ffp-contract=off -Wno-psabi)
+    set_target_properties(r4d_emu_ds41aux PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  else()
+    add_custom_command(OUTPUT ${dir}/test_ds41aux.o
+      COMMAND ${R4D_EMU_CXX} ${flags} -MD -MF ${dir}/test_ds41aux.o.d -c ${R4D_EMU}/test_ds41aux.cpp
+              -o ${dir}/test_ds41aux.o
+      DEPENDS ${R4D_EMU}/test_ds41aux.cpp
+      DEPFILE ${dir}/test_ds41aux.o.d
+      COMMENT "Building r4d_emu test_ds41aux.o with ${R4D_EMU_CXX}"
+      VERBATIM)
+    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41aux
+      COMMAND ${R4D_EMU_CXX} ${dir}/test_ds41aux.o ${objs} ${dir}/ds41_host_experts.o ${dl}
+              -o ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41aux
+      DEPENDS ${dir}/test_ds41aux.o ${objs} ${dir}/ds41_host_experts.o
+      COMMENT "Linking r4d_emu_ds41aux"
+      VERBATIM)
+    add_custom_target(r4d_emu_ds41aux_bin ALL DEPENDS ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41aux)
+  endif()
+  add_test(NAME r4d_emu_ds41aux COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41aux)
+  add_test(NAME r4d_emu_ds41aux_tail COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41aux tail)
+  set_tests_properties(r4d_emu_ds41aux r4d_emu_ds41aux_tail PROPERTIES LABELS "r4d_emu" TIMEOUT 600)
+endif()
+
 # ================================================================== libhalo on the emulator
 #
 # tests/halo_emu runs libhalo units (gfx1151) on the same SIMT emulator through its gfx11 WMMA

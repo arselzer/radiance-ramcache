@@ -245,8 +245,12 @@ The rest is ab-20261104T003545Z:
   (626 tok/s) at 4,096; 99,987 tokens 221.7 s (451 tok/s) against 165.1 s (606 tok/s), and 224.5 s at 2,048 with the
   hashes off; the 32,768-token fill prompt (a 6,817-token text repeated) 64.2 s.
 - **Decode at a long context**: after the 99,987-token prompt, prefill hashes off, 20.9 tok/s against 29.35 at
-  `Lm131072` on short prompts in the table (−29%; not yet profiled). Arms with prefill hashes decode slower still (12-14 tok/s), an
-  instrumentation cost.
+  `Lm131072` on short prompts in the table, but that gap is the text, not the context. Profiled in ab-20261104T025134Z
+  (part `Ct4`, card 0's kernel times for one decode pass in 4): a 1,899-token head of the same text (`Ulong2k`) decoded at
+  52.60 ms a step against 53.43 ms after the 99,987 tokens (+1.6%), while the 8 held-out prompts took 37.67 ms; the long
+  text sends more experts to the CPU (22.4-22.8 gathers with CPU rows a step against 19.4). The one cost that grows with
+  the context is index_score, 11-13 to 329 us a call on its 8 layers (+2.5 ms of card time a step, mostly hidden behind
+  the CPU's rows). Arms with prefill hashes decode slower still (12-14 tok/s), an instrumentation cost.
 - The prefix cache did not run at these lengths; idle conversations must fit three quarters of the pool (**Long
   contexts** under Prefix caching). Receipts: `make_longctx_receipts.py` (parts `Ufill32k`, `Ulong48k`, `Ulong100k`;
   a receipt's `max_context_tokens` skips an arm with a shorter `--max-model-len` and lengthens its request timeout).

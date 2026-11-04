@@ -551,6 +551,43 @@ int     dev_code_runs(size_t from, size_t to, int device, std::string* why) {
     return r;
 }
 
+/* ------------------------------------------------------------------ the pin set (device.h) */
+static std::atomic<bool> g_pin_restricted{false};
+int dev_pin_devices(const std::vector<int>& ords) {
+    const auto f = dev()->pin_devices;
+    if (!f) {
+        device_set_error("the %s backend maps pinned memory to every device (no pin set)", dev()->name);
+        return RAD_E_UNSUPPORTED;
+    }
+    const int rc = f(ords.data(), (int)ords.size());
+    if (rc >= 0) {
+        const int n = dev()->count();
+        std::vector<char> in((size_t)(n > 0 ? n : 0), 0);
+        for (int o : ords)
+            if (o >= 0 && o < n) in[(size_t)o] = 1;
+        g_pin_restricted.store(std::find(in.begin(), in.end(), (char)0) != in.end(), std::memory_order_release);
+    }
+    return rc;
+}
+bool dev_pin_restricted() { return g_pin_restricted.load(std::memory_order_acquire); }
+void* dev_alloc_pinned_on(int64_t bytes, const std::vector<int>& ords) {
+    const auto f = dev()->alloc_pinned_on;
+    if (!f) {
+        device_set_error("the %s backend has no pinned memory for chosen devices", dev()->name);
+        return nullptr;
+    }
+    void* p = f(bytes, ords.data(), (int)ords.size());
+    if (p) {   /* in the ledger as rad_dev_alloc's pinned memory is */
+        g_ledger[RAD_MEM_HOST_PINNED].bytes.fetch_add(bytes, std::memory_order_relaxed);
+        g_ledger[RAD_MEM_HOST_PINNED].count.fetch_add(1, std::memory_order_relaxed);
+    }
+    return p;
+}
+bool dev_faulted(int device) {
+    const auto f = dev()->device_faulted;
+    return f && f(device) > 0;
+}
+
 }  /* namespace rad */
 
 extern "C" {

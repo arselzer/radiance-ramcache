@@ -252,6 +252,35 @@ Global& G() {
     return *g;
 }
 
+/* ------------------------------------------------------------------ the pin set
+ *
+ * rad::dev_pin_devices (core/place/aux_expert_worker.h's worker; unset, everything below is as without
+ * it): the device ordinals pinned host memory is mapped to. Empty, or every device, is every device,
+ * today's behaviour. A device outside the set maps only the pinned buffers allocated for it
+ * (alloc_pinned_on), and its faults are its own: a queue fault, a memory fault or a hardware exception
+ * on it marks it faulted and ends only the host waits that name it, where on a device of the set it
+ * ends every wait (the process cannot go on without a rank's card). */
+std::mutex            g_pin_mu;
+std::vector<int>      g_pin_ords;                 /* sorted; empty: every device */
+std::atomic<uint64_t> g_pin_mask{~0ull};          /* bit per ordinal of the set; all ones: every device */
+std::atomic<uint64_t> g_scoped_fault{0};          /* devices outside the set that faulted */
+hsa_signal_t          g_scoped_sig[64] = {};      /* a fault signal per device outside the set */
+
+/* Whether a range pinned for `mask` is mapped on device `ord`. */
+inline bool mapped_on(uint64_t mask, int ord) { return ord >= 64 || ((mask >> ord) & 1) != 0; }
+/* Whether device `ord` is outside a restricting pin set: its faults are scoped to it. */
+inline bool scoped(int ord) {
+    return ord >= 0 && ord < 64 && !mapped_on(g_pin_mask.load(std::memory_order_acquire), ord);
+}
+/* Marks device `ord` (outside the set) faulted and wakes its waiters. */
+void scoped_fault(int ord) {
+    g_scoped_fault.fetch_or(1ull << ord, std::memory_order_acq_rel);
+    if (g_scoped_sig[ord].handle) hsa_signal_store_screlease(g_scoped_sig[ord], 1);
+}
+inline bool scoped_faulted(int ord) {
+    return ord >= 0 && ord < 64 && ((g_scoped_fault.load(std::memory_order_acquire) >> ord) & 1) != 0;
+}
+
 /* Set by aql_force_host_kargs before the backend starts. */
 std::atomic<bool> g_force_host_kargs{false};
 
@@ -667,6 +696,13 @@ void on_queue_error(hsa_status_t st, hsa_queue_t*, void* data) {
     const char* m = nullptr;
     hsa_status_string(st, &m);
     s->fault.store((int)st, std::memory_order_release);
+    /* A device outside a restricting pin set (the aux worker's card): its fault is its own. */
+    if (scoped(s->ord)) {
+        scoped_fault(s->ord);
+        RAD_ERR("device %d (outside the pin set): the AQL queue faulted: %s; its work is given up and "
+                "the ranks' cards run on", s->ord, m ? m : "?");
+        return;
+    }
     uint64_t none = 0;
     g_fault_at.compare_exchange_strong(none, steady_ns(), std::memory_order_acq_rel);
     G().faulted.store(true, std::memory_order_release);
@@ -848,6 +884,19 @@ std::string runtime_view(uintptr_t a) {
 bool looks_like_pointer(uint64_t w) { return w >= 0x10000 && w < 0x0000800000000000ull; }
 
 hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
+    /* A hardware exception (a reset) on a device outside a restricting pin set is that device's alone
+     * (see the pin set above); anywhere else it stays the runtime's to handle, as without the set. */
+    if (e && e->event_type == HSA_AMD_GPU_HW_EXCEPTION_EVENT) {
+        for (size_t i = 0; i < G().dev.size(); ++i)
+            if (G().dev[i].agent.handle == e->hw_exception.agent.handle && scoped((int)i)) {
+                scoped_fault((int)i);
+                RAD_ERR("device %d (outside the pin set): a hardware exception (reset type %d, cause %d); its "
+                        "work is given up and the ranks' cards run on", (int)i, (int)e->hw_exception.reset_type,
+                        (int)e->hw_exception.reset_cause);
+                return HSA_STATUS_SUCCESS;
+            }
+        return HSA_STATUS_ERROR;
+    }
     if (!e || e->event_type != HSA_AMD_GPU_MEMORY_FAULT_EVENT) return HSA_STATUS_ERROR;
     const hsa_amd_gpu_memory_fault_info_t& f = e->memory_fault;
     const uintptr_t va = (uintptr_t)f.virtual_address;
@@ -895,6 +944,12 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
             if (!looks_like_pointer(w)) continue;
             RAD_ERR("  argument +%u = %#" PRIx64 ": %s", i * 8, w, where_is((uintptr_t)w).c_str());
         }
+    }
+    /* A device outside a restricting pin set: only its own work stops (the pin set above). */
+    if (scoped(card)) {
+        scoped_fault(card);
+        RAD_ERR("device %d (outside the pin set): its queues stopped for good; the ranks' cards run on", card);
+        return HSA_STATUS_SUCCESS;
     }
     fatal("a GPU memory fault on device %d stopped its queue for good (the report is above); "
           "exiting so a restart can bring the server back", card);
@@ -1465,22 +1520,32 @@ uint64_t& seen_age(uint32_t ev) {
     return age[ev];
 }
 
-int host_wait(hsa_signal_t sig) {
+/* `ord`: the device whose queue completes the signal, -1 unknown. A device outside a restricting pin
+ * set has a fault signal of its own (the pin set above), which ends a wait on it too. */
+int host_wait(hsa_signal_t sig, int ord = -1) {
     if (hsa_signal_load_scacquire(sig) != 0) {
         if (!interrupts(sig)) {
             device_set_error("a host wait on a signal that raises no interrupt");
             return RAD_E_DEVICE;
         }
         Stall st("a synchronisation");
-        kfd_event_data ev[2] = {};
+        kfd_event_data ev[3] = {};
         ev[0].event_id = reinterpret_cast<const amd_signal_t*>(sig.handle)->event_id;
         ev[1].event_id = reinterpret_cast<const amd_signal_t*>(G().fault.handle)->event_id;
+        uint32_t n_ev = 2;
+        const bool own = scoped(ord);
+        if (own && g_scoped_sig[ord].handle && interrupts(g_scoped_sig[ord]))
+            ev[n_ev++].event_id = reinterpret_cast<const amd_signal_t*>(g_scoped_sig[ord].handle)->event_id;
         do {
             if (G().faulted.load(std::memory_order_acquire)) return RAD_E_DEVICE;
-            for (kfd_event_data& e : ev) e.signal_event_data.last_event_age = seen_age(e.event_id);
+            if (own && scoped_faulted(ord)) {
+                device_set_error("a host wait on device %d, which faulted (outside the pin set)", ord);
+                return RAD_E_DEVICE;
+            }
+            for (uint32_t i = 0; i < n_ev; ++i) ev[i].signal_event_data.last_event_age = seen_age(ev[i].event_id);
             kfd_ioctl_wait_events_args w{};
             w.events_ptr = (uint64_t)(uintptr_t)ev;
-            w.num_events = 2;
+            w.num_events = n_ev;
             w.wait_for_all = 0;
             w.timeout = kStallMs;
             if (ioctl(G().kfd, AMDKFD_IOC_WAIT_EVENTS, &w) < 0) {
@@ -1488,7 +1553,7 @@ int host_wait(hsa_signal_t sig) {
                 device_set_error("a host wait failed in the driver: %s", std::strerror(errno));
                 return RAD_E_DEVICE;
             }
-            for (const kfd_event_data& e : ev) seen_age(e.event_id) = e.signal_event_data.last_event_age;
+            for (uint32_t i = 0; i < n_ev; ++i) seen_age(ev[i].event_id) = ev[i].signal_event_data.last_event_age;
             if (w.wait_result == KFD_IOC_WAIT_RESULT_TIMEOUT) st.check();
         } while (hsa_signal_load_scacquire(sig) != 0);
     }
@@ -1511,12 +1576,14 @@ int stream_drain(Stream* s) {
     hsa_signal_silent_store_relaxed(sig, 1);
     uint64_t idx = 0;
     RAD_TRY(barrier(s, hsa_signal_t{0}, sig, HSA_FENCE_SCOPE_SYSTEM, HSA_FENCE_SCOPE_SYSTEM, &idx));
-    return host_wait(sig);
+    return host_wait(sig, s->ord);
 }
 
 /* ------------------------------------------------------------------ where a pointer lives */
 
-enum Loc : uint8_t { kDevLocal, kDevPeer, kHost, kPageable };
+/* kUnmapped: pinned host memory a restricting pin set did not map on the stream's device (the pin set
+ * above). A copy, fill or range list naming it is refused: the device would fault on it. */
+enum Loc : uint8_t { kDevLocal, kDevPeer, kHost, kPageable, kUnmapped };
 
 /* Per-thread cache of pointer locations. hsa_amd_pointer_info takes the runtime's global lock and
  * walks its allocation map; every copy asks about both ends, a few hundred queries per step on
@@ -1533,6 +1600,11 @@ struct LocHit {
     intptr_t  shift = 0;        /* agent address minus host address (pinned host memory) */
     uint64_t  owner = 0;        /* the owning card's agent handle; 0 for host memory */
     uint64_t  gen = 0;
+    /* Host memory: the devices it is mapped on, a bit per ordinal (the pin set above); all ones for
+     * device memory and for memory the runtime allocated (its own access rules). Checked on every
+     * hit, so a cached range a restricting pin set did not map on the stream's device answers
+     * kUnmapped as the lookup below does. */
+    uint64_t  mask = ~0ull;
 };
 constexpr int kLocWays = 16;
 thread_local LocHit t_loc[kLocWays];
@@ -1542,7 +1614,8 @@ std::atomic<uint64_t> g_loc_gen{1};
 /* Invalidates every thread's cache. */
 void loc_forget() { g_loc_gen.fetch_add(1, std::memory_order_acq_rel); }
 
-void loc_keep(const void* host_base, size_t bytes, intptr_t shift, uint64_t owner, uint64_t gen) {
+void loc_keep(const void* host_base, size_t bytes, intptr_t shift, uint64_t owner, uint64_t gen,
+              uint64_t mask = ~0ull) {
     if (!host_base || !bytes) return;
     LocHit& h = t_loc[t_loc_next++ % kLocWays];
     h.lo = (uintptr_t)host_base;
@@ -1550,19 +1623,21 @@ void loc_keep(const void* host_base, size_t bytes, intptr_t shift, uint64_t owne
     h.shift = shift;
     h.owner = owner;
     h.gen = gen;
+    h.mask = mask;
 }
 
 /* Host ranges this backend pinned itself (see "pinned host memory, in pieces"), ordered by base
  * so an interior address finds its range. `pool` is the host-pool allocation holding the range,
- * or null if it was locked in pieces. */
+ * or null if it was locked in pieces. `mask`: the devices it is mapped on (the pin set above). */
 struct Pinned {
     int64_t len = 0;
     void* pool = nullptr;
+    uint64_t mask = ~0ull;
 };
 std::mutex g_pinned_mu;
 std::map<uintptr_t, Pinned> g_pinned;
 
-bool pinned_range(const void* p, uintptr_t* lo, int64_t* len) {
+bool pinned_range(const void* p, uintptr_t* lo, int64_t* len, uint64_t* mask = nullptr) {
     const uintptr_t a = (uintptr_t)p;
     std::lock_guard<std::mutex> lk(g_pinned_mu);
     auto it = g_pinned.upper_bound(a);
@@ -1571,6 +1646,7 @@ bool pinned_range(const void* p, uintptr_t* lo, int64_t* len) {
     if (a - it->first >= (uintptr_t)it->second.len) return false;
     if (lo) *lo = it->first;
     if (len) *len = it->second.len;
+    if (mask) *mask = it->second.mask;
     return true;
 }
 
@@ -1581,30 +1657,43 @@ Loc locate(const void* p, const Stream* s, const void** gpu) {
     for (const LocHit& h : t_loc) {
         if (h.gen != gen || a - h.lo >= h.hi - h.lo) continue;
         *gpu = (const void*)(a + (uintptr_t)h.shift);
-        if (!h.owner) return kHost;
+        if (!h.owner) return mapped_on(h.mask, s->ord) ? kHost : kUnmapped;
         return h.owner == s->agent.handle ? kDevLocal : kDevPeer;
     }
     /* Ranges pinned here are answered here: hsa_amd_pointer_info reports memory locked with
      * hsa_amd_memory_lock_to_pool as UNKNOWN (like pageable), although the lock mapped it on
-     * every card at its own address. */
+     * every card of the pin set at its own address. */
     uintptr_t plo = 0;
     int64_t plen = 0;
-    if (pinned_range(p, &plo, &plen)) {
-        loc_keep((const void*)plo, (size_t)plen, 0, 0, gen);
-        return kHost;
+    uint64_t pmask = ~0ull;
+    if (pinned_range(p, &plo, &plen, &pmask)) {
+        loc_keep((const void*)plo, (size_t)plen, 0, 0, gen, pmask);
+        return mapped_on(pmask, s->ord) ? kHost : kUnmapped;
     }
     hsa_amd_pointer_info_t info{};
     info.size = sizeof info;
-    if (hsa_amd_pointer_info(const_cast<void*>(p), &info, nullptr, nullptr, nullptr) !=
-        HSA_STATUS_SUCCESS)
+    /* Under a restricting pin set a range someone else locked is mapped on the agents it names. */
+    const bool restricted = g_pin_mask.load(std::memory_order_acquire) != ~0ull;
+    uint32_t n_acc = 0;
+    hsa_agent_t* acc = nullptr;
+    if (hsa_amd_pointer_info(const_cast<void*>(p), &info, restricted ? std::malloc : nullptr,
+                             restricted ? &n_acc : nullptr, restricted ? &acc : nullptr) != HSA_STATUS_SUCCESS)
         return kPageable;
+    uint64_t lmask = ~0ull;
+    if (restricted && acc) {
+        lmask = 0;
+        for (uint32_t i = 0; i < n_acc; ++i)
+            for (size_t d = 0; d < G().dev.size() && d < 64; ++d)
+                if (G().dev[d].agent.handle == acc[i].handle) lmask |= 1ull << d;
+    }
+    std::free(acc);
     switch (info.type) {
         case HSA_EXT_POINTER_TYPE_LOCKED:
             *gpu = (const char*)info.agentBaseAddress + ((const char*)p - (const char*)info.hostBaseAddress);
             loc_keep(info.hostBaseAddress, info.sizeInBytes,
                      (intptr_t)((uintptr_t)info.agentBaseAddress - (uintptr_t)info.hostBaseAddress),
-                     0, gen);
-            return kHost;
+                     0, gen, lmask);
+            return mapped_on(lmask, s->ord) ? kHost : kUnmapped;
         case HSA_EXT_POINTER_TYPE_HSA:
         case HSA_EXT_POINTER_TYPE_HSA_VMEM:
         case HSA_EXT_POINTER_TYPE_GRAPHICS: {
@@ -1983,12 +2072,15 @@ int a_event_sync(RadEvent re) {
         return RAD_E_INVAL;
     }
     hsa_signal_t sig;
+    int ord = -1;
     {
         std::lock_guard<std::mutex> lk(e->mu);
         if (!e->cur) return RAD_OK;
         sig = e->cur->h;
+        for (size_t i = 0; i < G().dev.size(); ++i)
+            if (G().dev[i].agent.handle == e->cur->agent.handle) ord = (int)i;
     }
-    return host_wait(sig);
+    return host_wait(sig, ord);
 }
 
 /* The next dispatch on every queue acquires at system scope, as after a host wait. */
@@ -2677,6 +2769,14 @@ int pageable_copy(Stream* s, void* dst, Loc ld, const void* src, Loc ls, int64_t
     return RAD_OK;
 }
 
+/* A copy or fill naming pinned memory not mapped on the stream's device (kUnmapped) is refused: the
+ * device would fault on it. Never bounced as pageable memory. */
+int unmapped(const char* who, const void* p, const Stream* s) {
+    device_set_error("%s: pinned range %p not mapped on device %d (a restricting pin set: "
+                     "rad::dev_pin_devices)", who, p, s->ord);
+    return RAD_E_INVAL;
+}
+
 int a_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream rs) {
     Stream* s = ours(rs);
     if (!s) { device_set_error("rad_memcpy_async: not a stream of this backend"); return RAD_E_INVAL; }
@@ -2686,6 +2786,7 @@ int a_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream rs) {
     const void* gs = nullptr;
     const Loc ld = locate(dst, s, &gd);
     const Loc ls = locate(src, s, &gs);
+    if (ld == kUnmapped || ls == kUnmapped) return unmapped("rad_memcpy_async", ld == kUnmapped ? dst : src, s);
     if (ld == kPageable || ls == kPageable)
         return pageable_copy(s, ld == kPageable ? dst : (void*)gd, ld,
                              ls == kPageable ? src : gs, ls, bytes);
@@ -2704,6 +2805,7 @@ int a_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
     const void* gs = nullptr;
     const Loc ld = locate(dst, s, &gd);
     const Loc ls = locate(src, s, &gs);
+    if (ld == kUnmapped || ls == kUnmapped) return unmapped("rad_memcpy_2d_async", ld == kUnmapped ? dst : src, s);
     if (ld == kPageable || ls == kPageable) {
         /* Row by row through the 1-D path; no step-path caller copies pitched pageable memory. */
         for (int64_t r = 0; r < height; ++r)
@@ -2740,6 +2842,8 @@ int a_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
     const Loc ld = locate(dst, s, &gd);
     const Loc ls = locate(src, s, &gs);
     const Loc lr = n > 0 ? locate(ranges, s, &gr) : kDevLocal;
+    if (ld == kUnmapped || ls == kUnmapped || lr == kUnmapped)
+        return unmapped("rad_memcpy_ranges_async", ld == kUnmapped ? dst : ls == kUnmapped ? src : (const void*)ranges, s);
     if (ld == kPageable || ls == kPageable || lr == kPageable ||
         (((uintptr_t)gd | (uintptr_t)gs) & 15)) {
         device_set_error("rad_memcpy_ranges_async(%p <- %p, ranges %p): every address must be one "
@@ -3521,6 +3625,8 @@ int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream
         const void* gs = nullptr;
         const Loc ld = locate(g.dst, s, &gd);
         const Loc ls = locate(g.src, s, &gs);
+        if (ld == kUnmapped || ls == kUnmapped)
+            return unmapped("rad_memcpy_list_async", ld == kUnmapped ? g.dst : g.src, s);
         /* The list stays on this card; a peer's memory is copied by kernel. */
         if (capturing() || ld == kPageable || ls == kPageable || ld == kDevPeer || ls == kDevPeer) {
             RAD_TRY(flush());
@@ -3584,6 +3690,7 @@ int a_memset_async(void* dst, int value, int64_t bytes, RadStream rs) {
     if (bytes == 0) return RAD_OK;
     const void* gd = nullptr;
     const Loc ld = locate(dst, s, &gd);
+    if (ld == kUnmapped) return unmapped("rad_memset_async", dst, s);
     if (ld == kPageable) {
         device_set_error("rad_memset_async(%p, %lld): the destination is not device-accessible "
                          "-- RAD_MEM_HOST is pageable and the GPU has never seen it. Use "
@@ -3983,7 +4090,7 @@ bool svm_in_place() {
 
 /* The range as one host-pool allocation, for a driver without the SVM API. The pool aligns only
  * a buffer's end to 2 MiB, so one extra alignment is requested and the base rounded up within it. */
-void* pin_whole(int64_t bytes, const std::vector<hsa_agent_t>& cards) {
+void* pin_whole(int64_t bytes, const std::vector<hsa_agent_t>& cards, uint64_t mask) {
     const int64_t align = RAD_ALIGN_POOL;
     const int64_t len = align_up(bytes, 4096);
     const int64_t ask = align_up(len, align) + align;
@@ -4005,8 +4112,18 @@ void* pin_whole(int64_t bytes, const std::vector<hsa_agent_t>& cards) {
     }
     char* const p = (char*)(((uintptr_t)q + (uintptr_t)align - 1) & ~((uintptr_t)align - 1));
     std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, q});
+    g_pinned.emplace((uintptr_t)p, Pinned{len, q, mask});
     return p;
+}
+
+/* The pin set's agents in device order (every device's when unrestricted), and its mask. */
+std::vector<hsa_agent_t> pin_cards(uint64_t* mask) {
+    const uint64_t m = g_pin_mask.load(std::memory_order_acquire);
+    std::vector<hsa_agent_t> cards;
+    for (size_t i = 0; i < G().dev.size(); ++i)
+        if (mapped_on(m, (int)i)) cards.push_back(G().dev[i].agent);
+    if (mask) *mask = m;
+    return cards;
 }
 
 /* Locks [p, p + len) in pieces of at most kPinPiece for every card, each mapped on the cards at
@@ -4046,10 +4163,10 @@ bool lock_pieces(char* p, int64_t len, int64_t bytes, std::vector<hsa_agent_t>& 
     return true;
 }
 
-void* pin_pieces(int64_t bytes) {
-    std::vector<hsa_agent_t> cards;
-    for (const Dev& d : G().dev) cards.push_back(d.agent);
-    if (!svm_in_place()) return pin_whole(bytes, cards);
+/* Pinned for `cards` (whose ordinals `mask` holds): every device of the pin set (pin_pieces), or the
+ * devices alloc_pinned_on names. */
+void* pin_pieces_on(int64_t bytes, std::vector<hsa_agent_t> cards, uint64_t mask) {
+    if (!svm_in_place()) return pin_whole(bytes, cards, mask);
 
     const int64_t align = RAD_ALIGN_POOL;
     const int64_t len = align_up(bytes, 4096);
@@ -4079,8 +4196,14 @@ void* pin_pieces(int64_t bytes) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr, mask});
     return p;
+}
+
+void* pin_pieces(int64_t bytes) {
+    uint64_t mask = ~0ull;
+    std::vector<hsa_agent_t> cards = pin_cards(&mask);
+    return pin_pieces_on(bytes, std::move(cards), mask);
 }
 
 /* pin_pieces over a shared file mapping instead of private anonymous memory: the pages are the
@@ -4090,8 +4213,8 @@ void* pin_pieces(int64_t bytes) {
  * swappable until the lock pins it, so MLOCK_ONFAULT keeps the pages in memory meanwhile; a
  * refusal (the memlock limit) costs only that. */
 void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
-    std::vector<hsa_agent_t> cards;
-    for (const Dev& d : G().dev) cards.push_back(d.agent);
+    uint64_t mask = ~0ull;
+    std::vector<hsa_agent_t> cards = pin_cards(&mask);
     if (!svm_in_place()) {
         device_set_error("rad_dev_map_file(%s): a file range is pinned in place only through the "
                          "kernel driver's SVM API, which this host lacks, so ram=DIR needs it",
@@ -4133,7 +4256,7 @@ void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr, mask});
     return p;
 }
 
@@ -4202,6 +4325,73 @@ void* a_map_file(int fd, int64_t foff, int64_t bytes) {
     note_alloc(p, bytes, RAD_MEM_HOST_MAPPED);
     return p;
 }
+
+/* rad::dev_pin_devices (device.h): the pin set, before any pinned range exists (or the same set again).
+ * A set of every device is no restriction at all: the same agents in the same order as without it. */
+int a_pin_devices(const int* ords, int n) {
+    if (n < 0 || (n > 0 && !ords)) return RAD_E_INVAL;
+    std::vector<int> set;
+    uint64_t mask = 0;
+    for (int i = 0; i < n; ++i) {
+        if (ords[i] < 0 || ords[i] >= (int)G().dev.size() || ords[i] >= 64) {
+            device_set_error("rad::dev_pin_devices: device %d is not one of the %zu visible", ords[i], G().dev.size());
+            return RAD_E_INVAL;
+        }
+        mask |= 1ull << ords[i];
+    }
+    for (int i = 0; i < (int)G().dev.size() && i < 64; ++i)
+        if ((mask >> i) & 1) set.push_back(i);
+    if (set.size() == G().dev.size()) {
+        set.clear();
+        mask = ~0ull;
+    }
+    std::lock_guard<std::mutex> pl(g_pin_mu);
+    {
+        std::lock_guard<std::mutex> lk(g_pinned_mu);
+        if (!g_pinned.empty() && set != g_pin_ords) {
+            device_set_error("rad::dev_pin_devices: %zu pinned ranges are mapped already; the pin set is chosen "
+                             "before the first", g_pinned.size());
+            return RAD_E_STATE;
+        }
+    }
+    /* A fault signal for each device outside the set, which its faults fire (host_wait). */
+    for (int i = 0; i < (int)G().dev.size() && i < 64; ++i)
+        if (!mapped_on(mask, i) && !g_scoped_sig[i].handle &&
+            hsa_signal_create(0, 0, nullptr, &g_scoped_sig[i]) != HSA_STATUS_SUCCESS)
+            g_scoped_sig[i] = hsa_signal_t{0};
+    g_pin_ords = set;
+    g_pin_mask.store(mask, std::memory_order_release);
+    loc_forget();
+    return RAD_OK;
+}
+
+/* rad::dev_alloc_pinned_on (device.h): pinned host memory mapped on the devices named only, freed by
+ * rad_dev_free(p, RAD_MEM_HOST_PINNED). */
+void* a_alloc_pinned_on(int64_t bytes, const int* ords, int n) {
+    if (bytes <= 0 || n <= 0 || !ords) {
+        device_set_error("rad::dev_alloc_pinned_on(%lld, %d devices): a size and a device are needed",
+                         (long long)bytes, n);
+        return nullptr;
+    }
+    uint64_t mask = 0;
+    for (int i = 0; i < n; ++i) {
+        if (ords[i] < 0 || ords[i] >= (int)G().dev.size() || ords[i] >= 64) {
+            device_set_error("rad::dev_alloc_pinned_on: device %d is not one of the %zu visible", ords[i],
+                             G().dev.size());
+            return nullptr;
+        }
+        mask |= 1ull << ords[i];
+    }
+    std::vector<hsa_agent_t> cards;
+    for (int i = 0; i < (int)G().dev.size() && i < 64; ++i)
+        if ((mask >> i) & 1) cards.push_back(G().dev[(size_t)i].agent);
+    void* p = pin_pieces_on(bytes, std::move(cards), mask);
+    note_alloc(p, bytes, RAD_MEM_HOST_PINNED);
+    return p;
+}
+
+/* rad::dev_faulted (device.h): a device outside a restricting pin set faulted (its own faults). */
+int a_device_faulted(int device) { return scoped_faulted(device) ? 1 : 0; }
 
 /* Every free invalidates locate()'s cache first. */
 void (*g_hip_free)(void*, int) = nullptr;
@@ -4351,6 +4541,9 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.live_open = a_live_open;
         g_aql.live_close = a_live_close;
         g_aql.live_stamp = a_live_stamp;
+        g_aql.pin_devices = a_pin_devices;
+        g_aql.alloc_pinned_on = a_alloc_pinned_on;
+        g_aql.device_faulted = a_device_faulted;
         return &g_aql;
     }();
     return b;

@@ -162,7 +162,9 @@
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `swiglu` the default checks, `tall` the exact-tall checks, `lcp` the large-chunk
 # ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK; `lsparse` the sparse ops at long-context index
-# widths with the same pair, LSPARSE_WIDTHS, logged but gating no arm; `n128` uses N128_CHECK_BIN/LIB),
+# widths with the same pair, LSPARSE_WIDTHS, logged but gating no arm; `n128` uses N128_CHECK_BIN/LIB; `aux` the
+# aux expert worker's checks on card 0 and on the extra card with AUX_CHECK (TALL_CHECK), VPACK_CHECK and AUX_LIBR4D
+# (the run home's libr4d.so), after QFN stopped; AUXRT_JOBS its timing's jobs),
 # SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's checks and timings on card 0 before the
 # arms; unset, none, and no Rb arm runs).
 set -u
@@ -494,11 +496,13 @@ bal_receipt_bound() {   # log, requested C; actual checked maximum on stdout, or
 }
 
 # A Kld arm: its server records the corpus (--kld-record) instead of serving, then exits. The
-# window's first Kld arm that finishes is the reference (KLD_REF), never an Xt/Lc/Fn128 arm; a later one's
-# records must equal it byte for byte. KLD_TIMEOUT (900 s) bounds a run.
+# window's first Kld arm that finishes is the reference (KLD_REF), never an Xt/Lc/Fn128/Ar/Ag/Ax arm; a
+# later one's records must equal it byte for byte. KLD_TIMEOUT (900 s) bounds a run. An Ax arm's run is
+# gated as a serving Ax arm is (aux_kld_check: its "on:" line, every rank's jobs at exit, the extra
+# card's clients), and only an arm of passes of at most 16 rows may have both parts (the arm loop).
 KLD_REF=
 kld_finish() {   # name; the run is SERVER_PID
-  local name=$1 t=0 rc
+  local name=$1 t=0 rc spid=$SERVER_PID
   while kill -0 "$SERVER_PID" 2>/dev/null; do
     sleep 5; t=$((t + 5))
     if (( t > ${KLD_TIMEOUT:-900} )); then log "arm $name: kld run still going after ${t}s; stopped"; stop_server; return 1; fi
@@ -515,6 +519,17 @@ kld_finish() {   # name; the run is SERVER_PID
   [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   xt_check "$name" || return 1
   lcp_check "$name" || return 1
+  # The aux expert worker: an arm with an Ax part is gated as arm() and aux_arm_exit gate a serving one
+  # (aux_kld_check), or the comparison below would pass for a worker that computed nothing.
+  if [[ -n "${ARM_AX:-}${ARM_AXVIS:-}" ]]; then
+    if ! aux_kld_check "$name" "$spid"; then
+      log "arm $name: $AUX_ARM_WHY; Kld not measured"
+      return 1
+    fi
+  elif grep -q 'aux experts: on:' "$OUT/$name.server.log"; then
+    log "arm $name: no Ax part, but the worker ran (the switch set for the window?); Kld not measured"
+    return 1
+  fi
   local extra_why
   if ! extra_why=$(vp_server_gate "$OUT/$name.server.log" "${ARM_VP:-}" "$([[ " ${ARGS[*]} " == *" --draft-bank "* ]] && echo 1)") ||
      ! extra_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit); then
@@ -522,9 +537,10 @@ kld_finish() {   # name; the run is SERVER_PID
   fi
   if [[ -z "$KLD_REF" ]]; then
     # The reference must be a plain 16-token arm's bits: a feature arm first (the plain one failed
-    # or is missing) would let a later feature arm be compared with another one.
-    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}${ARM_AG_ROWS:-}" ]]; then
-      log "arm $name: an Xt, Lc, Fn128, Ar or Ag arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
+    # or is missing) would let a later feature arm be compared with another one. An Ax / Axv arm as the
+    # reference would leave the worker's records compared with nothing.
+    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}${ARM_AG_ROWS:-}" || ( -n "${ARM_AX:-}" && "${ARM_AX}" != 0 ) ]]; then
+      log "arm $name: an Xt, Lc, Fn128, Ar, Ag or Ax arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
       return 1
     fi
     KLD_REF=$OUT/kld-$name
@@ -620,6 +636,13 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       echo "$(date -u +%T) $avail" >> "$OUT/$name.mem"
       sleep 5
     done ) &
+  # An arm with the extra card visible: its VRAM sampled every 2 s (the margin its other tenants keep).
+  if [[ -n "${ARM_AXVIS:-}" && -n "${AUX_DRM:-}" ]]; then
+    ( while kill -0 "$SERVER_PID" 2>/dev/null; do
+        echo "$(date -u +%T) $(cat "$AUX_DRM/mem_info_vram_total" 2>/dev/null) $(cat "$AUX_DRM/mem_info_vram_used" 2>/dev/null)" >> "$OUT/$name.aux-vram"
+        sleep 2
+      done ) &
+  fi
   if [[ -n "${ARM_KLD:-}" ]]; then kld_finish "$name"; return; fi
   local t=0
   until curl -s -m 3 "http://127.0.0.1:$PORT/stats" >/dev/null 2>&1; do
@@ -694,6 +717,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   # says (a radiance without the switch prints none; a plain arm with one took it from elsewhere).
   # A row a switch: the part, set when the arm has it, the line's pattern.
   local sw_bad="" sw_part sw_on sw_pat sw_n pi_n=${ARM_PSC:+${ARM_PRS:-12}}
+  local ARM_AX=${ARM_AX:-}; [[ "$ARM_AX" == 0 ]] && ARM_AX=   # Ax0: the worker off, no startup line
   pi_n=${pi_n:-[0-9]+}   # a Pi arm's rescore count; any, for the line no other arm may have
   while IFS='|' read -r sw_part sw_on sw_pat; do
     sw_n=$(grep -cE "$sw_pat" "$OUT/$name.server.log")
@@ -707,7 +731,11 @@ Ns${ARM_NS:-}|${ARM_NS:-}|side store: the planes of up to [0-9]+ units a rank
 Pv|${ARM_PV:-}|router predictor: every posted router input is recorded to
 Tb|${ARM_TB:-}|two-batch overlap \(RADIANCE_EXPERIMENTAL_SCHED_TBO=1\): a decode step
 Ba${ARM_BA:-}|${ARM_BA:-}|batch admission: on \(RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=${ARM_BA:-[0-9]+}\)
+Ax${ARM_AX:-}|${ARM_AX:-}|aux experts: on: [1-9][0-9]* units
+Axv|${ARM_AXV:-}|aux experts: on: .*policy verify
 EOF2
+  # Ax / Axv / AxfN: the worker's startup lines (an off line's reason with them), before any return below.
+  grep -E 'aux experts: (off|device|on): ' "$OUT/$name.server.log" | cut -c1-400 | tee -a "$OUT/window.log"
   if [[ -n "$sw_bad" ]]; then
     log "arm $name:$sw_bad not measured"
     stop_server; return 1
@@ -715,6 +743,22 @@ EOF2
   grep -m1 -E 'router predictor: [0-9]+ routers loaded .*scored in int' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -m1 -E "side store: the planes of up to|rank 0 posts the read-ahead's router input" "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -m1 -E 'batch admission: (on|refused)' "$OUT/$name.server.log" | cut -c1-240 | tee -a "$OUT/window.log"   # Ba
+  # Ax / Axv / AxfN: the "on:" line stating the arm's six switches (aux_want); Ax0: five devices and no aux line (the
+  # switch 0 reads nothing else); every other arm none (checked in the table above).
+  if [[ -n "${ARM_AX:-}" ]]; then
+    local ax_want; ax_want=$(aux_want)
+    if ! grep -qF "$ax_want" "$OUT/$name.server.log"; then
+      log "arm $name: Ax, but its 'aux experts: on:' line does not state '$ax_want'; not measured"
+      stop_server; return 1
+    fi
+  fi
+  if [[ "${ARM_AXVIS:-}" && "${ARM_AX:-}" == "" ]]; then
+    if ! grep -qE 'device: AQL backend, 5 device\(s\)' "$OUT/$name.server.log" || grep -q 'aux experts:' "$OUT/$name.server.log"; then
+      log "arm $name: Ax0, but the server did not see five devices or logged an aux line; not measured"
+      stop_server; return 1
+    fi
+    log "arm $name: Ax0: the extra card's VRAM used $(cat "${AUX_DRM:-/nonexistent}/mem_info_vram_used" 2>/dev/null) B serving (before the start ${ARM_AX0_USED:-?} B); startup $(grep -oE 'serving after [0-9]+s' "$OUT/window.log" | tail -1)"
+  fi
   # RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW (the Pmr parts): rank 0's file stager names it at
   # startup with its N. A Pmr arm without that line for its N (a radiance without the switch: decode
   # passes of 2+ rows go without the read-ahead), or another arm with the line, is not measured.
@@ -966,7 +1010,9 @@ EOF2
     python3 -I "$HERE/ab_requests.py" --force "$lpref" "http://127.0.0.1:$PORT" "$OUT/$name.lpforce.json" >>"$OUT/window.log" 2>&1
     log "arm $name: teacher-forced along $lpref: exit $?"
   fi
+  local spid=$SERVER_PID   # its KFD entry may outlive the reap (aux_clients_after)
   stop_server
+  aux_arm_exit "$name" "$spid"
   if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --log "$OUT/$name.server.log" --complete >>"$OUT/window.log" 2>&1; then
     log "arm $name: DSpark policy action/cycle/config guard failed; not measured"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
@@ -1560,6 +1606,255 @@ vpack_gate() {   # arm name, the libr4d.so it serves; 0 when the arm may run
   log "arm $a: Vp, but the device check did not pass on $lib; the arm is skipped"
   return 1
 }
+# ---- aux expert worker: functions (the Ax / AxN / Axv / Ax0 / AxfN parts; work/aux/SPEC.md §13) ----------
+# aux_find: the extra card by capability, from the KFD topology under $AUX_SYSFS (/sys): GPU nodes (gfx_target_version
+# not 0) whose UUID ("GPU-" and unique_id's 16 hex digits) the window's ROCR_VISIBLE_DEVICES does not name, of the
+# rank cards' gfx_target_version, with VRAM and a PCI location; AUX_UUID / AUX_BDF (window variables) narrow them; of
+# several, one off every rank card's PCI root complex, then more VRAM, then the lowest BDF (the engine's rule). Sets
+# AUX_UUID, AUX_BDF, AUX_GPUID, AUX_DRM (its drm card's device directory), AUX_VRAM and AUX_WHY; 0 when found.
+AUX_UUID_WANT=${AUX_UUID:-} AUX_BDF_WANT=${AUX_BDF:-}
+AUX_UUID= AUX_BDF= AUX_GPUID= AUX_DRM= AUX_VRAM=0 AUX_WHY="not looked for (no Ax part or aux check)"
+aux_prop() {   # properties file, key: its value, empty when absent
+  awk -v k="$2" '$1 == k { print $2; exit }' "$1" 2>/dev/null
+}
+aux_complex() {   # bdf: its PCI root complex (pciDDDD:BB), empty when unknown
+  local p
+  p=$(realpath -q "${AUX_SYSFS:-/sys}/bus/pci/devices/$1" 2>/dev/null) || return 0
+  tr '/' '\n' <<< "$p" | grep -m1 -E '^pci[0-9a-f]{4}:[0-9a-f]{2}$'
+}
+aux_find() {
+  local root=${AUX_SYSFS:-/sys} d props gtv uid dom loc gid bdf uuid size s b cx rank_gtv="" n_rank=0
+  local mask=",$(tr 'A-F' 'a-f' <<< "${ROCR_VISIBLE_DEVICES:-}"),"
+  local want_u want_b
+  want_u=$(tr 'A-F' 'a-f' <<< "$AUX_UUID_WANT")
+  want_b=$(tr 'A-F' 'a-f' <<< "$AUX_BDF_WANT")
+  [[ ${#want_b} == 7 ]] && want_b="0000:$want_b"
+  local -A rank_cx=()
+  local -a cand=()
+  AUX_UUID= AUX_BDF= AUX_GPUID= AUX_DRM= AUX_VRAM=0
+  for d in "$root"/class/kfd/kfd/topology/nodes/*; do
+    props=$d/properties
+    [[ -f $props ]] || continue
+    gtv=$(aux_prop "$props" gfx_target_version)
+    [[ -n $gtv && $gtv != 0 ]] || continue
+    uid=$(aux_prop "$props" unique_id) dom=$(aux_prop "$props" domain) loc=$(aux_prop "$props" location_id)
+    gid=$(cat "$d/gpu_id" 2>/dev/null)
+    [[ $uid =~ ^[0-9]+$ ]] || continue
+    uuid=$(python3 -I -c 'import sys; print("GPU-%016x" % (int(sys.argv[1]) & 0xffffffffffffffff))' "$uid") || continue
+    bdf=""
+    [[ $dom =~ ^[0-9]+$ && $loc =~ ^[0-9]+$ ]] &&
+      bdf=$(printf '%04x:%02x:%02x.%x' "$dom" $(( (loc >> 8) & 255 )) $(( (loc >> 3) & 31 )) $(( loc & 7 )))
+    if [[ $mask == *",$uuid,"* ]]; then
+      n_rank=$((n_rank + 1))
+      [[ -z $rank_gtv ]] && rank_gtv=$gtv
+      if [[ $gtv != "$rank_gtv" ]]; then AUX_WHY="the rank cards' gfx_target_version differ"; return 1; fi
+      if [[ -n $bdf ]]; then cx=$(aux_complex "$bdf"); [[ -n $cx ]] && rank_cx[$cx]=1; fi
+      continue
+    fi
+    size=0
+    for b in "$d"/mem_banks/*/properties; do
+      [[ -f $b ]] || continue
+      s=$(aux_prop "$b" size_in_bytes)
+      [[ $s =~ ^[0-9]+$ ]] && (( s > size )) && size=$s
+    done
+    cand+=("$gtv|$uuid|$bdf|$gid|$size")
+  done
+  if (( n_rank != 4 )); then
+    AUX_WHY="the window's ROCR_VISIBLE_DEVICES names $n_rank of the KFD nodes' UUIDs, not the four rank cards"; return 1
+  fi
+  local c c_gtv c_uuid c_bdf c_gid c_size indep rows="" n=0 rej=""
+  for c in "${cand[@]}"; do
+    IFS='|' read -r c_gtv c_uuid c_bdf c_gid c_size <<< "$c"
+    if [[ $c_gtv != "$rank_gtv" ]]; then rej+=" $c_uuid (gfx_target_version $c_gtv);"; continue; fi
+    if (( c_size <= 0 )); then rej+=" $c_uuid (no VRAM);"; continue; fi
+    if [[ -z $c_bdf ]]; then rej+=" $c_uuid (no PCI location);"; continue; fi
+    if [[ -n $want_u && $c_uuid != "$want_u" ]]; then rej+=" $c_uuid (not AUX_UUID);"; continue; fi
+    if [[ -n $want_b && $c_bdf != "$want_b" ]]; then rej+=" $c_uuid (not AUX_BDF);"; continue; fi
+    cx=$(aux_complex "$c_bdf")
+    indep=0
+    [[ -n $cx && -z ${rank_cx[$cx]:-} ]] && indep=1
+    rows+="$indep|$c_size|$c_bdf|$c_uuid|$c_gid|$cx"$'\n'
+    n=$((n + 1))
+  done
+  if (( n == 0 )); then AUX_WHY="no candidate beyond the rank cards:${rej:- none}"; return 1; fi
+  local pick
+  pick=$(printf '%s' "$rows" | sort -t'|' -k1,1nr -k2,2nr -k3,3 | head -1)
+  IFS='|' read -r indep AUX_VRAM AUX_BDF AUX_UUID AUX_GPUID cx <<< "$pick"
+  for c in "$root"/class/drm/card[0-9]*; do
+    [[ -f $c/device/uevent ]] && grep -qi "^PCI_SLOT_NAME=$AUX_BDF\$" "$c/device/uevent" && { AUX_DRM=$c/device; break; }
+  done
+  AUX_WHY="$n candidate(s); chose $AUX_UUID at $AUX_BDF (gpu_id $AUX_GPUID, $((AUX_VRAM >> 20)) MiB of VRAM, root ${cx:-unknown}$( ((indep)) && echo ', no rank card on it' || echo ', shared with a rank card or unknown'))"
+  return 0
+}
+aux_mask_ok() {   # 0 when the window's ROCR_VISIBLE_DEVICES names exactly four UUIDs (the rank cards)
+  local -a m
+  local u
+  IFS=, read -r -a m <<< "${ROCR_VISIBLE_DEVICES:-}"
+  (( ${#m[@]} == 4 )) || return 1
+  for u in "${m[@]}"; do [[ $u =~ ^GPU-[0-9A-Fa-f]{16}$ ]] || return 1; done
+  return 0
+}
+aux_clients() {   # "pid comm bytes" for every process holding VRAM on the extra card (AUX_GPUID)
+  local f pid v comm
+  [[ -n $AUX_GPUID ]] || return 0
+  for f in "${AUX_SYSFS:-/sys}"/class/kfd/kfd/proc/*/vram_"$AUX_GPUID"; do
+    [[ -f $f ]] || continue
+    v=$(cat "$f" 2>/dev/null)
+    [[ $v =~ ^[0-9]+$ ]] && (( v > 0 )) || continue
+    pid=${f%/vram_*}; pid=${pid##*/}
+    comm=$(cat "${AUX_PROC:-/proc}/$pid/comm" 2>/dev/null)
+    echo "$pid ${comm:-?} $v"
+  done
+}
+aux_free_mib() {   # the extra card's free VRAM now, MiB (mem_info_vram_total - _used); empty when unknown
+  local t u
+  [[ -n $AUX_DRM ]] || return 0
+  t=$(cat "$AUX_DRM/mem_info_vram_total" 2>/dev/null) u=$(cat "$AUX_DRM/mem_info_vram_used" 2>/dev/null)
+  [[ $t =~ ^[0-9]+$ && $u =~ ^[0-9]+$ ]] && echo $(( (t - u) >> 20 ))
+}
+# The extra card's clients now (into $OUT/<name>.aux-clients) against the sharing rules: every comm allowed
+# (AUX_ALLOW_CLIENTS, ^whisper), together at most AUX_FOREIGN_MAX_MIB (6144) and, with a need above 0, that many MiB
+# free (`what` names the need in the refusal). 0 when allowed; otherwise 1 with the reasons in AUX_BAD.
+aux_clients_eval() {   # name, MiB free needed (0: none), what the need is
+  local a=$1 need=$2 what=$3 pid comm v total=0 free
+  AUX_BAD=""
+  aux_clients > "$OUT/$a.aux-clients"
+  while read -r pid comm v; do
+    [[ -n $pid ]] || continue
+    total=$((total + v))
+    [[ $comm =~ ${AUX_ALLOW_CLIENTS:-^whisper} ]] ||
+      AUX_BAD+=" $comm (pid $pid) holds $((v >> 20)) MiB and is not allowed (AUX_ALLOW_CLIENTS=${AUX_ALLOW_CLIENTS:-^whisper});"
+  done < "$OUT/$a.aux-clients"
+  (( total > (${AUX_FOREIGN_MAX_MIB:-6144} << 20) )) &&
+    AUX_BAD+=" its clients hold $((total >> 20)) MiB, above AUX_FOREIGN_MAX_MIB=${AUX_FOREIGN_MAX_MIB:-6144};"
+  if (( need > 0 )); then
+    free=$(aux_free_mib)
+    if [[ -z $free ]]; then AUX_BAD+=" its free VRAM is unknown (no drm card for $AUX_BDF);"
+    elif (( free < need )); then AUX_BAD+=" it has $free MiB free, under $what;"; fi
+  fi
+  [[ -z $AUX_BAD ]]
+}
+aux_clients_gate() {   # arm, cap MiB (0: Ax0): 0 when the arm may start (writes $OUT/<arm>.aux-clients)
+  local a=$1 cap=$2 need=0 rc
+  (( cap > 0 )) && need=$(( cap + ${AUX_HEADROOM_MIB:-1024} + 512 ))
+  aux_clients_eval "$a" "$need" "the cap $cap + headroom ${AUX_HEADROOM_MIB:-1024} + 512 MiB"; rc=$?
+  log "arm $a: the extra card's clients at the start: $(tr '\n' ';' < "$OUT/$a.aux-clients")"
+  (( rc == 0 )) && return 0
+  log "arm $a: skipped:$AUX_BAD"
+  return 1
+}
+# DEVICE_CHECKS=aux on the shared extra card: its checks start only beside the clients an arm may start beside, and
+# with AUX_CHECK_FREE_MIB (6144) free -- the aux mode alone allocates about 3.5 GB. 0 when they may; otherwise 1 with
+# the refusal, the clients listed, in AUX_CHECK_WHY (writes $OUT/aux-checks.aux-clients).
+aux_checks_gate() {
+  local rc list
+  aux_clients_eval aux-checks "${AUX_CHECK_FREE_MIB:-6144}" \
+    "AUX_CHECK_FREE_MIB=${AUX_CHECK_FREE_MIB:-6144} (the aux mode alone allocates about 3.5 GB)"; rc=$?
+  list=$(tr '\n' ';' < "$OUT/aux-checks.aux-clients")
+  log "aux device checks: the extra card's clients: ${list:-none}"
+  (( rc == 0 )) && return 0
+  AUX_CHECK_WHY="refused: the extra card is not free for its checks (its clients: ${list:-none}):$AUX_BAD"
+  return 1
+}
+# After an arm: a client absent at its start is a new one (its results are set aside; exactness is still compared).
+# The KFD driver removes a stopped process's entry only after its last reference goes (a workqueue item behind an RCU
+# grace period), so the server just reaped may still be listed: its entry is waited for (AUX_KFD_WAIT_DS tenths of
+# a second, 100), then it is left out, and so is any pid whose process is gone (its entry outlives it the same way).
+aux_clients_after() {   # arm, the stopped server's pid (""): 0, or 1 with the new clients in AUX_NEW_CLIENTS
+  local a=$1 spid=${2:-} pid comm v t=0
+  AUX_NEW_CLIENTS=""
+  while [[ -n $spid && -e ${AUX_SYSFS:-/sys}/class/kfd/kfd/proc/$spid ]] && (( t < ${AUX_KFD_WAIT_DS:-100} )); do
+    sleep 0.1; t=$((t + 1))
+  done
+  aux_clients > "$OUT/$a.aux-clients-after"
+  while read -r pid comm v; do
+    [[ -n $pid && $pid != "$spid" && -d ${AUX_PROC:-/proc}/$pid ]] || continue
+    grep -q "^$pid " "$OUT/$a.aux-clients" 2>/dev/null || AUX_NEW_CLIENTS+=" $comm (pid $pid, $((v >> 20)) MiB)"
+  done < "$OUT/$a.aux-clients-after"
+  [[ -z $AUX_NEW_CLIENTS ]]
+}
+aux_exit_gate() {   # server log, cap ("" none, 0 Ax0), verify (1 or ""), forced N ("" none): "" when measured, else why
+  local f=$1 cap=$2 verify=$3 forced=$4 n jobs=0 fails=0 cmp=0 forced_n=0 l
+  [[ -n $cap && $cap != 0 ]] || return 0
+  n=$(grep -cE 'aux experts: rank [0-3]: ' "$f")
+  (( n == 4 )) || { echo "$n of 4 ranks' 'aux experts: rank' lines"; return 1; }
+  while IFS= read -r l; do
+    [[ $l =~ \ ([0-9]+)\ layer\ jobs ]] && (( BASH_REMATCH[1] > 0 )) && jobs=$((jobs + 1))
+    [[ $l =~ \ 0\ launch\ failures ]] && fails=$((fails + 1))
+    [[ $l =~ verify:\ ([0-9]+)\ rows\ compared,\ 0\ differ ]] && (( BASH_REMATCH[1] > 0 )) && cmp=$((cmp + 1))
+    [[ $l =~ deadline\ misses\ \(([0-9]+)\ forced ]] && (( BASH_REMATCH[1] > 0 )) && forced_n=$((forced_n + 1))
+  done < <(grep -E 'aux experts: rank [0-3]: ' "$f")
+  (( jobs == 4 )) || { echo "$jobs of 4 ranks ran layer jobs on the extra card"; return 1; }
+  (( fails == 4 )) || { echo "$((4 - fails)) rank(s) had launch failures"; return 1; }
+  if [[ -n $verify ]] && (( cmp != 4 )); then echo "AUX VERIFY FAIL: $cmp of 4 ranks compared rows with 0 differing"; return 1; fi
+  if [[ -n $forced ]] && (( forced_n == 0 )); then echo "forced lateness every $forced, but no rank forced a deadline miss"; return 1; fi
+  return 0
+}
+# The "aux experts: on:" line's six values an Ax / Axv arm must state (ARM_AX, ARM_AXV, ARM_AXF, ARM_AXDL, ARM_AXBO,
+# ARM_AXHR); the trailing space keeps "forced lateness 4" from matching 40.
+aux_want() {
+  echo "policy $([[ -n "${ARM_AXV:-}" ]] && echo verify || echo serve), deadline ${ARM_AXDL:-2000} us, backoff ${ARM_AXBO:-64}, headroom ${ARM_AXHR:-1024} MiB, cap ${ARM_AX} MiB, forced lateness ${ARM_AXF:-0} "
+}
+# After an arm with the extra card visible (its server stopped): its clients again (aux_clients_after) and its
+# minimum free VRAM over the arm (AUX MARGIN LOW under AUX_MARGIN_MIB, 1024), both logged; for an Ax / Axv arm the
+# worker's exit lines (into window.log) and aux_exit_gate. 0 when the arm may be measured; otherwise 1 with the
+# reasons in AUX_ARM_WHY. The caller sets the results aside (aux_arm_exit) or does not compare them (kld_finish).
+aux_arm_check() {   # arm name, the stopped server's pid
+  local name=$1 why="" g min
+  AUX_ARM_WHY=""
+  aux_clients_after "$name" "${2:-}" || why="the extra card gained clients during the arm:$AUX_NEW_CLIENTS"
+  if [[ -s "$OUT/$name.aux-vram" ]]; then
+    min=$(awk '$2 > 0 && $3 > 0 { f = ($2 - $3) / 1048576; if (m == "" || f < m) m = f } END { if (m != "") print int(m) }' "$OUT/$name.aux-vram")
+    [[ -n $min ]] && log "arm $name: the extra card's free VRAM during the arm: at least $min MiB"
+    [[ -n $min ]] && (( min < ${AUX_MARGIN_MIB:-1024} )) &&
+      log "arm $name: AUX MARGIN LOW: the extra card's free VRAM went down to $min MiB, under AUX_MARGIN_MIB=${AUX_MARGIN_MIB:-1024} (its other tenants)"
+  fi
+  if [[ -n "${ARM_AX:-}" && "${ARM_AX}" != 0 ]]; then
+    grep -E 'aux experts: (rank [0-3]|device)' "$OUT/$name.server.log" | cut -c1-600 | tee -a "$OUT/window.log"
+    g=$(aux_exit_gate "$OUT/$name.server.log" "$ARM_AX" "${ARM_AXV:-}" "${ARM_AXF:-}") || why+="${why:+; }$g"
+  fi
+  AUX_ARM_WHY=$why
+  [[ -z $why ]]
+}
+aux_arm_exit() {   # arm name, the stopped server's pid: aux_arm_check, the results set aside when it fails; Axv: AXV_OK
+  local name=$1
+  [[ -n "${ARM_AXVIS:-}" ]] || return 0
+  if ! aux_arm_check "$name" "${2:-}"; then
+    log "arm $name: $AUX_ARM_WHY; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
+  if [[ -n "${ARM_AXV:-}" && -f "$OUT/$name.json" ]]; then
+    AXV_OK=1 AXV_SUM=${ARM_AXSUM:-}
+    log "arm $name: Axv: every rank compared the worker's rows with the CPU's and none differ; Ax arms on this library may run"
+  fi
+  return 0
+}
+# A Kld arm's server records the corpus and exits (kld_finish): the same aux gates as a serving arm's, read after
+# the run. Ax / Axv: the "on:" line with the arm's six values, then aux_arm_check (every rank ran layer jobs with no
+# launch failure, Axv compared rows with none differing, AxfN forced a miss; the extra card's clients and margin);
+# Ax0: five devices and no aux line, then the clients and margin; an arm without an Ax part: no "on:" line. 0 when
+# the records may be compared; otherwise 1 with the reason in AUX_ARM_WHY.
+aux_kld_check() {   # arm name, the server's pid
+  local name=$1 f=$OUT/$1.server.log want
+  AUX_ARM_WHY=""
+  grep -E 'aux experts: (off|device|on): ' "$f" | cut -c1-400 | tee -a "$OUT/window.log"
+  if [[ -n "${ARM_AX:-}" && "${ARM_AX}" != 0 ]]; then
+    if ! grep -qE 'aux experts: on: [1-9][0-9]* units' "$f"; then
+      AUX_ARM_WHY="Ax, but the worker did not start ($(grep -m1 'aux experts: off:' "$f"))"; return 1
+    fi
+    want=$(aux_want)
+    if ! grep -qF "$want" "$f"; then AUX_ARM_WHY="Ax, but its 'aux experts: on:' line does not state '$want'"; return 1; fi
+  elif grep -q 'aux experts: on:' "$f"; then
+    AUX_ARM_WHY="no Ax part, but the worker ran (the switch set for the window?)"; return 1
+  fi
+  if [[ "${ARM_AX:-}" == 0 ]] && { ! grep -qE 'device: AQL backend, 5 device\(s\)' "$f" || grep -q 'aux experts:' "$f"; }; then
+    AUX_ARM_WHY="Ax0, but the server did not see five devices or logged an aux line"; return 1
+  fi
+  [[ -n "${ARM_AXVIS:-}" ]] || return 0
+  aux_arm_check "$name" "${2:-}"
+}
+# ---- aux expert worker: end of functions ----------------------------------------------------------------
 # Up front, before any arm runs: each Vp arm's library (its H / H3 part's home, as the loop below picks it,
 # else the run home), so the checks run on idle cards and a failure shows before the window spends its time.
 # The loop's gate then finds each library checked (and checks one this missed).
@@ -1586,6 +1881,86 @@ serving_cards_ok() {
   read -r -a cards <<< "$ROCR_VISIBLE_DEVICES"
   (( ${#cards[@]} == 4 ))
 }
+
+# ---- the aux expert worker's extra card and device checks (work/aux/SPEC.md §13.2, §14.3) ------------------
+# The card is looked for once, after QFN stopped, when an arm has an Ax part or DEVICE_CHECKS names aux. The
+# checks (DEVICE_CHECKS=aux): ds41_mxfp4_device_check's `aux` mode (AUX_CHECK, default TALL_CHECK) on card 0 (an XT)
+# and on the extra card, whose outputs must be byte-identical; on the extra card also `swiglu` (its table recaptured,
+# compared with SILU_TABLE) and VPACK_CHECK's `check 48` (and `check 48 tail` under LIVE_TAIL); then `auxrt`, the
+# worker's job shape timed through HIP, logged only, with the card's sclk sampled at 10 Hz into aux-sclk.log. Every
+# mode runs with the window's RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL. The extra card is shared: the checks start only
+# while its clients pass the arms' rules and it has AUX_CHECK_FREE_MIB (6144) free (aux_checks_gate), else none runs.
+# AUX_OK / AUX_SUM: Ax and Axv arms run only on the libr4d.so (sha256) the checks passed on; an Ax arm also needs an
+# Axv arm of this window measured on it (AXV_OK).
+AUX_OK="" AUX_LIB="" AUX_SUM="" AXV_OK="" AXV_SUM=""
+AUX_CHECK_WHY="no aux device check in this window (DEVICE_CHECKS=aux with AUX_CHECK or TALL_CHECK, VPACK_CHECK and an extra card)"
+aux_any=""
+for aux_a in $ARMS; do [[ "-$aux_a-" =~ -Ax(v|0)?[0-9]*- ]] && aux_any=1; done
+if [[ " ${DEVICE_CHECKS:-1} " == *" aux "* || -n "$aux_any" ]]; then
+  if aux_find; then log "aux card: $AUX_WHY"; else log "aux card: none: $AUX_WHY"; fi
+fi
+if [[ " ${DEVICE_CHECKS:-1} " == *" aux "* ]]; then
+  AC=${AUX_CHECK:-${TALL_CHECK:-}} AL=${AUX_LIBR4D:-$RHOME/kernels/libr4d.so}
+  if [[ ! -x "$AC" || ! -x "${VPACK_CHECK:-}" || ! -f "$AL" ]]; then
+    AUX_CHECK_WHY="AUX_CHECK=$AC or VPACK_CHECK=${VPACK_CHECK:-} is not an executable, or $AL is not a file"
+  elif [[ -z "$AUX_UUID" ]]; then
+    AUX_CHECK_WHY="no extra card ($AUX_WHY)"
+  elif [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != exited ]]; then
+    AUX_CHECK_WHY="refused: QFN ($NAME) is not stopped"
+  elif ! aux_checks_gate; then
+    :   # the extra card is shared: its clients or free VRAM refuse the checks (AUX_CHECK_WHY), and no card is checked
+  else
+    aux_sum0=$(sha256sum "$AL" | cut -d' ' -f1)
+    aux_tail=0; [[ "${RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL:-}" == 1 ]] && aux_tail=1
+    log "aux device checks with $AL (sha256 ${aux_sum0:0:16}, live tail $aux_tail): card 0, then the extra card $AUX_UUID ($AUX_BDF)"
+    ( export HIP_VISIBLE_DEVICES=0 RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=$aux_tail
+      timeout 1800 "$AC" "$AL" aux "$OUT/aux-xt.bin" >"$OUT/devcheck-aux-xt.log" 2>&1
+      echo "aux exit $?" >>"$OUT/devcheck-aux-xt.log" )
+    ( export ROCR_VISIBLE_DEVICES=$AUX_UUID HIP_VISIBLE_DEVICES=0 RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=$aux_tail
+      timeout 1200 "$AC" "$AL" swiglu "$OUT/silu_aux.bin" >"$OUT/devcheck-aux-swiglu.log" 2>&1
+      echo "swiglu exit $?" >>"$OUT/devcheck-aux-swiglu.log"
+      timeout 1200 "$VPACK_CHECK" "$AL" check 48 >"$OUT/devcheck-aux-vpack.log" 2>&1
+      echo "vpack check exit $?" >>"$OUT/devcheck-aux-vpack.log"
+      if (( aux_tail )); then
+        timeout 1200 "$VPACK_CHECK" "$AL" check 48 tail >"$OUT/devcheck-aux-vpack-tail.log" 2>&1
+        echo "vpack check exit $?" >>"$OUT/devcheck-aux-vpack-tail.log"
+      fi
+      timeout 1800 "$AC" "$AL" aux "$OUT/aux-ext.bin" >"$OUT/devcheck-aux-ext.log" 2>&1
+      echo "aux exit $?" >>"$OUT/devcheck-aux-ext.log"
+      ( while :; do echo "$(date +%s.%N) $(tr '\n' ' ' < "${AUX_DRM:-/nonexistent}/pp_dpm_sclk" 2>/dev/null)"; sleep 0.1; done ) \
+        >"$OUT/aux-sclk.log" 2>&1 &
+      aux_sp=$!
+      timeout 900 "$AC" "$AL" auxrt ${AUXRT_JOBS:-} >"$OUT/devcheck-auxrt.log" 2>&1
+      echo "auxrt exit $?" >>"$OUT/devcheck-auxrt.log"
+      kill "$aux_sp" 2>/dev/null; wait "$aux_sp" 2>/dev/null )
+    grep -E '^(PASS|FAIL)|exit' "$OUT"/devcheck-aux-*.log | tail -16 | tee -a "$OUT/window.log"
+    grep -E '^auxrt' "$OUT/devcheck-auxrt.log" | tee -a "$OUT/window.log"
+    aux_bad=""
+    for f in aux-xt aux-ext; do
+      grep -qx "aux exit 0" "$OUT/devcheck-$f.log" || aux_bad+=" $f exited non-zero;"
+      grep -q '^PASS: aux: ' "$OUT/devcheck-$f.log" || aux_bad+=" $f has no PASS line;"
+      grep -q '^FAIL' "$OUT/devcheck-$f.log" && aux_bad+=" $f printed FAIL;"
+    done
+    cmp -s "$OUT/aux-xt.bin" "$OUT/aux-ext.bin" || aux_bad+=" the extra card's aux outputs differ from card 0's;"
+    grep -qx "swiglu exit 0" "$OUT/devcheck-aux-swiglu.log" || aux_bad+=" swiglu exited non-zero;"
+    cmp -s "$OUT/silu_aux.bin" "$SILU" || aux_bad+=" the extra card's silu table differs from SILU_TABLE;"
+    vpack_pass "$OUT/devcheck-aux-vpack.log" "gemv_vp over packed experts is bit-identical" check || aux_bad+=" vpack check 48 did not pass;"
+    if (( aux_tail )); then
+      vpack_pass "$OUT/devcheck-aux-vpack-tail.log" "gemv_vp over packed experts is bit-identical" check ||
+        aux_bad+=" vpack check 48 tail did not pass;"
+    fi
+    [[ "$(sha256sum "$AL" | cut -d' ' -f1)" == "$aux_sum0" ]] || aux_bad+=" the library changed during the checks;"
+    if [[ -z "$aux_bad" ]]; then
+      AUX_OK=1 AUX_LIB=$AL AUX_SUM=$aux_sum0
+      log "aux device checks passed on $AL, sha256 ${AUX_SUM:0:16}: Ax / Axv arms on it may run"
+    else
+      AUX_CHECK_WHY="the aux device checks did not pass on $AL:$aux_bad"
+      log "$AUX_CHECK_WHY no Ax / Axv arm runs"
+    fi
+  fi
+  [[ -n "$AUX_OK" ]] || log "aux device checks: $AUX_CHECK_WHY"
+fi
+
 declare -A AR_ROWS_PASSED=() AR_ROWS_RECEIPT=()
 ar_rows_receipt_ok() {   # fresh log, full library SHA256; four exact case lines, no skips/failures
   local f=$1 sum=$2 cap ts
@@ -1946,6 +2321,25 @@ for a in $ARMS; do
 # or Kld part; a radiance from claude/ds41-batch-admit): measured only with the scheduler's startup line
 # "batch admission: on (...=N)" (every other arm states the switch 0 and must not have it), and a Ba arm
 # that sent requests together but batched no step is set aside; rN a repeat (ignored).
+# Ax / AxN the aux expert worker (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=N MiB, AUX_MIB or 26000 for Ax; core/place/
+# aux_expert_worker.h; a radiance from claude/ds41-aux-worker): an extra card of the ranks' ISA (aux_find, by
+# capability from the KFD topology; AUX_UUID or AUX_BDF narrow it) appended last to the window's mask of the four
+# rank cards' UUIDs holds the hottest CPU-path units in its VRAM and computes their rows in routed layer passes of
+# up to 16 rows; Axv / AxvN the same with ..._AUX_POLICY=verify (the CPU computes every row and the worker's are
+# compared); Ax0 the extra card visible with the switch 0 (a fifth visible card's own cost); AxfN with an Ax or Axv
+# part every Nth worker job forced late (4; the CPU fallback on real data, with the backoff 0). Ax / Axv need policy
+# all, K, Vp, a BN part and M16 or more, refuse Tb, Rt and a Ds / Dk part, and run only on the libr4d.so the window's
+# DEVICE_CHECKS=aux passed on (AUX_OK); an Ax arm also only after an Axv arm of this window measured on it (AXV_OK).
+# Every Ax part needs the window's mask to name exactly four UUIDs and an extra card found, and starts only while
+# the extra card's KFD clients are allowed (AUX_ALLOW_CLIENTS, ^whisper), hold at most AUX_FOREIGN_MAX_MIB (6144)
+# and leave cap + AUX_HEADROOM_MIB + 512 MiB free (<arm>.aux-clients; a client arriving during the arm sets its
+# results aside). Every arm states the six switches (the worker off without an Ax part; AUX_DEADLINE_US 2000,
+# AUX_BACKOFF 64 and AUX_HEADROOM_MIB 1024 from the window); the server's "aux experts: on:" line must state them,
+# and at exit every rank's line needs layer jobs and 0 launch failures (Axv: rows compared and 0 differ; AxfN: a
+# forced miss), else the arm is set aside. The extra card's free VRAM is sampled every 2 s (AUX MARGIN LOW under
+# AUX_MARGIN_MIB, 1024). Ax0 needs five devices and no aux line. An Ax / Axv arm with Kld needs passes of at most 16
+# rows (no Lc part, no BT above 16: KL mode is prefill only, so a taller step leaves the worker no row), its run is
+# gated as a serving arm's (kld_finish, aux_kld_check), and it is never the window's Kld reference.
 # the RAM cache's profile-hot units get N second chances before eviction; Ov / Ov2 a launch whose
 # first dispatch depends on nothing in flight on its queue goes without the barrier bit, in decode
 # passes / in every pass issued live (RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1 / 2; exact, only
@@ -2065,6 +2459,7 @@ for a in $ARMS; do
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
+  ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -2304,6 +2699,22 @@ for a in $ARMS; do
                if ! [[ $pmr =~ ^[0-9]+$ ]] || (( 10#$pmr < 2 || 10#$pmr > 16 )); then
                  log "arm $a: $p: N is 2-16 rows; the arm is skipped"; skip=1
                else pmr=$((10#$pmr)); fi ;;
+      Ax0)     [[ -n "$ax" ]] && { log "arm $a: two Ax parts; the arm is skipped"; skip=1; }
+               ax=0 ;;                                                  # the extra card visible, the worker off
+      Axv|Axv[0-9]*|Ax|Ax[0-9]*)                                       # the aux expert worker (Axv: verify)
+               [[ -n "$ax" ]] && { log "arm $a: two Ax parts; the arm is skipped"; skip=1; }
+               if [[ $p == Axv* ]]; then axv=1; ax=${p#Axv}; else ax=${p#Ax}; fi
+               ax=${ax:-${AUX_MIB:-26000}}
+               if ! [[ $ax =~ ^[0-9]+$ ]] || (( 10#$ax < 1024 || 10#$ax > 1048576 )); then
+                 log "arm $a: $p: the worker's cap is 1024-1048576 MiB; the arm is skipped"; skip=1; ax=1
+               fi
+               ax=$((10#$ax)) ;;
+      Axf|Axf[0-9]*)                                                   # every Nth worker job forced late (4)
+               axf=${p#Axf}; axf=${axf:-4}
+               if ! [[ $axf =~ ^[0-9]+$ ]] || (( 10#$axf < 1 || 10#$axf > 1000000 )); then
+                 log "arm $a: $p: forced lateness takes 1-1000000; the arm is skipped"; skip=1; axf=1
+               fi
+               axf=$((10#$axf)) ;;
       *)     log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
@@ -2783,7 +3194,66 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
   ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp
+  # Ax / AxN / Axv / AxvN / Ax0 / AxfN (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS, core/place/aux_expert_worker.h): the
+  # extra card appended last to the window's mask of the four rank cards (ranks 0-3 stay the XTs), the worker on it
+  # with the arm's cap (Ax0: the card visible, the worker off). Every arm states the six switches (the worker off
+  # without an Ax part), so a window's VAR=val cannot turn it on or change an arm's deadline, backoff or headroom
+  # (the window's AUX_DEADLINE_US, AUX_BACKOFF and AUX_HEADROOM_MIB set them for its Ax arms, AxfN the forced
+  # lateness with the backoff 0); the startup line states all of them and arm() checks it.
+  ARM_AX=$ax ARM_AXV=$axv ARM_AXF=$axf ARM_AXVIS="" axsum=""
+  if [[ -n "$axf" && ( -z "$ax" || "$ax" == 0 ) ]]; then log "arm $a: Axf$axf needs an Ax or Axv part; the arm is skipped"; skip=1; fi
+  if [[ -n "$ax" ]]; then
+    aux_mask_ok || { log "arm $a: an Ax part needs the window's ROCR_VISIBLE_DEVICES to name exactly the four rank cards' UUIDs; the arm is skipped"; skip=1; }
+    [[ -n "$AUX_UUID" ]] || { log "arm $a: no extra card ($AUX_WHY); the arm is skipped"; skip=1; }
+    ARM_AXVIS="${ROCR_VISIBLE_DEVICES:-},$AUX_UUID"
+  fi
+  if [[ -n "$ax" && "$ax" != 0 ]]; then
+    [[ "$pol" == all ]] || { log "arm $a: Ax needs policy all (every cached unit the CPU path's); the arm is skipped"; skip=1; }
+    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 "* ]] || { log "arm $a: Ax needs K (the packed RAM cache: the worker loads its slots); the arm is skipped"; skip=1; }
+    [[ -n "$ARM_VP" ]] || { log "arm $a: Ax needs Vp (the worker runs gemv_vp, the decode band's row under it); the arm is skipped"; skip=1; }
+    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS="* ]] || { log "arm $a: Ax needs a BN part (every file-tier unit the CPU's); the arm is skipped"; skip=1; }
+    axm=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
+    (( ${axm:-0} >= 16 )) || { log "arm $a: Ax needs M16 or more (misses on the CPU in passes of 16); the arm is skipped"; skip=1; }
+    [[ -n "$tb" ]] && { log "arm $a: Ax with Tb (sliced layers: the engine refuses it); the arm is skipped"; skip=1; }
+    [[ -n "$rt" ]] && { log "arm $a: Ax with Rt (the routing trace has no code for the worker's units; the engine refuses it); the arm is skipped"; skip=1; }
+    [[ -n "$ds$dk" ]] && { log "arm $a: Ax with a Ds / Dk part (the worker takes no drafter layer; not measured together); the arm is skipped"; skip=1; }
+    # Kld sends each corpus text as one prompt scored at every row (max_tokens 1): prefill only, in passes of the
+    # arm's step. The worker takes passes of at most 16 rows, so beside a taller step (an Lc part, BT above 16) it
+    # would serve no row and the comparison would not test it: build the Kld arm on the 16-token base instead.
+    if [[ -n "$kld" ]]; then
+      axtall=""
+      [[ -n "$lc" ]] && axtall="Lc$lc"
+      [[ -n "$bt" ]] && ! { [[ $bt =~ ^[0-9]+$ ]] && (( 10#$bt <= 16 )); } && axtall="BT$bt"
+      [[ -n "$axtall" ]] && { log "arm $a: Ax with Kld needs passes of at most 16 rows, not $axtall's (KL mode is prefill only and the worker declines taller passes: it would serve no row); the arm is skipped"; skip=1; }
+    fi
+    if [[ -z "$skip" ]]; then
+      axlib=""
+      IFS=: read -r -a homes <<< "$ARM_HOME"
+      for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { axlib=$h/kernels/libr4d.so; break; }; done
+      axsum=$(sha256sum "$axlib" 2>/dev/null | cut -d' ' -f1)
+      if [[ -z "$AUX_OK" ]]; then
+        log "arm $a: Ax refused: $AUX_CHECK_WHY"; skip=1
+      elif [[ "$axsum" != "$AUX_SUM" ]]; then
+        log "arm $a: Ax refused: its libr4d.so (${axlib:-none under $ARM_HOME}) is not the one the aux device checks passed on ($AUX_LIB, sha256 ${AUX_SUM:0:16})"; skip=1
+      elif [[ -z "$axv" && ( -z "$AXV_OK" || "$axsum" != "$AXV_SUM" ) ]]; then
+        log "arm $a: Ax refused: no Axv arm of this window compared the worker's rows with the CPU's on this library (run an Axv arm first)"; skip=1
+      fi
+    fi
+    env+=(RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=$ax RADIANCE_EXPERIMENTAL_DS41_AUX_DEVICE=$AUX_BDF
+          RADIANCE_EXPERIMENTAL_DS41_AUX_POLICY=${axv:+verify})
+  else
+    env+=(RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=0 RADIANCE_EXPERIMENTAL_DS41_AUX_DEVICE= RADIANCE_EXPERIMENTAL_DS41_AUX_POLICY=)
+  fi
+  ARM_AXDL=${AUX_DEADLINE_US:-2000} ARM_AXHR=${AUX_HEADROOM_MIB:-1024} ARM_AXBO=${AUX_BACKOFF:-64}
+  [[ -n "$axf" ]] && ARM_AXBO=0
+  env+=(RADIANCE_EXPERIMENTAL_DS41_AUX_DEADLINE_US=$ARM_AXDL RADIANCE_EXPERIMENTAL_DS41_AUX_HEADROOM_MIB=$ARM_AXHR
+        RADIANCE_EXPERIMENTAL_DS41_AUX_BACKOFF=$ARM_AXBO RADIANCE_EXPERIMENTAL_DS41_AUX_FORCE_LATE=${axf:-0})
+  [[ -n "$ARM_AXVIS" ]] && env+=("ROCR_VISIBLE_DEVICES=$ARM_AXVIS")
+  ARM_AXSUM=${axsum:-}
   [[ -n "$skip" ]] && continue
+  # The extra card's clients at the arm's start (it is shared): only allowed tenants, and room for the cap.
+  if [[ -n "$ax" ]] && ! aux_clients_gate "$a" "$ax"; then continue; fi
+  [[ "$ax" == 0 ]] && ARM_AX0_USED=$(cat "${AUX_DRM:-/nonexistent}/mem_info_vram_used" 2>/dev/null)
   [[ -n "$power" ]] && power_set "$power"
   case $pol in
     base) arm "$a" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0 "${env[@]}" ;;

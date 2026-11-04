@@ -473,8 +473,10 @@ struct MoverCounters {
 
 /* ------------------------------------------------------------------ the mover */
 struct NativeMappedMoverHostTest;
+struct AuxStagerProbe;
 class Mover {
     friend struct NativeMappedMoverHostTest; //private HOST-only fixture seam
+    friend struct AuxStagerProbe; //tests/aux_stager_test.cpp: borrow_hook_ only
     friend class Engine; //drain mapped source consumers before Engine tears down arenas/events
 public:
     ~Mover();
@@ -854,6 +856,11 @@ public:
      * file stager refuses it unless the CPU computes every routed unit (..._FILE_BUFFER_UNITS).
      * ..._PACKED_CACHE_RAW=<gate_up>,<down>: the raw rounds a slot holds (see mover.cpp). */
     bool  packed_cache() const { return mapped_file_cache_on_ && mapped_file_cache_.packed(); }
+    /* The packed cache's slot size of class `klass` (0 gate_up, 1 down), what a borrow's slot[] says; 0
+     * without the packed cache (the aux expert worker's slot layout, core/place/aux_expert_worker.h). */
+    int64_t packed_slot_bytes(int klass) const {
+        return packed_cache() && (klass == 0 || klass == 1) ? (int64_t)mapped_file_cache_.slot_bytes()[(size_t)klass] : 0;
+    }
     /* One gate_up and one down slot of the mapped cache's slabs, with their guards. */
     int64_t mapped_pair_bytes() const;
     /* Pins the mapped cache's slabs (as ..._PREGROW does; again adds nothing) and returns the
@@ -1135,6 +1142,12 @@ private:
         int (*sync)(void*,RadEvent) = nullptr;
         int (*drain)(void*,RadStream) = nullptr;
     } mapped_copy_hooks_; //only the friend fixture can change these; default real device API
+    /* A host test's packed RAM cache (tests/aux_stager_test.cpp, through its friend): set, borrow_host_unit
+     * answers from it instead of the mapped cache. The engine never sets it. */
+    struct BorrowHook {
+        void* context = nullptr;
+        bool (*borrow)(void*, int32_t, HostUnit*, bool) = nullptr;
+    } borrow_hook_;
     static bool mapped_file_eligible(const WeightInfo& w);
     int mapped_file_drain();
     int retire_file_window(int window);

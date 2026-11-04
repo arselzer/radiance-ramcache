@@ -206,6 +206,7 @@ struct AllocRec {
     int64_t bytes = 0;
     int     kind  = 0;
     int     device = 0;
+    uint64_t devices = 0;   /* a pinned kind: the devices it is mapped on (the pin set), a bit each */
 };
 
 std::mutex&                               alloc_mutex() { static std::mutex m; return m; }
@@ -359,6 +360,14 @@ int h_enable_peer(int self, int peer) {
     return RAD_OK;   /* one address space; nothing to enable */
 }
 
+/* The pin set (h_pin_devices below), under alloc_mutex(): 0 is every device. */
+uint64_t g_pin_set = 0;
+uint64_t all_devices_mask() {
+    const int n = host_count();
+    return n >= 64 ? ~0ull : ((1ull << n) - 1);
+}
+uint64_t pin_set_mask() { return g_pin_set ? g_pin_set : all_devices_mask(); }
+
 void* h_alloc(int64_t bytes, int kind) {
     if (bytes <= 0) {
         device_set_error("rad_dev_alloc(%lld): size must be positive", (long long)bytes);
@@ -380,6 +389,53 @@ void* h_alloc(int64_t bytes, int kind) {
     int dev = t_device;
     alloc_note(p, bytes, kind, dev);
     if (kind == RAD_MEM_DEVICE) g_used[dev].fetch_add(bytes, std::memory_order_relaxed);
+    if (kind == RAD_MEM_HOST_PINNED || kind == RAD_MEM_HOST_MAPPED) {
+        std::lock_guard<std::mutex> lk(alloc_mutex());
+        alloc_table()[p].devices = pin_set_mask();
+    }
+    return p;
+}
+
+/* The pin set (device.h, DeviceBackend::pin_devices) as the host backend keeps it: recorded per pinned
+ * allocation, nothing mapped anywhere (one address space), so tests can check what a card would map. */
+int h_pin_devices(const int* ords, int n) {
+    if (n < 0 || (n > 0 && !ords)) return RAD_E_INVAL;
+    uint64_t m = 0;
+    for (int i = 0; i < n; ++i) {
+        if (ords[i] < 0 || ords[i] >= host_count()) {
+            device_set_error("rad::dev_pin_devices: device %d of %d", ords[i], host_count());
+            return RAD_E_INVAL;
+        }
+        m |= 1ull << ords[i];
+    }
+    if (m == all_devices_mask()) m = 0;   /* every device: no restriction */
+    std::lock_guard<std::mutex> lk(alloc_mutex());
+    bool pinned = false;
+    for (const auto& kv : alloc_table())
+        pinned = pinned || kv.second.kind == RAD_MEM_HOST_PINNED || kv.second.kind == RAD_MEM_HOST_MAPPED;
+    if (pinned && m != g_pin_set) {
+        device_set_error("rad::dev_pin_devices: pinned memory exists already");
+        return RAD_E_STATE;
+    }
+    g_pin_set = m;
+    return RAD_OK;
+}
+
+void* h_alloc_pinned_on(int64_t bytes, const int* ords, int n) {
+    if (n <= 0 || !ords) return nullptr;
+    uint64_t m = 0;
+    for (int i = 0; i < n; ++i) {
+        if (ords[i] < 0 || ords[i] >= host_count()) {
+            device_set_error("rad::dev_alloc_pinned_on: device %d of %d", ords[i], host_count());
+            return nullptr;
+        }
+        m |= 1ull << ords[i];
+    }
+    void* p = h_alloc(bytes, RAD_MEM_HOST_PINNED);
+    if (p) {
+        std::lock_guard<std::mutex> lk(alloc_mutex());
+        alloc_table()[p].devices = m;
+    }
     return p;
 }
 
@@ -842,10 +898,30 @@ const DeviceBackend g_host = {
 
     h_stream_gate, h_gate_open, h_gate_room,
     nullptr,                     /* event_dma: no DMA queue */
+    nullptr, nullptr,            /* map_file, stuck_ms */
+    nullptr, nullptr, nullptr, nullptr,   /* the live issue path's entries */
+    /* The pin set, recorded only (one address space): tests see what a card would map. */
+    h_pin_devices, h_alloc_pinned_on, nullptr,
 };
 
 }  /* namespace */
 
 const DeviceBackend* host_backend(void) { return &g_host; }
+
+uint64_t host_pinned_devices(const void* p) {
+    AllocRec r;
+    if (!alloc_find(const_cast<void*>(p), &r)) return 0;
+    return r.kind == RAD_MEM_HOST_PINNED || r.kind == RAD_MEM_HOST_MAPPED ? r.devices : 0;
+}
+
+int64_t host_live_allocs(int kind, int device) {
+    if (device < 0 || device >= 64) return 0;
+    const bool pinned = kind == RAD_MEM_HOST_PINNED || kind == RAD_MEM_HOST_MAPPED;
+    std::lock_guard<std::mutex> lk(alloc_mutex());
+    int64_t n = 0;
+    for (const auto& kv : alloc_table())
+        if (kv.second.kind == kind && (pinned ? kv.second.devices == (1ull << device) : kv.second.device == device)) ++n;
+    return n;
+}
 
 }  /* namespace rad */

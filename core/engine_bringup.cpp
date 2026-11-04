@@ -4251,6 +4251,9 @@ int Engine::start() {
                 cfg_.tp, cfg_.tp, devs.size(), inventory.c_str());
         return RAD_E_DEVICE;
     }
+    /* RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS (engine_aux.cpp): before any pinned allocation, so the pin
+     * set holds for all of them. Off, it returns at once. */
+    RAD_TRY(aux_discover(devs));
     /* The machine before the model: a refusal here costs a second, after the load it costs the
      * load. */
     RAD_TRY(check_configuration(devs));
@@ -4722,6 +4725,10 @@ int Engine::start() {
         }
         arena_rows_ = { cfg_.max_tok, ranks_[0]->arena_levels[li].rows };
     }
+    /* RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS (engine_aux.cpp): every rank's stager is up and the lent units
+     * are known; the worker's set, lanes, load and binding. A configuration it cannot serve refuses; anything
+     * else that fails turns it off. */
+    RAD_TRY(aux_start());
     /* Immediate recall: when a request needs more cache than is in hand, rank 0's cache calls this
      * from the scheduler between dispatches, with every rank thread parked. Each rank's slab is
      * drained to the affordable loan before the blocks are handed out, and the followers' marks
@@ -4751,6 +4758,14 @@ int Engine::start() {
         int64_t pooled = 0;
         for (auto& r : ranks_)
             pooled += r->pools.weights().bytes() + r->pools.kv().bytes();
+        /* The aux worker's arena is on the extra card, not the ranks': its own line. The ledger's bytes are
+         * what is held (a freed arena has left them), its count every allocation since the start. */
+        if (aux_ledger_ > 0) {
+            if (aux_) dev_bytes -= aux_ledger_;
+            dev_count -= 1;
+            RAD_INFO("device allocations on the aux worker's card: its arena of %s%s", humanb(aux_ledger_).c_str(),
+                     aux_ ? "" : " (freed: the worker is off)");
+        }
         RAD_INFO("device allocations: %lld totalling %s, of which %s is the two pools -- the rest "
                  "is the activation arena and the step staging. Anything on the card past this is "
                  "the driver or a kernel plugin's own hipMalloc, which this cannot see.",

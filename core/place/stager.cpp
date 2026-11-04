@@ -761,6 +761,8 @@ bool FileStager::begin_pass(const RadBatch* b) {
     tbo_ = ep_program_ && ep_program_->two_batch && tbo::step_splits(b);
     tbo_tok_ = b->n_tok;
     tbo_slice_ = 0;
+    /* The aux expert worker takes layers of trunk passes only, never a sliced one. */
+    aux_pass_ = aux_ && b->draft_pass == 0 && !tbo_;
     if (tbo_) tbo_enter(0);
     if (hx_ra_) {   /* predictions for this pass may come; units of earlier ones are stale */
         hx_ra_at_.store((uint64_t)trace_pass_ << 32, std::memory_order_release);
@@ -1084,10 +1086,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     mover_->alias_file_units(skip_, buf_[b], &staged_[b]);
     bool cpu_aliased = false;
     if (hx_li_ == li && hx_policy_ != kHxVerify) {
-        hx_keep_.clear();
-        for (int k = 0; k < hx_n_; ++k)
-            if (hx_units_[k].n) hx_keep_.push_back(hx_units_[k].unit);
-        for (const auto& p : hx_miss_) hx_keep_.push_back(p->unit);
+        hx_cpu_units();
         mover_->alias_file_units(hx_keep_, buf_[b], &staged_[b]);
         cpu_aliased = !hx_keep_.empty();
     }
@@ -2015,6 +2014,8 @@ void FileStager::lcp_report() const {
 }
 
 int FileStager::hx_init_impl(const Program& prog) {
+    /* A re-run of init drops the aux worker's binding: the engine binds after init (aux_bind). */
+    if (aux_) aux_unbind();
     hx_drain();
     hx_pool_ = nullptr;
     hx_defer_ok_ = false;
@@ -2065,8 +2066,10 @@ int FileStager::hx_init_impl(const Program& prog) {
         for (int32_t h = L.first_op + 1; h < L.last_op; ++h) {
             const OpInfo& op = prog.ops[(size_t)h];
             double v = 0;
-            if (op.op == "swiglu_clamped")
+            if (op.op == "swiglu_clamped") {
                 limit = op.base.get_f("limit", &v) && (float)v == pool->limit();
+                o.sw = h;   /* the aux expert worker relaunches it (aux_resolve) */
+            }
         }
         /* Every reader of the down rows up to the next routed layer must be one of these: up to
          * the next layer staged here, or the next MoE block this stager does not stage (a DSpark
@@ -2307,6 +2310,29 @@ void FileStager::hx_choose(int32_t li) {
     hx_ra_fin_b_ = 0;
     hx_side_handed_ = 0;
     hx_slot_.assign(want_.size(), -1);
+    /* The aux expert worker (stager_aux.cpp): whether this layer's selected resident units go to its lane.
+     * Without a binding nothing below changes. */
+    aux_take_ = false;
+    aux_n_ = 0;
+    aux_list_.clear();
+    aux_job_ = kAuxNone;
+    if (aux_) {
+        bool res = false;
+        for (int32_t u : want_) res = res || aux_view_->is_resident(u);
+        if (res) {   /* a decline counts only for a layer with a selected resident unit */
+            if (!aux_pass_ || layers_[(size_t)li].layer >= n_model_layers_) ++aux_stats_.declined_draft;
+            else if (layer_rows(li) > ds41aux::kMaxRows) ++aux_stats_.declined_tall;
+            else if (aux_guard_bad_ || (size_t)li >= aux_rows_.size() || !aux_rows_[(size_t)li].ok)
+                ++aux_stats_.declined_rows;
+            else
+                switch (aux_->state()) {
+                    case aux::Lane::kReady: aux_take_ = true; break;
+                    case aux::Lane::kBackoff: aux_->declined(); ++aux_stats_.declined_busy; break;
+                    case aux::Lane::kBusy: ++aux_stats_.declined_busy; break;
+                    default: ++aux_stats_.declined_dead; break;
+                }
+        }
+    }
     /* Large-chunk prefill: whether the cache admits what this unit's rows select (lcp_admit_row_). */
     const bool lcp_chunk = lcp_ && pass_tok_ > kEpRouteMaxRows;
     /* Read-ahead in pieces: this layer's units (a one-token pass, or a multi-row decode pass with
@@ -2321,7 +2347,13 @@ void FileStager::hx_choose(int32_t li) {
     int64_t link = 0;
     for (size_t i = 0; i < want_.size(); ++i) {
         const int32_t u = want_[i];
-        Mover::HostUnit* hu = hx_n_ < kHxUnits ? &hx_units_[hx_n_] : nullptr;
+        /* The aux worker's resident unit: in serve mode its lease goes to aux_units_ (the base's admit and
+         * touch); in verify mode the CPU computes it as always and the worker computes it too. */
+        const bool aux_res = aux_take_ && aux_view_->is_resident(u);
+        const bool to_aux = aux_res && !aux_verify_;
+        if (aux_res && aux_verify_) aux_list_.push_back(u);
+        Mover::HostUnit* hu = to_aux ? (aux_n_ < kHxUnits ? &aux_units_[aux_n_] : nullptr)
+                                     : (hx_n_ < kHxUnits ? &hx_units_[hx_n_] : nullptr);
         ++hx_stats_.probed;
         const bool admit = hx_admits(li, plan_->units[(size_t)u].expert);
         if (hu && mover_->borrow_host_unit(u, hu, admit)) {
@@ -2332,7 +2364,13 @@ void FileStager::hx_choose(int32_t li) {
                 dn = dn || hu->bytes[k] == HostExpertPool::kDnBytes;
             }
             if (hu->n == 2 && gu && dn) {
-                hx_slot_[i] = hx_n_++;
+                if (to_aux) {   /* slot code -3: no pool job, no reservation; aliased as a CPU unit */
+                    hx_slot_[i] = -3;
+                    ++aux_n_;
+                    aux_list_.push_back(u);
+                } else {
+                    hx_slot_[i] = hx_n_++;
+                }
                 if (ra)
                     for (RaEntry& r : hx_ra_here_)
                         if (r.u && r.unit == u) hx_ra_drop(r, true);
@@ -2340,6 +2378,7 @@ void FileStager::hx_choose(int32_t li) {
             }
             mover_->release_host_unit(hu);
         }
+        if (to_aux) ++aux_stats_.uncached;   /* the CPU's miss path reads it, as in the base */
         ++hx_stats_.missed;
         /* A miss for the CPU: its planes are read in hx_submit_misses; reserved now so the
          * schedule below and the other ranks see the pool's load. */
@@ -2489,8 +2528,12 @@ void FileStager::hx_choose(int32_t li) {
         ++hx_stats_.linked;
         link += bytes;
     }
-    if (!n_cpu && hx_miss_.empty()) {
+    /* The aux worker took nothing (every resident unit uncached): no job. */
+    if (aux_take_ && aux_list_.empty()) aux_take_ = false;
+    if (!n_cpu && hx_miss_.empty() && !aux_n_) {
         hx_n_ = 0;
+        aux_take_ = false;
+        aux_list_.clear();
         return;
     }
     if (hx_policy_ != kHxVerify) {
@@ -2501,6 +2544,15 @@ void FileStager::hx_choose(int32_t li) {
     }
     hx_li_ = li;
     hx_stage_ = 1;
+}
+
+void FileStager::hx_cpu_units() {
+    hx_keep_.clear();
+    for (int k = 0; k < hx_n_; ++k)
+        if (hx_units_[k].n) hx_keep_.push_back(hx_units_[k].unit);
+    for (int k = 0; k < aux_n_; ++k)   /* the aux worker's units: aliased as the CPU's */
+        if (aux_units_[k].n) hx_keep_.push_back(aux_units_[k].unit);
+    for (const auto& p : hx_miss_) hx_keep_.push_back(p->unit);
 }
 
 /* The pass's token rows, sorted order and expert offsets to the host, queued behind the counts
@@ -2806,6 +2858,11 @@ int FileStager::hx_early_decide() {
  * reads the weights again for a few rows. Returns the rows, or an error when they disagree with the
  * expert's count. */
 int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
+    return hx_jobs_into(e, proto, &hx_jobs_, &hx_rows_);
+}
+
+int FileStager::hx_jobs_into(int e, const HostExpertPool::Job& proto, std::vector<HostExpertPool::Job>* jobs,
+                             std::vector<int32_t>* rows) {
     const HxOps& o = hx_ops_[(size_t)hx_li_];
     const int64_t AR = layer_rows(hx_li_), T = AR * o.top_k;
     const int32_t* const sorted = hx_idx_;
@@ -2828,7 +2885,7 @@ int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
             ++hx_stats_.many_jobs;
             hx_stats_.many_rows += (uint64_t)in_job;
         }
-        hx_jobs_.push_back(j);
+        jobs->push_back(j);
         j = proto;
         in_job = 0;
         want = HostExpertPool::job_rows(n, ++k);
@@ -2840,7 +2897,7 @@ int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
         if (!in_job) { j.x = x; j.y = y; }
         else { j.xs[in_job - 1] = x; j.ys[in_job - 1] = y; }
         if (++in_job == want) flush();
-        hx_rows_.push_back(i);
+        if (rows) rows->push_back(i);
     }
     flush();
     /* The scatter's own count for the expert, which chose it: a different number of rows means the
@@ -2890,6 +2947,11 @@ int FileStager::hx_submit() {
         if (n < 0) return n;
         ++hx_stats_.units;
     }
+    /* The aux worker's slots, compacted beside the CPU's jobs and before the pool's submit: its count
+     * check may still refuse the layer here, with no job running yet (hx_drain then waits for none). In
+     * serve mode their sorted rows join hx_rows_ (`appended`), so the sort and the copy take them. */
+    int appended = 0;
+    if (aux_take_) RAD_TRY(aux_prepare(&appended));
     /* What hx_choose reserved for the misses stays reserved for hx_submit_misses. */
     int64_t miss_res = 0;
     for (const auto& p : hx_miss_) {
@@ -2901,13 +2963,16 @@ int FileStager::hx_submit() {
     if (hx_reserved_ - miss_res != submitted) hx_pool_->unreserve(hx_reserved_ - miss_res - submitted);
     hx_reserved_ = miss_res;
     RAD_TRY(hx_pool_->submit(hx_jobs_.data(), (int)hx_jobs_.size(), &hx_ticket_));
+    /* The aux worker's job, behind the CPU's. It never fails here: a step that fails marks the job failed,
+     * and hx_finish has the CPU compute its rows. */
+    if (aux_take_) aux_submit();
     /* hx_finish copies the rows in runs, from the lowest: the order above is the pool's only. */
     std::sort(hx_rows_.begin(), hx_rows_.end());
     hx_stage_ = 2;
     hx_confirmed_ = false;
     ++hx_stats_.layers;
-    hx_stats_.rows += hx_rows_.size();
-    if (prof_on_) prof_[prof_bucket()].cpu_rows += hx_rows_.size();
+    hx_stats_.rows += hx_rows_.size() - (size_t)appended;
+    if (prof_on_) prof_[prof_bucket()].cpu_rows += hx_rows_.size() - (size_t)appended;
     return RAD_OK;
 }
 
@@ -4279,8 +4344,16 @@ int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
         ++hx_stats_.d_waits[m];
         hx_stats_.d_wait_ns[m] += waited;
     }
+    /* The aux worker: its rows placed (or compared, or computed by the CPU from the kept leases) before the
+     * leases go back and before the copy below. */
+    if (aux_ && layer_rows(hx_li_) <= ds41aux::kMaxRows) aux_stats_.eligible_rows += hx_rows_.size();
+    if (aux_job_ != kAuxNone) RAD_TRY(aux_finish());
     for (int k = 0; k < hx_n_; ++k) mover_->release_host_unit(&hx_units_[k]);
     hx_n_ = 0;
+    for (int k = 0; k < aux_n_; ++k) mover_->release_host_unit(&aux_units_[k]);
+    aux_n_ = 0;
+    aux_list_.clear();
+    aux_take_ = false;
     hx_miss_.clear();
     hx_miss_ra_.clear();
     const int32_t li = hx_li_;
@@ -4359,6 +4432,9 @@ void FileStager::hx_drain() {
     hx_join_miss_post();   /* before hx_miss_ lets the planes go */
     if (hx_async_) (void)hx_mw_wait();
     if (hx_stage_ == 2 && hx_pool_) hx_pool_->wait(&hx_ticket_);
+    /* The aux worker's job is given up (its rows never read; the lane stays busy until it completes), its
+     * fallback's jobs waited for, and its leases go back: nothing of it touches the stager's buffers. */
+    aux_abandon();
     if (hx_reserved_ && hx_pool_) hx_pool_->unreserve(hx_reserved_);
     hx_reserved_ = 0;
     if (hx_units_)
@@ -4899,6 +4975,9 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
     }
     p1_lend_rec_ = false;
     RAD_TRY(p1_->lend_init(units, slots, at, t.grace_ms, why));
+    /* The units lent (the ring's and the arena's): never the aux expert worker's (p1_lent). */
+    p1_lent_.assign(plan_->units.size(), 0);
+    for (int i = 0; i < n; ++i) p1_lent_[(size_t)cand[(size_t)i]] = 1;
     if (at.empty()) (void)p1_->lender().begin_pass(false, p1_now_ms());   /* the first reloads begin now */
     if (plan_->rank == 0 && nk > 0) {
         double share = 0.0;
@@ -5064,6 +5143,9 @@ bool FileStager::p1_admits(int32_t li, int32_t e) const {
 }
 
 int FileStager::launched(rad_op h, RadStream, const RadArgs* a, int (*launch)(const RadArgs*, RadStream)) {
+    /* The aux worker relaunches the rows it resolved for these ops (aux_resolve): a launch of another row
+     * at a height it takes stops its jobs on this rank (stager_aux.cpp aux_guard). */
+    if (aux_ && (size_t)h < aux_op_.size() && aux_op_[(size_t)h] >= 0) aux_guard((int32_t)h, a, launch);
     if (!p1_armed_ || p1_li_ < 0) return RAD_OK;
     const size_t li = (size_t)p1_li_;
     const int32_t op = (int32_t)h;

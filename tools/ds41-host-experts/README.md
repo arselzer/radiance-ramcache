@@ -55,6 +55,8 @@ RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512          # with the prefix cac
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=32          # prefill: CPU jobs of up to 32 rows of one expert, many-row kernel
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=2048         # misses computed on the CPU in passes of up to 2048 tokens (>= the chunk with a lent arena)
 RADIANCE_EXPERIMENTAL_DS41_LCP=2048                         # large-chunk prefill: chunks of 2048 tokens (with --max-num-batched-tokens 2048)
+RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all                    # recommended 192 GiB cache: retain every unit a chunk uses (use 128 with smaller/changing budgets)
+RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=64                   # bounded insertion queue; zero drops in the 6.8K/48K qualification
 RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1                    # routed gemv: work split by row passes, all-dropped passes skipped (exact)
 RADIANCE_EXPERIMENTAL_DS41_P1=1                             # prefill Phase 1: layer passes of >= 320 rows (..._P1_MIN_ROWS) compute every routed expert on the cards (needs the libr4d whose P1 card check passed)
 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64                 # the activation arena's idle top holds ~42 decode residents a card between long prefills (needs the deepseek41 plugin from this tree and ..._EARLY_ISSUE=1)
@@ -143,7 +145,7 @@ instead of 279. Every held-out reply was identical to the base engine. The decod
 `..._VRAM_PACKED` and `..._ROUTER_BF16` measured 38.7 / 42.9 at 4 / 8 streams (ab-20261030T231526Z, before the
 upstream sync; not re-measured).
 
-**Long-prefill admission with a 192 GiB expert cache** (opt-in, four RX 9070 XT, C2 at 2,048-token chunks): add
+**Recommended admission with a 192 GiB expert cache** (four RX 9070 XT, C2 at 2,048-token chunks): the block above sets
 `RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all` and `RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=64`. Every expert unit a
 chunk selects can then enter the existing bounded RAM cache, instead of only units selected by its last 128 rows.
 Later chunks reuse those bytes rather than reading them again. Weights, routing and arithmetic are unchanged.
@@ -160,9 +162,10 @@ On the unchanged stable runtime f84b23db / libr4d 92bd7719, with a fixed 131,072
   all five captured full prefill digests matched too. Every admit-all rank reported zero insert-cap drops. Some
   experts were evicted, which is why the post-prefill decode guard is required.
 
-This recommendation is scoped to the tested 192 GiB cache and 6.8K/48K workloads. Keep default admission (`128`) for
-smaller or changing RAM budgets until separately measured; admit-all can thrash a smaller cache. The 100K and
-prefix-cached agent-harness extensions are not yet measured with admit-all. This does not change the engine default.
+This is the recommended default for the tested 192 GiB configuration. When reducing or changing its RAM-cache
+budget, also set `..._LCP_ADMIT=128` until separately measured; admit-all can thrash a smaller cache. The 100K and
+prefix-cached agent-harness extensions are not yet measured with admit-all. The engine's general fallback remains
+`128`, preserving existing configurations that do not select this profile.
 
 **4,096-token chunks** (opt-in, exact; for one stream prefilling uncached prompts well above 2,048 tokens, not for
 concurrent decode): `..._LCP=4096` with `--max-num-batched-tokens 4096`, `..._MISSES=4096` and

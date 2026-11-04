@@ -25,7 +25,7 @@ per-request decode rate.
 | decode, 8 streams, chat prompts | 38.4-38.9 tok/s | 45.8-46.5 tok/s |
 | agent-harness turns (13, prefix cache) | 61-63 s summed time to first token with Phase 1 read-ahead off (72 s with it on), decode 25-26 tok/s | decode 29.4-29.6 tok/s, all turns about 5-7% less time |
 
-- **Prefill**: optional admit-all at the tested 192 GiB expert-cache budget takes 6,817 tokens in
+- **Prefill**: recommended admit-all at the tested 192 GiB expert-cache budget takes 6,817 tokens in
   13.2 s and 47,917 in 61.8 s; fresh controls were 17.2 and 100.3 s, with identical replies and hashes
   and no post-prefill N8 decode regression. Default admission previously measured 48K/100K at
   115/222 s, or 77/165 s with 4,096-token chunks. Admit-all at 100K and on prefix-cached harness

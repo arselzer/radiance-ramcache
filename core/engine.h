@@ -39,6 +39,7 @@
 #include "format/table_share.h"
 #include "format/dspark_rad_banks.h"
 #include "place/vram_packed.h"
+#include "place/aux_expert_worker.h"
 #include "place/draft_vram.h"
 #include "place/draft_bank_lend.h"
 #include "lora/adapter.h"
@@ -783,6 +784,19 @@ private:
      * before anything loads: RAD_E_UNSUPPORTED with each one and its fix on an E line, or under
      * --proceed-with-incompatible-configuration each on a W line and the start goes on. */
     int check_configuration(const std::vector<int>& devs);
+    /* RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS (place/aux_expert_worker.h; off: nothing here runs).
+     * aux_discover, right after the devices are chosen: parse (a malformed value or a configuration the
+     * worker cannot serve refuses startup), the pin set, the decision, the arena reserved; any other "no"
+     * leaves the worker off with one line. aux_start, once every rank's stager is up: the unit set, lanes,
+     * load, tables and warm-up, then each rank's stager bound; a failure turns the worker off. aux_off:
+     * unbinds and frees it. aux_ledger_: the arena's bytes in the device ledger (counted even once freed),
+     * left out of the ranks' "device allocations" line. */
+    aux::Config                  aux_cfg_;
+    std::unique_ptr<aux::Worker> aux_;
+    int64_t                      aux_ledger_ = 0;
+    int  aux_discover(const std::vector<int>& devs);
+    int  aux_start();
+    void aux_off(const std::string& why, bool warn);
     /* Syscall-only facts (diag::probe_process), read once at the first report: the memlock limit
      * cannot change under a running process, and the io_uring probe need not repeat per
      * /diagnostics request. */

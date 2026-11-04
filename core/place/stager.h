@@ -93,6 +93,7 @@
 #include "hx_side_store.h"
 #include "readahead.h"
 #include "route_trace.h"
+#include "aux_expert_worker.h"
 #include "../sched/tbo.h"
 
 #include <algorithm>
@@ -556,8 +557,42 @@ public:
     //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
     int shutdown_head_cache();
 
+    /* ---- the aux expert worker (aux_expert_worker.h, stager_aux.cpp; nothing changes unless bound) --------
+     * aux_candidates  this rank's units the worker may hold (work/aux/SPEC.md §5.2): file-tier units of
+     *                 eligible trunk routed layers with the CPU path's decode shape, host-planes eligible,
+     *                 not in a slab, not lent to P1, of the two block sizes and not refused by the packed cache.
+     * aux_resolve     every such layer's gate_up, SwiGLU and down rows for the worker's heights (the band of
+     *                 each op's ranged M: 1..16 rows for the GEMMs, 1..96 for the SwiGLU), which must be
+     *                 moe_gemm_ggml_mxfp4_gemv_vp and swiglu_clamped_bf16, scratch-free and instance-free, and
+     *                 the weight-table operands as the issue path builds them. < 0 with *why otherwise.
+     * aux_load        `list` (in order) into the worker's slots [first, first + quota) through rank `r`'s lane:
+     *                 each unit from its packed RAM-cache slot (a read-only lease) or read and packed, copied,
+     *                 read back and compared; a unit that does not pack is skipped (the next one takes its
+     *                 place). Fills the rank's view. < 0 with *why: the worker goes off.
+     * aux_warm        one job through `lane` (the rank's first resident unit, one token row) whose rows must
+     *                 equal the CPU pool's for the same unit and row; it also loads libr4d's code object on the
+     *                 extra card before any pass.
+     * aux_bind / aux_unbind  from the engine once init ran / before the worker goes. */
+    int  aux_candidates(std::vector<ds41aux::Cand>* out) const;
+    int  aux_resolve(std::string* why);
+    struct AuxLoadStats {
+        int64_t loaded = 0, cached = 0, packed = 0, skipped = 0;
+        double  share = 0;
+    };
+    int  aux_load(aux::Worker* w, int r, const std::vector<int32_t>& list, int64_t first, int64_t quota,
+                  AuxLoadStats* st, std::string* why);
+    int  aux_warm(aux::Worker* w, int r, std::string* why);
+    void aux_bind(aux::Lane* lane, const aux::RankView* view, const aux::Config& cfg);
+    void aux_unbind();
+    bool aux_bound() const { return aux_ != nullptr; }
+    const aux::Stats& aux_stats() const { return aux_stats_; }
+    /* Whether unit u is lent to prefill Phase 1's ring or arena (p1_lend_init). */
+    bool p1_lent(int32_t u) const { return u >= 0 && (size_t)u < p1_lent_.size() && p1_lent_[(size_t)u] != 0; }
+    size_t aux_routed_layers() const { return layers_.size(); }
+
 private:
     friend struct EpCountsHostProbe;
+    friend struct AuxStagerProbe;
     using Layer = StagedLayer;
     std::vector<Layer>   layers_;      /* the routed layers with file-tier units, in first-op order */
     std::vector<int32_t> first_of_;    /* by op: the layer whose first op it is, or -1 */
@@ -852,6 +887,7 @@ private:
      * x .. off: the gate_up's operands as last issued. */
     struct HxOps {
         int32_t gu = -1;
+        int32_t sw = -1;                  /* the layer's swiglu_clamped op (the aux worker relaunches it) */
         int32_t gather[3] = { -1, -1, -1 };
         int64_t n_expert = 0, top_k = 0;
         const void* x = nullptr;
@@ -893,6 +929,51 @@ private:
     bool      hx_out_rec_ = false;
     int       hx_told_ = 0;
     HostStats hx_stats_;
+    /* ---- the aux expert worker's per-layer state (stager_aux.cpp; aux_ null: none of it runs) ---------
+     * hx_choose takes a layer of at most 16 rows of a trunk, non-draft pass while the lane is ready
+     * (aux_take_); in serve mode a selected resident unit's lease goes to aux_units_ (the base's admit, so
+     * the RAM cache's LRU evolves as in the base) and its slot code is -3: no pool job, no reservation, an
+     * alias like a CPU unit's. hx_submit compacts their slots (aux_prepare, before the pool's submit: its
+     * count check may refuse the layer) and queues the lane's job after the pool's (aux_submit, which never
+     * fails: a failed job's rows are the CPU's at the gather). hx_finish places the rows, compares them in
+     * verify mode, or computes them on the CPU from the kept leases (aux_finish); hx_drain gives a job in
+     * flight up (aux_abandon). */
+    aux::Lane*           aux_ = nullptr;
+    const aux::RankView* aux_view_ = nullptr;
+    bool    aux_verify_ = false;
+    int64_t aux_deadline_ns_ = 0;
+    int64_t aux_force_late_ = 0;      /* ..._AUX_FORCE_LATE: every Nth job abandoned as late */
+    uint64_t aux_seq_ = 0;            /* jobs submitted, for the forced lateness */
+    bool    aux_pass_ = false;        /* this pass may take jobs (begin_pass) */
+    bool    aux_take_ = false;        /* this layer's job is taken (hx_choose) */
+    std::unique_ptr<Mover::HostUnit[]> aux_units_;
+    int     aux_n_ = 0;               /* serve mode: aux_units_ leased */
+    std::vector<int32_t> aux_list_;   /* the units of this layer's job */
+    ds41aux::Compact aux_cmp_;        /* their compacted slots (row_of: the sorted rows) */
+    enum { kAuxNone = 0, kAuxPending = 1, kAuxFailed = 2, kAuxForced = 3 };
+    int     aux_job_ = kAuxNone;
+    int64_t aux_t0_ns_ = 0;
+    HostExpertPool::Ticket aux_ticket_;   /* the fallback's jobs (hx_drain waits for them) */
+    bool    aux_fb_ = false;
+    std::vector<HostExpertPool::Job> aux_fb_jobs_;
+    std::vector<int32_t> aux_op_;     /* by op: li * 3 + k (gate_up 0, SwiGLU 1, down 2), or -1 */
+    /* By routed layer: the rows a job relaunches by height (index M: 1..16 for the GEMMs, 1..96 for the
+     * SwiGLU), the weight-table operands' descriptors (data set per job), and whether the layer is usable. */
+    struct AuxRows {
+        std::vector<const Resolved*> gu, sw, dn;
+        RadTensor gu_w{}, dn_w{};
+        bool ok = false;
+    };
+    std::vector<AuxRows> aux_rows_;
+    bool    aux_guard_bad_ = false;   /* a launch the rank made was not the resolved row: no more jobs */
+    aux::Stats aux_stats_;
+    int  aux_prepare(int* appended);
+    void aux_submit();
+    int  aux_finish();
+    void aux_abandon();
+    int  aux_fallback();
+    void aux_guard(int32_t op, const RadArgs* a, int (*launch)(const RadArgs*, RadStream));
+    std::vector<uint8_t> p1_lent_;    /* by plan unit: lent to P1's ring or arena (p1_lend_init) */
     int  hx_init(const Program& prog);
     int  hx_init_impl(const Program& prog);
     /* The first pass's CPU work, at its gate_up's operands (start_ep_routed deferred it). */
@@ -940,6 +1021,9 @@ private:
     void hx_choose(int32_t li);
     int  hx_submit();
     int  hx_jobs_for(int e, const HostExpertPool::Job& proto);
+    /* hx_jobs_for into other vectors: `rows` null appends no row (the aux fallback's rows are in hx_rows_). */
+    int  hx_jobs_into(int e, const HostExpertPool::Job& proto, std::vector<HostExpertPool::Job>* jobs,
+                      std::vector<int32_t>* rows);
     int  hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t);
     int  hx_finish(RadStream s, const RadTensor* t, int n_t);
     void hx_drain();

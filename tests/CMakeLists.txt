@@ -548,6 +548,12 @@ set_tests_properties(ab_window_shared_test PROPERTIES LABELS "unit;fast" TIMEOUT
 add_test(NAME ab_window_ba_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_ba_test.sh)
 set_tests_properties(ab_window_ba_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# ab_window.sh's aux expert worker parts (Ax / AxN / Axv / Ax0 / AxfN): the arm loop with every action stubbed,
+# arm()'s startup-line guards on lines in the engine's format, aux_find on fabricated KFD topologies, the extra
+# card's client and exit gates, and the DEVICE_CHECKS=aux section with stub checks. No card, no server, no model.
+add_test(NAME ab_window_aux_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_aux_test.sh)
+set_tests_properties(ab_window_aux_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 
 # ================================================================== libr4d's kernels, on the host
 #

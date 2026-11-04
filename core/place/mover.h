@@ -854,6 +854,11 @@ public:
      * file stager refuses it unless the CPU computes every routed unit (..._FILE_BUFFER_UNITS).
      * ..._PACKED_CACHE_RAW=<gate_up>,<down>: the raw rounds a slot holds (see mover.cpp). */
     bool  packed_cache() const { return mapped_file_cache_on_ && mapped_file_cache_.packed(); }
+    /* The packed cache's slot size of class `klass` (0 gate_up, 1 down), what a borrow's slot[] says; 0
+     * without the packed cache (the aux expert worker's slot layout, core/place/aux_expert_worker.h). */
+    int64_t packed_slot_bytes(int klass) const {
+        return packed_cache() && (klass == 0 || klass == 1) ? (int64_t)mapped_file_cache_.slot_bytes()[(size_t)klass] : 0;
+    }
     /* One gate_up and one down slot of the mapped cache's slabs, with their guards. */
     int64_t mapped_pair_bytes() const;
     /* Pins the mapped cache's slabs (as ..._PREGROW does; again adds nothing) and returns the

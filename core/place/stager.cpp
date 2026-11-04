@@ -2015,6 +2015,8 @@ void FileStager::lcp_report() const {
 }
 
 int FileStager::hx_init_impl(const Program& prog) {
+    /* A re-run of init drops the aux worker's binding: the engine binds after init (aux_bind). */
+    if (aux_) aux_unbind();
     hx_drain();
     hx_pool_ = nullptr;
     hx_defer_ok_ = false;
@@ -2065,8 +2067,10 @@ int FileStager::hx_init_impl(const Program& prog) {
         for (int32_t h = L.first_op + 1; h < L.last_op; ++h) {
             const OpInfo& op = prog.ops[(size_t)h];
             double v = 0;
-            if (op.op == "swiglu_clamped")
+            if (op.op == "swiglu_clamped") {
                 limit = op.base.get_f("limit", &v) && (float)v == pool->limit();
+                o.sw = h;   /* the aux expert worker relaunches it (aux_resolve) */
+            }
         }
         /* Every reader of the down rows up to the next routed layer must be one of these: up to
          * the next layer staged here, or the next MoE block this stager does not stage (a DSpark
@@ -4899,6 +4903,9 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
     }
     p1_lend_rec_ = false;
     RAD_TRY(p1_->lend_init(units, slots, at, t.grace_ms, why));
+    /* The units lent (the ring's and the arena's): never the aux expert worker's (p1_lent). */
+    p1_lent_.assign(plan_->units.size(), 0);
+    for (int i = 0; i < n; ++i) p1_lent_[(size_t)cand[(size_t)i]] = 1;
     if (at.empty()) (void)p1_->lender().begin_pass(false, p1_now_ms());   /* the first reloads begin now */
     if (plan_->rank == 0 && nk > 0) {
         double share = 0.0;

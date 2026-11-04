@@ -181,6 +181,8 @@ Engine::~Engine() {
                      (unsigned long long)hx.moved, (unsigned long long)hx.probed,
                      (unsigned long long)hx.miss_units, (unsigned long long)hx.miss_rows,
                      (double)hx.miss_read_ns / 1e6);
+        /* RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS (place/aux_expert_worker.h): this rank's jobs. */
+        if (r->fstager.aux_bound()) RAD_INFO("%s", aux::stats_line(r->index, r->fstager.aux_stats()).c_str());
         if (hx.d_waits[0] || hx.d_waits[1])
             RAD_INFO("host experts, one-token passes: %llu gathers without a miss waited %.1f ms for the "
                      "CPU's rows (%.1f us each), %llu with one %.1f ms (%.1f us each)",
@@ -460,6 +462,22 @@ Engine::~Engine() {
                      (unsigned long long)t.uncaptured, (unsigned long long)t.biases,
                      (unsigned long long)t.copy_failed);
         }
+    }
+    /* RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS: the process line (its lanes drained, at most 2 s each), then
+     * every stager unbound and the worker freed, before the ranks (whose leases and buffers it uses) go. */
+    if (aux_) {
+        uint64_t jobs = 0, rows = 0, late = 0;
+        for (auto& r : ranks_)
+            if (r && r->fstager.aux_bound()) {
+                const aux::Stats& s = r->fstager.aux_stats();
+                jobs += s.jobs;
+                rows += s.placed;
+                late += s.late;
+            }
+        for (auto& r : ranks_)
+            if (r) r->fstager.aux_unbind();
+        RAD_INFO("%s", aux_->finish(jobs, rows, late).c_str());
+        aux_.reset();
     }
     /* The route trace's files: everything the ranks and the step loop recorded is written before
      * the line that counts it (the writer joined). */

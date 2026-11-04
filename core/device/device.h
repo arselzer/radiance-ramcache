@@ -381,10 +381,35 @@ struct DeviceBackend {
     void    (*live_open)(RadStream s, uint64_t tag, uint64_t at, int permit);
     void    (*live_close)(uint64_t* first, int32_t* packets, int* flags);
     void    (*live_stamp)(int on, uint64_t pass, const char* path);
+
+    /* ---- the pin set (dev_pin_devices below; the aux expert worker, core/place/aux_expert_worker.h).
+     * Last in the table, so the positional backends leave them null; a backend without them maps pinned
+     * memory on every device, and the worker stays off.
+     * `pin_devices`: the devices pinned host memory is mapped to from here on (every device until
+     * called; a set of every device is that too). RAD_E_INVAL for an ordinal out of range, RAD_E_STATE
+     * when a pinned range exists already and the set differs from the current one.
+     * `alloc_pinned_on`: pinned host memory mapped on the devices named only (RAD_MEM_HOST_PINNED, freed
+     * by rad_dev_free with that kind); a copy on another device's stream naming it is refused.
+     * `device_faulted`: 1 when a device outside a restricting set faulted (a queue fault, a memory
+     * fault or a hardware exception): such a fault is that device's alone, never the process's. */
+    int     (*pin_devices)(const int* ords, int n);
+    void*   (*alloc_pinned_on)(int64_t bytes, const int* ords, int n);
+    int     (*device_faulted)(int device);
 };
 
 
 const DeviceBackend* host_backend(void);
+
+/* The pin set (DeviceBackend::pin_devices). dev_pin_devices: RAD_E_UNSUPPORTED from a backend without
+ * the entry; dev_pin_restricted: a set that leaves a device out took effect; dev_alloc_pinned_on: null
+ * without the entry; dev_faulted: false without it. */
+int     dev_pin_devices(const std::vector<int>& ords);
+bool    dev_pin_restricted();
+void*   dev_alloc_pinned_on(int64_t bytes, const std::vector<int>& ords);
+bool    dev_faulted(int device);
+/* The host backend's record of a pinned allocation's devices, a bit per ordinal (0: not a pinned
+ * allocation of that backend): for tests (aux_stager_test) of the pin set without a card. */
+uint64_t host_pinned_devices(const void* p);
 
 /* The current backend's recorded passes; RAD_E_UNSUPPORTED (or null) from one that has none. */
 bool    tape_supported();

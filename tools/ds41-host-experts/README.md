@@ -849,6 +849,57 @@ rows the CPU recomputed, launch failures, verify counts) and
 `aux_compact_test`, `aux_stager_test` (switch-off identity, the deadline fallback, the pin set on the host backend),
 `r4d_emu_ds41aux` and `r4d_emu_ds41aux_tail` (the compacted launches on the emulator), `ab_window_aux_test.sh`.
 
+### Sharing the card, and the online unit set (experimental, not yet measured on a card)
+
+Branch `claude/ds41-aux-dynamic` (work/aux-dyn/SPEC.md). Both are off unless asked for; unset, the worker above is
+unchanged. They share one control thread (core/place/aux_control.h), one slot pool and one step-boundary hand-off.
+
+**Use the card only when it is free.** `RADIANCE_EXPERIMENTAL_DS41_AUX_SHARE=allow` (the box's policy: serve while every
+other process on the card matches `..._SHARE_ALLOW`, default `^whisper`, and together they hold at most
+`..._SHARE_FOREIGN_MIB`, 6144) or `exclusive` (no other process at all). The server watches the card's KFD clients and
+VRAM counters through sysfs every `..._SHARE_POLL_MS` (100): a process the policy refuses releases the card at the first
+poll that sees it (any process holding 1 MiB there, `..._SHARE_MIN_MIB`, is a client: ROCr's own setup takes ~4.4 MB),
+the card's free VRAM under `..._SHARE_FLOOR_MIB` (1024) for 2 polls does too. A release shuts the ranks out of the card
+within one layer (their layers go to the CPU path, as declined layers do), waits for every job on the card, and frees
+the 26 GB arena; the replies are the CPU path's throughout. Once the card has been free for `..._SHARE_REACQUIRE_S`
+(60; doubled after a release within 10 minutes of an acquire, up to 16x) the server reserves the arena again, warms
+each lane against the CPU's rows and refills the unit set at `..._SHARE_FILL_MBPS` (3000), serving from the first unit
+of each rank. A server that finds the card busy at startup starts released and acquires later.
+
+**Manual control.** `RADIANCE_EXPERIMENTAL_DS41_AUX_CONTROL=<path>` (works with any policy, `always` too): write `off`,
+`on` or `auto` into `<path>` (best through a temp file and `mv`); `<path>.state` says what the server does
+(`starting`, `serving`, `draining`, `released`, `loading`, `dead freed`, `dead held <MiB>`, `stopped`, with the time,
+the server's pid and start time, the mode and why). For a job that needs the card's memory:
+
+```
+tools/ds41-host-experts/aux_yield.sh <path> [timeout s, 60] -- python3 train_fig.py ...
+```
+
+holds the card (a flocked holder under `<path>.d/`) for the command's life, starts the command only once the state file
+says the arena is freed (`released`, `dead freed`, `stopped`, or no server), and refuses (exit 3, 4) when the card stays
+held (`dead held`: until the server restarts) or the timeout passes. Without it, a job that allocates more than the
+card's free VRAM within the release's fraction of a second can fail its first allocation.
+
+**The online unit set.** `RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE=1`: the set starts as the sealed one and follows the
+traffic: each rank counts the rows its passes of at most 16 rows route to each candidate unit, the control thread keeps
+decayed scores (half-life 512 tokens, the sealed profile as a 256-token prior) and swaps up to 2 units a token
+(`..._ONLINE_RATE` 200 per 100 tokens) within each rank's quota, copying each new unit from its RAM-cache slot into one
+of 16 spare slots on a copy queue of its own (read back on a sample), flipping both units at the next step boundary.
+Replay of the Oct 29 traces under the engine's exact rule (work/aux-dyn/replay/q5_engine_rule.py; plan L1024, 1,513
+slots): absorption of CPU-path decode rows 40.1 / 41.9% held-out / chat at 8 streams against the static set's 30.1 /
+21.6%, 36.1 / 38.0% at one stream. Expected decode gain (the measured elasticity, net of the copies): +4..+8%
+held-out, +17..+21% chat at 8 streams. `..._ONLINE_DRY=1` runs the copies without flipping (their cost alone).
+
+Startup lines `aux experts: sharing: policy ...`, `aux experts: online set: ...` (or `aux experts: released at start:
+<why>; ...`); transitions `aux experts: releasing (...)`, `released in T ms (...)`, `acquiring (...)`,
+`serving again in T s`, `full set in T s`; shutdown lines `aux experts: sharing: R releases (...), A acquires ...` and
+`aux experts: online: D decisions, S swaps (...), R read back (0 differ), ...`. Harness parts `AxS` / `AxSx`, `AxO` /
+`AxON` / `AxOd`, `AxT` / `AxTN` (the control file toggled every N/2 s), `AxF` / `AxFN` (a simulated tenant, aux_tenant).
+Tests: `aux_share_test`, `aux_online_test` (the C++ planner against the replay, swap for swap), `aux_fence_test` (the
+control thread, worker and lanes on the host backend: jobs never read a slot or table entry being rewritten, through
+swaps, releases and reacquires), the `aux_stager_test` additions, `ab_window_aux_test.sh` §11; the card check
+`ds41_mxfp4_device_check ... auxswap` (window only).
+
 ## The lossy track: routing trace and quality harness
 
 Exact past ~18-19 tok/s means more RAM, a second drive, or giving up exactness on misses

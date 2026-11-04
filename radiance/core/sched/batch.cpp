@@ -1139,8 +1139,10 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
      * (StepEntry::consumer_ckpt; "complete checkpoints"). A chunk of such a prompt in a step
      * with anything else beside it (decode rows, another chunk, encoder or scored rows) runs every
      * layer, which is the base engine's step; the scheduler's startup refuses the deployments
-     * where that can happen (Scheduler::init), so `shared` stays 0. The prompt's last chunk holds
-     * its target's row and is never cut. */
+     * where that can happen (Scheduler::init), so `shared` stays 0, but for the steps of whole
+     * prompts admitted together (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT), which run uncut and are
+     * counted here (one pass; under the per-row cut, every entry's rows in full). The prompt's last
+     * chunk holds its target's row and is never cut. */
     int32_t cs_full = 0;
     int64_t cs_end = 0;
     const int32_t* cs_row0 = nullptr;
@@ -1238,8 +1240,12 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 ++cs_stats_.shared;
             }
             if (!cut) {
+                /* Every layer ran on every row of the step: a shared step's rows are every entry's
+                 * (the whole prompts admitted together), not the first's alone. */
+                int64_t step_rows = 0;
+                for (const StepEntry& x : plan.e) step_rows += x.n_tokens;
                 cs_stats_.full += (uint64_t)nl;
-                cs_stats_.rows_full += (uint64_t)(nl * rows);
+                cs_stats_.rows_full += (uint64_t)(nl * step_rows);
             }
         }
     }

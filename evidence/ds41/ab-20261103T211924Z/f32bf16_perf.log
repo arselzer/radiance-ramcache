@@ -1,0 +1,100 @@
+  ok    gemm_nt_f32 at M=1 N=384 K=5120: byte-identical to the host arithmetic
+
+gemm_nt_f32  N=384 K=5120 M=1  7.50 MiB weight, 35 copies, 200 iters
+  rule          20.4 us    386.8 GB/s    0.19 TFLOP/s
+  ok    gemm_nt_f32bf16 at M=1 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+
+gemm_nt_f32 / gemm_nt_f32bf16  N=384 K=5120 M=1  7.50 / 3.75 MiB weight, 64 copies, 200 iters
+  rule     f32     20.4 us   386.8 GB/s   bf16 halves     14.4 us   273.1 GB/s
+  ok    gemm_nt_f32bf16 form 4x1 at M=1 N=384 K=5120: byte-identical
+  4x1      f32     35.0 us   225.0 GB/s   bf16 halves     26.1 us   151.0 GB/s
+  ok    gemm_nt_f32bf16 form 2x2x16 at M=1 N=384 K=5120: byte-identical
+  2x2x16   f32     20.3 us   388.4 GB/s   bf16 halves     14.6 us   270.9 GB/s
+  ok    gemm_nt_f32bf16 form 8x1x8 at M=1 N=384 K=5120: byte-identical
+  8x1x8    f32     22.7 us   346.7 GB/s   bf16 halves     57.8 us    68.2 GB/s
+  ok    gemm_nt_f32bf16 form 8x4 at M=1 N=384 K=5120: byte-identical
+  8x4      f32     44.0 us   178.8 GB/s   bf16 halves     35.4 us   111.5 GB/s
+  ok    gemm_nt_f32bf16 form 1x2x16 at M=1 N=384 K=5120: byte-identical
+  1x2x16   f32     20.3 us   387.6 GB/s   bf16 halves     14.3 us   276.2 GB/s
+  ok    gemm_nt_f32bf16 form 1x2x32 at M=1 N=384 K=5120: byte-identical
+  1x2x32   f32     34.2 us   230.0 GB/s   bf16 halves     28.5 us   138.5 GB/s
+  ok    gemm_nt_f32bf16 form 2x2x32 at M=1 N=384 K=5120: byte-identical
+  2x2x32   f32     38.8 us   203.2 GB/s   bf16 halves     53.6 us    73.5 GB/s
+  ok    gemm_nt_f32bf16 form 1x4x16 at M=1 N=384 K=5120: byte-identical
+  1x4x16   f32     34.8 us   226.3 GB/s   bf16 halves     30.4 us   129.6 GB/s
+perff32 384 1 exit 0
+  ok    gemm_nt_f32 at M=16 N=384 K=5120: byte-identical to the host arithmetic
+
+gemm_nt_f32  N=384 K=5120 M=16  7.50 MiB weight, 35 copies, 200 iters
+  rule          25.6 us    314.1 GB/s    2.45 TFLOP/s
+  ok    gemm_nt_f32bf16 at M=16 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+
+gemm_nt_f32 / gemm_nt_f32bf16  N=384 K=5120 M=16  7.50 / 3.75 MiB weight, 64 copies, 200 iters
+  rule     f32     25.4 us   317.0 GB/s   bf16 halves     20.1 us   205.2 GB/s
+  ok    gemm_nt_f32bf16 form 4x1 at M=16 N=384 K=5120: byte-identical
+  4x1      f32     36.8 us   219.1 GB/s   bf16 halves     36.8 us   112.0 GB/s
+  ok    gemm_nt_f32bf16 form 2x2x16 at M=16 N=384 K=5120: byte-identical
+  2x2x16   f32     25.3 us   318.5 GB/s   bf16 halves     21.0 us   196.6 GB/s
+  ok    gemm_nt_f32bf16 form 8x1x8 at M=16 N=384 K=5120: byte-identical
+  8x1x8    f32     25.0 us   321.6 GB/s   bf16 halves    130.0 us    31.7 GB/s
+  ok    gemm_nt_f32bf16 form 8x4 at M=16 N=384 K=5120: byte-identical
+  8x4      f32     54.9 us   146.7 GB/s   bf16 halves     51.6 us    79.9 GB/s
+  ok    gemm_nt_f32bf16 form 1x2x16 at M=16 N=384 K=5120: byte-identical
+  1x2x16   f32     35.6 us   226.4 GB/s   bf16 halves     25.8 us   160.0 GB/s
+  ok    gemm_nt_f32bf16 form 1x2x32 at M=16 N=384 K=5120: byte-identical
+  1x2x32   f32     52.1 us   154.6 GB/s   bf16 halves     45.2 us    91.1 GB/s
+  ok    gemm_nt_f32bf16 form 2x2x32 at M=16 N=384 K=5120: byte-identical
+  2x2x32   f32     49.8 us   161.6 GB/s   bf16 halves     63.4 us    65.0 GB/s
+  ok    gemm_nt_f32bf16 form 1x4x16 at M=16 N=384 K=5120: byte-identical
+  1x4x16   f32     40.2 us   200.3 GB/s   bf16 halves     31.6 us   130.4 GB/s
+perff32 384 16 exit 0
+  ok    gemm_nt_f32 at M=1 N=1024 K=5120: byte-identical to the host arithmetic
+
+gemm_nt_f32  N=1024 K=5120 M=1  20.00 MiB weight, 13 copies, 200 iters
+  rule          40.6 us    517.4 GB/s    0.26 TFLOP/s
+  ok    gemm_nt_f32bf16 at M=1 N=1024 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+
+gemm_nt_f32 / gemm_nt_f32bf16  N=1024 K=5120 M=1  20.00 / 10.00 MiB weight, 26 copies, 200 iters
+  rule     f32     40.7 us   515.9 GB/s   bf16 halves     24.2 us   433.2 GB/s
+  ok    gemm_nt_f32bf16 form 4x1 at M=1 N=1024 K=5120: byte-identical
+  4x1      f32     46.0 us   456.2 GB/s   bf16 halves     29.4 us   356.7 GB/s
+  ok    gemm_nt_f32bf16 form 2x2x16 at M=1 N=1024 K=5120: byte-identical
+  2x2x16   f32     40.6 us   517.4 GB/s   bf16 halves     24.5 us   428.9 GB/s
+  ok    gemm_nt_f32bf16 form 8x1x8 at M=1 N=1024 K=5120: byte-identical
+  8x1x8    f32     41.5 us   505.9 GB/s   bf16 halves     67.0 us   156.7 GB/s
+  ok    gemm_nt_f32bf16 form 8x4 at M=1 N=1024 K=5120: byte-identical
+  8x4      f32     50.6 us   415.1 GB/s   bf16 halves     39.4 us   266.8 GB/s
+  ok    gemm_nt_f32bf16 form 1x2x16 at M=1 N=1024 K=5120: byte-identical
+  1x2x16   f32     40.8 us   514.9 GB/s   bf16 halves     24.4 us   429.6 GB/s
+  ok    gemm_nt_f32bf16 form 1x2x32 at M=1 N=1024 K=5120: byte-identical
+  1x2x32   f32     53.0 us   395.7 GB/s   bf16 halves     38.8 us   270.9 GB/s
+  ok    gemm_nt_f32bf16 form 2x2x32 at M=1 N=1024 K=5120: byte-identical
+  2x2x32   f32     57.1 us   367.4 GB/s   bf16 halves     54.2 us   193.6 GB/s
+  ok    gemm_nt_f32bf16 form 1x4x16 at M=1 N=1024 K=5120: byte-identical
+  1x4x16   f32     52.1 us   402.9 GB/s   bf16 halves     38.7 us   271.5 GB/s
+perff32 1024 1 exit 0
+  ok    gemm_nt_f32 at M=16 N=1024 K=5120: byte-identical to the host arithmetic
+
+gemm_nt_f32  N=1024 K=5120 M=16  20.00 MiB weight, 13 copies, 200 iters
+  rule         100.4 us    211.2 GB/s    1.67 TFLOP/s
+  ok    gemm_nt_f32bf16 at M=16 N=1024 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+
+gemm_nt_f32 / gemm_nt_f32bf16  N=1024 K=5120 M=16  20.00 / 10.00 MiB weight, 26 copies, 200 iters
+  rule     f32    100.4 us   211.1 GB/s   bf16 halves     47.2 us   226.8 GB/s
+  ok    gemm_nt_f32bf16 form 4x1 at M=16 N=1024 K=5120: byte-identical
+  4x1      f32     97.3 us   217.8 GB/s   bf16 halves     74.6 us   143.6 GB/s
+  ok    gemm_nt_f32bf16 form 2x2x16 at M=16 N=1024 K=5120: byte-identical
+  2x2x16   f32    100.6 us   210.7 GB/s   bf16 halves     47.4 us   226.1 GB/s
+  ok    gemm_nt_f32bf16 form 8x1x8 at M=16 N=1024 K=5120: byte-identical
+  8x1x8    f32     56.9 us   372.7 GB/s   bf16 halves    152.1 us    70.5 GB/s
+  ok    gemm_nt_f32bf16 form 8x4 at M=16 N=1024 K=5120: byte-identical
+  8x4      f32     71.2 us   297.8 GB/s   bf16 halves     59.8 us   179.1 GB/s
+  ok    gemm_nt_f32bf16 form 1x2x16 at M=16 N=1024 K=5120: byte-identical
+  1x2x16   f32    192.6 us   110.1 GB/s   bf16 halves     64.6 us   165.8 GB/s
+  ok    gemm_nt_f32bf16 form 1x2x32 at M=16 N=1024 K=5120: byte-identical
+  1x2x32   f32    148.8 us   142.5 GB/s   bf16 halves    103.1 us   103.9 GB/s
+  ok    gemm_nt_f32bf16 form 2x2x32 at M=16 N=1024 K=5120: byte-identical
+  2x2x32   f32    119.5 us   177.4 GB/s   bf16 halves    123.1 us    87.1 GB/s
+  ok    gemm_nt_f32bf16 form 1x4x16 at M=16 N=1024 K=5120: byte-identical
+  1x4x16   f32     93.2 us   227.4 GB/s   bf16 halves     75.9 us   141.2 GB/s
+perff32 1024 16 exit 0

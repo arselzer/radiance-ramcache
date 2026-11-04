@@ -1,0 +1,7 @@
+lsparse W=32769 (ratio 1, positions 32512..32767, 256 rows): index_score 0, index_candidates 0, index_topk 0 (with keep 0), attn_sparse_sink (16, 32 heads) 0 differing values against rows alone, 16 at a time and as suffixes; host top-k 0, unfilled 0, score shape 0
+lsparse W=65537 (ratio 2, positions 130816..131071, 256 rows): index_score 0, index_topk 0, attn_sparse_sink (16, 32 heads) 0 differing values against rows alone, 16 at a time and as suffixes; host top-k 0, unfilled 0, score shape 0
+lsparse W=131073 (ratio 1, positions 130816..131071, 256 rows): index_score 0, index_candidates 0, index_topk 0 (with keep 0), attn_sparse_sink (16, 32 heads) 0 differing values against rows alone, 16 at a time and as suffixes; host top-k 0, unfilled 0, score shape 0
+lsparse W=262145 (ratio 2, positions 524032..524287, 256 rows): index_score 0, index_topk 0, attn_sparse_sink (16, 32 heads) 0 differing values against rows alone, 16 at a time and as suffixes; host top-k 0, unfilled 0, score shape 0
+lsparse W=524289 (ratio 1, positions 524032..524287, 256 rows): index_score 0, index_candidates 0, index_topk 0 (with keep 0), attn_sparse_sink (16, 32 heads) 0 differing values against rows alone, 16 at a time and as suffixes; host top-k 0, unfilled 0, score shape 0
+lsparse: PASS: index_score, index_candidates, index_topk and attn_sparse_sink at index widths 32769:1 65537:2 131073:1 262145:2 524289:1 keep the chunk's bits in 4480 rows launched alone, 16 at a time and as suffixes; host top-k equal
+lsparse exit 0

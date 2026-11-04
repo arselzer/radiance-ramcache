@@ -1,0 +1,8 @@
+Warning: Resource leak detected by SharedSignalPool, 77 Signals leaked.
+  sNaN up:  gate 0x0000 up 0x7f81  host 0x0000  card 0x8000
+  sNaN up:  gate 0x0001 up 0x7f81  host 0x0005  card 0x8005
+  sNaN up:  gate 0x0002 up 0x7f81  host 0x000a  card 0x800a
+  sNaN up:  gate 0x0003 up 0x7f81  host 0x000f  card 0x800f
+swiglu_clamped: 2202009600 (gate, up) pairs, 8257410 differing: 8257410 with a signaling-NaN up (of 8257536 such pairs), 0 others; table written to build/ab-20261103T230607Z/silu_recheck.bin
+PASS: host swiglu with the captured table equals libr4d's for every bf16 input but a signaling-NaN up, which a gate_up row never holds
+swiglu exit 0

@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "0fb1f93e5aebc9b71f3aedb692509bbc6e58fb6d",
+  "engine_commit": "ca5b1a3bfcb5a8bb3f73acc00e31ab49eb6df601",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -46,7 +46,10 @@
     "SECOND-SERVER.md",
     "PREFILL-QA0-20261102.md",
     "PREFILL-QA0-20261103.md",
-    "PREFILL-QW-20261103.md"
+    "PREFILL-QW-20261103.md",
+    "RESEARCH-20261103.md",
+    "UPSTREAM-SYNC-20261103.md",
+    "LONGCTX-FIFTHCARD-20261103.md"
   ],
   "research": [
     "ds41_supply_model.py",
@@ -218,7 +221,11 @@
     "ab-20261103T090558Z",
     "ab-20261103T110235Z",
     "ab-20261103T114720Z",
-    "ab-20261103T143939Z"
+    "ab-20261103T143939Z",
+    "ab-20261103T211924Z",
+    "ab-20261103T221104Z",
+    "ab-20261103T230607Z",
+    "ab-20261104T003545Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",
@@ -258,7 +265,9 @@
     "ab-20261103T090558Z": "bf16 routers and packed residents under Phase 1, and 4,096-token chunks, on the stable build",
     "ab-20261103T110235Z": "the gates for bf16 routers and packed residents: logits, prefill hashes, harness turns, one stream",
     "ab-20261103T114720Z": "the clean 6,817-token re-measure",
-    "ab-20261103T143939Z": "startup cache fill, GPU clocks and memory compaction"
+    "ab-20261103T143939Z": "startup cache fill, GPU clocks and memory compaction",
+    "ab-20261103T230607Z": "batch admission: scheduler lines and prefill hashes",
+    "ab-20261104T003545Z": "long context: kv budgets, prefill hashes, lsparse card check"
   },
   "allowed_emails": [
     "aselzer3@gmail.com",

@@ -18,6 +18,10 @@
                                           PREFILL_HASH, the Kh part) equal the first arm's, every KV
                                           group of every rank and the last row's logits; on a
                                           difference, the groups, ranks and window layers that differ
+  ab_requests.py --hashes-ref KHREF DIR ARM...
+                                          the same against a reference recorded in another run (a
+                                          <name>-khref.json, make_longctx_receipts.py), and each of
+                                          its requests' replies against the reference's text
   ab_requests.py --kld-corpus OUT MAXCHARS RECEIPT...
                                           a --kld-corpus (JSONL) of the receipts' text prompts
                                           (chat_text, or a string prompt) of at most MAXCHARS
@@ -36,6 +40,11 @@
   ab_requests.py --kld-compare REF DIR    two --kld-record directories byte for byte: every
                                           position's log-probabilities, top entries and row values
                                           (exit 1 when any differ, naming the first positions)
+
+Each timed request (RECEIPT URL N OUT) times out after AB_REQUEST_TIMEOUT_S seconds (600 by default;
+ab_window.sh raises it for a receipt that declares long prompts, its max_context_tokens). A receipt's
+`provenance` may give each request's prompt_tokens (the model's tokenizer, make_longctx_receipts.py):
+the server's count is printed beside it.
 
 A request is a completion body, with its prompt as text or token ids, or one of:
   chat_text   one user message in DeepSeek-V4.1's chat framing (BOS, <|User|>, the text,
@@ -74,6 +83,7 @@ Validation (exact arm against itself): every forced token followed, every positi
 (ids, logprobs and top K), KL 0 and top-1 agreement 100%.
 """
 import glob
+import hashlib
 import json
 import math
 import os
@@ -91,6 +101,20 @@ def post(url, path, body, timeout=900):
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
+
+
+def request_timeout():
+    """The timed requests' timeout in seconds: AB_REQUEST_TIMEOUT_S, 600 when unset or empty (a
+    100K-token prefill takes ~5 min at large chunks, a 32K one ~15 min at 16-token passes, so
+    ab_window.sh sets it for a receipt of long prompts). Anything but a positive number raises
+    ValueError."""
+    v = os.environ.get("AB_REQUEST_TIMEOUT_S", "").strip()
+    if not v:
+        return 600.0
+    t = float(v)
+    if not (math.isfinite(t) and t > 0):
+        raise ValueError("AB_REQUEST_TIMEOUT_S=%r is not a positive number of seconds" % v)
+    return t
 
 
 # DeepSeek-V4.1's chat tokens, as the held-out prompts use them.
@@ -180,9 +204,9 @@ def family(b):
     return b.get("domain") or b.get("family") or b["name"].rsplit("-", 1)[0]
 
 
-def one(b, url, replies=None):
+def one(b, url, replies=None, timeout=600.0):
     """Sends one request of the receipt; the row saved for it. `replies`: earlier requests' rows
-    by name, for chat_turns' assistant_from."""
+    by name, for chat_turns' assistant_from; `timeout` in seconds (request_timeout())."""
     prompt_ids = None
     sent_back = []
     if "chat_turns" in b["request"]:
@@ -196,7 +220,7 @@ def one(b, url, replies=None):
     body, chat = framed(b, url, prompt_ids)   # a chat request goes through the server's chat template
     t0 = time.time()
     try:
-        resp = post(url, "/v1/chat/completions" if chat else "/v1/completions", body, 600)
+        resp = post(url, "/v1/chat/completions" if chat else "/v1/completions", body, timeout)
     except Exception as e:  # recorded, the next request still runs
         resp = {"error": repr(e)}
     wall = time.time() - t0
@@ -221,18 +245,26 @@ def one(b, url, replies=None):
 def run(receipt, url, n, out):
     """One request at a time, or with AB_CONCURRENCY=K in waves of K sent together; each wave's
     wall time and generated tokens are kept for the aggregate rate."""
-    reqs = json.load(open(receipt))["benchmark_requests"][:n]
+    with open(receipt) as f:
+        rec = json.load(f)
+    reqs = rec["benchmark_requests"][:n]
     k = max(1, int(os.environ.get("AB_CONCURRENCY", "1")))
+    try:
+        timeout = request_timeout()
+    except ValueError as e:
+        sys.exit("ab_requests.py: %s" % e)
+    if os.environ.get("AB_REQUEST_TIMEOUT_S", "").strip():
+        print("requests time out after %g s (AB_REQUEST_TIMEOUT_S)" % timeout, flush=True)
     rows, waves = [None] * len(reqs), []
     replies = {}   # earlier requests' rows by name, for chat_turns' assistant_from
     for w in range(0, len(reqs), k):
         idx = list(range(w, min(len(reqs), w + k)))
         t0 = time.time()
         if k == 1:
-            rows[idx[0]] = one(reqs[idx[0]], url, replies)
+            rows[idx[0]] = one(reqs[idx[0]], url, replies, timeout)
         else:
             def go(i):
-                rows[i] = one(reqs[i], url, dict(replies))
+                rows[i] = one(reqs[i], url, dict(replies), timeout)
             th = [threading.Thread(target=go, args=(i,)) for i in idx]
             for x in th: x.start()
             for x in th: x.join()
@@ -244,13 +276,25 @@ def run(receipt, url, n, out):
     if k > 1:
         tok = sum(x["tokens"] for x in waves); wall = sum(x["wall_s"] for x in waves)
         print("aggregate: %d tokens in %.1f s of waves of %d: %.2f tok/s" % (tok, wall, k, tok / wall if wall else 0.0), flush=True)
+    # The receipt's own count of each prompt (provenance, the model's tokenizer) beside the server's.
+    want = {q.get("name"): q.get("prompt_tokens")
+            for q in ((rec.get("provenance") or {}).get("requests") or []) if isinstance(q, dict)}
+    for r in rows:
+        if want.get(r["name"]) is None:
+            continue
+        got = prompt_tokens(r["timings"] or {})
+        print("%s: %s prompt tokens by the server's count, %d by the receipt's (%s)" % (
+            r["name"], "no" if got is None else got, want[r["name"]],
+            "same" if got == want[r["name"]] else "DIFFERENT"), flush=True)
     stats = None
     try:
         with urllib.request.urlopen(url + "/stats", timeout=30) as r:
             stats = json.load(r)
     except Exception as e:
         stats = {"error": repr(e)}
-    json.dump({"requests": rows, "waves": waves, "concurrency": k, "stats": stats}, open(out, "w"), indent=1)
+    with open(out, "w") as f:
+        json.dump({"requests": rows, "waves": waves, "concurrency": k, "request_timeout_s": timeout, "stats": stats},
+                  f, indent=1)
 
 
 def load(d, arms):
@@ -830,9 +874,8 @@ def hash_log(path):
     return out
 
 
-def hashes(d, arms):
-    """Each arm's prompts against the first arm's, by position: the same tokens and digest, or what
-    differs. Exit status 1 when anything differs, 2 when an arm has no hashes."""
+def hash_logs(d, arms):
+    """Each arm's hash_log records (none for an arm without a log or hashes, said so)."""
     logs = {}
     for a in arms:
         try:
@@ -841,31 +884,64 @@ def hashes(d, arms):
             logs[a] = []
         if not logs[a]:
             print("arm %s: no prefill hashes (run it with the Kh part)" % a)
+    return logs
+
+
+def hashes(d, arms):
+    """Each arm's prompts against the first arm's, by position: the same tokens and digest, or what
+    differs. Requests sent together (CK) reach the server in an order of their own in each arm, so a
+    prompt whose position differs is matched to the arm's prompt of the same tokens and digest
+    elsewhere in its log (each used once; counted as reordered). A prompt that matches none is then
+    compared with one of the arm's prompts of its length that matched none either (the one at its own
+    position first, each used once), naming the groups, ranks and window layers that differ. Exit
+    status 1 when anything differs, 2 when an arm has no hashes."""
+    logs = hash_logs(d, arms)
     arms = [a for a in arms if logs[a]]
     if len(arms) < 2:
         return 2
-    first = arms[0]
-    ref = logs[first]
+    return hash_compare(arms[0], logs[arms[0]], arms[1:], logs)
+
+
+def hash_compare(first, ref, arms, logs):
+    """`arms`' records (logs) against `ref`, the records of `first` (an arm, or a reference), as
+    hashes() describes; 1 when anything differs, else 0."""
     bad = 0
     print("prefill hashes against %s: %d prompts" % (first, len(ref)))
-    for a in arms[1:]:
+    for a in arms:
         got = logs[a]
         same = 0
+        moved = 0
+        used = [False] * len(got)
+        unmatched = []
         for i, r in enumerate(ref):
-            if i >= len(got):
-                print("  %s: prompt %d (%d tokens) missing" % (a, i, r["tokens"]))
-                bad += 1
-                continue
-            g = got[i]
-            if g["tokens"] != r["tokens"]:
-                print("  %s: prompt %d is %d tokens, %s's %d: not the same prompts" %
-                      (a, i, g["tokens"], first, r["tokens"]))
-                bad += 1
-                continue
-            if g["all"] == r["all"]:
+            j = i if (i < len(got) and not used[i] and got[i]["tokens"] == r["tokens"] and
+                      got[i]["all"] == r["all"]) else None
+            if j is None:
+                j = next((k for k, g in enumerate(got) if not used[k] and g["tokens"] == r["tokens"] and
+                          g["all"] == r["all"]), None)
+                moved += j is not None
+            if j is not None:
+                used[j] = True
                 same += 1
-                continue
+            else:
+                unmatched.append(i)
+        # What differs, once every match is taken: in a reordered arm the prompt at a position is often
+        # another one, so each unmatched prompt is compared with an unmatched one of its length.
+        for i in unmatched:
+            r = ref[i]
             bad += 1
+            cands = [k for k, g in enumerate(got) if not used[k] and g["tokens"] == r["tokens"]]
+            if not cands:
+                left = [str(g["tokens"]) for k, g in enumerate(got) if not used[k]]
+                if left:
+                    print("  %s: prompt %d (%d tokens): no unmatched prompt of that length (%s tokens "
+                          "left): not the same prompts" % (a, i, r["tokens"], ", ".join(left)))
+                else:
+                    print("  %s: prompt %d (%d tokens) missing" % (a, i, r["tokens"]))
+                continue
+            j = i if i in cands else cands[0]
+            used[j] = True
+            g = got[j]
             diffs = []
             for rank in sorted(r["ranks"]):
                 for name, h in r["ranks"][rank].items():
@@ -875,11 +951,76 @@ def hashes(d, arms):
                 ls = [l for l in lr if lg.get(l) != lr[l]]
                 if ls:
                     diffs.append("rank %d window layers %s" % (rank, ",".join(ls)))
-            print("  %s: prompt %d (%d tokens, %s): DIFFERS: %s" %
-                  (a, i, r["tokens"], g["cut"].get(0, "?"), "; ".join(diffs) or "the digest"))
+            print("  %s: prompt %d (%d tokens, %s%s): DIFFERS: %s" %
+                  (a, i, r["tokens"], g["cut"].get(0, "?"), "" if j == i else "; its prompt %d" % j,
+                   "; ".join(diffs) or "the digest"))
+        # Each prefill as rank 0's line names it: "cut for N", "not cut", or "not cut: shared step" (a
+        # whole prompt admitted beside others into one step, which the consumer skip runs uncut).
         cut = sum(1 for g in got if g["cut"].get(0, "").startswith("cut"))
-        print("  %s: %d of %d prompts identical (%d of its prefills cut)" %
-              (a, same, len(ref), cut))
+        shared = sum(1 for g in got if g["cut"].get(0, "").startswith("not cut: shared"))
+        print("  %s: %d of %d prompts identical (%d of its prefills cut%s%s)" %
+              (a, same, len(ref), cut, ", %d uncut in a shared step" % shared if shared else "",
+               ", %d matched out of order" % moved if moved else ""))
+    return 1 if bad else 0
+
+
+def load_khref(path):
+    """A prefill-hash reference (<name>-khref.json): the file and its prompts as hash_log's records,
+    each with the request's name and reply text."""
+    with open(path) as f:
+        k = json.load(f)
+    if k.get("schema") != "ds41-prefill-hash-reference-v1":
+        raise ValueError("%s: schema %r" % (path, k.get("schema")))
+    recs = []
+    for p in k["prompts"]:
+        recs.append({"name": p.get("name"), "text": p.get("text"), "tokens": int(p["tokens"]), "all": p["all"],
+                     "ranks": {int(r): g for r, g in (p.get("ranks") or {}).items()},
+                     "layers": {int(r): v for r, v in (p.get("layers") or {}).items()},
+                     "cut": {int(r): c for r, c in (p.get("cut") or {}).items()}})
+    return k, recs
+
+
+def hashes_ref(path, d, arms):
+    """Each arm's prefill hashes against a reference recorded in another run (load_khref), as
+    hashes() compares two arms, and each reference request's reply against the arm's (its
+    <arm>.json row of that name). The reference names its receipt (beside it) by sha256: a receipt
+    that changed since makes the reference stale. Exit status 1 when anything differs, 2 when no
+    arm has hashes."""
+    k, ref = load_khref(path)
+    bad = 0
+    rp = os.path.join(os.path.dirname(os.path.abspath(path)), k.get("receipt") or "")
+    if k.get("receipt"):
+        try:
+            with open(rp, "rb") as f:
+                sha = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            sha = None
+        if sha != k.get("receipt_sha256"):
+            print("reference %s: made for %s with sha256 %s, which now has %s: stale" %
+                  (path, k["receipt"], str(k.get("receipt_sha256"))[:16], str(sha)[:16]))
+            bad = 1
+    logs = hash_logs(d, arms)
+    have = [a for a in arms if logs[a]]
+    if not have:
+        return 2
+    bad |= hash_compare("the reference %s" % os.path.basename(path), ref, have, logs)
+    for a in have:
+        try:
+            with open("%s/%s.json" % (d, a)) as f:
+                rows = {r["name"]: r for r in json.load(f)["requests"]}
+        except (OSError, ValueError, KeyError):
+            rows = {}
+        same = 0
+        named = [r for r in ref if r.get("name") and r.get("text") is not None]
+        for r in named:
+            got = (rows.get(r["name"]) or {}).get("text")
+            if got == r["text"]:
+                same += 1
+            else:
+                bad = 1
+                print("  %s: %s: reply %s" % (a, r["name"], "missing" if got is None else "DIFFERS: %r" % got[:80]))
+        if named:
+            print("  %s: %d of %d replies identical to the reference's" % (a, same, len(named)))
     return 1 if bad else 0
 
 
@@ -897,6 +1038,8 @@ if __name__ == "__main__":
         kl_dir(a[1])
     elif a[0] == "--hashes":
         sys.exit(hashes(a[1], a[2:]))
+    elif a[0] == "--hashes-ref":
+        sys.exit(hashes_ref(a[1], a[2], a[3:]))
     elif a[0] == "--ttft":
         ttft(a[1], a[2:])
     elif a[0] == "--draft-stats":

@@ -103,6 +103,15 @@ by SHA256. No model/container metadata was modified.
 **For concurrent requests** (agent harnesses) add `RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1` and `--max-num-seqs N`
 (with `--max-model-len` sized so N sequences' KV fit, e.g. 1024 at N = 4-8): large-chunk prefill refuses steps that
 mix a prompt's chunk with other sequences' decode rows, and the window arms at 4 and 8 streams below ran that way.
+Where short prompts arrive in bursts (several sent at once) and the prefix cache is off, also add
+`RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=256`: whole prompts waiting together then share one prefill-only step instead
+of one a step. It needs prefill alone, large-chunk prefill (`..._LCP`), `--max-num-seqs` above 1 and
+`--no-prefix-cache`, and is refused with the reason otherwise, so the agent-harness setup above (prefix cache on) does
+not get it. In one window (ab-20261103T230607Z, the 8 held-out prompts sent 4 or 8 at a time) every reply was
+identical to the engine without it, and so was every prefill hash at 8 streams; the total at 4 / 8 streams rose
+8.3-12.9% / 8.5-9.3%, and at 8 streams the first reply's first token came about 1.9 s later and the last one's
+1.2-1.4 s earlier (the `..._BATCH_ADMIT` row of the table below). Prompts arriving apart and prompts longer than 256
+tokens are admitted as before and gain nothing.
 In the paragraphs from here to the two-batch overlap one, every 4- and 8-stream arm also ran
 `..._PREFETCH_MULTIROW=N` (parts `Pmr4` / `Pmr8`) with `--max-model-len 1024` (`L1024`), sending the 8 held-out
 requests N at a time. A total at N streams is N times the mean of the requests' `predicted_per_second`
@@ -201,6 +210,47 @@ ab-20261103T110235Z, 0.68 at 4,096 in ab-20261103T090558Z). Time long prompts ov
 Two-batch overlap of concurrent decode steps (`RADIANCE_EXPERIMENTAL_SCHED_TBO=1`, opt-in, exact) loses on 256 GB
 too: 37.4 against 38.7 tok/s in total at 4 streams and 40.7 against 42.9 at 8 (ab-20261030T231526Z). Leave it off.
 
+**For contexts beyond 32K** keep the KV reservation fixed: with the block above (`--deterministic`) the pool is reserved
+at startup for one sequence of `--max-model-len` tokens on every card and paid for in VRAM expert residents (startup's
+`kv:` lines). Use `--max-model-len 131072` (part `Lm131072`) for long-context harness use; the 4,096-token
+chunks above (`..._LCP=4096` with its companions, parts `M4096` `Lc4096` `Pci4096`) when long prompts dominate: they
+prefill 1.34-1.5x faster at 48K-100K tokens, at the cost of the 4- and 8-stream decode deficit described there; and
+`L1024` or another small `--max-model-len` for decode-heavy concurrency. Growing KV is not the route: it refuses Phase
+1, the lent arena and more than one sequence, funds its full maximum at startup anyway, and its re-commit corruption is
+still open (`/home/as/ds41-decode-review-20261028/LONGCTX-FIFTHCARD-20261103.md`, 3.3-3.4). Measured on four RX 9070
+XT with the block above, one run each (ab-20261103T230607Z, the 524,288 row ab-20261104T003545Z; claude/ds41-batch-admit
+f4fe2ff1 and abe09503, libr4d f1b1507a in both):
+
+| `--max-model-len` | KV a card | rank 0: static residents + lent slots | 1 stream, held-out prompts |
+|---|---|---|---|
+| 512 (no `Lm` part) | 21.6 MiB | 667 + 41 | 29.11 tok/s |
+| 65,536 | 287 MiB | 635 + 51 | 29.50 |
+| 131,072 | 487 MiB | 621 + 48 | 29.35 |
+| 262,144 | 887 MiB | 594 + 40 | 28.66 |
+| 524,288 | 1.65 GiB | 525 + 40 | 27.73, against 29.73 at 512 in its window (−6.7%) |
+
+The rest is ab-20261104T003545Z:
+- **At 8 streams** with batch admission (`Ba`, `Pmr8`, the held-out prompts sent 8 at a time) `Lm131072` totalled
+  44.91 / 45.12 against 46.04 / 45.67 tok/s at `L1024` (−1.7%, two runs each).
+- **Exact.** At `Lm131072` with prefill hashes on, the 6,817-token prompt gave its reference prefill hash
+  (8c583a997ef6f1db) and reply; the 32,768-token fill prompt and its 82-token follow-up (`Ufill32k`) gave the hashes
+  71eaab9a74338840 / 112530d7d4d5b367 and both replies of the reference run with plain 16-token passes (M16) on the
+  stable e184 build; at 47,917 and 99,987 tokens (`Ulong48k`, `Ulong100k`; no 16-token reference exists above 32K)
+  2,048- and 4,096-token chunks gave the same prefill hash (87d485202785b186, 53cf0ecb89f99dad) and reply. All 48
+  held-out replies (at 512, 1,024, 131,072 and 524,288) equalled the base engine's. The card check `lsparse`
+  (`DEVICE_CHECKS=lsparse`, with the `TALL_LIBR4D` / `TALL_CHECK` pair): index_score, index_candidates, index_topk and
+  attn_sparse_sink on a 256-row chunk ending at index widths 32,769-524,289 gave 0 differing values against the same
+  rows launched alone, 16 at a time and as suffixes (top-k also against the host). It is logged and gates no arm.
+- **Prefill** at `Lm131072` (prefill hashes on): 47,917 tokens 115.1 s (416 tok/s) at 2,048-token chunks against 76.6 s
+  (626 tok/s) at 4,096; 99,987 tokens 221.7 s (451 tok/s) against 165.1 s (606 tok/s), and 224.5 s at 2,048 with the
+  hashes off; the 32,768-token fill prompt (a 6,817-token text repeated) 64.2 s.
+- **Decode at a long context**: after the 99,987-token prompt, prefill hashes off, 20.9 tok/s against 29.35 at
+  `Lm131072` on short prompts in the table (−29%; not yet profiled). Arms with prefill hashes decode slower still (12-14 tok/s), an
+  instrumentation cost.
+- The prefix cache did not run at these lengths; idle conversations must fit three quarters of the pool (**Long
+  contexts** under Prefix caching). Receipts: `make_longctx_receipts.py` (parts `Ufill32k`, `Ulong48k`, `Ulong100k`;
+  a receipt's `max_context_tokens` skips an arm with a shorter `--max-model-len` and lengthens its request timeout).
+
 **On 256 GB of RAM (8x 32 GB DDR4-2666) with a 192 GiB expert cache** (ab-20261030T194..., replies identical): decode **31.2 tok/s** a stream (19.9 with 96 GiB on 128 GB of DDR4-2133; 20.9 with 96 GiB on the new RAM, so the cache size, not the memory speed, is the gain: rank 0's misses fall 2,073 → 361 on the held-out prompts); **38.7 tok/s in all at 4 streams**; prefill 3,086 tokens in 28.1 s (110 tok/s) and 6,817 in 51.7 s (132 tok/s). 192 and 208 GiB measure the same.
 
 **For single-stream use, add DSpark speculation.** Exact (every draft is verified; replies identical in
@@ -265,6 +315,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=1` | not yet measured (estimate +0.1-0.2%; rank 0's EP-decision `choose` 8.1-8.9 us should fall to ~4.3 us, the `predictor post` part showing the post's 4-6 us after the submit) | with `..._EARLY_ISSUE=1` and the read-ahead in pieces: at an early-issued layer's gather rank 0 posts the read-ahead's router input after the layer's CPU work is submitted, as `start_ep_routed` does, instead of before `hx_choose`, where the post (its copy of the input and the predictor's wake) held back the pool's start. Refused without Ei and pieces. Startup line `rank 0 posts the read-ahead's router input once a layer's CPU work is submitted`; arm part `Pw` |
 | `RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=N` (2-16) | not yet measured | the read-ahead in pieces in decode passes of 2..N rows too: DSpark's verify passes (2 rows at cap 1, up to 6) and several sequences' decode rows, which otherwise all go without it (window C's `Ds1`/`Ds2` arms: 0 inputs posted, 0 pieces read). Rank 0 posts every row's router input at the one-token pass's points; the predictor reads layer L+2's router once for all the rows (each row's logits bit for bit the one-row kernel's) and hands every rank the union of the rows' top K (every row's best before any row's second), planned under the same live cap, with the same yields to demand reads, finishing rule (the plane mirror's share for the pass's rows) and epoch check. One-token passes go as without it; prefill chunks, mixed passes and the drafter's own passes never read ahead. Reads only. Refused unless the read-ahead in pieces runs (`..._PREFETCH=pieces`, `..._MISSES` ≥ N). The on-die reads (`Pa`/`PmN`/`Pe`: decode passes of up to 16 rows) and early issue (`Ei`) already covered verify passes (window C's Ds1 arm: on-die reads in all 269 verify passes, 11,640 early layers). Arm part `PmrN` (`Pmr`: 6), with a `PpK` part; startup line `read-ahead: decode passes of 2-N rows read ahead too`; shutdown lines `read-ahead in pieces by pass size` (each rank's planned / used / dropped by the pass's rows) and `router predictor, multi-row decode passes` (the scoring a row) |
 | `RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1` with `--max-num-seqs N` | aggregate decode 16.2 → 20.1 tok/s at N=4 (+24%), 20.6 at N=8; per stream ~1/N | concurrent requests' decode rows run in one step and a prefill chunk runs in a step of its own (the 16-token budget otherwise admits nothing beside a decode row, so N>1 served requests one after another). Every reply identical to running alone. `--max-model-len` must cover N sequences (512 holds four ~110-token requests). Arm parts Pf, NK, CK, LK |
+| `RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=R` (32-256) beside `..._PREFILL_ALONE=1`, `..._LCP` and `--max-num-seqs` above 1, prefix cache off | exact; for a burst of short prompts arriving together +8.3-12.9% in total at 4 streams and +8.5-9.3% at 8 (window ab-20261103T230607Z, four RX 9070 XT, the recommended configuration with prefill alone, `L1024` and `PmrN`, the 8 held-out prompts sent N at a time; one window, below the route-trace replay's estimate of +13-17% / +12-18%). Every reply identical to the base engine (112 of 112: 8 prompts in 14 arms, `ab_requests.py --compare` exit 0), every prefill hash at 8 streams (8 of 8). A-B-B-A at 4 streams: 37.65 / 40.79 / 42.64 / 37.78 tok/s in total (+8.3% and +12.9% against the arm without it beside each), the wave's wall time 16.62 / 16.00 / 15.59 / 16.66 s, prefill steps 8 → 4 / 3, TTFT min / mean / max 0.49 / 1.64 / 2.97 and 0.47 / 1.67 / 3.03 s without it against 0.47 / 1.82 / 2.69 and 1.32 / 1.96 / 2.45 s with it; at 8 streams 41.79 / 45.68 / 45.36 / 41.79 tok/s (+9.3% and +8.5%), wall time 15.37 / 14.11 / 14.22 / 15.26 s, prefill steps 8 → 2, TTFT 0.96 / 3.29 / 5.45 and 1.01 / 3.18 / 5.29 s without against 2.86 / 3.17 / 4.09 and 2.88 / 3.19 / 4.13 s with it (the first token later, the last earlier); the pair with prefill hashes on (`Kh`) 42.75 against 46.31 tok/s. Prompts arriving apart and prompts longer than R are admitted as before. Recommended for such bursts ("For concurrent requests" above) | prompts waiting together are admitted into one prefill-only step instead of one a step, in arrival order, each whole (its prompt one chunk from position 0, the chunk it takes alone), while their rows fit in R (held to the chunk and, under Phase 1, below its threshold: at most 256 rows stays on the activation arena's smallest level, so the lent arena stays lent and the card path is never armed); decode rows wait as under prefill alone. A prompt of at most R rows that the rows left cannot take ends the batch (none behind it is taken ahead of it) and opens the next step's, which the prompts behind it may join. Kept out, each in a step of its own as before: a prompt longer than R, a request back from preemption, media, scored or embedding inputs, an adapter or plugin words. Only step composition changes: under LCP's admission every op gives a row the same bytes at any launch height (the `lcp` card check holds each row launched alone, 16 at a time and whole), and the sequence-aware ops (sparse attention, compressor work list, indexer, Engram ids) read each sequence's own rows, block tables and state through `cu_seqlens`; a shared step runs every layer on every row (the consumer skip cuts only a prompt alone in its step) and admits every unit into the RAM cache. Refused with the reason without prefill alone or LCP, at one sequence, with the prefix cache, KLD modes, `--prefill-span` or R-SWA. Startup line `batch admission: on (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=R)`, shutdown line `batch admission: N steps admitted P whole prompts together`. Gates: replies and Kh against the arm without it at N4 / N8 (`ab_requests.py --hashes` matches prompts that arrived in another order; a prompt run in a shared step is labelled `not cut: shared step` in the hash lines and not counted as cut), steps_prefill. Arm part `Ba` / `BaN` (needs `Pf`, `Lc` and `NK` above 1; skipped beside `Pc` or `Kld`; `claude/ds41-batch-admit`); tests `sched_test` `batch_admission_*`, `ab_window_ba_test.sh` |
 | `..._ACCESS_TRACE=<dir>` | | per-rank access traces for `cache_sim.py` |
 | `RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1` | alone 17.40 / 17.80 / 17.35 against 17.37 / 17.65 / 17.69 tok/s (−0.3%), replies identical; with Rb and Vp 17.86 / 17.99 / 17.96 (+2.1%); being separated | Every step is followed by a step issued ahead (`Scheduler::step_next`) before the host has read its tokens, so the step that samples a reply's end-of-generation token gets one more forward pass, for the finished request (max_tokens ends are predicted and get none). On the CPU path issuing a pass waits for the card at every routed layer, so `issue_ahead` returns only once most of that pass has run, and the commit that ends the reply comes after it: the reply, its `predicted_ms` and the next request all wait it out (29 Oct trace: 204-207 of its 240 selections off the card, 103-105 misses). Nothing reads that pass: its token is dropped, the prefix cache publishes a finished sequence up to its last token's position and the pass writes the one after, and its blocks are freed at its commit. With the switch, a step of one sequence that its own token can end (not `ignore_eos`) has its ids read back first (`Engine::peek_outcome`: collect_step's rules without its effects), and `step_next` issues nothing behind a step whose outcome ends every request it carries (commit's own end conditions, `Scheduler::outcome_ends_every_request`). Exact: every pass that runs ran before, and the commits are the same. The cost is the host's turnaround between two such passes, while the card waits: the next step's build, advance and the ranks' release (tens of µs a token). Steps of two or more sequences keep the step issued ahead. Arm part `Ss`; the shutdown's `post-stop passes:` line counts the passes run after a reply's last token and, with the switch, the steps read back, the wait for their ids, the turnaround and the passes withheld |
 | miss reads on kept readers, 2 MiB pages | +4.6%, TTFT −3.6% | on by default; `RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0` starts threads a call and `..._PLANE_HUGEPAGES=0` uses 4 KiB pages, as before (A/B switches) |
@@ -930,7 +981,7 @@ on the held-out prompts). The conversations kept idle must fit three quarters of
 to keep their chains whole (each publish trims the pool to a quarter free, the least recently used
 conversation's end first), or live in the host tier; one larger than that alone stays whole through
 its own turns with `Pce`, not through another session's. Parts: `Lm32768`, `Lm65536` (the `LmN`
-part).
+part). Measured up to 524,288 since: **For contexts beyond 32K** under Configuration.
 
 **The harness receipt** (`make_prefix_receipt.py --harness`, part `Uharness`; `Uharness1` is its
 first session alone): two agent sessions interleaved turn by turn, each turn the whole

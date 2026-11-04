@@ -11,9 +11,12 @@
  *
  * and logs, per rank, one line of group hashes (each layer's folded in order) and one of each layer
  * of the window group apart (the consumer skip's layers, where a difference would show), then one
- * line folding every rank's. Two runs with the same requests in the same order compare line by line
- * (tools/ds41-host-experts/prefill_hash_compare.py). Debug only: each rank synchronises its stream
- * and copies whole layer pools to the host, and steps are not issued ahead while it is on. */
+ * line folding every rank's. A rank's line names the prompt's cut: "cut for N" (its consumer-skip
+ * target), "not cut", or "not cut: shared step" for a whole prompt whose one prefill step held
+ * other sequences (whole prompts admitted together, RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT), which
+ * BatchBuilder::build runs uncut. Two runs with the same requests in the same order compare line by
+ * line (tools/ds41-host-experts/prefill_hash_compare.py). Debug only: each rank synchronises its
+ * stream and copies whole layer pools to the host, and steps are not issued ahead while it is on. */
 #include "engine_priv.h"
 #include "device/device.h"
 
@@ -84,6 +87,10 @@ void Engine::prefill_hash_stage(const StepPlan& plan, const StepOut& so, int ste
             sq.n = (int64_t)e.ctx_len + e.n_tokens;
             sq.row = so.first_row[i];
             sq.cut = e.consumer_end;
+            /* Its whole prefill (one chunk from position 0) in a step holding other sequences: the
+             * consumer skip cuts a chunk alone in its step only, so this step ran every layer on
+             * every row whatever target the entry carries. */
+            sq.shared = plan.e.size() > 1 && e.ctx_len == 0;
             for (int32_t g = 1; g < (int32_t)p.kv_groups.size(); ++g) {
                 const KVGroupPlan* gp = kv.plan(g);
                 if (!gp) continue;
@@ -131,11 +138,14 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
             return nullptr;
         return r.hash_host;
     };
+    /* Whether this step ran cut (the builder's decision, the same on every rank's batch). */
+    const bool step_cut = b->consumer_full != 0 || b->consumer_row0 != nullptr;
     for (const PrefillHashJob::Seq& sq : job.seqs) {
+        const std::string how = sq.cut <= 0             ? std::string("not cut")
+                              : sq.shared && !step_cut ? std::string("not cut: shared step")
+                                                       : fmt("cut for %lld", (long long)sq.cut);
         std::string line = fmt("prefill hash: seq %llu, %lld tokens (%s), rank %d:",
-                               (unsigned long long)sq.seq, (long long)sq.n,
-                               sq.cut > 0 ? fmt("cut for %lld", (long long)sq.cut).c_str() : "not cut",
-                               r.index);
+                               (unsigned long long)sq.seq, (long long)sq.n, how.c_str(), r.index);
         std::string per_layer;
         uint64_t all = kSeed;
         for (const PrefillHashJob::Group& gr : sq.groups) {

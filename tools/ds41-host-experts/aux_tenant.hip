@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
         if (g_term || unix_ms() - t_open >= wait_s * 1000) {
             std::printf("aux_tenant: no room for %lld MiB after %lld ms (%zu MiB free)\n", mib, unix_ms() - t_open,
                         free_b >> 20);
-            hipFree(small);
+            (void)hipFree(small);
             return 2;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
     if (hipMalloc(&big, want) != hipSuccess || hipMemset(big, 1, want) != hipSuccess ||
         hipDeviceSynchronize() != hipSuccess) {
         std::printf("aux_tenant: %lld MiB refused after the room was seen\n", mib);
-        hipFree(small);
+        (void)hipFree(small);
         return 3;
     }
     std::printf("aux_tenant: room after %lld ms, holding %lld MiB\n", unix_ms() - t_open, mib);
@@ -80,8 +80,8 @@ int main(int argc, char** argv) {
     const long long t_hold = unix_ms();
     while (!g_term && (hold_s == 0 || unix_ms() - t_hold < hold_s * 1000))
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    hipFree(big);
-    hipFree(small);
+    (void)hipFree(big);
+    (void)hipFree(small);
     std::printf("aux_tenant: freed\n");
     std::fflush(stdout);
     return 0;

@@ -83,7 +83,11 @@ above for passes on the 16-token quantum, and the switch refuses configurations 
 tuned kernel point per M band, no large-chunk prefill). Measured on 13 harness turns of up to 9.7K tokens
 (ab-20261031T090154Z): prefill hashes identical to the cold run on 13 of 13 turns, every reply identical; summed
 time to first token 72.7 s, against 82.5 s on the chunk grid and 135.1 s cold; short follow-ups 0.3-0.6 s instead
-of 3.3-3.7 s; decode unchanged.
+of 3.3-3.7 s; decode unchanged. Add `RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD=0` (Phase 1's read-ahead off, part `Qa0`)
+for these turns: on the same 13 turns with the switches above at `--max-model-len 32768` (ab-20261104T081812Z, A-B-B-A,
+prefill hashes on) the summed time to first token was 63.48 and 61.28 s against 72.03 s (and 89.13 s in the window's
+first long-prefill arm), 12-15% less; follow-up turns gained most (3.5 to 1.7 s, 6.8-7.0 to 4.1-4.3 s), the long first
+turn lost 7-10% (14.6-14.9 to 15.7-16.4 s); decode unchanged; prefill hashes 13/13 and replies 52/52 identical.
 
 **DSML chat replies**: the ds41 plugin declares upstream PR 266's reply format, so
 `/v1/chat/completions` returns typed DSML calls as `message.tool_calls` and thinking as

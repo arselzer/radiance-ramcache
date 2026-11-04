@@ -161,7 +161,8 @@
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `swiglu` the default checks, `tall` the exact-tall checks, `lcp` the large-chunk
-# ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK; `n128` uses N128_CHECK_BIN/LIB),
+# ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK; `lsparse` the sparse ops at long-context index
+# widths with the same pair, LSPARSE_WIDTHS, logged but gating no arm; `n128` uses N128_CHECK_BIN/LIB),
 # SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's checks and timings on card 0 before the
 # arms; unset, none, and no Rb arm runs).
 set -u
@@ -196,6 +197,9 @@ hotset_for() {   # an arm's name: its hot-set file (above), or empty
 }
 PROFILE=$R/ds41-dev-window-profile-calibration-20261028T034300Z/sealed-decode-profile.json
 PROMPTS=${PROMPTS:-$R/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/receipt.json}
+# The U parts' receipts (U<name>: <name>-receipt.json), the Kld corpus's and the prefill-hash
+# references some of them have (<name>-khref.json; make_longctx_receipts.py).
+EXTRA_PROMPTS=${EXTRA_PROMPTS:-/home/as/ds41-claude-build/work/extra-prompts}
 PORT=18089
 DOCKER=(/usr/bin/sudo -n /usr/bin/docker)
 NAME=radiance-flashnext
@@ -940,7 +944,8 @@ EOF2
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
   d0=$(awk '{print $10}' /sys/block/nvme0n1/stat 2>/dev/null); t0=$(date +%s%N)
-  env AB_CONCURRENCY=${ARM_CONC:-${AB_CONCURRENCY:-1}} \
+  # ARM_TIMEOUT: the arm's per-request timeout (the arm loop sets it for a receipt of long prompts).
+  env AB_CONCURRENCY=${ARM_CONC:-${AB_CONCURRENCY:-1}} ${ARM_TIMEOUT:+AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT} \
     python3 -I "$HERE/ab_requests.py" "${ARM_PROMPTS:-$PROMPTS}" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
   rc=$?
   log "arm $name: requests exit $rc"
@@ -1238,6 +1243,35 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
     else
       LCP_WHY="the large-chunk prefill device checks did not pass on $TL:$lcp_bad"
       log "$LCP_WHY no Lc arm is measured"
+    fi
+  fi
+fi
+# The sparse ops at long context (`lsparse` in DEVICE_CHECKS; ds41_mxfp4_device_check lsparse, card 0, LCP set
+# as an Lc arm's server has it): index_score, index_candidates, index_topk and attn_sparse_sink on a 256-row
+# chunk at the end of contexts of index width up to 524,289 (LSPARSE_WIDTHS, W:r pairs; the harness's own list
+# without: --max-model-len 32768, 131072 and 524288 at ratios 1 and 2), each chunk against its rows alone, 16
+# at a time and as suffixes, top-k also against the host. The long-context qualification's kernel evidence:
+# it gates no arm (its verdict is logged, devcheck-lsparse.log, and read with the arms' prefill hashes).
+LSPARSE_OK=""
+if [[ " ${DEVICE_CHECKS:-1} " == *" lsparse "* ]]; then
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} LC=${LCP_CHECK_C:-2048}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    log "long-context sparse ops device check: TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file; not run"
+  elif ! [[ $LC =~ ^[0-9]+$ ]] || (( 10#$LC < 64 || 10#$LC > 4096 || 10#$LC % 16 )); then
+    log "long-context sparse ops device check: LCP_CHECK_C=$LC is not a multiple of 16 in 64..4096; not run"
+  else
+    log "long-context sparse ops device check on card 0 with $TL ($TC), LCP $((10#$LC))${LSPARSE_WIDTHS:+, widths $LSPARSE_WIDTHS}"
+    ( export HIP_VISIBLE_DEVICES=0
+      unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1
+      timeout 600 "$TC" "$TL" lsparse $((10#$LC)) ${LSPARSE_WIDTHS:-} >"$OUT/devcheck-lsparse.log" 2>&1
+      echo "lsparse exit $?" >>"$OUT/devcheck-lsparse.log" )
+    grep -E '^(lsparse|FAIL)' "$OUT/devcheck-lsparse.log" | tail -12 | tee -a "$OUT/window.log"
+    if grep -qx 'lsparse exit 0' "$OUT/devcheck-lsparse.log" &&
+       [[ "$(grep -E '^lsparse: (PASS|FAIL)' "$OUT/devcheck-lsparse.log" | tail -1)" == "lsparse: PASS"* ]]; then
+      LSPARSE_OK=1
+      log "long-context sparse ops device check passed on $TL, sha256 $(sha256sum "$TL" 2>/dev/null | cut -c1-16) (it gates no arm)"
+    else
+      log "long-context sparse ops device check did NOT pass on $TL (devcheck-lsparse.log): it gates no arm, but no long-context result is exact-qualified without it"
     fi
   fi
 fi
@@ -1540,6 +1574,18 @@ if [[ -n "${VPACK_CHECK:-}" && -x "${VPACK_CHECK:-}" ]]; then
   done
 fi
 
+# The all-card row checks (Ar, Ag, the shared oracle) run on the cards the arms' servers serve on: the
+# window's own ROCR_VISIBLE_DEVICES (the chains pass the four XT UUIDs in rank order), not every visible
+# card (with the mask unset the selftest's four were c3, the R9700, then c6, 83 and 48, never 03). Only the
+# one-card settings of the card-0 checks are dropped. A mask that names other than four cards is refused;
+# without one every visible card is used, as the servers use them.
+serving_cards() { echo "${ROCR_VISIBLE_DEVICES:-every visible card}"; }
+serving_cards_ok() {
+  local IFS=, cards
+  [[ -z ${ROCR_VISIBLE_DEVICES:-} ]] && return 0
+  read -r -a cards <<< "$ROCR_VISIBLE_DEVICES"
+  (( ${#cards[@]} == 4 ))
+}
 declare -A AR_ROWS_PASSED=() AR_ROWS_RECEIPT=()
 ar_rows_receipt_ok() {   # fresh log, full library SHA256; four exact case lines, no skips/failures
   local f=$1 sum=$2 cap ts
@@ -1563,10 +1609,14 @@ ar_rows_check() {   # library; GPU work only in the stopped-QFN portion of this 
      [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) != exited ]]; then
     log 'AR row check refused: no active stopped-QFN window'; return 1
   fi
+  if ! serving_cards_ok; then
+    log "AR row check refused: ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES does not name the four serving cards"; return 1
+  fi
   f=$OUT/ar-rows-$sum.log
-  log "exact AR row check on all four cards with $lib, sha256 $sum"
-  ( unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
+  log "exact AR row check on the serving cards ($(serving_cards)) with $lib, sha256 $sum"
+  ( unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
     echo "ar_rows sha256 $sum"
+    echo "ar_rows cards $(serving_cards)"
     timeout 1800 "$SELFTEST_AR_ROWS" "$lib" --case ds41_ar_rows_exact
     echo "ar_rows exit $?"
     echo "ar_rows finished sha256 $(sha256sum "$lib" | cut -d' ' -f1)"
@@ -1630,10 +1680,14 @@ ag_rows_check() {   # library; GPU work only in the stopped-QFN portion of this 
      [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) != exited ]]; then
     log 'Engram gather row check refused: no active stopped-QFN window'; return 1
   fi
+  if ! serving_cards_ok; then
+    log "Engram gather row check refused: ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES does not name the four serving cards"; return 1
+  fi
   f=$OUT/ag-rows-$sum.log
-  log "exact Engram gather row check on all four cards with $lib, sha256 $sum"
-  ( unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
+  log "exact Engram gather row check on the serving cards ($(serving_cards)) with $lib, sha256 $sum"
+  ( unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
     echo "ag_rows sha256 $sum"
+    echo "ag_rows cards $(serving_cards)"
     timeout 1800 "$SELFTEST_AG_ROWS" "$lib" --case ds41_ag_rows_exact
     echo "ag_rows exit $?"
     echo "ag_rows finished sha256 $(sha256sum "$lib" | cut -d' ' -f1)"
@@ -1719,10 +1773,14 @@ ar_ag_shared_check() {   # library; GPU work only in the stopped-QFN portion of 
      [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) != exited ]]; then
     log 'mixed shared AR/AG check refused: no active stopped-QFN window'; return 1
   fi
+  if ! serving_cards_ok; then
+    log "mixed shared AR/AG check refused: ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES does not name the four serving cards"; return 1
+  fi
   f=$OUT/ar-ag-shared-$sum.log
-  log "mixed shared AR/AG check on all four cards with $lib, sha256 $sum"
-  ( unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
+  log "mixed shared AR/AG check on the serving cards ($(serving_cards)) with $lib, sha256 $sum"
+  ( unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
     echo "ar_ag_shared sha256 $sum"
+    echo "ar_ag_shared cards $(serving_cards)"
     timeout 1800 "$SELFTEST_AR_AG_SHARED" "$lib" --case ds41_ar_ag_shared_exact
     echo "ar_ag_shared exit $?"
     echo "ar_ag_shared finished sha256 $(sha256sum "$lib" | cut -d' ' -f1)"
@@ -1920,8 +1978,18 @@ for a in $ARMS; do
 # pass's miss reads start on the kept readers as soon as the layer's choice is made, before the
 # pool's wake (RADIANCE_EXPERIMENTAL_DS41_MISS_POST); U<name> the arm sends every request of
 # work/extra-prompts/<name>-receipt.json (chat: 16 chat-framed prompts; long: 64-3500-token
-# prompts; long8k: one ~7K-token document, with LmN of 8448 or more) instead of $PROMPTS' first
-# AB_REQUESTS (compare texts only between arms with the same prompts); Cs the exact consumer-suffix
+# prompts; long8k: one ~7K-token document, with LmN of 8448 or more; from make_longctx_receipts.py:
+# fill32k the filled 32K reference's 32,768-token prompt and its 82-token recovery request, long48k
+# and long100k one document of 47,917 / 99,987 tokens, each with Lm131072 or another LmN of at least
+# its max_context_tokens) instead of $PROMPTS' first AB_REQUESTS (compare texts only between arms
+# with the same prompts; one U part an arm). A receipt that declares max_context_tokens (its longest
+# request's prompt plus max_tokens) refuses an arm whose --max-model-len (the last Lm / L part, 512
+# without one) is shorter, and gives the arm's requests a timeout of 300 s plus its wave of K at 100
+# tokens/s with an Lc part or 25 without (16-token passes: 36 tok/s on the filled 32K), at least
+# ab_requests.py's 600 (AB_REQUEST_TIMEOUT_S, which a window's own value overrides for every arm);
+# a prompt set with a reference from another run (<name>-khref.json: fill32k, long8k) has its Kh
+# arms' prefill hashes and their replies to those requests compared with it at the end
+# (ab_requests.py --hashes-ref); Cs the exact consumer-suffix
 # skip (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1: a prompt's early prefill passes run layers 21..39
 # only where their rows reach its last token or its state; needs a radiance and a deepseek41 from
 # claude/ds41-cskip, and the server's "consumer skip: on" line, or the arm is not measured; every
@@ -1998,7 +2066,7 @@ for a in $ARMS; do
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
-  ARM_PROMPTS= ARM_N= ARM_LQ= rt=
+  ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   fn128=""
   arm_checkpoint_interval=2048
@@ -2121,7 +2189,7 @@ for a in $ARMS; do
       Dm)      dm=1 ;;                     # the drafter's Markov codebooks pinned with the embedding (DSPARK_CODEBOOK_RAM; needs Er)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
-      Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
+      Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}"); arm_ctx=${p#Lm} ;;   # a longer context (default 512), e.g. for long-prompt TTFT
       Pc)      pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact)                          # prefix cache on (exact resume, the default, named)
                env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... and pinned slabs not reserved twice
       Pc0)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                      # prefix cache on, the margin as before (the control)
@@ -2145,7 +2213,7 @@ for a in $ARMS; do
       Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
-      L[0-9]*) ARGS+=(--max-model-len "${p#L}") ;;                    # this arm's --max-model-len (KV for N sequences)
+      L[0-9]*) ARGS+=(--max-model-len "${p#L}"); arm_ctx=${p#L} ;;    # this arm's --max-model-len (KV for N sequences)
       Ov)      env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1) ;;    # independent dispatches overlap, decode passes
       Ov2)     env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=2) ;;    # ... in every pass issued live
       Ct|Ct[0-9]*)
@@ -2202,7 +2270,8 @@ for a in $ARMS; do
                if [[ ${p#Wl} =~ ^[0-9]+$ ]] && (( 10#${p#Wl} <= 100000 )); then
                  wl=$((10#${p#Wl})); env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_LEAD_US=$wl)
                else log "arm $a: $p: a pre-wake lead takes 0-100000 us; the arm is skipped"; skip=1; fi ;;
-      U?*)     ARM_PROMPTS=/home/as/ds41-claude-build/work/extra-prompts/${p#U}-receipt.json ARM_N=999
+      U?*)     [[ -n "$upart" ]] && { log "arm $a: $p after U$upart (one receipt an arm); the arm is skipped"; skip=1; }
+               upart=${p#U} ARM_PROMPTS=$EXTRA_PROMPTS/${p#U}-receipt.json ARM_N=999
                [[ -f $ARM_PROMPTS ]] || { log "arm $a: no prompts $ARM_PROMPTS; the arm is skipped"; skip=1; } ;;
       Rt)      mkdir -p "$OUT/rtrace-$a"   # the routing trace, exact (rtrace.py reads it)
                rt=1; env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=$(cd "$OUT" && pwd)/rtrace-$a/rt) ;;
@@ -2641,7 +2710,7 @@ for a in $ARMS; do
   if [[ -n "$kld" ]]; then
     if [[ ! -s "$OUT/kld-corpus.jsonl" ]] &&
        ! python3 -I "$HERE/ab_requests.py" --kld-corpus "$OUT/kld-corpus.jsonl" "${KLD_MAX_CHARS:-6000}" \
-           $(for r in ${KLD_RECEIPTS:-long chat}; do echo /home/as/ds41-claude-build/work/extra-prompts/$r-receipt.json; done) \
+           $(for r in ${KLD_RECEIPTS:-long chat}; do echo "$EXTRA_PROMPTS/$r-receipt.json"; done) \
            >>"$OUT/window.log" 2>&1; then
       log "arm $a: no kld corpus; the arm is skipped"; skip=1
     fi
@@ -2682,6 +2751,35 @@ for a in $ARMS; do
   if [[ -z "$skip" && $ARM_AR_CAP == 1280 && $ARM_AG_CAP == 1024 ]]; then
     ar_ag_shared_gate "$a" "$aglib" || skip=1
   fi
+  # A U part's receipt that declares max_context_tokens (its longest request's prompt plus max_tokens,
+  # by the model's tokenizer; make_longctx_receipts.py): an arm whose --max-model-len is shorter would
+  # have its requests refused, so it is skipped; its requests time out after 300 s plus its wave of K
+  # at 100 tokens/s with an Lc part (355-537 tok/s measured) or 25 without (36 on the filled 32K at
+  # 16-token passes), at least 600 (ab_requests.py's default). A window's AB_REQUEST_TIMEOUT_S wins.
+  ARM_TIMEOUT=${AB_REQUEST_TIMEOUT_S:-}
+  if [[ -n "$upart" && -z "$kld" && -f "$ARM_PROMPTS" ]]; then
+    if ! umct=$(python3 -I -c 'import json, sys
+v = json.load(open(sys.argv[1])).get("max_context_tokens")
+print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
+      log "arm $a: U$upart: the receipt does not read as JSON ($(tail -1 <<< "$umct")); the arm is skipped"; skip=1; umct=""
+    fi
+    if [[ -n "$umct" ]]; then
+      if ! [[ $arm_ctx =~ ^[0-9]{1,9}$ ]]; then
+        log "arm $a: U$upart needs a whole --max-model-len, not '$arm_ctx'; the arm is skipped"; skip=1
+      elif (( 10#$arm_ctx < umct )); then
+        log "arm $a: U$upart's longest request needs $umct tokens of context (its receipt's max_context_tokens), more than the arm's --max-model-len $((10#$arm_ctx)); the arm is skipped"; skip=1
+      fi
+      if [[ -z "${AB_REQUEST_TIMEOUT_S:-}" ]]; then
+        urate=25; [[ -n "$lc" ]] && urate=100
+        uk=${ARM_CONC:-${AB_CONCURRENCY:-1}}; [[ $uk =~ ^[1-9][0-9]{0,3}$ ]] || uk=1
+        ARM_TIMEOUT=$(( 300 + 10#$uk * ((umct + urate - 1) / urate) ))
+        (( ARM_TIMEOUT < 600 )) && ARM_TIMEOUT=600
+      fi
+    fi
+  fi
+  if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
+    log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
+  fi
   ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
@@ -2715,6 +2813,14 @@ fi
 for u in "${!KH_BY_PROMPTS[@]}"; do
   log "prefill hashes with prompts $u"
   python3 -I "$HERE/ab_requests.py" --hashes "$OUT" ${KH_BY_PROMPTS[$u]} | tee -a "$OUT/window.log"
+done
+# A prompt set with a reference recorded in another run (<name>-khref.json beside its receipt;
+# make_longctx_receipts.py): each of its Kh arms' prefill hashes against it, prompt by prompt, and
+# their replies to the reference's requests (ab_requests.py --hashes-ref).
+for u in "${!KH_BY_PROMPTS[@]}"; do
+  [[ $u == U?* && -f "$EXTRA_PROMPTS/${u#U}-khref.json" ]] || continue
+  log "prefill hashes with prompts $u against the reference $EXTRA_PROMPTS/${u#U}-khref.json"
+  python3 -I "$HERE/ab_requests.py" --hashes-ref "$EXTRA_PROMPTS/${u#U}-khref.json" "$OUT" ${KH_BY_PROMPTS[$u]} | tee -a "$OUT/window.log"
 done
 # Dk / Dkt arms: the draft GEMV is exact, so the drafter proposes the same tokens. Each Dk arm's
 # requests must have the draft_n and draft_n_accepted (and the texts) of the same arm without its

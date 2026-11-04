@@ -542,6 +542,11 @@ set_tests_properties(ab_window_ag_test PROPERTIES LABELS "unit;fast" TIMEOUT ${R
 add_test(NAME ab_window_shared_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_shared_test.sh)
 set_tests_properties(ab_window_shared_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# ab_window.sh's long-context prompt sets (receipts with max_context_tokens: the context gate and the request
+# timeout), the --hashes-ref step and the lsparse card check's wiring, all with every action stubbed.
+add_test(NAME ab_window_longctx_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_longctx_test.sh)
+set_tests_properties(ab_window_longctx_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 
 # ================================================================== libr4d's kernels, on the host
 #

@@ -61,6 +61,15 @@
  *                                                      SwiGLU waves equal to one launch; pitched slices
  *                                                      preserve guards and NaN payloads; then "p1 time:" lines. Last line
  *                                                      "p1: PASS ..." or "p1: FAIL ...".
+ *   ds41_mxfp4_device_check LIBR4D.so lsparse [C] [W:r...] the sparse ops at long context (LCP=C, 2048 by
+ *                                                      default, set here): index_score, index_candidates,
+ *                                                      index_topk (with and without keep) and attn_sparse_sink
+ *                                                      on a 256-row chunk at the end of a context of index
+ *                                                      width W at ratio r (32769:1 65537:2 131073:1 262145:2
+ *                                                      524289:1 by default: --max-model-len 32768, 131072 and
+ *                                                      524288), the chunk against its rows alone, 16 at a
+ *                                                      time and as suffixes, top-k also against the host.
+ *                                                      Last line "lsparse: PASS ..." or "lsparse: FAIL ...".
  *   ds41_mxfp4_device_check LIBR4D.so sweep [trials]   the height sweep under EXACT_TALL, or under
  *                                                      RADIANCE_EXPERIMENTAL_DS41_LCP when that is in
  *                                                      the environment (its heights); sweep0 without
@@ -123,6 +132,9 @@ struct Lib {
     /* For `tall`: the twin's launch, the tiled row's (to show what the twin replaces), the sparse
      * ops, and the plugin's row table. */
     Launch moe_tall = nullptr, moe_tiled = nullptr, attn = nullptr, iscore = nullptr;
+    /* For `lsparse`: the indexer's selection ops and index_topk's scratch hook. */
+    Launch itopk = nullptr, icand = nullptr;
+    int64_t (*itopk_scratch)(const RadArgs*) = nullptr;
     /* For `sweep`: the other ops whose launcher reads the pass height. */
     Launch rmsnorm = nullptr, collapse_norm = nullptr, post_collapse_norm = nullptr, norm_rope = nullptr,
            mix = nullptr, gemm64 = nullptr, logits = nullptr;
@@ -147,6 +159,9 @@ struct Lib {
         moe_tiled = (Launch)dlsym(h, "r4d_rad_moe_gemm_mxfp4_tiled");
         attn = (Launch)dlsym(h, "r4d_rad_ds41_attn_sparse_sink");
         iscore = (Launch)dlsym(h, "r4d_rad_ds41_index_score");
+        itopk = (Launch)dlsym(h, "r4d_rad_ds41_index_topk");
+        icand = (Launch)dlsym(h, "r4d_rad_ds41_index_candidates");
+        itopk_scratch = (int64_t (*)(const RadArgs*))dlsym(h, "r4d_rad_ds41_index_topk_scratch");
         rmsnorm = (Launch)dlsym(h, "r4d_rad_rmsnorm");
         collapse_norm = (Launch)dlsym(h, "r4d_rad_mhc_collapse_rmsnorm");
         post_collapse_norm = (Launch)dlsym(h, "r4d_rad_mhc_post_collapse_rmsnorm");
@@ -1287,6 +1302,426 @@ int tall_check(const Lib& L, const std::vector<int>& Ts) {
     rc |= sp_bad ? 1 : 0;
     std::printf(rc ? "FAIL\n" : "PASS: tall passes give 16-token passes' bits on all three ops\n");
     return rc;
+}
+
+/* ================================================================== lsparse (the sparse ops at long context)
+ *
+ * The indexer and the sparse attention at the index widths of a long --max-model-len: an index_score row
+ * has max_ctx / ratio + 1 columns (deepseek41.cpp: ratio 2 at layers 2-19, ratio 1 from layer 20), so
+ * 65,537 / 131,073 at --max-model-len 131072 and 262,145 / 524,289 at 524288, where `lcp` stops at a few
+ * thousand. One sequence's chunk of M rows ends at the context's last position (every row's reach near
+ * the width); with RADIANCE_EXPERIMENTAL_DS41_LCP set (the servers' Lc parts: the sparse ops' scalar forms
+ * at every height) each op's rows launched as one chunk are held to the same rows launched alone (the
+ * decode form: index_topk's split kernels over the scratch its hook asks for), 16 at a time and as the
+ * suffixes a consumer cut issues, every op on the same inputs:
+ *
+ *   index_score        q, w and the index keys (one entry a block of `ratio` slots, as entry_store keeps
+ *                      them; the block table permuted) -> f32 scores, every column's bits
+ *   index_candidates   (ratio 1: the candidate layer's) blocks of 8 positions, the best 2048 a row ->
+ *                      keep words
+ *   index_topk         the best 512 positions a row in position order, -1 past them; without keep, and
+ *                      at ratio 1 also with the candidates' keep (layers 24-36); its selections are also
+ *                      held, on three rows a width, to a host top-k under (score desc, position asc)
+ *   attn_sparse_sink   16 and 32 heads, the 128-position window and the 512 selected compressed entries
+ *                      (the chunk's own top-k), bf16 outputs
+ *
+ * The chunk's selections must hold 512 positions a row (else the comparison would be vacuous). */
+constexpr int kLsIH = 32, kLsID = 128, kLsTopk = 512, kLsCandBlock = 8, kLsCandBlocks = 2048;
+constexpr int kLsD = 512, kLsWin = 128, kLsBs = 16;
+
+uint64_t ls_mix(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+/* Uniform bf16 values in [-amp, amp), a hash of (seed, index): fast at hundreds of millions. */
+void ls_fill(std::vector<uint16_t>& v, uint64_t seed, float amp) {
+    for (size_t i = 0; i < v.size(); ++i) {
+        const float u = (float)(ls_mix(seed ^ (i * 0x632be59bd9b4e019ull)) >> 40) / 16777216.0f;
+        v[i] = f32_to_bf16((2.0f * u - 1.0f) * amp);
+    }
+}
+/* A permutation of [0, n) (block tables). */
+std::vector<int32_t> ls_perm(long n, uint64_t seed) {
+    std::vector<int32_t> p((size_t)n);
+    for (long i = 0; i < n; ++i) p[(size_t)i] = (int32_t)i;
+    std::mt19937_64 rng(seed);
+    std::shuffle(p.begin(), p.end(), rng);
+    return p;
+}
+
+struct LongSparse {
+    int W = 0, r = 1, M = 0;
+    long last = 0, P0 = 0;
+    long nib = 0, ncb = 0, nwbt = 0, nwphys = 0, kwords = 0;
+    std::vector<int32_t> pos;
+    std::unique_ptr<Dev> iq, iw, kc, ibt, dpos, wc, wbt, cc, cbt, q16, q32, sink16, sink32, cu, used, scratch;
+    int64_t scratch_bytes = 0;
+};
+
+/* The fixture of one width: the chunk's last row at the last position of a context of (W - 1) * r. */
+bool ls_build(const Lib& L, LongSparse& f, int W, int r, int M, uint64_t seed) {
+    f.W = W; f.r = r; f.M = M;
+    f.last = (long)(W - 1) * r - 1;
+    f.P0 = f.last - M + 1;
+    f.pos.resize((size_t)M);
+    for (int m = 0; m < M; ++m) f.pos[(size_t)m] = (int32_t)(f.P0 + m);
+    /* The index keys and the compressed entries: one entry a block, block b of the table at entry b. */
+    f.nib = W;
+    f.ncb = W;
+    {
+        std::vector<uint16_t> v((size_t)M * kLsIH * kLsID);
+        ls_fill(v, seed + 1, 0.5f);
+        f.iq.reset(new Dev(v.size() * 2)); f.iq->put(v.data());
+        v.assign((size_t)M * kLsIH, 0);
+        ls_fill(v, seed + 2, 1.0f);
+        f.iw.reset(new Dev(v.size() * 2)); f.iw->put(v.data());
+        v.assign((size_t)f.nib * kLsID, 0);
+        ls_fill(v, seed + 3, 0.5f);
+        f.kc.reset(new Dev(v.size() * 2)); f.kc->put(v.data());
+        v.assign((size_t)f.ncb * kLsD, 0);
+        ls_fill(v, seed + 4, 0.5f);
+        f.cc.reset(new Dev(v.size() * 2)); f.cc->put(v.data());
+    }
+    {
+        const std::vector<int32_t> ib = ls_perm(f.nib, seed + 5), cb = ls_perm(f.ncb, seed + 6);
+        f.ibt.reset(new Dev(ib.size() * 4)); f.ibt->put(ib.data());
+        f.cbt.reset(new Dev(cb.size() * 4)); f.cbt->put(cb.data());
+    }
+    /* The window: its table covers positions from 0 (window_used = the launch's last position + 1); only
+     * the blocks the chunk's windows reach hold keys (permuted), the rest name block 0 and are not read. */
+    f.nwbt = f.last / kLsBs + 1;
+    const long b_lo = std::max(0L, (f.P0 - kLsWin + 1) / kLsBs), b_hi = f.last / kLsBs;
+    f.nwphys = b_hi - b_lo + 1;
+    {
+        std::vector<int32_t> wb((size_t)f.nwbt, 0);
+        const std::vector<int32_t> p = ls_perm(f.nwphys, seed + 7);
+        for (long b = b_lo; b <= b_hi; ++b) wb[(size_t)b] = p[(size_t)(b - b_lo)];
+        f.wbt.reset(new Dev(wb.size() * 4)); f.wbt->put(wb.data());
+        std::vector<uint16_t> v((size_t)f.nwphys * kLsBs * kLsD);
+        ls_fill(v, seed + 8, 0.5f);
+        f.wc.reset(new Dev(v.size() * 2)); f.wc->put(v.data());
+    }
+    for (int H : { 16, 32 }) {
+        std::vector<uint16_t> v((size_t)M * H * kLsD);
+        ls_fill(v, seed + 9 + (uint64_t)H, 0.5f);
+        std::vector<float> s((size_t)H);
+        for (int h = 0; h < H; ++h) s[(size_t)h] = (float)((int)(ls_mix(seed + 100 + (uint64_t)h) % 2001) - 1000) / 1000.0f;
+        Dev* dq = new Dev(v.size() * 2);
+        dq->put(v.data());
+        Dev* ds = new Dev(s.size() * 4);
+        ds->put(s.data());
+        (H == 16 ? f.q16 : f.q32).reset(dq);
+        (H == 16 ? f.sink16 : f.sink32).reset(ds);
+    }
+    f.dpos.reset(new Dev(f.pos.size() * 4)); f.dpos->put(f.pos.data());
+    f.cu.reset(new Dev(8));
+    f.used.reset(new Dev(4));
+    f.kwords = (((long)W + kLsCandBlock - 1) / kLsCandBlock + 31) / 32;
+    /* index_topk's scratch, as the core sizes it at declare: the hook at the band's bound of 16 rows. */
+    {
+        RadParam p[4] = { pi("M", 16), pi("width", W), pi("topk", kLsTopk), pi("ratio", r) };
+        RadArgs a{};
+        a.p = p; a.n_p = 4;
+        f.scratch_bytes = L.itopk_scratch(&a);
+        if (f.scratch_bytes <= 0) {
+            std::printf("FAIL: lsparse W=%d: index_topk's scratch hook asks for %lld bytes (no split form for a long row?)\n",
+                        W, (long long)f.scratch_bytes);
+            return false;
+        }
+        f.scratch.reset(new Dev((size_t)f.scratch_bytes));
+    }
+    return true;
+}
+
+void ls_rows(LongSparse& f, int n, int r0) {
+    const int32_t cu[2] = { 0, n }, used = f.pos[(size_t)(r0 + n - 1)] + 1;
+    f.cu->put(cu);
+    f.used->put(&used);
+}
+
+/* Rows [r0, r0 + n) of the chunk, one launch of each op into `out` (device; rows from 0). */
+int ls_score(const Lib& L, hipStream_t s, LongSparse& f, int r0, int n, float* out) {
+    ls_rows(f, n, r0);
+    RadTensor t[7] = { tensor((uint16_t*)f.iq->p + (size_t)r0 * kLsIH * kLsID, RAD_BF16, { n, kLsIH * kLsID }),
+                       tensor((uint16_t*)f.iw->p + (size_t)r0 * kLsIH, RAD_BF16, { n, kLsIH }),
+                       tensor(f.kc->p, RAD_BF16, { f.nib, 1, f.r, kLsID / f.r }),
+                       tensor(f.ibt->p, RAD_I32, { 1, f.nib }),
+                       tensor((int32_t*)f.dpos->p + r0, RAD_I32, { n }), tensor(f.cu->p, RAD_I32, { 2 }),
+                       tensor(out, RAD_F32, { n, f.W }) };
+    RadParam p[7] = { pi("M", n), pi("heads", kLsIH), pi("dim", kLsID), pi("ratio", f.r), pi("width", f.W),
+                      pf("wscale", 1.0 / std::sqrt((double)kLsID * (double)kLsIH)), ps("dtype", "bf16") };
+    RadArgs a{};
+    a.t = t; a.n_t = 7; a.p = p; a.n_p = 7;
+    const int rc = L.iscore(&a, (RadStream)s);
+    HC(hipStreamSynchronize(s));
+    return rc;
+}
+int ls_cand(const Lib& L, hipStream_t s, LongSparse& f, int r0, int n, const float* score, int32_t* keep) {
+    RadTensor t[3] = { tensor((void*)score, RAD_F32, { n, f.W }), tensor((int32_t*)f.dpos->p + r0, RAD_I32, { n }),
+                       tensor(keep, RAD_I32, { n, f.kwords }) };
+    RadParam p[3] = { pi("block", kLsCandBlock), pi("topk_blocks", kLsCandBlocks), pi("ratio", f.r) };
+    RadArgs a{};
+    a.t = t; a.n_t = 3; a.p = p; a.n_p = 3;
+    const int rc = L.icand(&a, (RadStream)s);
+    HC(hipStreamSynchronize(s));
+    return rc;
+}
+int ls_topk(const Lib& L, hipStream_t s, LongSparse& f, int r0, int n, const float* score, const int32_t* keep,
+            int32_t* sel) {
+    RadTensor t[4] = { tensor((void*)score, RAD_F32, { n, f.W }),
+                       keep ? tensor((void*)keep, RAD_I32, { n, f.kwords }) : RadTensor{},
+                       tensor((int32_t*)f.dpos->p + r0, RAD_I32, { n }), tensor(sel, RAD_I32, { n, kLsTopk }) };
+    std::vector<RadParam> p = { pi("M", n), pi("width", f.W), pi("topk", kLsTopk), pi("ratio", f.r) };
+    if (keep) p.push_back(pi("block", kLsCandBlock));
+    RadArgs a{};
+    a.t = t; a.n_t = 4; a.p = p.data(); a.n_p = (int)p.size();
+    a.scratch = f.scratch->p; a.scratch_bytes = f.scratch_bytes;
+    const int rc = L.itopk(&a, (RadStream)s);
+    HC(hipStreamSynchronize(s));
+    return rc;
+}
+int ls_attn(const Lib& L, hipStream_t s, LongSparse& f, int H, int r0, int n, const int32_t* sel, uint16_t* out) {
+    ls_rows(f, n, r0);
+    const Dev& q = *(H == 16 ? f.q16 : f.q32);
+    const Dev& sink = *(H == 16 ? f.sink16 : f.sink32);
+    RadTensor t[11] = { tensor((uint16_t*)q.p + (size_t)r0 * H * kLsD, RAD_BF16, { n, (int64_t)H * kLsD }),
+                        tensor(f.wc->p, RAD_BF16, { f.nwphys, 1, kLsBs, kLsD }), tensor(f.wbt->p, RAD_I32, { 1, f.nwbt }),
+                        tensor(f.used->p, RAD_I32, { 1 }), tensor(f.cc->p, RAD_BF16, { f.ncb, 1, f.r, kLsD / f.r }),
+                        tensor(f.cbt->p, RAD_I32, { 1, f.ncb }), tensor((void*)(sel + (size_t)r0 * kLsTopk), RAD_I32, { n, kLsTopk }),
+                        tensor((int32_t*)f.dpos->p + r0, RAD_I32, { n }), tensor(f.cu->p, RAD_I32, { 2 }),
+                        tensor(sink.p, RAD_F32, { H }), tensor(out, RAD_BF16, { n, (int64_t)H * kLsD }) };
+    RadParam p[8] = { pi("M", n), pi("heads", H), pi("dim", kLsD), pi("window", kLsWin), pi("ratio", f.r),
+                      pi("topk", kLsTopk), pf("scale", 0.04419417382415922), ps("dtype", "bf16") };
+    RadArgs a{};
+    a.t = t; a.n_t = 11; a.p = p; a.n_p = 8;
+    const int rc = L.attn(&a, (RadStream)s);
+    HC(hipStreamSynchronize(s));
+    return rc;
+}
+
+/* The selection's key (r4d_ds41_sparse.hip ds_key; 0 for -inf and NaN, not candidates). */
+uint32_t ls_key(float v) {
+    if (!(v > -INFINITY)) return 0u;
+    const float w = v + 0.0f;
+    uint32_t u;
+    std::memcpy(&u, &w, 4);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+/* The best `take` of keys (index i -> key, 0 = none) under (key desc, index asc), as a membership mask. */
+std::vector<char> ls_best(const std::vector<uint32_t>& key, long take) {
+    std::vector<int32_t> idx;
+    for (size_t i = 0; i < key.size(); ++i) if (key[i]) idx.push_back((int32_t)i);
+    const auto better = [&](int32_t a, int32_t b) { return key[(size_t)a] != key[(size_t)b] ? key[(size_t)a] > key[(size_t)b] : a < b; };
+    if ((long)idx.size() > take) {
+        std::nth_element(idx.begin(), idx.begin() + take, idx.end(), better);
+        idx.resize((size_t)take);
+    }
+    std::vector<char> in(key.size(), 0);
+    for (int32_t i : idx) in[(size_t)i] = 1;
+    return in;
+}
+/* Row m's candidates (index_candidates) and selection (index_topk, with keep or without) on the host. */
+std::vector<int32_t> ls_host_keep(const LongSparse& f, const float* row, int m) {
+    const long nb = ((long)f.W + kLsCandBlock - 1) / kLsCandBlock;
+    const long reach = ((long)f.pos[(size_t)m] + 1) / f.r;
+    const long pin = (reach >= 1 && (reach - 1) / kLsCandBlock < nb) ? (reach - 1) / kLsCandBlock : -1;
+    std::vector<uint32_t> key((size_t)nb);
+    for (long b = 0; b < nb; ++b) {
+        float bs = -INFINITY;
+        for (long j = b * kLsCandBlock; j < std::min((long)f.W, (b + 1) * kLsCandBlock); ++j) bs = bs < row[j] ? row[j] : bs;
+        if (b == pin) bs = INFINITY;
+        key[(size_t)b] = ls_key(bs);
+    }
+    const std::vector<char> in = ls_best(key, kLsCandBlocks);
+    std::vector<int32_t> words((size_t)f.kwords, 0);
+    for (long b = 0; b < nb; ++b)
+        if (in[(size_t)b]) words[(size_t)(b >> 5)] |= (int32_t)(1u << (b & 31));
+    return words;
+}
+std::vector<int32_t> ls_host_topk(const LongSparse& f, const float* row, int m, const int32_t* keep) {
+    long reach = ((long)f.pos[(size_t)m] + 1) / f.r;
+    reach = std::max(0L, std::min(reach, (long)f.W));
+    std::vector<uint32_t> key((size_t)reach);
+    for (long j = 0; j < reach; ++j) {
+        const long b = j / kLsCandBlock;
+        key[(size_t)j] = keep && !(((uint32_t)keep[b >> 5] >> (b & 31)) & 1u) ? 0u : ls_key(row[j]);
+    }
+    const std::vector<char> in = ls_best(key, kLsTopk);
+    std::vector<int32_t> sel;
+    for (long j = 0; j < reach; ++j) if (in[(size_t)j]) sel.push_back((int32_t)j);
+    sel.resize(kLsTopk, -1);
+    return sel;
+}
+
+/* Every row range of the chunk the check launches apart from the whole: alone, 16 at a time, suffixes. */
+std::vector<std::pair<int, int>> ls_ranges(int M) {
+    std::vector<std::pair<int, int>> v;
+    for (int r0 : { 16, M / 2 / 16 * 16, (M - 1) / 16 * 16 })
+        if (r0 > 0 && r0 < M) v.push_back({ r0, M - r0 });
+    for (int cut : { 1, 16 })
+        for (int r0 = 0; r0 < M; r0 += cut) v.push_back({ r0, std::min(cut, M - r0) });
+    return v;
+}
+
+/* One width: each op's whole chunk against its row ranges; the differing values (1 << 40 on a refusal). */
+size_t ls_width(const Lib& L, hipStream_t s, int W, int r, int M, size_t* compared) {
+    LongSparse f;
+    if (!ls_build(L, f, W, r, M, 0x15a7c0deull + (uint64_t)W * 31 + (uint64_t)r)) return (size_t)1 << 40;
+    const size_t plane = (size_t)M * W;
+    Dev score(plane * 4), score2(plane * 4), keep((size_t)M * f.kwords * 4), keep2((size_t)M * f.kwords * 4),
+        sel((size_t)M * kLsTopk * 4), selk((size_t)M * kLsTopk * 4), sel2((size_t)M * kLsTopk * 4),
+        att((size_t)M * 32 * kLsD * 2), att2((size_t)M * 32 * kLsD * 2);
+    const auto refused = [&](const char* op, int rc, int r0, int n) {
+        std::printf("FAIL: lsparse W=%d r=%d: %s refused rows %d..%d (%d)\n", W, r, op, r0, r0 + n - 1, rc);
+        return (size_t)1 << 40;
+    };
+    HC(hipMemset(score.p, 0xAA, score.n));
+    int rc = ls_score(L, s, f, 0, M, (float*)score.p);
+    if (rc < 0) return refused("index_score", rc, 0, M);
+    std::vector<float> hs(plane);
+    score.get(hs.data());
+    /* The chunk's scores: finite below each row's reach, -inf from it. */
+    size_t bad_shape = 0;
+    for (int m = 0; m < M; ++m) {
+        const long reach = std::min((long)W, ((long)f.pos[(size_t)m] + 1) / r);
+        for (long j = 0; j < W; ++j) {
+            const float v = hs[(size_t)m * W + j];
+            bad_shape += j < reach ? !std::isfinite(v) : !(v == -INFINITY);
+        }
+    }
+    if (bad_shape) std::printf("  W=%d r=%d: %zu scores not finite below a row's reach or not -inf from it\n", W, r, bad_shape);
+    const bool cand = r == 1;
+    std::vector<int32_t> hk, hsel((size_t)M * kLsTopk), hselk;
+    if (cand) {
+        HC(hipMemset(keep.p, 0xAA, keep.n));
+        if ((rc = ls_cand(L, s, f, 0, M, (const float*)score.p, (int32_t*)keep.p)) < 0) return refused("index_candidates", rc, 0, M);
+        hk.resize((size_t)M * f.kwords);
+        keep.get(hk.data());
+    }
+    HC(hipMemset(sel.p, 0xAA, sel.n));
+    if ((rc = ls_topk(L, s, f, 0, M, (const float*)score.p, nullptr, (int32_t*)sel.p)) < 0) return refused("index_topk", rc, 0, M);
+    sel.get(hsel.data());
+    if (cand) {
+        HC(hipMemset(selk.p, 0xAA, selk.n));
+        if ((rc = ls_topk(L, s, f, 0, M, (const float*)score.p, (const int32_t*)keep.p, (int32_t*)selk.p)) < 0)
+            return refused("index_topk (keep)", rc, 0, M);
+        hselk.resize((size_t)M * kLsTopk);
+        selk.get(hselk.data());
+    }
+    /* Not vacuous: every row of the chunk selected 512 positions. */
+    size_t short_rows = 0;
+    for (int m = 0; m < M; ++m)
+        for (int k = 0; k < kLsTopk; ++k) {
+            short_rows += hsel[(size_t)m * kLsTopk + k] < 0;
+            if (cand) short_rows += hselk[(size_t)m * kLsTopk + k] < 0;
+        }
+    if (short_rows) std::printf("  W=%d r=%d: %zu unfilled selections in the chunk's top-k\n", W, r, short_rows);
+    /* The host's selection on the first, middle and last rows. */
+    size_t host_bad = 0;
+    for (int m : { 0, M / 2, M - 1 }) {
+        const float* row = &hs[(size_t)m * W];
+        std::vector<int32_t> hkm;
+        if (cand) {
+            hkm = ls_host_keep(f, row, m);
+            host_bad += std::memcmp(hkm.data(), &hk[(size_t)m * f.kwords], (size_t)f.kwords * 4) != 0;
+        }
+        const std::vector<int32_t> t0 = ls_host_topk(f, row, m, nullptr);
+        host_bad += std::memcmp(t0.data(), &hsel[(size_t)m * kLsTopk], kLsTopk * 4) != 0;
+        if (cand) {
+            const std::vector<int32_t> t1 = ls_host_topk(f, row, m, &hk[(size_t)m * f.kwords]);
+            host_bad += std::memcmp(t1.data(), &hselk[(size_t)m * kLsTopk], kLsTopk * 4) != 0;
+        }
+    }
+    if (host_bad) std::printf("  W=%d r=%d: %zu of the sampled rows' selections or keep words differ from the host's\n", W, r, host_bad);
+    std::vector<std::vector<uint16_t>> ha(2);
+    for (int hi = 0; hi < 2; ++hi) {
+        const int H = hi ? 32 : 16;
+        HC(hipMemset(att.p, 0xAA, att.n));
+        if ((rc = ls_attn(L, s, f, H, 0, M, (const int32_t*)sel.p, (uint16_t*)att.p)) < 0) return refused("attn_sparse_sink", rc, 0, M);
+        ha[(size_t)hi].resize((size_t)M * H * kLsD);
+        HC(hipMemcpy(ha[(size_t)hi].data(), att.p, ha[(size_t)hi].size() * 2, hipMemcpyDeviceToHost));
+    }
+    size_t d_score = 0, d_cand = 0, d_topk = 0, d_topkk = 0, d_attn = 0;
+    std::vector<float> s2;
+    std::vector<int32_t> i2;
+    std::vector<uint16_t> a2;
+    for (const auto& rg : ls_ranges(M)) {
+        const int r0 = rg.first, n = rg.second;
+        /* Each launch's rows start from 0xAA bytes, so a value it does not write cannot pass. */
+        HC(hipMemset(score2.p, 0xAA, (size_t)n * W * 4));
+        if ((rc = ls_score(L, s, f, r0, n, (float*)score2.p)) < 0) return refused("index_score", rc, r0, n);
+        s2.resize((size_t)n * W);
+        HC(hipMemcpy(s2.data(), score2.p, s2.size() * 4, hipMemcpyDeviceToHost));
+        d_score += std::memcmp(s2.data(), &hs[(size_t)r0 * W], s2.size() * 4) ? [&] {
+            size_t d = 0;
+            for (size_t i = 0; i < s2.size(); ++i) d += std::memcmp(&s2[i], &hs[(size_t)r0 * W + i], 4) != 0;
+            return d;
+        }() : 0;
+        /* The selections from the chunk's own scores and keep (each op on the same inputs). */
+        const float* srow = (const float*)score.p + (size_t)r0 * W;
+        if (cand) {
+            HC(hipMemset(keep2.p, 0xAA, (size_t)n * f.kwords * 4));
+            if ((rc = ls_cand(L, s, f, r0, n, srow, (int32_t*)keep2.p)) < 0) return refused("index_candidates", rc, r0, n);
+            i2.resize((size_t)n * f.kwords);
+            HC(hipMemcpy(i2.data(), keep2.p, i2.size() * 4, hipMemcpyDeviceToHost));
+            for (size_t i = 0; i < i2.size(); ++i) d_cand += i2[i] != hk[(size_t)r0 * f.kwords + i];
+        }
+        HC(hipMemset(sel2.p, 0xAA, (size_t)n * kLsTopk * 4));
+        if ((rc = ls_topk(L, s, f, r0, n, srow, nullptr, (int32_t*)sel2.p)) < 0) return refused("index_topk", rc, r0, n);
+        i2.resize((size_t)n * kLsTopk);
+        HC(hipMemcpy(i2.data(), sel2.p, i2.size() * 4, hipMemcpyDeviceToHost));
+        for (size_t i = 0; i < i2.size(); ++i) d_topk += i2[i] != hsel[(size_t)r0 * kLsTopk + i];
+        if (cand) {
+            const int32_t* krow = (const int32_t*)keep.p + (size_t)r0 * f.kwords;
+            HC(hipMemset(sel2.p, 0xAA, (size_t)n * kLsTopk * 4));
+            if ((rc = ls_topk(L, s, f, r0, n, srow, krow, (int32_t*)sel2.p)) < 0) return refused("index_topk (keep)", rc, r0, n);
+            HC(hipMemcpy(i2.data(), sel2.p, i2.size() * 4, hipMemcpyDeviceToHost));
+            for (size_t i = 0; i < i2.size(); ++i) d_topkk += i2[i] != hselk[(size_t)r0 * kLsTopk + i];
+        }
+        for (int hi = 0; hi < 2; ++hi) {
+            const int H = hi ? 32 : 16;
+            HC(hipMemset(att2.p, 0xAA, (size_t)n * H * kLsD * 2));
+            if ((rc = ls_attn(L, s, f, H, r0, n, (const int32_t*)sel.p, (uint16_t*)att2.p)) < 0) return refused("attn_sparse_sink", rc, r0, n);
+            a2.resize((size_t)n * H * kLsD);
+            HC(hipMemcpy(a2.data(), att2.p, a2.size() * 2, hipMemcpyDeviceToHost));
+            d_attn += count_diff(&ha[(size_t)hi][(size_t)r0 * H * kLsD], a2.data(), a2.size());
+        }
+        *compared += (size_t)n;
+    }
+    std::printf("lsparse W=%d (ratio %d, positions %ld..%ld, %d rows): index_score %zu, %sindex_topk %zu%s, "
+                "attn_sparse_sink (16, 32 heads) %zu differing values against rows alone, 16 at a time and as "
+                "suffixes; host top-k %zu, unfilled %zu, score shape %zu\n",
+                W, r, f.P0, f.last, M, d_score, cand ? ("index_candidates " + std::to_string(d_cand) + ", ").c_str() : "",
+                d_topk, cand ? (" (with keep " + std::to_string(d_topkk) + ")").c_str() : "", d_attn, host_bad,
+                short_rows, bad_shape);
+    std::fflush(stdout);
+    return d_score + d_cand + d_topk + d_topkk + d_attn + host_bad + short_rows + bad_shape;
+}
+
+/* `lsparse [C] [W:r ...]`: the widths (default the two ratios' at --max-model-len 32768, 131072 and
+ * 524288's), M = 256 rows (the score plane's rows a run at 256K and above). */
+int long_sparse_check(const Lib& L, const std::vector<std::pair<int, int>>& widths) {
+    if (!L.attn || !L.iscore || !L.itopk || !L.icand || !L.itopk_scratch) {
+        std::printf("lsparse: FAIL: the plugin lacks a sparse op's launcher (attn_sparse_sink, index_score, index_topk, "
+                    "index_candidates or index_topk's scratch hook)\n");
+        return 1;
+    }
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    size_t bad = 0, rows = 0;
+    std::string ws;
+    for (const auto& w : widths) {
+        bad += ls_width(L, s, w.first, w.second, 256, &rows);
+        ws += (ws.empty() ? "" : " ") + std::to_string(w.first) + ":" + std::to_string(w.second);
+    }
+    HC(hipStreamDestroy(s));
+    if (bad) std::printf("lsparse: FAIL: %zu differing values at widths %s\n", bad, ws.c_str());
+    else std::printf("lsparse: PASS: index_score, index_candidates, index_topk and attn_sparse_sink at index widths %s "
+                     "keep the chunk's bits in %zu rows launched alone, 16 at a time and as suffixes; host top-k equal\n",
+                     ws.c_str(), rows);
+    return bad ? 1 : 0;
 }
 
 /* ================================================================== sweep (the height-dependent ops)
@@ -2757,7 +3192,7 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
@@ -2773,6 +3208,13 @@ int main(int argc, char** argv) {
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL");
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE");
         g_lcp = 2048;
+    } else if (!std::strcmp(argv[2], "lsparse")) {
+        /* `lsparse [C]`: LCP=C (2048) and EXACT_TALL unset, as an Lc arm's server has them. */
+        const int c = argc > 3 ? std::atoi(argv[3]) : 2048;
+        if (c < 64 || c > 4096 || c % 16) { std::fprintf(stderr, "lsparse C: a multiple of 16 in 64 .. 4096\n"); return 2; }
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", std::to_string(c).c_str(), 1);
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+        g_lcp = c;
     } else if (!std::strcmp(argv[2], "lcp") || !std::strcmp(argv[2], "bal")) {
         const int c = argc > 3 ? std::atoi(argv[3]) : 1024;
         if (c < 64 || c > 4096 || c % 16) { std::fprintf(stderr, "lcp C: a multiple of 16 in 64 .. 4096\n"); return 2; }
@@ -2831,6 +3273,19 @@ int main(int argc, char** argv) {
         return rc;
     }
     if (!std::strcmp(argv[2], "bal")) return bal_check(lib, argc > 4 ? argv[4] : nullptr);
+    if (!std::strcmp(argv[2], "lsparse")) {
+        std::vector<std::pair<int, int>> ws;
+        for (int i = 4; i < argc; ++i) {
+            int w = 0, r = 0;
+            if (std::sscanf(argv[i], "%d:%d", &w, &r) != 2 || w < 2 || (r != 1 && r != 2)) {
+                std::fprintf(stderr, "lsparse W:r: a width of 2 or more at ratio 1 or 2, not %s\n", argv[i]);
+                return 2;
+            }
+            ws.push_back({ w, r });
+        }
+        if (ws.empty()) ws = { { 32769, 1 }, { 65537, 2 }, { 131073, 1 }, { 262145, 2 }, { 524289, 1 } };
+        return long_sparse_check(lib, ws);
+    }
     if (!std::strcmp(argv[2], ds41p1::kCheckMode)) {
         const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;
         if (mmax < 17 || mmax > ds41p1::kTwinMaxRows) {

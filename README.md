@@ -1,3 +1,40 @@
+# radiance-ramcache: DeepSeek-V4.1-Flash at full precision on four RX 9070 XT
+
+This is a fork of [radiance](https://codeberg.org/StillDeadcode/radiance) tuned for one job: serving
+DeepSeek-V4.1-Flash (ds41) at its released precision (FP8 dense weights, MXFP4 routed experts, nothing
+quantized further) on a workstation with four 16 GB Radeon RX 9070 XT cards (gfx1201, tensor parallel 4)
+and an AMD EPYC 7443 (Zen 3 "Milan", 24 cores) with 256 GB of DDR4-2666. The routed experts (about
+289 GB) do not fit in the cards' 64 GB, so the hottest experts stay in VRAM, most of the rest sit in a
+192 GiB packed RAM cache whose experts the CPU computes, and the remainder is read from NVMe. Every
+optimization is exact: replies stay byte-identical to the base engine's, which each measurement window
+checks by comparing replies, prefill hashes and logits. [RAMCACHE.md](RAMCACHE.md) lists what the fork
+adds; [tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md) has the configuration,
+the switches and every measurement. Below the line is upstream's README, unchanged.
+
+Latest numbers (November 2026): the recommended configuration on the `ds41-stable` branch (radiance
+1.15 base). On the cards, `main` (radiance 1.16) matched that line with identical replies and logits at
+the same speed, before batch admission and the expert worker were merged; those two are built and
+host-tested here. Each row comes from one or two A/B windows; a total at N streams is N times the mean
+per-request decode rate.
+
+| workload | four RX 9070 XT | plus an R9700 (32 GB) as expert worker |
+|---|---|---|
+| decode, 1 stream | 28-30 tok/s | 33.9 tok/s |
+| decode, 4 streams, batch admission | 41-44 tok/s | 51.5 tok/s |
+| decode, 8 streams, batch admission | 45-47 tok/s | 57.6-58.2 tok/s |
+| decode, 8 streams, chat prompts | 38.4-38.9 tok/s | 45.8-46.5 tok/s |
+| agent-harness turns (13, prefix cache) | 72-76 s summed time to first token, decode 25-26 tok/s | decode 29.4-29.6 tok/s, all turns about 5-7% less time |
+
+- **Prefill**: a 6,817-token prompt in about 17 s (about 400 tok/s); 47,917 and 99,987 tokens in 115
+  and 222 s (416 and 451 tok/s), or 77 and 165 s (626 and 606 tok/s) with 4,096-token chunks.
+- **Context**: up to 131,072 tokens qualified end to end with a fixed KV reservation (about 0-2% decode
+  cost at short context); a 524,288-token reservation starts and costs 7% at short context.
+- **Notes**: the expert worker is optional and turns itself off without a fifth card of the
+  same architecture. Branches: `main` (this one), `ds41-stable` (the measured line), `ds41` (a curated
+  evidence snapshot) and `ds41-research`.
+
+---
+
 # radiance
 
 An inference server for AMD GPUs, in C++ and HIP: language models, and image, video, speech and

@@ -60,7 +60,10 @@ Control::Control(const Config& cfg, const ds41aux::Card& card, int n_ranks)
     mail_.excluded.assign((size_t)R_, 0);
     excluded_.assign((size_t)R_, 0);
     excluded_told_.assign((size_t)R_, 0);
-    if (ctl_) gate_.reset(new Gate);
+    if (ctl_) {
+        gate_.reset(new Gate);
+        gate_->closed.store(true, std::memory_order_seq_cst);   /* attach() opens it when the worker serves */
+    }
     st_.state_since_ms = mono_ms();
 }
 

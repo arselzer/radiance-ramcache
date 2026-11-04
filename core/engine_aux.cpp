@@ -108,7 +108,7 @@ int Engine::aux_discover(const std::vector<int>& devs) {
         if (held) {
             aux_ctl_->watch(w.get(), /*reserving=*/true);
             const int rc = w->reserve(devs[0], &why);
-            std::string early;
+            if (rc >= 0) aux_ledger_ = w->arena_bytes();   /* in the device ledger even if given back at once */
             if (!aux_ctl_->reserved(rc >= 0)) {
                 if (rc >= 0) {   /* the watch asked for the card back during the reserve */
                     w->release_arena(devs[0]);
@@ -120,7 +120,6 @@ int Engine::aux_discover(const std::vector<int>& devs) {
             }
         }
         if (!held) aux_ctl_->watch(w.get(), /*reserving=*/false);
-        if (held) aux_ledger_ = w->arena_bytes();
         aux_released_why_ = held ? std::string() : busy;
         if (held)
             RAD_INFO("%s%d (%s, %s, %s): %s free of %s; reserved %lld MiB (headroom %lld MiB, %s free after); %s; "

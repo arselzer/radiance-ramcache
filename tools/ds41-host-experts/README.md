@@ -5,6 +5,16 @@ RAM cache, or on the NVMe drive. This directory holds the CPU kernels and tools 
 host-expert path: the CPU computes every routed expert the cards do not hold, bit-exact with the
 card's MXFP4 GEMV, so every reply stays byte-identical to the base engine's.
 
+The model behind the measurements is a hybrid conversion of the official
+[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017):
+routed experts retain the release's native FP4 E2M1 codes and E8M0 scales; other neural weights
+come from that checkpoint with BF16/F32 conversions; the two Engram embedding tables use
+ISTA's IQ4_NL conversion. The supplemental IQ2_XS file supplies integer Engram controls only,
+not IQ2 expert weights. This is not a wholly untouched official-precision checkpoint. The
+exactness claims below compare optimizations with this same imported base engine; they do not
+establish equivalence to an independent official runner. Engram is the confirmed additional
+quantization; a complete numerical audit of all other conversions remains outstanding.
+
 On the loop's eight held-out prompts (64 tokens, greedy, TP4) the path takes decode from 5.03 to
 about 17 tok/s and the time to first token summed over the prompts from 64.0 to about 15.5 s. Every
 step was measured as an A/B window; the log is `/home/as/ds41-decode-review-20261028/NIGHT-LOG.md`.

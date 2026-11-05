@@ -22,27 +22,32 @@ official FP8 Engram requires a new qualified baseline.
 Latest validated numbers (November 5, 2026): the recommended configuration on the `ds41-stable`
 branch (radiance 1.15 base). On the cards, `main` (radiance 1.16) matched that line with identical replies and logits at
 the same speed, before batch admission and the expert worker were merged; those two are built and
-host-tested here. Each row comes from one or two A/B windows; a total at N streams is N times the mean
-per-request decode rate.
+host-tested here. Each row comes from one or two A/B windows.
 
-| workload | four RX 9070 XT | plus an R9700 (32 GB) as expert worker |
-|---|---|---|
-| decode, 1 stream | 28-30 tok/s | 33.9 tok/s |
-| decode, 4 streams, batch admission | 41-44 tok/s | 51.5 tok/s |
-| decode, 8 streams, batch admission | 45-47 tok/s | 57.6-58.2 tok/s |
-| decode, 8 streams, chat prompts | 38.4-38.9 tok/s | 45.8-46.5 tok/s |
-| prefill, 6,817 tokens, admit-all | 13.24 s to first token | — |
-| prefill, 47,917 tokens, admit-all | 61.79 s to first token | — |
-| decode, 8 streams after the 47,917-token prefill, admit-all | 46.5-47.8 tok/s | — |
-| agent-harness turns (13, prefix cache) | 61-63 s summed time to first token with Phase 1 read-ahead off (72 s with it on), decode 25-26 tok/s | decode 29.4-29.6 tok/s, all turns about 5-7% less time |
+| Workload | Four RX 9070 XT (tok/s) | Plus optional R9700 expert worker (tok/s) |
+|---|---:|---:|
+| Decode, 1 stream | 28-30 | 33.9 |
+| Decode, 4 streams | 41-44 | 51.5 |
+| Decode, 8 streams | 45-47 | 57.6-58.2 |
+| Decode, 8 streams, chat prompts | 38.4-38.9 | 45.8-46.5 |
+| Decode, agent-harness turns with prefix cache | 25-26 | 29.4-29.6 |
+| Prefill, 6,817-token prompt | 515 | — |
+| Prefill, 47,917-token prompt | 776 | — |
 
-- **Prefill**: recommended admit-all at the tested 192 GiB expert-cache budget reduces time to first
-  token by 22.8% at 6,817 tokens (one quiet pair) and 38.4% at 47,917 tokens (OFF/ON/ON/OFF means).
-  Fresh controls were 17.16 and 100.25 s; all 80 replies/counts and five full prefill hashes matched,
-  with no post-prefill N8 decode regression. The worker column is unmeasured for these new rows.
+Decode rates are totals across the active streams (N times the mean per-request rate); concurrent
+rows use batch admission. Prefill uses the server's measured prompt-processing rate, rounded to
+whole tokens per second; the longer prompt's value is the mean of two runs. It excludes parsing,
+tokenization and admission wait. Both prefill rows use admit-all with the tested 192 GiB cache;
+`—` means unmeasured with the worker.
+
+- **Prefill latency**: admit-all takes 13.24 s to first token at 6,817 tokens, 22.8% less than the
+  fresh control (one quiet pair), and 61.79 s at 47,917 tokens, 38.4% less (OFF/ON/ON/OFF means).
+  All 80 replies/counts and five full prefill hashes matched, with no post-prefill N8 decode regression.
   Default admission previously measured 48K/100K at
   115/222 s, or 77/165 s with 4,096-token chunks. Admit-all at 100K and on prefix-cached harness
   turns remains unmeasured; smaller cache budgets retain default admission.
+- **Agent-harness latency**: 13 prefix-cached turns total 61-63 s to first token with Phase 1
+  read-ahead off (72 s with it on). The optional worker reduces total turn time by about 5-7%.
 - **Context**: a fixed 131,072-token reservation is qualified through 100K-token prompts (about
   0-2% decode cost at short context); a 524,288-token reservation starts and costs 7% at short context.
 - **Notes**: the expert worker is optional and turns itself off without a fifth card of the

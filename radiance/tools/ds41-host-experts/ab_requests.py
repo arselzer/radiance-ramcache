@@ -3,6 +3,10 @@
   ab_requests.py RECEIPT URL N OUT.json   send the first N held-out requests of RECEIPT (the loop's
                                           receipt.json) to URL, one at a time (AB_CONCURRENCY=K:
                                           in waves of K at once); save each response
+  ab_requests.py --before RECEIPT N K MAIN_RECEIPT URL MAIN_N OUT.json
+                                          run the first receipt, then the main receipt on the same
+                                          server; save the first phase as OUT.before.json, with its
+                                          own metrics. Main concurrency is AB_CONCURRENCY as usual.
   ab_requests.py --compare DIR ARM...     per request: whether each arm's text equals that of the
                                           first arm that sent the request (by name), and each arm's
                                           decode tokens/s (arms with no request in common, a U
@@ -242,13 +246,14 @@ def one(b, url, replies=None, timeout=600.0):
     return row
 
 
-def run(receipt, url, n, out):
+def run(receipt, url, n, out, concurrency=None, phase=None):
     """One request at a time, or with AB_CONCURRENCY=K in waves of K sent together; each wave's
     wall time and generated tokens are kept for the aggregate rate."""
+    phase_start = time.time() if phase is not None else None
     with open(receipt) as f:
         rec = json.load(f)
     reqs = rec["benchmark_requests"][:n]
-    k = max(1, int(os.environ.get("AB_CONCURRENCY", "1")))
+    k = max(1, int(os.environ.get("AB_CONCURRENCY", "1"))) if concurrency is None else concurrency
     try:
         timeout = request_timeout()
     except ValueError as e:
@@ -292,9 +297,58 @@ def run(receipt, url, n, out):
             stats = json.load(r)
     except Exception as e:
         stats = {"error": repr(e)}
+    result = {"requests": rows, "waves": waves, "concurrency": k, "request_timeout_s": timeout, "stats": stats}
+    if phase is not None:
+        result["phase"] = dict(phase, client_wall_s=time.time() - phase_start)
     with open(out, "w") as f:
-        json.dump({"requests": rows, "waves": waves, "concurrency": k, "request_timeout_s": timeout, "stats": stats},
-                  f, indent=1)
+        json.dump(result, f, indent=1)
+    return result
+
+
+def before_run(before_receipt, before_n, before_k, receipt, url, n, out):
+    """F5's two phases: original receipts and request bodies, a joined first phase, then the main
+    phase on the same server. Each phase has its own waves, replies and full cumulative /stats;
+    stats_before allows scheduler deltas without subtracting or hiding first-phase requests.
+    No aggregate across the phases is reported. A failed first phase never warms a measured main.
+    """
+    if before_n < 1 or before_k < 1 or n < 1 or not out.endswith(".json"):
+        raise ValueError("--before needs positive counts/concurrency and an OUT.json path")
+    main_k = max(1, int(os.environ.get("AB_CONCURRENCY", "1")))
+    request_timeout()   # reject an invalid timeout before sending either phase
+    # Validate both inputs before sending either phase. Preserve the receipt bytes and names.
+    sources = []
+    for path, count in ((before_receipt, before_n), (receipt, n)):
+        with open(path, "rb") as f:
+            raw = f.read()
+        reqs = json.loads(raw)["benchmark_requests"][:count]
+        names = [r["name"] for r in reqs]
+        if len(reqs) != count or len(set(names)) != len(names):
+            raise ValueError("--before needs %d requests with unique names: %s" % (count, path))
+        sources.append({"receipt": os.path.abspath(path), "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+                        "request_names": names})
+    try:
+        with urllib.request.urlopen(url + "/stats", timeout=30) as r:
+            initial = json.load(r)
+    except Exception as e:
+        raise ValueError("--before cannot record initial /stats: %r" % e)
+    if not isinstance(initial, dict) or initial.get("error"):
+        raise ValueError("--before initial /stats is not a complete observer snapshot")
+    before_out = out[:-5] + ".before.json"
+    first = run(before_receipt, url, before_n, before_out, concurrency=before_k,
+                phase=dict(sources[0], role="before", next=os.path.basename(out), stats_scope="server_cumulative",
+                           stats_before=initial))
+    def complete(result, expected):
+        return (len(result["requests"]) == len(expected) and
+                all(r is not None and r.get("text") is not None and not r.get("error")
+                    for r in result["requests"]) and isinstance(result.get("stats"), dict) and
+                not result["stats"].get("error"))
+    if not complete(first, sources[0]["request_names"]):
+        print("before phase failed; main phase not sent; retained %s" % before_out, flush=True)
+        return 1
+    main = run(receipt, url, n, out, concurrency=main_k,
+               phase=dict(sources[1], role="main", before=os.path.basename(before_out),
+                          stats_scope="server_cumulative", stats_before=first["stats"]))
+    return 0 if complete(main, sources[1]["request_names"]) else 1
 
 
 def load(d, arms):
@@ -1026,7 +1080,14 @@ def hashes_ref(path, d, arms):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if a[0] == "--compare":
+    if a[0] == "--before":
+        if len(a) != 8:
+            sys.exit("usage: ab_requests.py --before RECEIPT N K MAIN_RECEIPT URL MAIN_N OUT.json")
+        try:
+            sys.exit(before_run(a[1], int(a[2]), int(a[3]), a[4], a[5], int(a[6]), a[7]))
+        except (OSError, ValueError, KeyError) as e:
+            sys.exit("ab_requests.py: %s" % e)
+    elif a[0] == "--compare":
         compare(a[1], a[2:])
     elif a[0] == "--lp":
         lp_run(a[1], a[2], int(a[3]), a[4])

@@ -1,0 +1,40 @@
+[r4d] f32bf16: 1 of the 384 x 5120 weight's elements have a nonzero low half, so it is not a bf16 weight (the first at row 0, column 5119: 0x3dca0001); refused rather than rounded
+[r4d] f32bf16: 1 of the 384 x 5120 weight's elements have a nonzero low half, so it is not a bf16 weight (the first at row 383, column 5119: 0xbe008000); refused rather than rounded
+[r4d] f32bf16: 1 of the 1024 x 5120 weight's elements have a nonzero low half, so it is not a bf16 weight (the first at row 1023, column 5119: 0x3d7fffff); refused rather than rounded
+[r4d] f32bf16: 1 of the 384 x 5120 weight's elements have a nonzero low half, so it is not a bf16 weight (the first at row 0, column 5119: 0x3dca0001); refused rather than rounded
+[r4d] f32bf16: 1 of the 384 x 5120 weight's elements have a nonzero low half, so it is not a bf16 weight (the first at row 383, column 5119: 0xbe008000); refused rather than rounded
+[r4d] f32bf16: 1 of the 1024 x 5120 weight's elements have a nonzero low half, so it is not a bf16 weight (the first at row 1023, column 5119: 0x3d7fffff); refused rather than rounded
+  ok    gemm_nt_f32bf16 at M=1 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=2 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=16 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=33 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=64 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=130 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=1 N=1024 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=16 N=1024 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=70 N=1024 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=3 N=4 K=4096: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=3 N=36 K=4096: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=3 N=96 K=4096: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=7 N=31 K=129: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=70 N=13 K=130: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    ds41 f32bf16 tall M=256 N=96 K=5120 weight_col=288: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall M=256 N=384 K=5120 weight_col=0: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall M=256 N=1024 K=5120 weight_col=0: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall M=1024 N=96 K=5120 weight_col=288: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall M=1024 N=384 K=5120 weight_col=0: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall M=1024 N=1024 K=5120 weight_col=0: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall N=96 M=2048 source[5119]: whole-plane nonzero low half refused
+  ok    ds41 f32bf16 tall M=2048 N=96 K=5120 weight_col=288: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall N=384 M=2048 source[1966079]: whole-plane nonzero low half refused
+  ok    ds41 f32bf16 tall M=2048 N=384 K=5120 weight_col=0: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall N=1024 M=2048 source[5242879]: whole-plane nonzero low half refused
+  ok    ds41 f32bf16 tall M=2048 N=1024 K=5120 weight_col=0: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall N=96 M=4096 source[5119]: whole-plane nonzero low half refused
+  ok    ds41 f32bf16 tall M=4096 N=96 K=5120 weight_col=288: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall N=384 M=4096 source[1966079]: whole-plane nonzero low half refused
+  ok    ds41 f32bf16 tall M=4096 N=384 K=5120 weight_col=0: every output byte, sampled host rows and guards
+  ok    ds41 f32bf16 tall N=1024 M=4096 source[5242879]: whole-plane nonzero low half refused
+  ok    ds41 f32bf16 tall M=4096 N=1024 K=5120 weight_col=0: every output byte, sampled host rows and guards
+PASS: ds41 f32bf16 tall: 12 served shapes through M4096, every output byte equals f32; sampled host rows and guards match; 6 nonzero-low-half loads refused
+check exit 0

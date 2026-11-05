@@ -18,7 +18,6 @@
     "ab-20261031T022949Z": "the compressor tail sized to the step, lent arena gate",
     "ab-20261031T030023Z": "the prefill configurations under concurrency",
     "ab-20261031T034433Z": "harness turns with the adopted prefill and the prefix cache",
-    "ab-20261031T090154Z": "harness turns resuming at the previous request's end",
     "ab-20261031T100852Z": "the upstream sync's speeds and its Kld, Kh and reply gates",
     "ab-20261031T104524Z": "the merged base engine's replies and the CPU-path checks",
     "ab-20261031T111018Z": "DSML device gates and off/on references; initial live request exposed missing template",
@@ -33,7 +32,6 @@
     "ab-20261031T162629Z": "4K corpus and long/prefix/small-cache gate",
     "ab-20261031T165338Z": "Frozen adaptive policy real engine and heldout results",
     "ab-20261031T175623Z": "Failed mixed-client admission attempt and passing backup/window codec cards",
-    "ab-20261031T180730Z": "Exact bank lending192/96 transitions and measured short-burst loss",
     "ab-20261031T182505Z": "Exact AR and Engram gather slices with mixed performance",
     "ab-20261031T185127Z": "Exact P1 span and n128, nearly neutral timing",
     "ab-20261103T090558Z": "bf16 routers and packed residents under Phase 1, and 4,096-token chunks, on the stable build",
@@ -42,7 +40,19 @@
     "ab-20261103T143939Z": "startup cache fill, GPU clocks and memory compaction",
     "ab-20261103T230607Z": "batch admission: scheduler lines and prefill hashes",
     "ab-20261104T003545Z": "long context: kv budgets, prefill hashes, lsparse card check",
-    "ab-20261104T051616Z": "aux expert worker: worker lines, verify, deadline and VRAM checks"
+    "ab-20261104T051616Z": "aux expert worker: worker lines, verify, deadline and VRAM checks",
+    "ab-20261104T115653Z": "6.8K admit-all quiet screen; original gates retained",
+    "ab-20261104T121517Z": "48K admit-all ABBA and subsequent N8 guard",
+    "ab-20261104T171727Z": "P4 negative timing retained; no adoption",
+    "ab-20261104T195802Z": "C4+admit-all earlier 48K comparison; original Pu/global qualification failure retained",
+    "ab-20261105T052136Z": "Finite DSpark32K exactness; no broad promotion",
+    "ab-20261105T145020Z": "DSpark96 matched code ABBA +17.14%; not an absolute speed record",
+    "ab-20261105T160034Z": "100K admit-all ABBA +58.72% prompt tok/s; full84 and14Kh; prefix pair exploratory",
+    "ab-20261105T164754Z": "Matched current-profile accepted/prototype PLAIN64 role1 accepted",
+    "ab-20261105T170206Z": "Matched current-profile PLAIN64 role2 prototype OFF",
+    "ab-20261105T171654Z": "Matched current-profile PLAIN64 role3 prototype OFF",
+    "ab-20261105T172921Z": "Matched current-profile PLAIN64 role4 accepted",
+    "ab-20261105T174226Z": "Qa75 warmed gain; cold control drift inconclusive; no general default change"
   },
   "windows": {
     "ab-20261028T220036Z": {
@@ -2903,38 +2913,6 @@
         }
       ]
     },
-    "ab-20261030T124207Z": {
-      "files": 16,
-      "bytes": 3427510,
-      "server_logs": 0,
-      "server_log_bytes": 0,
-      "server_log_xz_bytes": 0,
-      "started_utc": "2026-10-30T12:50:26Z",
-      "arms_started": 4,
-      "qfn_restored": true,
-      "left_out": [
-        {
-          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Cs-Mr16-Kh-Lm32768-Pc-Pcb1024-Uharness.server.log",
-          "bytes": 145257,
-          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
-        },
-        {
-          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Cs-Mr16-Kh-Lm32768-Pc-Pce-Pcb1024-Uharness.server.log",
-          "bytes": 146163,
-          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
-        },
-        {
-          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Cs-Mr16-Kh-Lm32768-Uharness.server.log",
-          "bytes": 142947,
-          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
-        },
-        {
-          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Cs-Mr16-Lm32768-Pc-Pce-Pcb1024-Uharness.server.log",
-          "bytes": 101534,
-          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
-        }
-      ]
-    },
     "ab-20261030T134728Z": {
       "files": 42,
       "bytes": 1380182,
@@ -3681,17 +3659,6 @@
         }
       ]
     },
-    "ab-20261031T090154Z": {
-      "files": 16,
-      "bytes": 4338874,
-      "server_logs": 5,
-      "server_log_bytes": 645038,
-      "server_log_xz_bytes": 104836,
-      "started_utc": "2026-10-31T09:02:54Z",
-      "arms_started": 5,
-      "qfn_restored": true,
-      "left_out": []
-    },
     "ab-20261031T100852Z": {
       "files": 28,
       "bytes": 2181511,
@@ -3892,17 +3859,6 @@
       "server_log_bytes": 84941,
       "server_log_xz_bytes": 14736,
       "started_utc": "2026-10-31T17:56:24Z",
-      "arms_started": 0,
-      "qfn_restored": true,
-      "left_out": []
-    },
-    "ab-20261031T180730Z": {
-      "files": 37,
-      "bytes": 8086540,
-      "server_logs": 6,
-      "server_log_bytes": 565324,
-      "server_log_xz_bytes": 100200,
-      "started_utc": "2026-10-31T18:07:30Z",
       "arms_started": 0,
       "qfn_restored": true,
       "left_out": []
@@ -4676,6 +4632,339 @@
           "bytes": 262144,
           "reason": "binary capture"
         },
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261104T081812Z": {
+      "files": 23,
+      "bytes": 3599502,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-11-04T08:18:12Z",
+      "arms_started": 5,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness-r1.server.log",
+          "bytes": 159984,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Kh-Lm32768-Uharness-r2.server.log",
+          "bytes": 151626,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Rt.server.log",
+          "bytes": 60480,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Qa0-Pc-Pce-Pcg16-Kh-Lm32768-Uharness-r1.server.log",
+          "bytes": 151572,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Qa0-Pc-Pce-Pcg16-Kh-Lm32768-Uharness-r2.server.log",
+          "bytes": 151563,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs.server.log",
+          "bytes": 98016,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "rtrace-all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Pc-Pce-Pcg16-Lm32768-Uharness-Rt/",
+          "bytes": 0,
+          "reason": "routing trace (binary records)"
+        },
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261104T115653Z": {
+      "files": 22,
+      "bytes": 450170,
+      "server_logs": 5,
+      "server_log_bytes": 482420,
+      "server_log_xz_bytes": 85268,
+      "started_utc": "2026-11-04T11:56:53Z",
+      "arms_started": 5,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261104T121517Z": {
+      "files": 42,
+      "bytes": 1836432,
+      "server_logs": 11,
+      "server_log_bytes": 1150752,
+      "server_log_xz_bytes": 200168,
+      "started_utc": "2026-11-04T12:15:17Z",
+      "arms_started": 11,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261104T171727Z": {
+      "files": 33,
+      "bytes": 987316,
+      "server_logs": 9,
+      "server_log_bytes": 887724,
+      "server_log_xz_bytes": 158264,
+      "started_utc": "2026-11-04T17:17:28Z",
+      "arms_started": 9,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261104T195802Z": {
+      "files": 39,
+      "bytes": 1393631,
+      "server_logs": 11,
+      "server_log_bytes": 1142435,
+      "server_log_xz_bytes": 198608,
+      "started_utc": "2026-11-04T19:58:02Z",
+      "arms_started": 11,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261105T052136Z": {
+      "files": 18,
+      "bytes": 310833,
+      "server_logs": 2,
+      "server_log_bytes": 3846953,
+      "server_log_xz_bytes": 347212,
+      "started_utc": "2026-11-05T05:21:37Z",
+      "arms_started": 2,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-D2v-Ds-Db2-Dx-Dpp-Ucode256-Lm32768-Dfn-r90.d2-after.prom",
+          "bytes": 39930,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-D2v-Ds-Db2-Dx-Dpp-Ucode256-Lm32768-Dfn-r90.d2-before.prom",
+          "bytes": 32769,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "functional/",
+          "bytes": 41899744,
+          "reason": "subdirectory"
+        },
+        {
+          "path": "native-target-all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-D2v-Ds-Db2-Dx-Dpp-Ucode256-Lm32768-Dfn-r90/",
+          "bytes": 335792749,
+          "reason": "subdirectory"
+        },
+        {
+          "path": "native-target-all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-Ucode256-Lm32768-Dfn-r91/",
+          "bytes": 319002751,
+          "reason": "subdirectory"
+        },
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261105T065155Z": {
+      "files": 16,
+      "bytes": 211856,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-11-05T06:51:56Z",
+      "arms_started": 0,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Hcl0-Kh-Lm131072-r0.server.log",
+          "bytes": 16414,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261105T145020Z": {
+      "files": 41,
+      "bytes": 700294,
+      "server_logs": 6,
+      "server_log_bytes": 2769837,
+      "server_log_xz_bytes": 311032,
+      "started_utc": "2026-11-05T14:50:21Z",
+      "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-D2v-Ds-Db2-Dx-Dpp-Uchat-Lm32768-r100.d2-after.prom",
+          "bytes": 39945,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-D2v-Ds-Db2-Dx-Dpp-Uchat-Lm32768-r100.d2-before.prom",
+          "bytes": 37790,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-D2v-Ds-Db2-Dx-Dpp-Ucode256-Lm32768-r100.d2-after.prom",
+          "bytes": 39927,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-D2v-Ds-Db2-Dx-Dpp-Ucode256-Lm32768-r100.d2-before.prom",
+          "bytes": 37790,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-D2v-Ds-Db2-Dx-Dpp-Ucode256-Lm32768-r101.d2-after.prom",
+          "bytes": 39915,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-D2v-Ds-Db2-Dx-Dpp-Ucode256-Lm32768-r101.d2-before.prom",
+          "bytes": 37790,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261105T160034Z": {
+      "files": 50,
+      "bytes": 3591381,
+      "server_logs": 9,
+      "server_log_bytes": 1011307,
+      "server_log_xz_bytes": 171224,
+      "started_utc": "2026-11-05T16:00:35Z",
+      "arms_started": 9,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261105T164754Z": {
+      "files": 22,
+      "bytes": 204086,
+      "server_logs": 1,
+      "server_log_bytes": 102762,
+      "server_log_xz_bytes": 17652,
+      "started_utc": "2026-11-05T16:47:55Z",
+      "arms_started": 1,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261105T170206Z": {
+      "files": 22,
+      "bytes": 204981,
+      "server_logs": 1,
+      "server_log_bytes": 102814,
+      "server_log_xz_bytes": 17712,
+      "started_utc": "2026-11-05T17:02:07Z",
+      "arms_started": 1,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261105T171654Z": {
+      "files": 22,
+      "bytes": 204983,
+      "server_logs": 1,
+      "server_log_bytes": 102813,
+      "server_log_xz_bytes": 17696,
+      "started_utc": "2026-11-05T17:16:54Z",
+      "arms_started": 1,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261105T172921Z": {
+      "files": 22,
+      "bytes": 203957,
+      "server_logs": 1,
+      "server_log_bytes": 102759,
+      "server_log_xz_bytes": 17644,
+      "started_utc": "2026-11-05T17:29:22Z",
+      "arms_started": 1,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "silu_recheck.bin",
+          "bytes": 262144,
+          "reason": "binary capture"
+        }
+      ]
+    },
+    "ab-20261105T174226Z": {
+      "files": 60,
+      "bytes": 1841051,
+      "server_logs": 11,
+      "server_log_bytes": 1136638,
+      "server_log_xz_bytes": 199020,
+      "started_utc": "2026-11-05T17:42:27Z",
+      "arms_started": 11,
+      "qfn_restored": true,
+      "left_out": [
         {
           "path": "silu_recheck.bin",
           "bytes": 262144,

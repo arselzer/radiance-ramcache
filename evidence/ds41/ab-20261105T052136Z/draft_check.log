@@ -1,0 +1,18 @@
+libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV: the DSpark draft bank's moe_gemm_ggml (32 experts a rank, top-3) take the live tail and one pass over each expert's weights
+libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (the live tail and one pass over each expert's weights): 72 draft moe_gemm_ggml calls (36 gate_up, 36 down; 456 query rows; 0 tiled), 0 draft-shaped calls left on the old path
+Warning: Resource leak detected by SharedSignalPool, 625 Signals leaked.
+draft GEMV: 36 trials, 59885568 outputs compared; differing values (old, tail, one pass, both): pinned host 0 0 0 0, VRAM 0 0 0 0; served entry 0 in 72 calls; 0 work counts wrong
+draft GEMV weight passes over the trials (old, tail, one pass, both): gate_up 684 194 192 99, down 297 117 192 99
+PASS: every draft GEMV mode is bit-identical to the host experts and does the work it should
+draft GEMV time a call, 5 query rows (15 slots), experts in pinned host memory; old / tail / one pass / both, and the live experts' weights over the best
+  gate_up live 1 (4 rows):   5766.3   1436.5   1602.3    474.5 us   26.4 GB/s
+  down    live 1 (4 rows):    621.5    267.2    538.5    250.8 us   25.0 GB/s
+  gate_up live 2 (4 rows):   6541.9   1641.9   2191.9    917.5 us   27.3 GB/s
+  down    live 2 (4 rows):    818.3    469.9    782.3    470.2 us   26.7 GB/s
+  gate_up live 3 (4 rows):   6490.3   1819.0   2629.5   1373.2 us   27.4 GB/s
+  down    live 3 (4 rows):   1087.1    693.9   1039.5    693.8 us   27.1 GB/s
+  gate_up live 4 (4 rows):   6631.8   1821.7   3132.7   1821.5 us   27.5 GB/s
+  down    live 4 (4 rows):   1376.3    921.4   1304.4    921.1 us   27.2 GB/s
+  gate_up live 5 (5 rows):   6653.5   2286.4   3171.3   2279.7 us   27.5 GB/s
+  down    live 5 (5 rows):   1625.8   1142.9   1497.2   1143.1 us   27.4 GB/s
+draft check exit 0

@@ -1,0 +1,21 @@
+{
+  "schema": "ds41-qfn-pre-gpu-gate-v1",
+  "mode": "stopped",
+  "passed": true,
+  "scanner": "/home/as/ds41-claude-build/work/p1-packed-speed/native-oracle-check-root-v2.py",
+  "scanner_sha256": "d1b37d50494b405bc12f72417d3e34f92f3d2fe5ed5a16804cacabbb08dfeb1c",
+  "scanner_status": 0,
+  "observed_unix": 1793899052.685098,
+  "selected": {
+    "id": "72c1f8960c1ad0000aad3a59d0e25999fde2025102f1d5df049deaa7dccc89ad",
+    "image": "sha256:b1017ce0e615dbd16370f84724aac1f0b999a2cfb769d1b2f49d2dd7c0913cd1",
+    "status": "exited",
+    "running": false,
+    "pid": 0,
+    "started_at": "2026-11-05T17:12:43.621191834Z"
+  },
+  "inventory": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261105T171654Z/qfn-gate-stopped-inventory.json",
+  "inventory_sha256": "ed3294e84174fb5b9d52de05eac3c7a07a5e7fa46c2c68073067702357f05325",
+  "ROOT_review_sha256": "8e572f6d94b09c196e2358517f5c5df5939c58db64fb64387803509d7dfe0a1e",
+  "process_start_ticks": null
+}

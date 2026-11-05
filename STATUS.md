@@ -1,10 +1,29 @@
 # Status
 
-The current source is engine `0fb1f93e` (README changes over runtime `e184c6b7`), which contains upstream main `b6acbd69` (v1.15.0 and 12 commits) since 31 Oct. This is a research checkpoint for DeepSeek-V4.1-Flash on four RX 9070 XT cards with CPU-computed experts. The 131 exported A/B windows end at `ab-20261103T143939Z` (the 3 November adoption windows CW, CF, CG and CH included); separate November prefill reports identify other custom-window evidence and its limits. Since 30 Oct the box has 256 GB of RAM (8 x 32 GB DDR4-2666); windows before `ab-20261030T194552Z` ran on 128 GB (8 x 16 GB DDR4-2133).
+Updated November 5, 2026. The exported accepted source is `d316a3b32ea9c9d43c46ca70357ff4ecbce02ee2`
+(1866 files), a documentation-only successor to `32d033e1`; compiled runtime `f84b23db`
+and coherent `libr4d` `92bd7719` are unchanged. The snapshot contains 149 retained A/B
+windows through `ab-20261105T174226Z`, including incomplete/failed windows without promoting their status.
+No build, GPU execution, runtime installation or deployment occurs during export.
+
+Current measured results and qualification limits are in
+[radiance/docs/DS41-RESULTS-20261105.md](radiance/docs/DS41-RESULTS-20261105.md).
+The controller extracts retain full local receipt hashes in
+[qualification-results-20261105.json](research/ds41/qualification-results-20261105.json).
+100K admit-all prefill gained 58.72% in prompt-processing throughput with exact replies/hashes;
+DSpark's finite 32K code ABBA gained 17.14%, without a new absolute speed record or broad promotion.
+The optional worker, smaller/dynamic admission budgets and newer kernel/overlap candidates retain
+separate gates. The 7/21/46-suite CPU batches establish component behavior only.
+
+The checkpoint is a hybrid: native official MXFP4 experts, declared BF16/F32 neural conversions,
+and two additionally quantized IQ4_NL Engram tables. All 1,119 other neural mappings and seven
+integer controls passed their audit; independent official-runner equivalence is not established.
+
+## Earlier checks (date and source specific)
 
 | Check | Result |
 |---|---|
-| Source snapshot | `radiance/` equals engine commit `0fb1f93e` file for file: 1,849 files, matched by SHA256 pins and by git blob ids and modes against the engine repository. `tools/verify_snapshot.py` passes. |
+| Earlier source snapshot (superseded) | `radiance/` equals engine commit `0fb1f93e` file for file: 1,849 files, matched by SHA256 pins and by git blob ids and modes against the engine repository. `tools/verify_snapshot.py` passes. |
 | November Qa0 prefill | Independent stable-build 8/0/8: 3,086-token TTFT 12.22–14.25% lower and 6,817-token TTFT 8.52–8.67% lower; 82-token request 1.8–3.5% slower. All 15 replies and 6 full hash captures exact. Defaults unchanged. [Report](docs/ds41/PREFILL-QA0-20261103.md), [numerical records](research/ds41/ds41_prefill_qa0_stable_20261103.json). Separate current43 prefix/cancel/N4/N8 aggregate 76 replies + 2 accepted cancels passed; it does not transfer whole-build or 96 GiB qualification to the exported engine. |
 | November Qw screening | Fixed Qa0/current43: Qw4 longest prompt 11.05 s versus 11.44/11.64 s controls (3.44–5.08% lower), 3K 0.47% slower; all 15 replies, 6 hash captures and four-card native gates pass. Diagnostic only, `performance_eligible=false`, unadopted. [Report](docs/ds41/PREFILL-QW-20261103.md). |
 | Decode, 8 held-out prompts, one stream | 256 GB: the recommended configuration ran 20.87 tok/s with a 96 GiB cache, 31.24 with 192 GiB and 31.25 with 208 GiB (`ab-20261030T194552Z`), and 31.24 again in `ab-20261030T205440Z`. 128 GB: 19.85 at the end, 18.93 / 18.88 / 18.98 in `ab-20261030T090127Z`. The base engine ran 5.03 tok/s in `ab-20261028T223812Z` (128 GB; not re-measured). |
@@ -33,3 +52,5 @@ The current source is engine `0fb1f93e` (README changes over runtime `e184c6b7`)
 No deployment, driver change or hardware change is part of this export. The RAM upgrade and the cards' slot moves were made by the owner before the 256 GB windows.
 
 The windows ran on a box shared with a production service (QFN). Each window logs its stop and its restoration, with a test completion.
+
+Three larger historical windows remain fully available in the [prior snapshot index](research/ds41/archived-window-index-20261105.json), with file hashes and immutable links. Their results and failures remain part of the research record. The current export keeps the existing 100 MB evidence bound.

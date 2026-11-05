@@ -1,3 +1,0 @@
-I device: AQL backend, 4 device(s) [0:gfx1201 1:gfx1201 2:gfx1201 3:gfx1201]
-bank-card captured ranks=4 hot_n=24 raw_bytes=5414584320 charged=5523921320 hash=0b5c3137997168c1
-PASS: DSBANK_BACKUP_CARD ranks=4 hot_n=24 restores=3 partial_fill_rollback=1 short_restore_fatal=1 masks=1

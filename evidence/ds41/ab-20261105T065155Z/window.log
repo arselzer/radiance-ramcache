@@ -1,0 +1,139 @@
+[2026-11-05T06:51:56Z] waiting for 30 s of QFN idleness
+before: 72c1f8960c1ad0000aad3a59d0e25999fde2025102f1d5df049deaa7dccc89ad running 2026-11-05T06:00:33.644797222Z sha256:b1017ce0e615dbd16370f84724aac1f0b999a2cfb769d1b2f49d2dd7c0913cd1
+[2026-11-05T06:52:24Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-11-05T06:52:33Z] local-map native owner proof: /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/tests/native_mapped_local_test sha256 c1b4a062c0ad1033f56625f005a14b9ac5fe164a8297a3ace335da9fe45f93a5 targets 0,1,2,3
+local-map native process exit 0
+rank-local mapped contract PASS
+[2026-11-05T06:52:34Z] large-chunk prefill device checks on card 0 with /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so (/home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/checkers/ds41_mxfp4_device_check), chunks of up to 2048
+PASS: row table: moe_gemm_ggml_mxfp4_gemv_tall, priority 57 (the gemv's 58), 11 constraints, M up to 4096 (LCP: at least 2048)
+PASS: the twin at 17130 rows over 8 heights equals the gemv in passes of 16 and the host kernels (the tiled row at the same heights differs in 24697 values)
+PASS: sparse attention and index score at 17..1024 rows equal their rows launched alone, 16 at a time and as suffixes (14312 rows)
+PASS: tall passes give 16-token passes' bits on all three ops
+PASS: row table: moe_gemm_ggml_mxfp4_gemv_tall, priority 57 (the gemv's 58), 11 constraints, M up to 4096 (LCP: at least 2048)
+PASS: sweep: every height up to the reach gives each row its bytes launched alone and in launches of 16 (rows above it, if any differ, only in a norm)
+PASS: lcp 2048: tall passes and the height sweep keep 16-token passes' bits
+lcp exit 0
+PASS: row table: moe_gemm_ggml_mxfp4_gemv_tall, priority 57 (the gemv's 58), 11 constraints, M up to 4096 (LCP: at least 2048)
+PASS: sweep: every height up to the reach gives each row its bytes launched alone and in launches of 16 (rows above it, if any differ, only in a norm)
+sweep exit 0
+norm rows in passes above the reach (32): 40 of 3872 differ from the same row alone
+PASS: sweep: every height up to the reach gives each row its bytes launched alone and in launches of 16 (rows above it, if any differ, only in a norm)
+sweep0 exit 0
+[2026-11-05T06:54:19Z] large-chunk prefill device checks passed on /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so, sha256 92bd771935343752: Lc arms of up to 2048 tokens on it are measured
+[2026-11-05T06:54:19Z] balanced gemv device check on card 0 with /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so (/home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/checkers/ds41_mxfp4_device_check), up to 2048 tokens, routes /home/as/ds41-claude-build/work/p0/routes-long3086.bin
+bal: moe_gemm_ggml mxfp4 gate_up [4608, 5120] and down [5120, 2304], 96 VRAM experts, EP4 rank slots as served
+bal: qualification-only: every height is byte-only; one launch per projection/kernel/profile; no timings
+bal: qualification-only: 2762440704 output values and output redzones compared; no timings
+bal: byte coverage max_M=2048 requested_C=2048 heights=1,6,16,17,64,256,512,1024,2048
+PASS: bal: the balanced gemv and twin give the plain kernel's bytes at 9 tested heights through M2048 tokens (requested C2048; byte-only above M2048)
+bal exit 0
+[2026-11-05T06:56:46Z] balanced gemv device check passed through M2048 on /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so, sha256 92bd771935343752: covered Mb arms on it are measured
+[2026-11-05T06:56:46Z] prefill Phase 1 device check on card 0 with /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so (/home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/checkers/ds41_mxfp4_device_check), M up to 2048, routes /home/as/ds41-claude-build/work/p0/routes-long3086.bin
+p1: 96 experts of gate_up [4608, 5120] and down [5120, 2304] in VRAM, block_mxfp4 and packed (83330 and 55809 raw rounds), made in 4.8 s
+p1: 49 cases, 22108 (token, slot) rows against 16-token passes, 340 against the host kernels, 813 NaN pairs (any NaN equal), 0 bad values, 18 s
+p1: qualification-only: timing shapes run once per projection and synchronize; no timings
+p1: qualification-only: 160 projection/shape launches synchronized; no timings
+p1: PASS: moe_gemm_ggml_mxfp4_gemv_tall_p1 at M 17..2048: 22108 rows equal to 16-token passes, skipped rows untouched, tail zeros, splits and full/span SwiGLU waves of 1-3 equal to one launch (49 cases)
+p1 exit 0
+[2026-11-05T06:57:10Z] prefill Phase 1 device check passed on /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so, sha256 92bd771935343752: P1 arms on it are measured
+[2026-11-05T06:57:10Z] device checks on card 0 with /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so
+swiglu_clamped: 2202009600 (gate, up) pairs, 8257410 differing: 8257410 with a signaling-NaN up (of 8257536 such pairs), 0 others; table written to build/ab-20261105T065155Z/silu_recheck.bin
+PASS: host swiglu with the captured table equals libr4d's for every bf16 input but a signaling-NaN up, which a gate_up row never holds
+swiglu exit 0
+24 trials, 48 expert rows: differing values gate_up 0, swiglu 0, down 0, whole host chain 0
+PASS: host experts are bit-identical to libr4d's decode chain
+chain exit 0
+[2026-11-05T06:57:32Z] silu table recaptured identical
+[2026-11-05T06:57:32Z] gemm_nt_f32bf16 checks on card 0 with /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so
+f32bf16 check FAIL lines: 0
+check exit 0
+gemm_nt_f32  N=384 K=5120 M=1  7.50 MiB weight, 35 copies, 200 iters
+  rule          20.3 us    387.6 GB/s    0.19 TFLOP/s
+gemm_nt_f32 / gemm_nt_f32bf16  N=384 K=5120 M=1  7.50 / 3.75 MiB weight, 64 copies, 200 iters
+  rule     f32     20.4 us   386.8 GB/s   bf16 halves     14.4 us   274.6 GB/s
+  4x1      f32     34.9 us   225.5 GB/s   bf16 halves     26.0 us   151.5 GB/s
+  2x2x16   f32     20.2 us   389.9 GB/s   bf16 halves     14.5 us   271.6 GB/s
+  8x1x8    f32     22.6 us   349.1 GB/s   bf16 halves     57.7 us    68.3 GB/s
+  8x4      f32     43.9 us   179.5 GB/s   bf16 halves     35.2 us   111.9 GB/s
+  1x2x16   f32     20.2 us   389.1 GB/s   bf16 halves     14.2 us   277.0 GB/s
+  1x2x32   f32     34.2 us   230.6 GB/s   bf16 halves     28.4 us   138.9 GB/s
+  2x2x32   f32     38.8 us   203.2 GB/s   bf16 halves     53.6 us    73.6 GB/s
+  1x4x16   f32     34.7 us   226.8 GB/s   bf16 halves     30.4 us   129.9 GB/s
+perff32 384 1 exit 0
+gemm_nt_f32  N=384 K=5120 M=16  7.50 MiB weight, 35 copies, 200 iters
+  rule          25.6 us    314.6 GB/s    2.46 TFLOP/s
+gemm_nt_f32 / gemm_nt_f32bf16  N=384 K=5120 M=16  7.50 / 3.75 MiB weight, 64 copies, 200 iters
+  rule     f32     25.4 us   316.5 GB/s   bf16 halves     20.1 us   205.2 GB/s
+  4x1      f32     36.5 us   220.5 GB/s   bf16 halves     36.8 us   111.8 GB/s
+  2x2x16   f32     25.4 us   317.5 GB/s   bf16 halves     20.7 us   198.9 GB/s
+  8x1x8    f32     25.0 us   322.6 GB/s   bf16 halves    130.0 us    31.7 GB/s
+  8x4      f32     54.5 us   147.7 GB/s   bf16 halves     51.4 us    80.2 GB/s
+  1x2x16   f32     35.6 us   225.9 GB/s   bf16 halves     25.9 us   159.2 GB/s
+  1x2x32   f32     52.1 us   154.6 GB/s   bf16 halves     45.2 us    91.2 GB/s
+  2x2x32   f32     49.9 us   161.4 GB/s   bf16 halves     63.4 us    65.0 GB/s
+  1x4x16   f32     40.3 us   199.9 GB/s   bf16 halves     31.6 us   130.2 GB/s
+perff32 384 16 exit 0
+gemm_nt_f32  N=1024 K=5120 M=1  20.00 MiB weight, 13 copies, 200 iters
+  rule          40.7 us    515.9 GB/s    0.26 TFLOP/s
+gemm_nt_f32 / gemm_nt_f32bf16  N=1024 K=5120 M=1  20.00 / 10.00 MiB weight, 26 copies, 200 iters
+  rule     f32     40.7 us   515.4 GB/s   bf16 halves     24.3 us   432.5 GB/s
+  4x1      f32     46.1 us   455.4 GB/s   bf16 halves     29.2 us   359.1 GB/s
+  2x2x16   f32     40.6 us   517.4 GB/s   bf16 halves     24.5 us   428.2 GB/s
+  8x1x8    f32     41.5 us   505.4 GB/s   bf16 halves     67.0 us   156.7 GB/s
+  8x4      f32     50.6 us   414.7 GB/s   bf16 halves     39.3 us   267.0 GB/s
+  1x2x16   f32     40.8 us   514.4 GB/s   bf16 halves     24.4 us   429.6 GB/s
+  1x2x32   f32     53.0 us   396.0 GB/s   bf16 halves     38.8 us   270.6 GB/s
+  2x2x32   f32     57.2 us   367.1 GB/s   bf16 halves     54.3 us   193.3 GB/s
+  1x4x16   f32     52.1 us   402.9 GB/s   bf16 halves     38.8 us   270.6 GB/s
+perff32 1024 1 exit 0
+gemm_nt_f32  N=1024 K=5120 M=16  20.00 MiB weight, 13 copies, 200 iters
+  rule         100.2 us    211.5 GB/s    1.67 TFLOP/s
+gemm_nt_f32 / gemm_nt_f32bf16  N=1024 K=5120 M=16  20.00 / 10.00 MiB weight, 26 copies, 200 iters
+  rule     f32    100.3 us   211.3 GB/s   bf16 halves     47.2 us   227.0 GB/s
+  4x1      f32     97.6 us   217.1 GB/s   bf16 halves     74.9 us   143.0 GB/s
+  2x2x16   f32    100.2 us   211.6 GB/s   bf16 halves     47.5 us   225.7 GB/s
+  8x1x8    f32     57.1 us   371.4 GB/s   bf16 halves    151.8 us    70.6 GB/s
+  8x4      f32     71.1 us   298.1 GB/s   bf16 halves     59.9 us   178.8 GB/s
+  1x2x16   f32    192.6 us   110.1 GB/s   bf16 halves     64.6 us   165.9 GB/s
+  1x2x32   f32    148.5 us   142.8 GB/s   bf16 halves    103.2 us   103.9 GB/s
+  2x2x32   f32    119.7 us   177.1 GB/s   bf16 halves    122.8 us    87.2 GB/s
+  1x4x16   f32     93.1 us   227.7 GB/s   bf16 halves     75.8 us   141.4 GB/s
+perff32 1024 16 exit 0
+[2026-11-05T06:57:54Z] gemm_nt_f32bf16 card checks passed (14 comparisons, 36 in the form sweep) on /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so, sha256 92bd771935343752: Rb arms on it are measured
+[2026-11-05T06:57:54Z] packed VRAM residents: gemv_vp against the plain row on card 0 with /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so (md5 966b1489c058d952045a4b74f72b9e07)
+gemv_vp[r2cz]: 6087680 values compared with the plain row, 0 differ
+480 calls, 30438400 values compared: 0 differ; damaged headers: 363520 values NaN, 0 not
+dropped slots: 49745920 dropped slots' values, 0 not zero in both rows
+PASS: gemv_vp over packed experts is bit-identical to the plain row over block_mxfp4
+vpack check exit 0
+gemv_vp/block  gate_up hot   : back to back 21.9 us a call, 574 GB/s (one copy, from the on-die cache)
+gemv_vp[old]/packed gate_up hot   : back to back 250.0 us a call, 48 GB/s (one copy, from the on-die cache)
+gemv_vp[old]/block  gate_up hot   : back to back 236.9 us a call, 53 GB/s (one copy, from the on-die cache)
+gemv_vp[r2]/packed gate_up hot   : back to back 93.9 us a call, 128 GB/s (one copy, from the on-die cache)
+gemv_vp[r2]/block  gate_up hot   : back to back 92.7 us a call, 135 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cf]/packed gate_up hot   : back to back 90.9 us a call, 132 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cf]/block  gate_up hot   : back to back 91.0 us a call, 138 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cz]/packed gate_up hot   : back to back 21.1 us a call, 569 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cz]/block  gate_up hot   : back to back 21.5 us a call, 583 GB/s (one copy, from the on-die cache)
+plain/block    down    hot   : back to back 106.1 us a call, 59 GB/s (one copy, from the on-die cache)
+gemv_vp/packed down    hot   : back to back 16.8 us a call, 358 GB/s (one copy, from the on-die cache)
+gemv_vp/block  down    hot   : back to back 17.0 us a call, 369 GB/s (one copy, from the on-die cache)
+gemv_vp[old]/packed down    hot   : back to back 176.3 us a call, 34 GB/s (one copy, from the on-die cache)
+gemv_vp[old]/block  down    hot   : back to back 171.0 us a call, 37 GB/s (one copy, from the on-die cache)
+gemv_vp[r2]/packed down    hot   : back to back 65.3 us a call, 92 GB/s (one copy, from the on-die cache)
+gemv_vp[r2]/block  down    hot   : back to back 66.0 us a call, 95 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cf]/packed down    hot   : back to back 66.3 us a call, 91 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cf]/block  down    hot   : back to back 66.7 us a call, 94 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cz]/packed down    hot   : back to back 16.9 us a call, 354 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cz]/block  down    hot   : back to back 17.0 us a call, 368 GB/s (one copy, from the on-die cache)
+PASS: the timed calls' outputs are bit-identical
+vpack time exit 0
+[2026-11-05T06:58:03Z] packed VRAM residents: device check PASS on /home/as/ds41-claude-build/work/packed-host-cache/p1-cancel-native-v3-20261105/cohort-root1-20261105T0641Z/home/kernels/libr4d.so; its Vp arms run
+[2026-11-05T06:58:04Z] arm all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Hcl0-Kh-Lm131072-r0: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=2048 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=6 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=2 RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=4 RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB=56 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM=1 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=32 RADIANCE_EXPERIMENTAL_DS41_LCP=2048 RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1 RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=64 RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE= RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1 RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16_FORM=0 RADIANCE_EXPERIMENTAL_DS41_N128=0 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=8 RADIANCE_EXPERIMENTAL_SCHED_TBO=0 RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=256 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RESCORE=12 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE_CHECK=0 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=0 RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=7 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RECORD= RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE= RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1 RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512 RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1 RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=0 RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=0 RADIANCE_EXPERIMENTAL_PREFIX_EORS=0 RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=0 RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=0 RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB= RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF_HEAD= RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_PROB_CAPTURE=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_EARLY_VERIFY=off RADIANCE_EXPERIMENTAL_DS41_DSPARK_PREFIX_POLICY=off RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=0 RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=0 RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET= RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1 RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=0 RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL= RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=0 RADIANCE_EXPERIMENTAL_DS41_P1=1 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT= RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY= RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0 RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=0 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_LEAD_US=60 RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=0 RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256 RADIANCE_EXPERIMENTAL_DS41_INSERT_WAIT_US= RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0 RADIANCE_EXPERIMENTAL_DS41_AR_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_AG_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=0 RADIANCE_EXPERIMENTAL_DS41_AUX_DEVICE= RADIANCE_EXPERIMENTAL_DS41_AUX_POLICY= RADIANCE_EXPERIMENTAL_DS41_AUX_DEADLINE_US=2000 RADIANCE_EXPERIMENTAL_DS41_AUX_HEADROOM_MIB=1024 RADIANCE_EXPERIMENTAL_DS41_AUX_BACKOFF=64 RADIANCE_EXPERIMENTAL_DS41_AUX_FORCE_LATE=0 RADIANCE_EXPERIMENTAL_DS41_CACHE_RANK_LOCAL_MAP=0 RADIANCE_DS41_P1_CANCEL_TRACE=0 RADIANCE_DS41_P1_CANCEL_TRACE_DIR= RADIANCE_DS41_P1_CANCEL_PROMPT_SHA256= RADIANCE_DS41_P1_CANCEL_CASE_RECEIPT= RADIANCE_DS41_P1_CANCEL_CASE_RECEIPT_SHA256= RADIANCE_DS41_P1_CANCEL_PROMPT_N= RADIANCE_DS41_P1_CANCEL_MAX_TOKENS=
+[2026-11-05T06:58:04Z] arm all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Hcl0-Kh-Lm131072-r0: proc trace observer 2974433 started; counters are diagnostic
+[2026-11-05T07:02:42Z] server 2974432 still up after 180s; SIGKILL
+[2026-11-05T07:02:43Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-11-05T07:03:34Z] QFN up after 50s; completion: {"id":"cmpl-e8fd9ab67cf462aa3e7e4a74","object":"text_completion","created":1793862213,"model":"qwen-vllm","system_fingerprint":"radiance-1.16.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+72c1f8960c1ad0000aad3a59d0e25999fde2025102f1d5df049deaa7dccc89ad running 2026-11-05T07:02:43.427938144Z sha256:b1017ce0e615dbd16370f84724aac1f0b999a2cfb769d1b2f49d2dd7c0913cd1

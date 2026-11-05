@@ -1,0 +1,278 @@
+[2026-11-05T17:29:22Z] waiting for 30 s of QFN idleness
+[2026-11-05T17:29:22Z] server readiness timeout: 1200s (AB_READY_TIMEOUT_S; polling limit, per arm)
+before: 72c1f8960c1ad0000aad3a59d0e25999fde2025102f1d5df049deaa7dccc89ad running 2026-11-05T17:27:23.22290299Z sha256:b1017ce0e615dbd16370f84724aac1f0b999a2cfb769d1b2f49d2dd7c0913cd1
+[2026-11-05T17:29:50Z] stopping radiance-flashnext
+/home/as/ds41-claude-build/work/run-20261105T172921Z/ds41_window_gate.py: OK
+radiance-flashnext
+[2026-11-05T17:30:00Z] large-chunk prefill device checks on card 0 with /home/as/ds41-claude-build/home-stable/kernels/libr4d.so (/home/as/ds41-claude-build/work/check-qualify/serve/ds41_mxfp4_device_check), chunks of up to 2048
+PASS: row table: moe_gemm_ggml_mxfp4_gemv_tall, priority 57 (the gemv's 58), 11 constraints, M up to 4096 (LCP: at least 2048)
+PASS: the twin at 17130 rows over 8 heights equals the gemv in passes of 16 and the host kernels (the tiled row at the same heights differs in 24697 values)
+PASS: sparse attention and index score at 17..1024 rows equal their rows launched alone, 16 at a time and as suffixes (14312 rows)
+PASS: tall passes give 16-token passes' bits on all three ops
+PASS: row table: moe_gemm_ggml_mxfp4_gemv_tall, priority 57 (the gemv's 58), 11 constraints, M up to 4096 (LCP: at least 2048)
+PASS: sweep: every height up to the reach gives each row its bytes launched alone and in launches of 16 (rows above it, if any differ, only in a norm)
+PASS: lcp 2048: tall passes and the height sweep keep 16-token passes' bits
+lcp exit 0
+PASS: row table: moe_gemm_ggml_mxfp4_gemv_tall, priority 57 (the gemv's 58), 11 constraints, M up to 4096 (LCP: at least 2048)
+PASS: sweep: every height up to the reach gives each row its bytes launched alone and in launches of 16 (rows above it, if any differ, only in a norm)
+sweep exit 0
+norm rows in passes above the reach (32): 40 of 3872 differ from the same row alone
+PASS: sweep: every height up to the reach gives each row its bytes launched alone and in launches of 16 (rows above it, if any differ, only in a norm)
+sweep0 exit 0
+[2026-11-05T17:31:43Z] large-chunk prefill device checks passed on /home/as/ds41-claude-build/home-stable/kernels/libr4d.so, sha256 92bd771935343752: Lc arms of up to 2048 tokens on it are measured
+[2026-11-05T17:31:43Z] balanced gemv device check on card 0 with /home/as/ds41-claude-build/home-stable/kernels/libr4d.so (/home/as/ds41-claude-build/work/check-qualify/serve/ds41_mxfp4_device_check), up to 2048 tokens, routes /home/as/ds41-claude-build/work/p0/routes-long3086.bin
+bal: moe_gemm_ggml mxfp4 gate_up [4608, 5120] and down [5120, 2304], 96 VRAM experts, EP4 rank slots as served
+bal: qualification-only: every height is byte-only; one launch per projection/kernel/profile; no timings
+bal: qualification-only: 2762440704 output values and output redzones compared; no timings
+bal: byte coverage max_M=2048 requested_C=2048 heights=1,6,16,17,64,256,512,1024,2048
+PASS: bal: the balanced gemv and twin give the plain kernel's bytes at 9 tested heights through M2048 tokens (requested C2048; byte-only above M2048)
+bal exit 0
+[2026-11-05T17:34:11Z] balanced gemv device check passed through M2048 on /home/as/ds41-claude-build/home-stable/kernels/libr4d.so, sha256 92bd771935343752: covered Mb arms on it are measured
+[2026-11-05T17:34:11Z] prefill Phase 1 device check on card 0 with /home/as/ds41-claude-build/home-stable/kernels/libr4d.so (/home/as/ds41-claude-build/work/check-qualify/serve/ds41_mxfp4_device_check), M up to 2048, routes /home/as/ds41-claude-build/work/p0/routes-long3086.bin
+p1: 96 experts of gate_up [4608, 5120] and down [5120, 2304] in VRAM, block_mxfp4 and packed (83330 and 55809 raw rounds), made in 4.9 s
+p1: 49 cases, 22108 (token, slot) rows against 16-token passes, 340 against the host kernels, 813 NaN pairs (any NaN equal), 0 bad values, 18 s
+p1: qualification-only: timing shapes run once per projection and synchronize; no timings
+p1: qualification-only: 160 projection/shape launches synchronized; no timings
+p1: PASS: moe_gemm_ggml_mxfp4_gemv_tall_p1 at M 17..2048: 22108 rows equal to 16-token passes, skipped rows untouched, tail zeros, splits and full/span SwiGLU waves of 1-3 equal to one launch (49 cases)
+p1 exit 0
+[2026-11-05T17:34:35Z] prefill Phase 1 device check passed on /home/as/ds41-claude-build/home-stable/kernels/libr4d.so, sha256 92bd771935343752: P1 arms on it are measured
+[2026-11-05T17:34:35Z] device checks on card 0 with /home/as/ds41-claude-build/home-stable/kernels/libr4d.so
+swiglu_clamped: 2202009600 (gate, up) pairs, 8257410 differing: 8257410 with a signaling-NaN up (of 8257536 such pairs), 0 others; table written to build/ab-20261105T172921Z/silu_recheck.bin
+PASS: host swiglu with the captured table equals libr4d's for every bf16 input but a signaling-NaN up, which a gate_up row never holds
+swiglu exit 0
+24 trials, 48 expert rows: differing values gate_up 0, swiglu 0, down 0, whole host chain 0
+PASS: host experts are bit-identical to libr4d's decode chain
+chain exit 0
+[2026-11-05T17:34:57Z] silu table recaptured identical
+[2026-11-05T17:34:57Z] gemm_nt_f32bf16 checks on card 0 with /home/as/ds41-claude-build/home-stable/kernels/libr4d.so
+f32bf16 check FAIL lines: 0
+check exit 0
+gemm_nt_f32  N=384 K=5120 M=1  7.50 MiB weight, 35 copies, 200 iters
+  rule          20.3 us    387.6 GB/s    0.19 TFLOP/s
+gemm_nt_f32 / gemm_nt_f32bf16  N=384 K=5120 M=1  7.50 / 3.75 MiB weight, 64 copies, 200 iters
+  rule     f32     20.3 us   387.6 GB/s   bf16 halves     14.4 us   273.9 GB/s
+  4x1      f32     35.0 us   225.0 GB/s   bf16 halves     26.2 us   150.8 GB/s
+  2x2x16   f32     20.3 us   388.4 GB/s   bf16 halves     14.6 us   270.9 GB/s
+  8x1x8    f32     22.8 us   345.4 GB/s   bf16 halves     57.8 us    68.3 GB/s
+  8x4      f32     44.0 us   179.0 GB/s   bf16 halves     35.4 us   111.4 GB/s
+  1x2x16   f32     20.3 us   387.6 GB/s   bf16 halves     14.3 us   275.4 GB/s
+  1x2x32   f32     34.2 us   230.0 GB/s   bf16 halves     28.5 us   138.3 GB/s
+  2x2x32   f32     38.8 us   203.2 GB/s   bf16 halves     53.7 us    73.4 GB/s
+  1x4x16   f32     34.8 us   226.1 GB/s   bf16 halves     30.4 us   129.7 GB/s
+perff32 384 1 exit 0
+gemm_nt_f32  N=384 K=5120 M=16  7.50 MiB weight, 35 copies, 200 iters
+  rule          25.6 us    315.1 GB/s    2.46 TFLOP/s
+gemm_nt_f32 / gemm_nt_f32bf16  N=384 K=5120 M=16  7.50 / 3.75 MiB weight, 64 copies, 200 iters
+  rule     f32     25.4 us   317.5 GB/s   bf16 halves     20.2 us   204.4 GB/s
+  4x1      f32     36.6 us   219.8 GB/s   bf16 halves     36.9 us   111.7 GB/s
+  2x2x16   f32     25.3 us   318.0 GB/s   bf16 halves     21.0 us   196.2 GB/s
+  8x1x8    f32     24.9 us   323.7 GB/s   bf16 halves    130.1 us    31.7 GB/s
+  8x4      f32     54.3 us   148.4 GB/s   bf16 halves     51.7 us    79.7 GB/s
+  1x2x16   f32     35.6 us   225.9 GB/s   bf16 halves     26.0 us   158.5 GB/s
+  1x2x32   f32     52.2 us   154.3 GB/s   bf16 halves     45.3 us    91.0 GB/s
+  2x2x32   f32     50.1 us   160.7 GB/s   bf16 halves     63.5 us    64.9 GB/s
+  1x4x16   f32     40.2 us   200.1 GB/s   bf16 halves     31.7 us   130.1 GB/s
+perff32 384 16 exit 0
+gemm_nt_f32  N=1024 K=5120 M=1  20.00 MiB weight, 13 copies, 200 iters
+  rule          40.6 us    516.9 GB/s    0.26 TFLOP/s
+gemm_nt_f32 / gemm_nt_f32bf16  N=1024 K=5120 M=1  20.00 / 10.00 MiB weight, 26 copies, 200 iters
+  rule     f32     40.7 us   515.4 GB/s   bf16 halves     24.2 us   433.9 GB/s
+  4x1      f32     46.0 us   456.6 GB/s   bf16 halves     29.3 us   358.1 GB/s
+  2x2x16   f32     40.6 us   517.4 GB/s   bf16 halves     24.4 us   430.3 GB/s
+  8x1x8    f32     41.4 us   506.4 GB/s   bf16 halves     67.0 us   156.7 GB/s
+  8x4      f32     50.6 us   415.1 GB/s   bf16 halves     39.3 us   267.3 GB/s
+  1x2x16   f32     40.7 us   515.4 GB/s   bf16 halves     24.4 us   431.0 GB/s
+  1x2x32   f32     53.0 us   396.3 GB/s   bf16 halves     38.8 us   270.9 GB/s
+  2x2x32   f32     57.1 us   367.7 GB/s   bf16 halves     54.3 us   193.3 GB/s
+  1x4x16   f32     52.2 us   402.3 GB/s   bf16 halves     38.8 us   270.6 GB/s
+perff32 1024 1 exit 0
+gemm_nt_f32  N=1024 K=5120 M=16  20.00 MiB weight, 13 copies, 200 iters
+  rule         100.1 us    211.8 GB/s    1.68 TFLOP/s
+gemm_nt_f32 / gemm_nt_f32bf16  N=1024 K=5120 M=16  20.00 / 10.00 MiB weight, 26 copies, 200 iters
+  rule     f32    100.3 us   211.4 GB/s   bf16 halves     47.2 us   227.0 GB/s
+  4x1      f32     97.2 us   218.0 GB/s   bf16 halves     74.6 us   143.6 GB/s
+  2x2x16   f32    100.4 us   211.2 GB/s   bf16 halves     47.5 us   225.7 GB/s
+  8x1x8    f32     57.0 us   372.2 GB/s   bf16 halves    152.0 us    70.5 GB/s
+  8x4      f32     71.2 us   297.8 GB/s   bf16 halves     59.6 us   179.7 GB/s
+  1x2x16   f32    192.7 us   110.0 GB/s   bf16 halves     64.7 us   165.6 GB/s
+  1x2x32   f32    148.6 us   142.7 GB/s   bf16 halves    103.0 us   104.0 GB/s
+  2x2x32   f32    119.8 us   177.0 GB/s   bf16 halves    123.1 us    87.1 GB/s
+  1x4x16   f32     93.2 us   227.5 GB/s   bf16 halves     75.8 us   141.3 GB/s
+perff32 1024 16 exit 0
+[2026-11-05T17:35:19Z] gemm_nt_f32bf16 card checks passed (14 comparisons, 36 in the form sweep) on /home/as/ds41-claude-build/home-stable/kernels/libr4d.so, sha256 92bd771935343752: Rb arms on it are measured
+[2026-11-05T17:35:19Z] packed VRAM residents: gemv_vp against the plain row on card 0 with /home/as/ds41-claude-build/home-stable/kernels/libr4d.so (md5 966b1489c058d952045a4b74f72b9e07)
+gemv_vp[r2cz]: 6087680 values compared with the plain row, 0 differ
+480 calls, 30438400 values compared: 0 differ; damaged headers: 363520 values NaN, 0 not
+dropped slots: 49745920 dropped slots' values, 0 not zero in both rows
+PASS: gemv_vp over packed experts is bit-identical to the plain row over block_mxfp4
+vpack check exit 0
+gemv_vp/block  gate_up hot   : back to back 21.7 us a call, 577 GB/s (one copy, from the on-die cache)
+gemv_vp[old]/packed gate_up hot   : back to back 250.8 us a call, 48 GB/s (one copy, from the on-die cache)
+gemv_vp[old]/block  gate_up hot   : back to back 237.5 us a call, 53 GB/s (one copy, from the on-die cache)
+gemv_vp[r2]/packed gate_up hot   : back to back 93.6 us a call, 128 GB/s (one copy, from the on-die cache)
+gemv_vp[r2]/block  gate_up hot   : back to back 92.6 us a call, 135 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cf]/packed gate_up hot   : back to back 90.5 us a call, 133 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cf]/block  gate_up hot   : back to back 91.1 us a call, 138 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cz]/packed gate_up hot   : back to back 21.1 us a call, 570 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cz]/block  gate_up hot   : back to back 21.6 us a call, 579 GB/s (one copy, from the on-die cache)
+plain/block    down    hot   : back to back 106.1 us a call, 59 GB/s (one copy, from the on-die cache)
+gemv_vp/packed down    hot   : back to back 16.8 us a call, 356 GB/s (one copy, from the on-die cache)
+gemv_vp/block  down    hot   : back to back 16.9 us a call, 371 GB/s (one copy, from the on-die cache)
+gemv_vp[old]/packed down    hot   : back to back 176.4 us a call, 34 GB/s (one copy, from the on-die cache)
+gemv_vp[old]/block  down    hot   : back to back 170.9 us a call, 37 GB/s (one copy, from the on-die cache)
+gemv_vp[r2]/packed down    hot   : back to back 65.2 us a call, 92 GB/s (one copy, from the on-die cache)
+gemv_vp[r2]/block  down    hot   : back to back 66.0 us a call, 95 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cf]/packed down    hot   : back to back 66.2 us a call, 91 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cf]/block  down    hot   : back to back 66.7 us a call, 94 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cz]/packed down    hot   : back to back 17.0 us a call, 354 GB/s (one copy, from the on-die cache)
+gemv_vp[r2cz]/block  down    hot   : back to back 17.0 us a call, 368 GB/s (one copy, from the on-die cache)
+PASS: the timed calls' outputs are bit-identical
+vpack time exit 0
+[2026-11-05T17:35:28Z] packed VRAM residents: device check PASS on /home/as/ds41-claude-build/home-stable/kernels/libr4d.so; its Vp arms run
+[2026-11-05T17:35:29Z] arm all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-Ucode256-Lm32768-r113: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=2048 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=6 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=2 RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=4 RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB=56 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM=1 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=32 RADIANCE_EXPERIMENTAL_DS41_LCP=2048 RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1 RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=64 RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE= RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1 RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16_FORM=0 RADIANCE_EXPERIMENTAL_DS41_N128=0 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=0 RADIANCE_EXPERIMENTAL_SCHED_TBO=0 RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=0 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RESCORE=12 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE_CHECK=0 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=0 RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=7 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RECORD= RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE= RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1 RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512 RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=0 RADIANCE_EXPERIMENTAL_DS41_KH_GEOMETRY_DIR= RADIANCE_EXPERIMENTAL_DS41_KH_GEOMETRY_COHORT= RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=0 RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=0 RADIANCE_EXPERIMENTAL_PREFIX_EORS=0 RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=0 RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=0 RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB= RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF_HEAD= RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_PROB_CAPTURE=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_EARLY_VERIFY=off RADIANCE_EXPERIMENTAL_DS41_DSPARK_PREFIX_POLICY=off RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=0 RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=0 RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET= RADIANCE_EXPERIMENTAL_DS41_DSPARK_C2=off RADIANCE_EXPERIMENTAL_DS41_DSPARK_COMPUTE_OFF=0 RADIANCE_EXPERIMENTAL_DS41_DRAFT_ORIGIN_STATS=0 RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1 RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=0 RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL= RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=0 RADIANCE_EXPERIMENTAL_DS41_P1=1 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT= RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY= RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0 RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=0 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_LEAD_US=60 RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=0 RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256 RADIANCE_EXPERIMENTAL_DS41_INSERT_WAIT_US= RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0 RADIANCE_EXPERIMENTAL_DS41_AR_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_AG_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_TARGET_TRACE_DIR= RADIANCE_EXPERIMENTAL_DS41_TARGET_TRACE_CASES= RADIANCE_EXPERIMENTAL_DS41_TARGET_TRACE_COHORT= RADIANCE_EXPERIMENTAL_DS41_TARGET_STATE=0 RADIANCE_EXPERIMENTAL_DS41_TARGET_STATE_MAP_RECEIPT= RADIANCE_EXPERIMENTAL_DS41_TARGET_STATE_REFERENCE= RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=0 RADIANCE_EXPERIMENTAL_DS41_AUX_DEVICE= RADIANCE_EXPERIMENTAL_DS41_AUX_POLICY= RADIANCE_EXPERIMENTAL_DS41_AUX_DEADLINE_US=2000 RADIANCE_EXPERIMENTAL_DS41_AUX_HEADROOM_MIB=1024 RADIANCE_EXPERIMENTAL_DS41_AUX_BACKOFF=64 RADIANCE_EXPERIMENTAL_DS41_AUX_FORCE_LATE=0
+[2026-11-05T17:36:50Z] arm all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-Ucode256-Lm32768-r113: serving after 80s
+radiance: deepseek41: rank 3: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 1885.0 MiB of E4M3 codes where bf16 held 3770.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: rank 0: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 2035.0 MiB of E4M3 codes where bf16 held 4070.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: rank 2: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 1885.0 MiB of E4M3 codes where bf16 held 3770.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: rank 1: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 1885.0 MiB of E4M3 codes where bf16 held 3770.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16: 40 routers and 3 compressor kv|gate projections read as bf16 (gemm_nt_f32bf16), 180.0 MiB less a card; the load refuses any f32 one with a nonzero low half
+I[0] router predictor: 40 routers loaded (bf16, 157 MB); scored in int8 (one scale an expert, 79 MB, quantized in 0.23 s), the best 12 scored again in bf16; layer L's router input predicts layer L+2's top 4, read ahead in pieces
+I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)
+radiance: deepseek41: consumer suffix declared: layers 21..39 see earlier rows only through their own 128-row windows and layer 20's compressed and index keys; a cut pass runs layers [0, F) in full and layer F's key ops alone
+I consumer skip: on (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP), per row -- in a prompt's pure prefill chunks (large-chunk prefill, chunks of 2048) each layer L >= 20 of 40 runs in full on the chunk's rows from consumer_row0[L] and stores its keys from the layer below's: the 16-row schedule in every 16-row group of the chunk (window 128), the rows that reach neither the prompt's last token nor the state after it skipped
+I chunk geometry: quantum 16 (attn block 16, state chunk 1), checkpoint interval 2048, max_tok 2048 -> prefill chunks of at most 2048
+I[0] large-chunk prefill: passes of up to 2048 tokens (RADIANCE_EXPERIMENTAL_DS41_LCP=2048): 80 routed MXFP4 GEMMs on moe_gemm_ggml_mxfp4_gemv (or moe_gemm_ggml_mxfp4_gemv_vp) to 16 tokens and the P1 row moe_gemm_ggml_mxfp4_gemv_tall_p1 above (80 bands; this libr4d's row reaches 4096); multi-kernel ops admitted: 81 all_reduce exact (4 ranks) on ar_oneshot_4rank_exact, ar_twoshot_4rank_exact; 13 gemm_nt bf16 (m16 / m64 / tiled) on gemm_bf16_nt_m16, gemm_bf16_nt_m64, gemm_bf16_nt_tiled; the other 1636 of 1810 ops on one kernel at every height; the plugin's own height switches: the router split by columns (40 ops) from 256 rows, the indexer in 8 extra runs; libr4d keeps the sparse attention, the indexer and the norms on their decode-band arithmetic; every routed expert row of a layer pass of 320 rows or more is computed on the cards (RADIANCE_EXPERIMENTAL_DS41_P1=1, RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS=320), the CPU path takes every routed unit of the layer passes below it, up to 319 rows, in jobs of up to 32 rows over 256 pool slots
+I large-chunk prefill: a lone prompt's chunks are 2048 tokens (checkpoint interval 2048), each with the bits of the same tokens in 16-token passes; the RAM cache admits every unit a chunk selects, as 16-token passes do (RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all)
+I consumer skip: on (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP), per row -- in a prompt's pure prefill chunks (large-chunk prefill, chunks of 2048) each layer L >= 20 of 40 runs in full on the chunk's rows from consumer_row0[L] and stores its keys from the layer below's: the 16-row schedule in every 16-row group of the chunk (window 128), the rows that reach neither the prompt's last token nor the state after it skipped
+I[0] ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of 320 to 2048 rows on the cards (RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS=320; a shorter layer pass takes the CPU path, up to 319 rows); ring 12 slots of 18800640 bytes (215 MiB a card), waves of 2 units, 16 drive units in flight, 6 pinned ready slots, 8 units read ahead, verify 0 expert-rows a layer, chunks aligned to the prompt's end; 103 routed units pinned in the host pool copied to the ring from their pool slots; the RAM cache read-only but for the units the prompt's last rows select (..._LCP_ADMIT)
+I ds41 p1: lent arena: 53 slots (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64; 53 fit) in the activation arena's top, above the buffers of steps of up to 256 tokens and the guard, hold rank 0's next 53 hottest file-tier units (profile share 0.2110) as decode residents; a step at the full plan (above 256 tokens: every card-path pass among them) takes them back, its ops behind any reload copy still queued, and 1000 ms after the last such step (RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS) they are reloaded in the background as the lent ring's are (from the drive where the RAM cache is packed) and published again; a unit not yet reloaded takes the CPU path
+I ds41 p1: lent arena: 53 slots (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64; 53 fit) in the activation arena's top, above the buffers of steps of up to 256 tokens and the guard, hold rank 0's next 53 hottest file-tier units (profile share 0.2110) as decode residents; a step at the full plan (above 256 tokens: every card-path pass among them) takes them back, its ops behind any reload copy still queued, and 1000 ms after the last such step (RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS) they are reloaded in the background as the lent ring's are (from the drive where the RAM cache is packed) and published again; a unit not yet reloaded takes the CPU path
+I activation arena: steps of up to 256 tokens take 173.24 MiB of 1.11 GiB; the 958.98 MiB above them and a 1.00 MiB guard go to prefill Phase 1's lent arena (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA)
+I[0] host experts: background inserts write a missed unit's codes by non-temporal stores in pieces of 256 KiB; a one-token pass's insert sleeps before each piece while the pool has submitted jobs unfinished (not for a miss's reservation alone), at most 4000 us an insert (RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB)
+I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)
+I[0] read-ahead: rank 0 reads the rest of a partly read unit its layer needs in the layer's own call on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1), from the container alone
+I[1] read-ahead: rank 1 reads the rest of a partly read unit its layer needs in the layer's own call on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1), from the container alone
+I[2] read-ahead: rank 2 reads the rest of a partly read unit its layer needs in the layer's own call on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1), from the container alone
+I[3] read-ahead: rank 3 reads the rest of a partly read unit its layer needs in the layer's own call on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1), from the container alone
+requests time out after 900 s (AB_REQUEST_TIMEOUT_S)
+code-01: 13.5 s, decode 22.01 tok/s, prefill 1900 ms
+code-02: 11.2 s, decode 23.84 tok/s, prefill 513 ms
+code-03: 11.5 s, decode 22.99 tok/s, prefill 397 ms
+code-04: 11.3 s, decode 23.50 tok/s, prefill 477 ms
+code-05: 7.0 s, decode 25.93 tok/s, prefill 1040 ms
+code-06: 10.9 s, decode 24.60 tok/s, prefill 538 ms
+code-07: 10.1 s, decode 26.49 tok/s, prefill 425 ms
+code-08: 10.3 s, decode 26.22 tok/s, prefill 528 ms
+code-09: 10.7 s, decode 24.94 tok/s, prefill 488 ms
+code-10: 10.4 s, decode 25.93 tok/s, prefill 526 ms
+code-11: 10.3 s, decode 25.86 tok/s, prefill 467 ms
+code-12: 10.1 s, decode 26.17 tok/s, prefill 368 ms
+code-13: 10.2 s, decode 25.99 tok/s, prefill 403 ms
+code-14: 11.3 s, decode 23.69 tok/s, prefill 582 ms
+code-15: 10.2 s, decode 27.04 tok/s, prefill 801 ms
+code-16: 11.2 s, decode 23.96 tok/s, prefill 574 ms
+[2026-11-05T17:39:41Z] arm all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-Ucode256-Lm32768-r113: requests exit 0
+[2026-11-05T17:39:41Z] arm all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-Ucode256-Lm32768-r113: NVMe busy 7% of the requests' 170358 ms, drive at 48 C
+I[0] host experts' background inserts: 611 units relaid from passes, 4.488 ms a unit from the queue to published (496 from one-token passes, 4.583 ms a unit); non-temporal: 41548 pieces, 10811 MB of codes; waited before 1831 pieces, 1163.9 ms asleep, 28 inserts out of their wait; 1623 MB in 407.8 ms copied while the pool had submitted jobs unfinished, 3573 pieces begun while it held only reservations
+I[1] host experts' background inserts: 604 units relaid from passes, 4.498 ms a unit from the queue to published (476 from one-token passes, 4.663 ms a unit); non-temporal: 41072 pieces, 10688 MB of codes; waited before 1764 pieces, 1109.5 ms asleep, 34 inserts out of their wait; 1772 MB in 433.3 ms copied while the pool had submitted jobs unfinished, 2984 pieces begun while it held only reservations
+I[2] host experts' background inserts: 613 units relaid from passes, 4.473 ms a unit from the queue to published (479 from one-token passes, 4.659 ms a unit); non-temporal: 41684 pieces, 10847 MB of codes; waited before 1765 pieces, 1139.1 ms asleep, 40 inserts out of their wait; 1848 MB in 462.8 ms copied while the pool had submitted jobs unfinished, 3846 pieces begun while it held only reservations
+I[3] host experts' background inserts: 614 units relaid from passes, 4.410 ms a unit from the queue to published (485 from one-token passes, 4.556 ms a unit); non-temporal: 41752 pieces, 10865 MB of codes; waited before 1763 pieces, 1116.2 ms asleep, 29 inserts out of their wait; 1796 MB in 422.4 ms copied while the pool had submitted jobs unfinished, 4422 pieces begun while it held only reservations
+  host experts' plane reads: 5586 weights read for the CPU in 8.59 s of issuing-thread time (1.54 ms a batch weight), 5610 relaid into the RAM cache beside it
+  host experts' kept plane readers: 820 calls on them (0 posted ahead of the pool's jobs, ..._MISS_POST; 0 posts read the normal way, the readers on another thread's call), 0 that could not start them; 7 threads started
+I[3] EP scoped file staging: 159800 count rows completed, 27792 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 90279 layers handed 131180 experts (139085 rows) to the CPU; 0 cached experts went over the copy link, 867 routed experts were not cached; 44006.3 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 132047 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 867 units, 1110 rows, 2018.0 ms reading their planes
+I[3] host experts, one-token passes: 88911 gathers without a miss waited 39440.8 ms for the CPU's rows (443.6 us each), 731 with one 207.1 ms (283.3 us each)
+I[3] host experts: 848.3 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+I[3] host experts' background inserts: 614 units relaid from passes, 4.410 ms a unit from the queue to published (485 from one-token passes, 4.556 ms a unit); non-temporal: 41752 pieces, 10865 MB of codes; waited before 1763 pieces, 1116.2 ms asleep, 29 inserts out of their wait; 1796 MB in 422.4 ms copied while the pool had submitted jobs unfinished, 4422 pieces begun while it held only reservations
+I[3] host experts: 862 jobs of four or more rows of one expert (6558 rows) went through the many-row kernel
+I[3] host experts' side store: 1 of at most 7 units held (18.00 MiB) whose inserts the packed RAM cache refuses; 253 misses handed their planes without a read (252 in one-token passes); 0 refused units turned away for want of room
+I[3] host experts, early issue: 159760 layers issued their card ops ahead of their counts sync and waited 87925.6 ms for the counts at their gathers (550.4 us a layer; also in the router wait above); 3 found their counts already in (the thread was behind the card); 0 fetched their rows again after a gate_up operand move
+I[3] host experts' one-token miss reads, one unit: 399 calls, 0 posted at the choice, 0 with the mirror's tail in pieces; of 399 with a mirror leg the mirror landed last in 223 (55.9%, 0.128 ms after the container) and the container in 176 (0.668 ms after the mirror); from the dispatch: mirror leg 2.570 ms (its copy 0.172 ms, all its copies 0.172), container leg 2.793 ms, the caller back 2.872 ms
+I[3] host experts' one-token miss reads, one unit, readers: the first read begun 33.5 us after the dispatch, the first container read 89.9 us, the last read 364.1 us; the caller back 7.6 us after the last read landed
+I[3] host experts' one-token miss reads, two or more units: 2 calls, 0 posted at the choice, 0 with the mirror's tail in pieces; of 2 with a mirror leg the mirror landed last in 0 (0.0%, 0.000 ms after the container) and the container in 2 (0.674 ms after the mirror); from the dispatch: mirror leg 4.001 ms (its copy 0.218 ms, all its copies 0.419), container leg 4.675 ms, the caller back 4.676 ms
+I[3] host experts' one-token miss reads, two or more units, readers: the first read begun 16.6 us after the dispatch, the first container read 20.8 us, the last read 171.9 us; the caller back 0.7 us after the last read landed
+I[3] host experts' one-token miss reads, with a read-ahead unit's rest: 79 calls, 0 posted at the choice, 0 with the mirror's tail in pieces; of 3 with a mirror leg the mirror landed last in 0 (0.0%, 0.000 ms after the container) and the container in 3 (1.233 ms after the mirror); from the dispatch: mirror leg 2.433 ms (its copy 0.171 ms, all its copies 0.171), container leg 1.473 ms, the caller back 1.482 ms
+I[3] host experts' one-token miss reads, with a read-ahead unit's rest, readers: the first read begun 28.6 us after the dispatch, the first container read 29.9 us, the last read 108.8 us; the caller back 9.4 us after the last read landed
+I[0] read-ahead in pieces: 1016 units planned (0 more too late, 0 over the live cap); at their layer 84 used (1 whole, 83 finished by the layer's own read, their pieces in flight waited for 0.7 ms in all, 0.008 ms each), 6 read as any miss, 0 re-read after a failed piece; 926 dropped (926 not selected, 0 cache hits, 0 stale); 90 of 496 misses planned (18.1%), 84 used (16.9%); read ahead 815 MB for units used, 7617 MB for units dropped
+I[0] read-ahead in pieces by pass size: 1 row: 1016 planned (0 too late or over the cap), 84 used (1 whole, 83 finished, 0.7 ms waited), 6 read as any miss, 0 re-read, 926 dropped, 90 of 496 misses planned, 815 MB used, 7617 MB dropped
+I[1] read-ahead in pieces: 1291 units planned (0 more too late, 0 over the live cap); at their layer 80 used (0 whole, 80 finished by the layer's own read, their pieces in flight waited for 1.1 ms in all, 0.014 ms each), 6 read as any miss, 0 re-read after a failed piece; 1205 dropped (1205 not selected, 0 cache hits, 0 stale); 86 of 476 misses planned (18.1%), 80 used (16.8%); read ahead 718 MB for units used, 10994 MB for units dropped
+I[1] read-ahead in pieces by pass size: 1 row: 1291 planned (0 too late or over the cap), 80 used (0 whole, 80 finished, 1.1 ms waited), 6 read as any miss, 0 re-read, 1205 dropped, 86 of 476 misses planned, 718 MB used, 10995 MB dropped
+I[2] read-ahead in pieces: 1160 units planned (0 more too late, 0 over the live cap); at their layer 86 used (0 whole, 86 finished by the layer's own read, their pieces in flight waited for 0.0 ms in all, 0.000 ms each), 4 read as any miss, 0 re-read after a failed piece; 1070 dropped (1070 not selected, 0 cache hits, 0 stale); 90 of 479 misses planned (18.8%), 86 used (18.0%); read ahead 770 MB for units used, 8296 MB for units dropped
+I[2] read-ahead in pieces by pass size: 1 row: 1160 planned (0 too late or over the cap), 86 used (0 whole, 86 finished, 0.0 ms waited), 4 read as any miss, 0 re-read, 1070 dropped, 90 of 479 misses planned, 770 MB used, 8296 MB dropped
+I[3] read-ahead in pieces: 841 units planned (0 more too late, 0 over the live cap); at their layer 79 used (0 whole, 79 finished by the layer's own read, their pieces in flight waited for 0.0 ms in all, 0.000 ms each), 5 read as any miss, 0 re-read after a failed piece; 757 dropped (757 not selected, 0 cache hits, 0 stale); 84 of 485 misses planned (17.3%), 79 used (16.3%); read ahead 689 MB for units used, 5903 MB for units dropped
+I[3] read-ahead in pieces by pass size: 1 row: 841 planned (0 too late or over the cap), 79 used (0 whole, 79 finished, 0.0 ms waited), 5 read as any miss, 0 re-read, 757 dropped, 84 of 485 misses planned, 689 MB used, 5903 MB dropped
+I read-ahead readers: 4 readers, 512 KiB pieces; 84617 pieces read (0 urgent, 0 failed), 44296 MB in 30666.4 ms of reads (0.362 ms a piece), at most 4 in flight; 1869.5 ms of reader time held back by demand reads; 2271 demand reads, 513 of them started with read-ahead pieces in flight, 284.2 ms in all until those pieces were in (0.554 ms each); 328 units stopped for their layer to read the rest (..._PREFETCH_URGENT)
+I router predictor (two ahead, top 4): 151202 inputs posted, 151202 predictions, 0 dropped behind a full queue; 50652.6 ms scoring (335.0 us a prediction), 874.9 ms planning the read-ahead (5.8 us a prediction)
+I[0] read-ahead in pieces, partly read units at their layer: 83 layers waited for them, 1.345 ms each from the layer's choice until every such unit was whole; 82 of those layers read nothing else, 1.316 ms each (one unit's own wait); 82 of them with the unit started at least the plane mirror's decode share, 1.316 ms each (the per-unit wait on the units every arm finishes)
+I[0] read-ahead in pieces, rests on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1): 83 units' rest read in their layer's own call, 592 MB (0.0 MB of it from the plane mirror, 0 units' rests with a part from it; 7.13 MB a unit); 0.7 ms waiting after the call for their pieces in flight
+I[1] read-ahead in pieces, partly read units at their layer: 80 layers waited for them, 1.458 ms each from the layer's choice until every such unit was whole; 77 of those layers read nothing else, 1.379 ms each (one unit's own wait); 77 of them with the unit started at least the plane mirror's decode share, 1.379 ms each (the per-unit wait on the units every arm finishes)
+I[1] read-ahead in pieces, rests on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1): 79 units' rest read in their layer's own call, 620 MB (0.0 MB of it from the plane mirror, 0 units' rests with a part from it; 7.85 MB a unit); 1.1 ms waiting after the call for their pieces in flight
+I[2] read-ahead in pieces, partly read units at their layer: 86 layers waited for them, 1.376 ms each from the layer's choice until every such unit was whole; 85 of those layers read nothing else, 1.349 ms each (one unit's own wait); 85 of them with the unit started at least the plane mirror's decode share, 1.349 ms each (the per-unit wait on the units every arm finishes)
+I[2] read-ahead in pieces, rests on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1): 86 units' rest read in their layer's own call, 668 MB (0.0 MB of it from the plane mirror, 0 units' rests with a part from it; 7.76 MB a unit); 0.0 ms waiting after the call for their pieces in flight
+I[3] read-ahead in pieces, partly read units at their layer: 79 layers waited for them, 1.518 ms each from the layer's choice until every such unit was whole; 76 of those layers read nothing else, 1.432 ms each (one unit's own wait); 76 of them with the unit started at least the plane mirror's decode share, 1.432 ms each (the per-unit wait on the units every arm finishes)
+I[3] read-ahead in pieces, rests on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1): 79 units' rest read in their layer's own call, 632 MB (0.0 MB of it from the plane mirror, 0 units' rests with a part from it; 8.01 MB a unit); 0.0 ms waiting after the call for their pieces in flight
+I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)
+  packed RAM cache: slots 11.44 MiB + 5.72 MiB (raw rounds 512, 320); 5684 weights packed and published; 2 unit inserts refused over a raw-round budget (2 distinct units, never cached); 0 weights failed the scales' round trip (never published); 0 block_mxfp4 calls turned away (the card's copy path)
+I[0] host experts' side store: 2 of at most 7 units held (36.00 MiB) whose inserts the packed RAM cache refuses; 236 misses handed their planes without a read (230 in one-token passes); 0 refused units turned away for want of room
+  packed RAM cache: slots 11.44 MiB + 5.72 MiB (raw rounds 512, 320); 5640 weights packed and published; 2 unit inserts refused over a raw-round budget (2 distinct units, never cached); 0 weights failed the scales' round trip (never published); 0 block_mxfp4 calls turned away (the card's copy path)
+I[1] host experts' side store: 2 of at most 7 units held (36.00 MiB) whose inserts the packed RAM cache refuses; 93 misses handed their planes without a read (91 in one-token passes); 0 refused units turned away for want of room
+  packed RAM cache: slots 11.44 MiB + 5.72 MiB (raw rounds 512, 320); 5598 weights packed and published; 1 unit inserts refused over a raw-round budget (1 distinct units, never cached); 0 weights failed the scales' round trip (never published); 0 block_mxfp4 calls turned away (the card's copy path)
+I[2] host experts' side store: 1 of at most 7 units held (18.00 MiB) whose inserts the packed RAM cache refuses; 237 misses handed their planes without a read (236 in one-token passes); 0 refused units turned away for want of room
+  packed RAM cache: slots 11.44 MiB + 5.72 MiB (raw rounds 512, 320); 5610 weights packed and published; 1 unit inserts refused over a raw-round budget (1 distinct units, never cached); 0 weights failed the scales' round trip (never published); 0 block_mxfp4 calls turned away (the card's copy path)
+I[3] host experts' side store: 1 of at most 7 units held (18.00 MiB) whose inserts the packed RAM cache refuses; 253 misses handed their planes without a read (252 in one-token passes); 0 refused units turned away for want of room
+I router predictor scoring: int8 (79 MB, one scale an expert), the best 12 scored again in bf16: 151202 predictions, 302.1 us a prediction in the int8 pass and 30.5 us rescoring
+radiance: deepseek41: rank 0: on-die reads (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN): a budget of 56.0 MiB an issue point over ekv,comp,qa,kv,iq,qb,oa,ob,rt,sgu,sdn; 37 layers read ahead, 9-10 reads, 52.5 MiB a layer (51.8-56.0); by kind ekv 2, comp 4, qa 39, kv 39, iq 8, qb 39, oa 78, ob 39, rt 39, sgu 36 (1 cut), sdn 35 (4 cut); Engram layers (MiB ahead of the GEMM + behind it) 1 37.5 + 51.8, 14 37.5 + 55.5
+radiance: deepseek41: rank 0: on-die reads issued live in 3979 decode steps: 1352860 reads at 155181 layer tails, 7843.37 GiB (2125.8 MiB a step, 51.8 a tail); behind the Engram GEMMs 71622 reads at 7958 layers, 416.75 GiB
+I post-stop passes: 0 request(s) ended with a step issued ahead behind their last one (a forward pass after the last token); ..._SKIP_POST_STOP: 3980 step(s) read back before the next was planned (2259.8 ms waiting for their ids, 567.8 us a step), 1 of them ended their request and issued nothing behind it, 3979 issued the next step 34.2 us after their ids (its build, advance and arena; the card waits through it)
+I VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED): device.ds41_vram_packed selects moe_gemm_ggml_mxfp4_gemv_vp for the routed GEMMs' decode band; static residents with room for 512 (gate_up) and 320 (down) raw rounds
+I[0] VRAM packed experts: rank 0: 7680 routed weights can be held packed
+I[0] VRAM packed experts: rank 0 holds 642 static residents in the packed-scale form (642 gate_up and 642 down weights): 10.76 GiB where block_mxfp4 takes 11.24 GiB; 0 eligible weights over their raw-round budget stay block_mxfp4; 1308 weights' scales read in 0.63 s to decide (0 unreadable, kept block_mxfp4); raw rounds 1595 in all, at most 309 in a weight
+I[0] expert profile: rank 0 planned units VRAM=642 pinned=103 SSD=3095; decode calibration mass 6.240176/0.441516/3.229311; two file buffers 215.16 MiB; calibration coverage is not held-out performance
+I[1] VRAM packed experts: rank 1 holds 650 static residents in the packed-scale form (650 gate_up and 650 down weights): 10.90 GiB where block_mxfp4 takes 11.38 GiB; 0 eligible weights over their raw-round budget stay block_mxfp4; 1326 weights' scales read in 0.65 s to decide (0 unreadable, kept block_mxfp4); raw rounds 1170 in all, at most 197 in a weight
+I[1] expert profile: rank 1 planned units VRAM=650 pinned=103 SSD=3087; decode calibration mass 6.270227/0.417476/3.098243; two file buffers 215.16 MiB; calibration coverage is not held-out performance
+I[2] VRAM packed experts: rank 2 holds 650 static residents in the packed-scale form (650 gate_up and 650 down weights): 10.90 GiB where block_mxfp4 takes 11.38 GiB; 0 eligible weights over their raw-round budget stay block_mxfp4; 1326 weights' scales read in 0.64 s to decide (0 unreadable, kept block_mxfp4); raw rounds 907 in all, at most 116 in a weight
+I[2] expert profile: rank 2 planned units VRAM=650 pinned=103 SSD=3087; decode calibration mass 6.562876/0.448914/3.202959; two file buffers 215.16 MiB; calibration coverage is not held-out performance
+I[3] VRAM packed experts: rank 3 holds 650 static residents in the packed-scale form (650 gate_up and 649 down weights): 10.90 GiB where block_mxfp4 takes 11.38 GiB; 1 eligible weights over their raw-round budget stay block_mxfp4; 1326 weights' scales read in 0.63 s to decide (0 unreadable, kept block_mxfp4); raw rounds 647 in all, at most 112 in a weight
+I[3] expert profile: rank 3 planned units VRAM=650 pinned=103 SSD=3087; decode calibration mass 6.548775/0.433426/3.106103; two file buffers 215.16 MiB; calibration coverage is not held-out performance
+  VRAM packed experts: 642 static residents hold 1284 weights (642 gate_up, 642 down) in the packed-scale form, 10.76 GiB where block_mxfp4 takes 11.24 GiB; 1284 weights packed and checked at load; 0 eligible weights over their raw-round budget stayed block_mxfp4; 1308 weights' scales read in 0.63 s to plan it; raw rounds 1595, at most 309 in a weight
+  VRAM packed experts: 650 static residents hold 1300 weights (650 gate_up, 650 down) in the packed-scale form, 10.90 GiB where block_mxfp4 takes 11.38 GiB; 1300 weights packed and checked at load; 0 eligible weights over their raw-round budget stayed block_mxfp4; 1326 weights' scales read in 0.65 s to plan it; raw rounds 1170, at most 197 in a weight
+  VRAM packed experts: 650 static residents hold 1300 weights (650 gate_up, 650 down) in the packed-scale form, 10.90 GiB where block_mxfp4 takes 11.38 GiB; 1300 weights packed and checked at load; 0 eligible weights over their raw-round budget stayed block_mxfp4; 1326 weights' scales read in 0.64 s to plan it; raw rounds 907, at most 116 in a weight
+  VRAM packed experts: 650 static residents hold 1299 weights (650 gate_up, 649 down) in the packed-scale form, 10.90 GiB where block_mxfp4 takes 11.38 GiB; 1299 weights packed and checked at load; 1 eligible weights over their raw-round budget stayed block_mxfp4; 1326 weights' scales read in 0.63 s to plan it; raw rounds 647, at most 112 in a weight
+I consumer skip: 16 prefill passes of cut prompts, 16 of them cut (0 shared a step and ran every layer, 0 off the grid): 640 layer-passes run in full, 0 key ops alone, 0 skipped (100.0% of those passes' layer-passes in full); checkpoints below a prompt's target: 0 written whole, 0 not written; their cones raised 0 passes by 0 layer-passes in full (the key ops alone stay one a cut pass), 0 snapshot passes cut at the last layer's keys, 0 run in full off the plan
+radiance: deepseek41: rank 0: consumer skip: 0 cut passes issued 0 layer-passes in full, 0 key ops alone and skipped 0
+radiance: deepseek41: rank 0: consumer skip, per row: 16 steps cut by row issued 19752 layer-rows in full, 368 key ops alone and skipped 0
+radiance: deepseek41: rank 1: consumer skip: 0 cut passes issued 0 layer-passes in full, 0 key ops alone and skipped 0
+radiance: deepseek41: rank 2: consumer skip: 0 cut passes issued 0 layer-passes in full, 0 key ops alone and skipped 0
+radiance: deepseek41: rank 3: consumer skip: 0 cut passes issued 0 layer-passes in full, 0 key ops alone and skipped 0
+I[0] ds41 p1 stats, rank 0: 0 chunks, 0 card-path layers; units RAM 0 / drive 0 / host pool 0 (read ahead: 0 posted, 0 used, 0 dropped); 0 waves (at most 0 a layer), 0 ring copies, 0.00 GB over DMA; drive 0 units, 0.00 GB, busy 0.0% of 0.00 s in chunks; issuing thread: 0.000 s waiting for drive units (0 waits), 0 ring-full waves, 0 release syncs; packer 0.00 ms a unit (0 packed, 0 block), 0.000 s waiting for ready slots; admitted 0; leases at pass end 0; verify rows 0, differ 0 (0 samples skipped); lent ring: 53 slots (53 in the activation arena), 53 residents now; 0 bursts took them back (0 residents withdrawn), 1 returns, 53 reloaded (RAM cache 0, drive 53 at 19.3 ms a unit), 0 failed, 0 overtaken, 0 passes held back by the grace; touched experts 0: VRAM residents 0, slab 0, ring 0; admission orders moved 0
+I[1] ds41 p1 stats, rank 1: 0 chunks, 0 card-path layers; units RAM 0 / drive 0 / host pool 0 (read ahead: 0 posted, 0 used, 0 dropped); 0 waves (at most 0 a layer), 0 ring copies, 0.00 GB over DMA; drive 0 units, 0.00 GB, busy 0.0% of 0.00 s in chunks; issuing thread: 0.000 s waiting for drive units (0 waits), 0 ring-full waves, 0 release syncs; packer 0.00 ms a unit (0 packed, 0 block), 0.000 s waiting for ready slots; admitted 0; leases at pass end 0; verify rows 0, differ 0 (0 samples skipped); lent ring: 53 slots (53 in the activation arena), 53 residents now; 0 bursts took them back (0 residents withdrawn), 1 returns, 53 reloaded (RAM cache 0, drive 53 at 19.0 ms a unit), 0 failed, 0 overtaken, 0 passes held back by the grace; touched experts 0: VRAM residents 0, slab 0, ring 0; admission orders moved 0
+I[2] ds41 p1 stats, rank 2: 0 chunks, 0 card-path layers; units RAM 0 / drive 0 / host pool 0 (read ahead: 0 posted, 0 used, 0 dropped); 0 waves (at most 0 a layer), 0 ring copies, 0.00 GB over DMA; drive 0 units, 0.00 GB, busy 0.0% of 0.00 s in chunks; issuing thread: 0.000 s waiting for drive units (0 waits), 0 ring-full waves, 0 release syncs; packer 0.00 ms a unit (0 packed, 0 block), 0.000 s waiting for ready slots; admitted 0; leases at pass end 0; verify rows 0, differ 0 (0 samples skipped); lent ring: 53 slots (53 in the activation arena), 53 residents now; 0 bursts took them back (0 residents withdrawn), 1 returns, 53 reloaded (RAM cache 0, drive 53 at 19.8 ms a unit), 0 failed, 0 overtaken, 0 passes held back by the grace; touched experts 0: VRAM residents 0, slab 0, ring 0; admission orders moved 0
+I[3] ds41 p1 stats, rank 3: 0 chunks, 0 card-path layers; units RAM 0 / drive 0 / host pool 0 (read ahead: 0 posted, 0 used, 0 dropped); 0 waves (at most 0 a layer), 0 ring copies, 0.00 GB over DMA; drive 0 units, 0.00 GB, busy 0.0% of 0.00 s in chunks; issuing thread: 0.000 s waiting for drive units (0 waits), 0 ring-full waves, 0 release syncs; packer 0.00 ms a unit (0 packed, 0 block), 0.000 s waiting for ready slots; admitted 0; leases at pass end 0; verify rows 0, differ 0 (0 samples skipped); lent ring: 53 slots (53 in the activation arena), 53 residents now; 0 bursts took them back (0 residents withdrawn), 1 returns, 53 reloaded (RAM cache 0, drive 53 at 19.2 ms a unit), 0 failed, 0 overtaken, 0 passes held back by the grace; touched experts 0: VRAM residents 0, slab 0, ring 0; admission orders moved 0
+I[0] host experts, one-token passes: 93805 gathers without a miss waited 58203.3 ms for the CPU's rows (620.5 us each), 719 with one 223.2 ms (310.5 us each)
+I[1] host experts, one-token passes: 94453 gathers without a miss waited 38551.7 ms for the CPU's rows (408.2 us each), 560 with one 146.8 ms (262.1 us each)
+I[2] host experts, one-token passes: 88654 gathers without a miss waited 42960.5 ms for the CPU's rows (484.6 us each), 713 with one 222.4 ms (312.0 us each)
+I[3] host experts, one-token passes: 88911 gathers without a miss waited 39440.8 ms for the CPU's rows (443.6 us each), 731 with one 207.1 ms (283.3 us each)
+I host expert pool: 40 workers, futex wake (..._FUTEX), pre-wake 0 (..._PREWAKE); 373102 submits, 372588 of them woke sleeping workers (22.3 us in the wake each); a submit's first job: its first tile 168.9 us after it, its 24th 199.6 us (373102 / 373102), from an all-asleep pool 158.1 and 187.9 us (335846 / 335846); idle spin 1499621.6 ms in all, 6332701 sleeps
+request     all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-Ucode256-Lm32768-r113
+code-01            22.01  same
+code-02            23.84  same
+code-03            22.99  same
+code-04            23.50  same
+code-05            25.93  same
+code-06            24.60  same
+code-07            26.49  same
+code-08            26.22  same
+code-09            24.94  same
+code-10            25.93  same
+code-11            25.86  same
+code-12            26.17  same
+code-13            25.99  same
+code-14            23.69  same
+code-15            27.04  same
+code-16            23.96  same
+decode             24.94 tok/s
+[2026-11-05T17:39:48Z] arms done
+[2026-11-05T17:39:48Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-11-05T17:40:39Z] QFN up after 50s; completion: {"id":"cmpl-5fedb8302a4698942932d58b","object":"text_completion","created":1793900438,"model":"qwen-vllm","system_fingerprint":"radiance-1.16.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+72c1f8960c1ad0000aad3a59d0e25999fde2025102f1d5df049deaa7dccc89ad running 2026-11-05T17:39:48.192752556Z sha256:b1017ce0e615dbd16370f84724aac1f0b999a2cfb769d1b2f49d2dd7c0913cd1

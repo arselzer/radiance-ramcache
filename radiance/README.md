@@ -1,3 +1,71 @@
+# radiance-ramcache: DeepSeek-V4.1-Flash with native MXFP4 experts on four RX 9070 XT
+
+This is a fork of [radiance](https://codeberg.org/StillDeadcode/radiance) tuned for one job: serving
+DeepSeek-V4.1-Flash (ds41) with its native MXFP4 routed experts on a workstation with four 16 GB Radeon RX 9070 XT cards (gfx1201, tensor parallel 4)
+and an AMD EPYC 7443 (Zen 3 "Milan", 24 cores) with 256 GB of DDR4-2666. The routed experts (about
+289 GB) do not fit in the cards' 64 GB, so the hottest experts stay in VRAM, most of the rest sit in a
+192 GiB packed RAM cache whose experts the CPU computes, and the remainder is read from NVMe. Every
+optimization is exact: replies stay byte-identical to the base engine's, which each measurement window
+checks by comparing replies, prefill hashes and logits. [RAMCACHE.md](RAMCACHE.md) lists what the fork
+adds; [tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md) has the configuration,
+the switches and every measurement. Below the line is upstream's README, unchanged.
+
+**Checkpoint precision:** the model used for these results preserves the official 1017 release's
+MXFP4 expert codes/scales, but uses ISTA IQ4_NL Engram tables and BF16/F32 conversions of other
+official neural weights. It is a hybrid, not an entirely untouched official-precision checkpoint.
+The IQ2_XS supplement supplies integer Engram controls only, not IQ2 neural weights. The numerical
+audit passed all 1,119 other neural tensors against their declared decode/cast mappings, and all
+seven integer Engram controls matched the official rules. Exactness checks compare with this same
+imported baseline; they do not establish equivalence to an independent official runner. Restoring
+official FP8 Engram requires a new qualified baseline.
+
+Latest validated numbers (November 5, 2026): the recommended configuration on the `ds41-stable`
+branch (radiance 1.15 base). On the cards, `main` (radiance 1.16) matched that line with identical replies and logits at
+the same speed, before batch admission and the expert worker were merged; those two are built and
+host-tested here. Each row comes from one or two A/B windows.
+
+| Workload | Four RX 9070 XT (tok/s) | Plus optional R9700 expert worker (tok/s) |
+|---|---:|---:|
+| Decode, 1 stream | 28-30 | 33.9 |
+| Decode, 4 streams | 41-44 | 51.5 |
+| Decode, 8 streams | 45-47 | 57.6-58.2 |
+| Decode, 8 streams, chat prompts | 38.4-38.9 | 45.8-46.5 |
+| Decode, agent-harness turns with prefix cache | 25-26 | 29.4-29.6 |
+| Prefill, 6,817-token prompt | 515 | — |
+| Prefill, 47,917-token prompt | 776 | — |
+| Prefill, 99,987-token prompt | 661 | — |
+
+Decode rates are totals across the active streams (N times the mean per-request rate); concurrent
+rows use batch admission. Prefill uses the server's measured prompt-processing rate, rounded to
+whole tokens per second; the two longer prompts' values are means of two runs. It excludes parsing,
+tokenization and admission wait. All prefill rows use admit-all with the tested 192 GiB cache;
+`—` means unmeasured with the worker.
+
+- **Prefill latency**: admit-all takes 13.24 s to first token at 6,817 tokens, 22.8% less than the
+  fresh control (one quiet pair), and 61.79 s at 47,917 tokens, 38.4% less (OFF/ON/ON/OFF means).
+  All 80 replies/counts and five full prefill hashes matched, with no post-prefill N8 decode regression.
+  A further OFF/ON/ON/OFF window at 99,987 tokens measured 151.32 s against 240.46 s, 37.069% less;
+  all 84 original replies/counts, 14 full prefill hashes and nine joined server exits passed.
+  Subsequent eight-stream wave wall time stayed neutral (13.9895 to 14.0133 s).
+  Default admission previously measured 48K/100K at
+  115/222 s, or 77/165 s with 4,096-token chunks. Smaller cache budgets retain default admission.
+- **Agent-harness latency**: 13 prefix-cached turns total 61-63 s to first token with Phase 1
+  read-ahead off (72 s with it on). The optional worker reduces total turn time by about 5-7%.
+  A separate admit-all pair at the fixed 32K reservation reduced summed TTFT from 68.9714 to
+  56.7298 s; that single quiet pair is exploratory.
+- **Context**: a fixed 131,072-token reservation is qualified through 100K-token prompts (about
+  0-2% decode cost at short context); a 524,288-token reservation starts and costs 7% at short context.
+- **Notes**: the expert worker is optional and turns itself off without a fifth card of the
+  same architecture. Branches: `main` (this one), `ds41-stable` (the measured line), `ds41` (a curated
+  evidence snapshot) and `ds41-research`.
+
+[Latest experiment status and qualification limits](docs/DS41-RESULTS-20261105.md) records the
+DSpark prototype's validated 32K/single-stream code gain (+17.14%) and the remaining two-batch
+integration gates. DSpark remains experimental; its code workload is separate from this table's
+held-out decode prompts, and the new result does not exceed the valid earlier DSpark speed record.
+
+---
+
 # radiance
 
 An inference server for AMD GPUs, in C++ and HIP: language models, and image, video, speech and

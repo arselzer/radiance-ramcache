@@ -1,15 +1,15 @@
 {
-  "commit": "e1f037e9575485f4583e545fd97dd149585681c8",
-  "tree": "1da554b858d8f5b66fca39815a0959e533036bb7",
+  "commit": "d316a3b32ea9c9d43c46ca70357ff4ecbce02ee2",
+  "tree": "71457cc43230f1d98b0771b500b9ff34a17cc4ab",
   "branch": "claude/ds41-decode-impl",
-  "subject": "ds41 README: the aux expert worker on chat prompts and harness turns (window F2)",
-  "committed_utc": "2026-11-04T07:26:49Z",
-  "files": 1863,
-  "bytes": 71563766,
+  "subject": "Document current prefill and DSpark results with qualification limits",
+  "committed_utc": "2026-11-05T18:51:07Z",
+  "files": 1866,
+  "bytes": 71604864,
   "executable_files": 67,
   "pins": "docs/ds41/provenance/ENGINE_SOURCE_PINS.json",
-  "pins_sha256": "d8cf87534d69b1026ee50ba39e80702d717b1be1d989ddb7eda26c4e53c9d298",
-  "export": "git archive --format=tar e1f037e9575485f4583e545fd97dd149585681c8 (tracked files only, modes kept)",
+  "pins_sha256": "355526879e14be79c8059583f2224ddf5af87dcdc984ae271e0fda34269f49af",
+  "export": "git archive --format=tar d316a3b32ea9c9d43c46ca70357ff4ecbce02ee2 (tracked files only, modes kept)",
   "upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -17,12 +17,12 @@
       "upstream main (upstream/main, v1.15.0 + 12)": {
         "commit": "b6acbd69e475b064f61c76ef7dbdea4e22956394",
         "contained": true,
-        "commits_after": 420
+        "commits_after": 428
       },
       "pull request 266, deepseek41 (upstream/pr-266 as of 2026-10-28)": {
         "commit": "bd65d4e58f7c4233de09ad5245a82c9510eb8962",
         "contained": true,
-        "commits_after": 599
+        "commits_after": 607
       }
     }
   }

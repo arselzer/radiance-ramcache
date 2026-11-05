@@ -1,0 +1,131 @@
+{
+  "exactness_passed": true,
+  "arm_count": 9,
+  "failures": [],
+  "all_arm_and_phase_metrics": {
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Lm131072-Ulong8k-r0": {
+      "requests": 1,
+      "client_concurrency": 1,
+      "sum_ttft_s": 13.951980261,
+      "N_x_mean_canonical_decode_tps": 25.53922493706586,
+      "wave_wall_s": 14.552533388137817,
+      "wave_tokens": 16,
+      "wave_tps": 1.0994649229282685,
+      "sum_request_wall_s": 14.540854454040527
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Kh-Lm131072-Ulong8k-r1": {
+      "requests": 1,
+      "client_concurrency": 1,
+      "sum_ttft_s": 13.400885902999999,
+      "N_x_mean_canonical_decode_tps": 8.654014629204415,
+      "wave_wall_s": 15.148781776428223,
+      "wave_tokens": 16,
+      "wave_tps": 1.0561905396839426,
+      "sum_request_wall_s": 15.135498285293579
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Qpk-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Kh-Lm131072-Ulong8k-r1": {
+      "requests": 1,
+      "client_concurrency": 1,
+      "sum_ttft_s": 13.507611004,
+      "N_x_mean_canonical_decode_tps": 21.653054678344198,
+      "wave_wall_s": 14.212549686431885,
+      "wave_tokens": 16,
+      "wave_tps": 1.1257656334017616,
+      "sum_request_wall_s": 14.201996326446533
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Lm131072-Ulong8k-r1": {
+      "requests": 1,
+      "client_concurrency": 1,
+      "sum_ttft_s": 13.344734629,
+      "N_x_mean_canonical_decode_tps": 24.62197439515578,
+      "wave_wall_s": 13.966258525848389,
+      "wave_tokens": 16,
+      "wave_tps": 1.14561820335687,
+      "sum_request_wall_s": 13.955554008483887
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Qpk-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Lm131072-Ulong8k-r1": {
+      "requests": 1,
+      "client_concurrency": 1,
+      "sum_ttft_s": 13.402660103,
+      "N_x_mean_canonical_decode_tps": 25.017053583391636,
+      "wave_wall_s": 14.014599084854126,
+      "wave_tokens": 16,
+      "wave_tps": 1.141666622293287,
+      "sum_request_wall_s": 14.003670692443848
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Qpk-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Lm131072-Ulong8k-r2": {
+      "requests": 1,
+      "client_concurrency": 1,
+      "sum_ttft_s": 13.388668423999999,
+      "N_x_mean_canonical_decode_tps": 24.954336641647302,
+      "wave_wall_s": 14.001460552215576,
+      "wave_tokens": 16,
+      "wave_tps": 1.1427379265421118,
+      "sum_request_wall_s": 13.990956783294678
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Lm131072-Ulong8k-r2": {
+      "requests": 1,
+      "client_concurrency": 1,
+      "sum_ttft_s": 13.27357189,
+      "N_x_mean_canonical_decode_tps": 24.92727368194199,
+      "wave_wall_s": 13.887200593948364,
+      "wave_tokens": 16,
+      "wave_tps": 1.1521400509597544,
+      "sum_request_wall_s": 13.8764967918396
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r1.before": {
+      "requests": 1,
+      "client_concurrency": 1,
+      "sum_ttft_s": 69.680444682,
+      "N_x_mean_canonical_decode_tps": 19.56208783225564,
+      "wave_wall_s": 72.51572775840759,
+      "wave_tokens": 56,
+      "wave_tps": 0.7722462661695796,
+      "sum_request_wall_s": 72.49587631225586
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r1": {
+      "requests": 8,
+      "client_concurrency": 8,
+      "sum_ttft_s": 26.646186242,
+      "N_x_mean_canonical_decode_tps": 47.43552213062166,
+      "wave_wall_s": 14.036548376083374,
+      "wave_tokens": 485,
+      "wave_tps": 34.552654043239215,
+      "sum_request_wall_s": 108.10103702545166
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Qpk-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r1.before": {
+      "requests": 1,
+      "client_concurrency": 1,
+      "sum_ttft_s": 67.61511971,
+      "N_x_mean_canonical_decode_tps": 24.694410963400376,
+      "wave_wall_s": 69.87568545341492,
+      "wave_tokens": 56,
+      "wave_tps": 0.8014232652835208,
+      "sum_request_wall_s": 69.84680223464966
+    },
+    "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Qpk-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r1": {
+      "requests": 8,
+      "client_concurrency": 8,
+      "sum_ttft_s": 25.925874526999998,
+      "N_x_mean_canonical_decode_tps": 46.50439235592164,
+      "wave_wall_s": 14.07720685005188,
+      "wave_tokens": 485,
+      "wave_tps": 34.45285738613783,
+      "sum_request_wall_s": 108.44804644584656
+    }
+  },
+  "quiet_ABBA": {
+    "OFF_mean_TTFT_s": 13.3091532595,
+    "ON_mean_TTFT_s": 13.395664263499999,
+    "ON_vs_OFF_TTFT_percent": 0.6500113291448395,
+    "OFF_mean_request_wall_s": 13.916025400161743,
+    "ON_mean_request_wall_s": 13.997313737869263,
+    "ON_vs_OFF_request_wall_percent": 0.5841347322244284
+  },
+  "same_server_post48K_N8": {
+    "ON_vs_OFF_canonical_decode_percent": -1.9629377581973362,
+    "ON_vs_OFF_wave_tps_percent": -0.2888248670463889,
+    "needs_fresh_ABBA_followup": false
+  },
+  "qualification_scope": "all legacy and P4 cases/shapes; no paid performance inferred from qualification mode"
+}

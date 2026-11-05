@@ -1,0 +1,17 @@
+I device: AQL backend, 4 device(s) [0:gfx1201 1:gfx1201 2:gfx1201 3:gfx1201]
+I device: card 2 copy lists go to DMA engine 0 on a queue of this process's own (0.8 ms to open)
+I device: card 0 copy lists go to DMA engine 0 on a queue of this process's own (0.7 ms to open)
+I device: card 3 copy lists go to DMA engine 0 on a queue of this process's own (0.7 ms to open)
+I device: card 1 copy lists go to DMA engine 0 on a queue of this process's own (0.7 ms to open)
+  ok   mapped_local_actual_full_payload_pending_source_and_terminal_owner (0.63 s)
+570 check(s) over 1 case(s) in 0.63 s, 0.69 s of CPU
+mapped-local full source PASS actual_device=2 pci=0000:83:00.0 mode=local pending=0 GU=11999296 DN=6001984 owner_retained=1
+mapped-local full source PASS actual_device=0 pci=0000:03:00.0 mode=local pending=0 GU=11999296 DN=6001984 owner_retained=1
+mapped-local full source PASS actual_device=3 pci=0000:c6:00.0 mode=local pending=0 GU=11999296 DN=6001984 owner_retained=1
+mapped-local full source PASS actual_device=1 pci=0000:48:00.0 mode=local pending=0 GU=11999296 DN=6001984 owner_retained=1
+mapped-local full source PASS actual_device=0 pci=0000:03:00.0 mode=all-target pending=0 GU=11999296 DN=6001984 owner_retained=1
+mapped-local terminal PASS actual_device=2 mode=local owners=1 retained_charge=20971520
+mapped-local terminal PASS actual_device=0 mode=local owners=1 retained_charge=20971520
+mapped-local terminal PASS actual_device=3 mode=local owners=1 retained_charge=20971520
+mapped-local terminal PASS actual_device=1 mode=local owners=1 retained_charge=20971520
+mapped-local terminal PASS actual_device=0 mode=all-target owners=1 retained_charge=20971520

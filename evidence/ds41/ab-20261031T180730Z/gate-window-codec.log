@@ -1,6 +1,0 @@
-PASS window-fp8-domain groups=1146 raw=0 bad=0 pair=2
-PASS window-fp8-original-producer profile=0 groups=65536 raw=0 bad=0 scale_bad=0 byte_guard_bad=0 pair=2
-PASS window-fp8-original-producer profile=1 groups=65536 raw=0 bad=0 scale_bad=0 byte_guard_bad=0 pair=65536
-PASS window-fp8-original-producer profile=2 groups=65536 raw=0 bad=0 scale_bad=0 byte_guard_bad=0 pair=64
-PASS window-fp8-original-producer profile=3 groups=65536 raw=0 bad=0 scale_bad=0 byte_guard_bad=0 pair=65536
-PASS ds41_window_codec_exact

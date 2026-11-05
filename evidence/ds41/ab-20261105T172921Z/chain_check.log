@@ -1,0 +1,4 @@
+Warning: Resource leak detected by SharedSignalPool, 77 Signals leaked.
+24 trials, 48 expert rows: differing values gate_up 0, swiglu 0, down 0, whole host chain 0
+PASS: host experts are bit-identical to libr4d's decode chain
+chain exit 0

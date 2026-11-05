@@ -1,0 +1,200 @@
+{
+  "schema": "ds41-c4-admission-screen-v1",
+  "adoption": false,
+  "failures": [
+    [
+      "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Kh-Lm131072-Ulong8k-r1",
+      "unmeasured arm"
+    ]
+  ],
+  "window": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261104T195802Z",
+  "arms_sha256": "478f1e259216943786714625287e486b1d525bd869d463770f1f47ccc37e670e",
+  "exactness_references": {
+    "heldout": {
+      "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261031T104524Z/base.json",
+      "sha256": "afdbe3f5f872b0fd032042b7198e3e4ffa3c0e3c849460923064d148660b7247"
+    },
+    "long8k": {
+      "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261104T003545Z/all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Kh-Lm131072-Ulong8k.json",
+      "sha256": "47faec540e6917ed00bb748a0882a94d062006644757046bee79b85ae80addb6"
+    },
+    "long48k": {
+      "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261104T003545Z/all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Kh-Lm131072-Ulong48k.json",
+      "sha256": "2d9a019de5b274e21f2afc8764497b976274ac7e41143ffa4fa29fb87de14f49"
+    },
+    "long100k": {
+      "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261104T003545Z/all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Kh-Lm131072-Ulong100k.json",
+      "sha256": "63d76c52bba19498ecba6294bfa45a26c5a79d4a3ae0f5be5e85d2c588f0008e"
+    }
+  },
+  "rows": [
+    {
+      "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Lm131072-Ulong8k-r0",
+      "suffix": "",
+      "family": "long8k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 16.597713057,
+      "canonical_tps": 24.83954017222078,
+      "wave_s": 17.21441411972046,
+      "response_sha256": "9f5fa3cf256b2995d7c0b049be5c3c5980ac81d2c49fc90bde7f082cb0aa2333",
+      "timing_eligible": false
+    },
+    {
+      "arm": "all-t40-f-M4096-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc4096-Pci4096-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Kh-Lm131072-Ulong8k-r1",
+      "suffix": "",
+      "family": "long8k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 13.267584467999999,
+      "canonical_tps": 8.461782820468814,
+      "wave_s": 15.052563667297363,
+      "response_sha256": "52a1fc30988412252f1cb0b7ed40d9f48085f80e862a5634a01591b84502857f",
+      "timing_eligible": false
+    },
+    {
+      "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Kh-Lm131072-Ulong48k-r1",
+      "suffix": "",
+      "family": "long48k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 74.476706452,
+      "canonical_tps": 13.070698838471278,
+      "wave_s": 78.71630001068115,
+      "response_sha256": "a037776ba7ccb7728cf5460ee3bcec9f273a1ff913ba7953f73e84b1dc25f096",
+      "timing_eligible": false
+    },
+    {
+      "arm": "all-t40-f-M4096-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc4096-Pci4096-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Kh-Lm131072-Ulong48k-r1",
+      "suffix": "",
+      "family": "long48k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 68.018845606,
+      "canonical_tps": 16.892389044862597,
+      "wave_s": 72.72258734703064,
+      "response_sha256": "3adb9cd38cf4c7ee782ce08a4302242873693f1fcd25f68b850dacd68c76a052",
+      "timing_eligible": false
+    },
+    {
+      "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Kh-Lm131072-Ulong100k-r1",
+      "suffix": "",
+      "family": "long100k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 138.10593203,
+      "canonical_tps": 15.84097237113498,
+      "wave_s": 142.27566766738892,
+      "response_sha256": "8a4c278d983d16310931a291db182b456765e4e848db96ab221b6776f69d6b80",
+      "timing_eligible": false
+    },
+    {
+      "arm": "all-t40-f-M4096-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc4096-Pci4096-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C1-Pf-Pmr8-Ba-Kh-Lm131072-Ulong100k-r1",
+      "suffix": "",
+      "family": "long100k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 141.198433432,
+      "canonical_tps": 17.339835966026758,
+      "wave_s": 145.028058052063,
+      "response_sha256": "05a4eecb5082c2e4eb87d10757ccc6b6ec85480b5b89f78831927d751f7daff4",
+      "timing_eligible": false
+    },
+    {
+      "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r1",
+      "suffix": ".before",
+      "family": "long48k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 69.128600804,
+      "canonical_tps": 22.828175365978414,
+      "wave_s": 71.57767057418823,
+      "response_sha256": "3b20ff300196c9704dea08e5efa383b59cbd938491dde35fc37dfe4a564b81e7",
+      "timing_eligible": true
+    },
+    {
+      "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r1",
+      "suffix": "",
+      "family": "heldout",
+      "requests": 8,
+      "concurrency": 8,
+      "ttft_s": 26.637776861,
+      "canonical_tps": 47.589314122523824,
+      "wave_s": 14.006636142730713,
+      "response_sha256": "ee5944f308f259ae5b05ccca6c3308ba9a6c8c4d64c9ff8ac4202949c7a358f8",
+      "timing_eligible": true
+    },
+    {
+      "arm": "all-t40-f-M4096-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc4096-Pci4096-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r1",
+      "suffix": ".before",
+      "family": "long48k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 65.027158093,
+      "canonical_tps": 21.5439158107234,
+      "wave_s": 67.618173122406,
+      "response_sha256": "5131ee2df2e04b799ffac5895e933bff6b472af2a5b5e452951d0c940399d36b",
+      "timing_eligible": true
+    },
+    {
+      "arm": "all-t40-f-M4096-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc4096-Pci4096-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r1",
+      "suffix": "",
+      "family": "heldout",
+      "requests": 8,
+      "concurrency": 8,
+      "ttft_s": 27.738532249,
+      "canonical_tps": 43.178483825060546,
+      "wave_s": 15.122029066085815,
+      "response_sha256": "07e69815469a7b0bf8742ac20f107122960e4369242dfd61ab0e986e988affa9",
+      "timing_eligible": true
+    },
+    {
+      "arm": "all-t40-f-M4096-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc4096-Pci4096-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r2",
+      "suffix": ".before",
+      "family": "long48k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 67.02717208199999,
+      "canonical_tps": 17.11664449474052,
+      "wave_s": 70.2717809677124,
+      "response_sha256": "a144d0eddb7f99a5c012cf468705c12ed2f76f97d89310a36ac8b85272313edf",
+      "timing_eligible": true
+    },
+    {
+      "arm": "all-t40-f-M4096-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc4096-Pci4096-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r2",
+      "suffix": "",
+      "family": "heldout",
+      "requests": 8,
+      "concurrency": 8,
+      "ttft_s": 28.215603546999997,
+      "canonical_tps": 44.477435586215215,
+      "wave_s": 14.943655252456665,
+      "response_sha256": "355ed11370678806623086830e4283d6cd6d05424476556a9ec1899ed511d96a",
+      "timing_eligible": true
+    },
+    {
+      "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r2",
+      "suffix": ".before",
+      "family": "long48k",
+      "requests": 1,
+      "concurrency": 1,
+      "ttft_s": 62.968230813,
+      "canonical_tps": 25.339574450863214,
+      "wave_s": 65.17781186103821,
+      "response_sha256": "e7a62acdcc0827ff43de9d655506786d92e41092b350f3883ecd116ad5b1bee7",
+      "timing_eligible": true
+    },
+    {
+      "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N8-C8-Pf-Pmr8-Ba-Lm131072-F5post-r2",
+      "suffix": "",
+      "family": "heldout",
+      "requests": 8,
+      "concurrency": 8,
+      "ttft_s": 25.94937443,
+      "canonical_tps": 46.65167562373483,
+      "wave_s": 14.045510053634644,
+      "response_sha256": "c8cd65d3d1c74f55d5d089febfa8c681c37a297dad473e174052cee13b8acba9",
+      "timing_eligible": true
+    }
+  ]
+}

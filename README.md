@@ -6,17 +6,39 @@ This branch is a research checkpoint, not a serving deployment: exported source 
 
 On 30 Oct the box went from 128 GB to 256 GB of RAM, so the RAM cache now holds 192 GiB of experts and drive reads are rare. Unless a row says otherwise, measurements use the 8 held-out prompts: 64 tokens each, greedy, four cards (TP4). The original results below come from A/B windows in `evidence/ds41/`; the November prefill reports separately identify their custom guarded windows and exported timing records.
 
-| Measure | Result | Window |
-|---|---|---|
-| Decode, one stream | recommended configuration 31.24 tok/s with the 192 GiB cache (20.87 at the earlier 96 GiB; 19.85 on 128 GB). Base engine 5.03 tok/s (128 GB, not re-measured) | `ab-20261030T194552Z`, `ab-20261030T205440Z`; base `ab-20261028T223812Z` |
-| Concurrent requests | 38.7 tok/s total decode at 4 streams, 42.2-42.9 at 8 (decode-only settings with packed VRAM residents); with the recommended prefill settings 37.2-38.0 and 41.2-41.5. Two-batch overlap of the steps: -3 to -5% (left off) | `ab-20261030T194552Z`, `ab-20261030T205440Z`, `ab-20261030T231526Z`, `ab-20261031T030023Z` |
-| DSpark speculative decoding, one stream | code prompts +12.2 to +12.5% (29.75-29.79 against 26.48-26.52 tok/s, 89% of drafts accepted), held-out +9.3%, chat +1.2 to +1.5%. Beside concurrent requests it drafts only while one decodes alone: 4 streams 37.1 against 38.8 tok/s in total (-4.5%, the bank's VRAM) | `ab-20261030T205440Z`, `ab-20261030T213623Z`, `ab-20261030T234957Z` |
-| Prefill, recommended (Phase 1: every routed expert of long layer passes on the cards, 2,048-token chunks, lent arena) | 82 / 272 / 933 tokens unchanged (1.9 / 3.8 / 4.2 s); 1,890 tokens 5.0 s, **3,086 7.2 s (429 tok/s)**, **6,817 17.2 s (396 tok/s)**; prefill hashes identical (5 of 5); held-out decode 29.45 tok/s (1,024-token chunks: 29.91, with 7.5 / 8.6 / 26.7 s prefill) | `ab-20261031T022949Z`, `ab-20261031T011849Z`, `ab-20261030T231526Z` |
-| Prefill, large chunks without Phase 1 | 933 / 1,890 / 3,086 tokens in 10.5 / 18.5 / 28.0 s; 6,817 tokens in 51.2 s. Phase 1 at 2,048-token chunks was faster still (6.6 s at 3,086) but cost decode residents | `ab-20261030T231526Z`, `ab-20261030T201710Z` |
-| Harness turns (2 sessions, 13 turns up to 9.7K tokens) | summed time to first token 135.1 s cold; 82.5 s with the prefix cache and end-of-request snapshots on the chunk grid; **72.7 s with snapshots on a 16-token grid** (`..._RESUME_GRID=16`: a turn resumes within 15 tokens of the previous reply's end; short follow-ups 0.3-0.6 s instead of 3.3-3.7 s). Prefill hashes identical to the cold run on 13 of 13 turns; decode unchanged | `ab-20261031T090154Z`, `ab-20261031T034433Z` |
-| Nov 3, stable build (runtime e184c6b7, four RX 9070 XT) | **Adopted: bf16 routers and packed VRAM residents under Phase 1** (`..._ROUTER_BF16=1`, `..._VRAM_PACKED=1`): 4 / 8 streams 37.98 / 41.77 against 37.27 / 40.84 tok/s in total (+1.9% / +2.3%), harness-turn decode +2.2%, one stream and long prompts unchanged (6,817 tokens 17.22-17.58 s both, run order R C2 C2 R); every reply, prefill hash, harness turn and logit record (3,397 positions) identical. 4,096-token chunks stay opt-in (3,086 tokens 6.0 vs 7.4 s, but −4.5% / −5.1% at 4 / 8 streams). Startup RAM-cache fill (−70% cold misses) and pinned GPU clocks showed no measurable gain (within a ~5% arm-order effect); not adopted | `ab-20261103T090558Z`, `T110235Z`, `T114720Z`, `T143939Z` |
-| Replies | all 72 held-out replies of the four post-upgrade windows byte-identical to the base engine's; code, chat and long-prompt replies identical across every arm of their window | the windows above |
-| Upstream sync (upstream main v1.15.0 + 12 merged, 31 Oct) | speeds unchanged: decode 31.09 / 29.29 tok/s (decode-only / recommended), 37.6 / 41.4 total at 4 / 8 streams, 3,086-token prefill 7.21 s, harness turns 72.9 s. Exact on the merged build: KLD records 1,512 / 1,512 positions, prefill hashes 13 / 13, CPU rows 29,668 against the card's with no difference. Upstream's own rounding changed (its RMS norm sums over a fixed partition), so the reference is now the merged base engine: 32 of 32 held-out replies identical to it; it differs from the pre-sync base in 3 of 8 replies (same top token at 98.9% of KLD positions) | `ab-20261031T100852Z`, `ab-20261031T104524Z` |
+The latest recommended configuration uses runtime `f84b23db` with coherent `libr4d` `92bd7719`.
+The source export includes documentation updates over that runtime; no rebuild occurred during export.
+
+| Workload | Four RX 9070 XT (tok/s) | With optional expert worker (tok/s) |
+|---|---:|---:|
+| Decode, 1 stream | 28–30 | 33.9 |
+| Decode, 4 streams | 41–44 | 51.5 |
+| Decode, 8 streams | 45–47 | 57.6–58.2 |
+| Decode, 8 streams, chat | 38.4–38.9 | 45.8–46.5 |
+| Decode, prefix-cached agent turns | 25–26 | 29.4–29.6 |
+| Prefill, 6,817-token prompt | 515 | unmeasured |
+| Prefill, 47,917-token prompt | 776 | unmeasured |
+| Prefill, 99,987-token prompt | 661 | unmeasured |
+
+Decode rates total the streams, using N times the mean server-reported rate. Prefill uses the
+server's prompt-processing rate; all three rows use admit-all at the tested 192 GiB cache budget.
+The 100K ABBA comparison measured 416→661 tok/s and TTFT 240.46→151.32 s, with all 84 original
+replies/counts and 14 full prefill hashes exact. Subsequent N8 wave time stayed neutral.
+Smaller/dynamic caches retain the general admission fallback; the worker combination is unmeasured.
+
+The latest DSpark prototype measured 24.92→29.19 tok/s (+17.14%) on its matched 32K/single-stream
+code workload, passing all 96 original replies/counts. The valid earlier 29.79 result used a
+different profile and metric: this is not a new absolute record. A separate matched current-profile
+PLAIN bracket measured accepted 24.83 versus prototype OFF 24.65 (-0.75%, within observed drift).
+Qa0 improved warmed 6.8K TTFT by 4.12%; the cold 48K comparison remains inconclusive due to control drift.
+
+[Detailed results and qualification limits](radiance/docs/DS41-RESULTS-20261105.md) distinguish
+model tests from the newer CPU component batches (7/21/46 suites), whose GPU/model gates remain open.
+[Controller extracts](research/ds41/qualification-results-20261105.json) retain full local receipt hashes.
+
+The imported baseline preserves official MXFP4 expert codes/scales and passed all 1,119 declared
+other-neural-tensor conversion mappings plus seven integer controls. Two ISTA IQ4_NL Engram tables
+remain additional quantization; reply exactness does not establish independent official-runner equivalence.
 
 The ds41 plugin also declares its DSML reply format: `/v1/chat/completions` returns tool calls in `message.tool_calls` and thinking in `message.reasoning_content`. Across `ab-20261031T111018Z` and `ab-20261031T115207Z`, all 16 chat and 13 harness replies stayed byte-identical with registration off/on, with identical prompts and generated token counts; the base arm matched the merged base on 8/8 held-out replies. A thinking-on calculator request parsed both fields and produced the same 116 token IDs through raw `/completion`; the weather request also matched all 67 IDs and chose empty reasoning (`evidence/ds41/ab-20261031T115207Z/dsml-probe.json`). The research container has no chat template, so chat serving needs `--override-chat-template`; the final window used the saved text-only adapter `evidence/ds41/ab-20261031T115207Z/dsml-chat-template.jinja.txt`, whose tested request renderings match the official V4.1 encoder byte for byte. The first window stopped at501 for the missing template, and the second stopped on an overly strict empty-reasoning assertion. All three windows restored QFN and checked a completion.
 
@@ -48,13 +70,13 @@ The second compares every held-out reply of that window with the base engine's (
 
 Nothing was rebuilt for this export. Each window ran a build of the engine branch at that time, and `docs/ds41/NIGHT-LOG.md` names the commit for most of them. The post-upgrade decode windows ran builds of `claude/ds41-lcpfast` and `claude/ds41-dsvp`, both merged in the exported engine; the Phase 1 adoption window ran a build of `claude/ds41-int5` (merged in the exported engine) with its own deepseek41 plugin; the first Phase 1 window, `ab-20261030T201710Z`, ran a build of `claude/ds41-p1`; the DSpark-beside-concurrency window `ab-20261030T234957Z` ran a build of `claude/ds41-dsconc`, and the lent-arena windows `ab-20261031T011849Z` to `ab-20261031T030023Z` builds of `claude/ds41-p1big` with its own plugin, and the upstream-sync windows `ab-20261031T100852Z` and `ab-20261031T104524Z` a build of `claude/ds41-sync` with every plugin from it (all merged). The host-expert optimizations use opt-in `RADIANCE_EXPERIMENTAL_*` switches or flags. The DSML chat reply format is registered by default.
 
-- `radiance/`: the exact tracked tree of engine commit `0fb1f93e` (1,849 files) from branch `claude/ds41-decode-impl` (GitHub `ds41-stable`): runtime e184c6b7 plus the README that recommends bf16 routers and packed residents. Its switches, the recommended configuration and the A/B tools are described in `radiance/tools/ds41-host-experts/README.md`.
-- `docs/ds41/`: 34 reports: the review, the plan, the night log, research, designs, implementation reports, November prefill results and the upstream sync (`UPSTREAM-SYNC-20261031.md`). `provenance/` pins every engine file.
-- `evidence/ds41/`: 131 A/B windows, each with its log, per-arm results and memory traces. Server logs (compressed) are kept for the thirty-eight windows the numbers above and the prefill exactness come from.
+- `radiance/`: exact engine `d316a3b3` (1866 files), including the latest documentation over runtime `f84b23db`; all paths, bytes and modes pinned.
+- `docs/ds41/`: 47 reports, including the night log, recovered workflow research and current prefill/precision plans; `provenance/` pins every engine file.
+- `evidence/ds41/`: 149 A/B windows, including interrupted and failed experiments with their original status preserved; selected server logs are compressed.
 - `research/ds41/`: the small measurement programs and outputs the reports cite.
 - `tools/`: `verify_snapshot.py` (snapshot verification), `ds41_reply_check.py` (reply identity check) and `ds41_refresh.py`. The refresh tool rebuilds this branch from an engine commit, the report folder and a window list.
 
-The engine is Radiance ([upstream](https://codeberg.org/StillDeadcode/radiance)). It contains upstream main through `b6acbd69` (2026-10-31, v1.15.0 and 12 commits), the 80 commits of the deepseek41 architecture pull request 266 (at `bd65d4e5`), and 326 commits of this work. Upstream licensing and notices remain (`LICENSE`, `radiance/LICENSE`, `radiance/NOTICE`).
+The engine is Radiance ([upstream](https://codeberg.org/StillDeadcode/radiance)), from the measured 1.15-based line with the deepseek41 architecture work and this fork’s exact optimizations. The separate `main` branch follows upstream 1.16. Licensing and notices remain unchanged.
 
 These are excluded:
 
@@ -66,3 +88,5 @@ These are excluded:
 `evidence/ds41/index.json` lists every file left out of a window, with its reason. Paths in the reports and logs refer to the author's machine.
 
 See [STATUS.md](STATUS.md) for what is and is not validated.
+
+Three larger historical windows remain fully available in the [prior snapshot index](research/ds41/archived-window-index-20261105.json), with file hashes and immutable links. Their results and failures remain part of the research record. The current export keeps the existing 100 MB evidence bound.

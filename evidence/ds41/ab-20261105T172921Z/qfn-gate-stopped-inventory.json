@@ -1,0 +1,119 @@
+{
+  "all_kfd_clients": [],
+  "all_nodes": [
+    {
+      "bdf": "0000:c3:00.0",
+      "current_link_speed": "32.0 GT/s PCIe",
+      "current_link_width": "16",
+      "device": "0x7551",
+      "gfx": "120001",
+      "gpu_id": 11920,
+      "node": "1",
+      "uuid": "GPU-31ab7bfac9162a52",
+      "vendor": "0x1002"
+    },
+    {
+      "bdf": "0000:c6:00.0",
+      "current_link_speed": "32.0 GT/s PCIe",
+      "current_link_width": "16",
+      "device": "0x7550",
+      "gfx": "120001",
+      "gpu_id": 24490,
+      "node": "2",
+      "uuid": "GPU-23aac62b67afffa9",
+      "vendor": "0x1002"
+    },
+    {
+      "bdf": "0000:83:00.0",
+      "current_link_speed": "32.0 GT/s PCIe",
+      "current_link_width": "16",
+      "device": "0x7550",
+      "gfx": "120001",
+      "gpu_id": 44060,
+      "node": "3",
+      "uuid": "GPU-be0851a556d0f2c1",
+      "vendor": "0x1002"
+    },
+    {
+      "bdf": "0000:48:00.0",
+      "current_link_speed": "32.0 GT/s PCIe",
+      "current_link_width": "16",
+      "device": "0x7550",
+      "gfx": "120001",
+      "gpu_id": 39759,
+      "node": "4",
+      "uuid": "GPU-e770be134869264b",
+      "vendor": "0x1002"
+    },
+    {
+      "bdf": "0000:03:00.0",
+      "current_link_speed": "32.0 GT/s PCIe",
+      "current_link_width": "16",
+      "device": "0x7550",
+      "gfx": "120001",
+      "gpu_id": 3197,
+      "node": "5",
+      "uuid": "GPU-e49179ac81aef5ad",
+      "vendor": "0x1002"
+    }
+  ],
+  "mask": "GPU-e49179ac81aef5ad,GPU-e770be134869264b,GPU-be0851a556d0f2c1,GPU-23aac62b67afffa9",
+  "observed_unix": 1793899799.9973075,
+  "primary": [
+    {
+      "bdf": "0000:03:00.0",
+      "current_link_speed": "32.0 GT/s PCIe",
+      "current_link_width": "16",
+      "device": "0x7550",
+      "gfx": "120001",
+      "gpu_id": 3197,
+      "node": "5",
+      "uuid": "GPU-e49179ac81aef5ad",
+      "vendor": "0x1002"
+    },
+    {
+      "bdf": "0000:48:00.0",
+      "current_link_speed": "32.0 GT/s PCIe",
+      "current_link_width": "16",
+      "device": "0x7550",
+      "gfx": "120001",
+      "gpu_id": 39759,
+      "node": "4",
+      "uuid": "GPU-e770be134869264b",
+      "vendor": "0x1002"
+    },
+    {
+      "bdf": "0000:83:00.0",
+      "current_link_speed": "32.0 GT/s PCIe",
+      "current_link_width": "16",
+      "device": "0x7550",
+      "gfx": "120001",
+      "gpu_id": 44060,
+      "node": "3",
+      "uuid": "GPU-be0851a556d0f2c1",
+      "vendor": "0x1002"
+    },
+    {
+      "bdf": "0000:c6:00.0",
+      "current_link_speed": "32.0 GT/s PCIe",
+      "current_link_width": "16",
+      "device": "0x7550",
+      "gfx": "120001",
+      "gpu_id": 24490,
+      "node": "2",
+      "uuid": "GPU-23aac62b67afffa9",
+      "vendor": "0x1002"
+    }
+  ],
+  "production": {
+    "id": "72c1f8960c1ad0000aad3a59d0e25999fde2025102f1d5df049deaa7dccc89ad",
+    "image": "sha256:b1017ce0e615dbd16370f84724aac1f0b999a2cfb769d1b2f49d2dd7c0913cd1",
+    "pid": 0,
+    "process_start_ticks": null,
+    "running": false,
+    "started_at": "2026-11-05T17:27:23.22290299Z",
+    "status": "exited"
+  },
+  "state": "stopped",
+  "zero_vram_note": "Zero VRAM is not proof of no queue. ROOT must review these retained associations; optional-card clients are not stopped."
+}

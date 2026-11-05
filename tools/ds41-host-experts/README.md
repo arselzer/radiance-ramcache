@@ -12,8 +12,10 @@ come from that checkpoint with BF16/F32 conversions; the two Engram embedding ta
 ISTA's IQ4_NL conversion. The supplemental IQ2_XS file supplies integer Engram controls only,
 not IQ2 expert weights. This is not a wholly untouched official-precision checkpoint. The
 exactness claims below compare optimizations with this same imported base engine; they do not
-establish equivalence to an independent official runner. Engram is the confirmed additional
-quantization; a complete numerical audit of all other conversions remains outstanding.
+establish equivalence to an independent official runner. The numerical audit passed all 1,119
+other neural tensors against their declared decode/cast mappings (zero mismatches), and all seven
+integer Engram controls matched the official rules. The two IQ4_NL Engram tables remain additional
+quantization; the audit does not turn this into an untouched official-precision checkpoint.
 
 On the loop's eight held-out prompts (64 tokens, greedy, TP4) the path takes decode from 5.03 to
 about 17 tok/s and the time to first token summed over the prompts from 64.0 to about 15.5 s. Every
@@ -161,11 +163,14 @@ chunk selects can then enter the existing bounded RAM cache, instead of only uni
 Later chunks reuse those bytes rather than reading them again. Weights, routing and arithmetic are unchanged.
 On the unchanged stable runtime f84b23db / libr4d 92bd7719, with a fixed 131,072-token reservation:
 
-- A fresh 6,817-token prompt took 13.24 s to first token against 17.16 s with default admission, a quiet single-pair
-  screen (ab-20261104T115653Z; the separate startup control and hash-instrumented arms are retained).
+- A fresh 6,817-token prompt took 13.24 s to first token against 17.16 s with default admission,
+  22.8% less time in a quiet single-pair screen (ab-20261104T115653Z; the separate startup control
+  and hash-instrumented arms are retained).
 - Quiet 47,917-token prompts in OFF/ON/ON/OFF order took 100.68 / 62.04 / 61.53 / 99.83 s, a 38.4% reduction by
   pair means (ab-20261104T121517Z). Each was followed on the same server by the original eight held-out requests at
   concurrency eight: mean total decode 46.67 versus 47.16 tok/s, wave time 14.08 versus 14.00 s, no measured regression.
+  The two admit-all runs measured 46.50 and 47.83 tok/s, using eight times the mean server-reported
+  per-request decode rate, consistently with the overview table.
 - After a fresh held-out wave at concurrency eight, the 6,817-token prompt took 13.33 / 11.74 / 12.02 / 12.82 s in
   the same OFF/ON/ON/OFF order, 9.1% less time by pair means. All warming requests and observer snapshots are retained.
 - All 80 replies and original prompt/generated counts across these two windows matched their qualified references;

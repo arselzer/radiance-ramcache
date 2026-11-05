@@ -33,21 +33,26 @@ host-tested here. Each row comes from one or two A/B windows.
 | Decode, agent-harness turns with prefix cache | 25-26 | 29.4-29.6 |
 | Prefill, 6,817-token prompt | 515 | — |
 | Prefill, 47,917-token prompt | 776 | — |
+| Prefill, 99,987-token prompt | 661 | — |
 
 Decode rates are totals across the active streams (N times the mean per-request rate); concurrent
 rows use batch admission. Prefill uses the server's measured prompt-processing rate, rounded to
-whole tokens per second; the longer prompt's value is the mean of two runs. It excludes parsing,
-tokenization and admission wait. Both prefill rows use admit-all with the tested 192 GiB cache;
+whole tokens per second; the two longer prompts' values are means of two runs. It excludes parsing,
+tokenization and admission wait. All prefill rows use admit-all with the tested 192 GiB cache;
 `—` means unmeasured with the worker.
 
 - **Prefill latency**: admit-all takes 13.24 s to first token at 6,817 tokens, 22.8% less than the
   fresh control (one quiet pair), and 61.79 s at 47,917 tokens, 38.4% less (OFF/ON/ON/OFF means).
   All 80 replies/counts and five full prefill hashes matched, with no post-prefill N8 decode regression.
+  A further OFF/ON/ON/OFF window at 99,987 tokens measured 151.32 s against 240.46 s, 37.069% less;
+  all 84 original replies/counts, 14 full prefill hashes and nine joined server exits passed.
+  Subsequent eight-stream wave wall time stayed neutral (13.9895 to 14.0133 s).
   Default admission previously measured 48K/100K at
-  115/222 s, or 77/165 s with 4,096-token chunks. Admit-all at 100K and on prefix-cached harness
-  turns remains unmeasured; smaller cache budgets retain default admission.
+  115/222 s, or 77/165 s with 4,096-token chunks. Smaller cache budgets retain default admission.
 - **Agent-harness latency**: 13 prefix-cached turns total 61-63 s to first token with Phase 1
   read-ahead off (72 s with it on). The optional worker reduces total turn time by about 5-7%.
+  A separate admit-all pair at the fixed 32K reservation reduced summed TTFT from 68.9714 to
+  56.7298 s; that single quiet pair is exploratory.
 - **Context**: a fixed 131,072-token reservation is qualified through 100K-token prompts (about
   0-2% decode cost at short context); a 524,288-token reservation starts and costs 7% at short context.
 - **Notes**: the expert worker is optional and turns itself off without a fifth card of the
@@ -55,8 +60,9 @@ tokenization and admission wait. Both prefill rows use admit-all with the tested
   evidence snapshot) and `ds41-research`.
 
 [Latest experiment status and qualification limits](docs/DS41-RESULTS-20261105.md) records the
-DSpark and two-batch-overlap work still awaiting throughput or integration gates. Those candidates
-remain experimental; this table reports the validated configuration.
+DSpark prototype's validated 32K/single-stream code gain (+17.14%) and the remaining two-batch
+integration gates. DSpark remains experimental; its code workload is separate from this table's
+held-out decode prompts, and the new result does not exceed the valid earlier DSpark speed record.
 
 ---
 

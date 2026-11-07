@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "d316a3b32ea9c9d43c46ca70357ff4ecbce02ee2",
+  "engine_commit": "e90fdae86b5b86da17f6b3006d93e6c410ac83ec",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -59,7 +59,10 @@
     "C4-ADMISSION-20261104.md",
     "PHASE2-AFTER-ADMISSION-20261104.md",
     "PACKED-RAM-GPU-PREFILL-REUSE-20261105.md",
-    "AUX-PLACEMENT-SCHEDULING-20261105.md"
+    "AUX-PLACEMENT-SCHEDULING-20261105.md",
+    "DS41-RESULTS-20261107.md",
+    "DS41-PUBLIC-C2-QUIET-20261107.md",
+    "qualification-results-20261107.json"
   ],
   "research": [
     "ds41_supply_model.py",
@@ -251,7 +254,11 @@
     "ab-20261105T170206Z",
     "ab-20261105T171654Z",
     "ab-20261105T172921Z",
-    "ab-20261105T174226Z"
+    "ab-20261105T174226Z",
+    "ab-20261107T043255Z",
+    "ab-20261107T062111Z",
+    "ab-20261107T072223Z",
+    "ab-20261107T075513Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",
@@ -304,7 +311,8 @@
     "ab-20261105T170206Z": "Matched current-profile PLAIN64 role2 prototype OFF",
     "ab-20261105T171654Z": "Matched current-profile PLAIN64 role3 prototype OFF",
     "ab-20261105T172921Z": "Matched current-profile PLAIN64 role4 accepted",
-    "ab-20261105T174226Z": "Qa75 warmed gain; cold control drift inconclusive; no general default change"
+    "ab-20261105T174226Z": "Qa75 warmed gain; cold control drift inconclusive; no general default change",
+    "ab-20261107T043255Z": "November7 exact scope and measured results; see dated qualification report"
   },
   "allowed_emails": [
     "aselzer3@gmail.com",

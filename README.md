@@ -26,11 +26,36 @@ The 100K ABBA comparison measured 416→661 tok/s and TTFT 240.46→151.32 s, wi
 replies/counts and 14 full prefill hashes exact. Subsequent N8 wave time stayed neutral.
 Smaller/dynamic caches retain the general admission fallback; the worker combination is unmeasured.
 
-The latest DSpark prototype measured 24.92→29.19 tok/s (+17.14%) on its matched 32K/single-stream
-code workload, passing all 96 original replies/counts. The valid earlier 29.79 result used a
-different profile and metric: this is not a new absolute record. A separate matched current-profile
-PLAIN bracket measured accepted 24.83 versus prototype OFF 24.65 (-0.75%, within observed drift).
-Qa0 improved warmed 6.8K TTFT by 4.12%; the cold 48K comparison remains inconclusive due to control drift.
+The latest separately built ABI33 candidate uses the recommended C2/P1 profile, fixed 131,072-token
+context and one stream on the 256 GB host with a 192 GiB expert cache. It is separate from the
+historical held-out/concurrent serving table above; the exported serving runtime/defaults are unchanged.
+
+| Original workload | Plain decode, tok/s | DSpark, tok/s | Change | Scope |
+|---|---:|---:|---:|---|
+| CODE16, cap256 | 24.81 | 28.59 | +15.23% | Matched OFF/ON/ON/OFF bracket |
+| CHAT16, cap64 | 24.55 | 25.23 | +2.76% | Exploratory single pair |
+
+All 96 original replies and both token counts matched. Rates divide generated tokens by decode
+time and average same-treatment arms. The older 32K prototype remains historical evidence; these
+results are not an absolute-speed record or concurrent/auxiliary/prefix-cache qualification.
+
+The separate P1 partial-wave-flush candidate passed its full 192/96 GiB correctness/activity gate.
+Both quiet timing screens stayed byte-exact but failed overall 5% control-drift limits; Qwf stays OFF.
+Descriptive Qwf-OFF means from separate windows:
+
+| Expert cache | Original prompt | Prefill, tok/s | TTFT, s | Decode, tok/s |
+|---|---|---:|---:|---:|
+| 192 GiB | 6,817 tokens | 431.09 | 15.857 | 26.50 |
+| 96 GiB | 6,817 tokens | 191.79 | 35.568 | 11.34 |
+| 192 GiB | 99,987 tokens | 682.68 | 146.523 | 21.68 |
+| 96 GiB | 99,987 tokens | 653.92 | 153.293 | 12.66 |
+
+Both budgets used this 256 GB host, fixed 131K context, one stream, 2K chunks and admit-all; decode
+is generated-token-weighted and startup is separate. These are diagnostic references, not a matched
+cache-size effect or whole 128 GB machine validation. The larger host can leave more OS page cache
+and temporary/staging headroom. [November 7 results](docs/ds41/DS41-RESULTS-20261107.md) retain
+full OFF/ON data, drift and exact scope. Qa0's older warmed 6.8K result is separate; its cold
+comparison was inconclusive.
 
 [Detailed results and qualification limits](radiance/docs/DS41-RESULTS-20261105.md) distinguish
 model tests from the newer CPU component batches (7/21/46 suites), whose GPU/model gates remain open.
@@ -70,9 +95,9 @@ The second compares every held-out reply of that window with the base engine's (
 
 Nothing was rebuilt for this export. Each window ran a build of the engine branch at that time, and `docs/ds41/NIGHT-LOG.md` names the commit for most of them. The post-upgrade decode windows ran builds of `claude/ds41-lcpfast` and `claude/ds41-dsvp`, both merged in the exported engine; the Phase 1 adoption window ran a build of `claude/ds41-int5` (merged in the exported engine) with its own deepseek41 plugin; the first Phase 1 window, `ab-20261030T201710Z`, ran a build of `claude/ds41-p1`; the DSpark-beside-concurrency window `ab-20261030T234957Z` ran a build of `claude/ds41-dsconc`, and the lent-arena windows `ab-20261031T011849Z` to `ab-20261031T030023Z` builds of `claude/ds41-p1big` with its own plugin, and the upstream-sync windows `ab-20261031T100852Z` and `ab-20261031T104524Z` a build of `claude/ds41-sync` with every plugin from it (all merged). The host-expert optimizations use opt-in `RADIANCE_EXPERIMENTAL_*` switches or flags. The DSML chat reply format is registered by default.
 
-- `radiance/`: exact engine `d316a3b3` (1866 files), including the latest documentation over runtime `f84b23db`; all paths, bytes and modes pinned.
-- `docs/ds41/`: 47 reports, including the night log, recovered workflow research and current prefill/precision plans; `provenance/` pins every engine file.
-- `evidence/ds41/`: 149 A/B windows, including interrupted and failed experiments with their original status preserved; selected server logs are compressed.
+- `radiance/`: exact engine `e90fdae8` (1868 files), including the latest documentation over runtime `f84b23db`; all paths, bytes and modes pinned.
+- `docs/ds41/`: 50 reports, including the night log, recovered workflow research and current prefill/precision plans; `provenance/` pins every engine file.
+- `evidence/ds41/`: 153 A/B windows, including interrupted and failed experiments with their original status preserved; selected server logs are compressed.
 - `research/ds41/`: the small measurement programs and outputs the reports cite.
 - `tools/`: `verify_snapshot.py` (snapshot verification), `ds41_reply_check.py` (reply identity check) and `ds41_refresh.py`. The refresh tool rebuilds this branch from an engine commit, the report folder and a window list.
 

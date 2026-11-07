@@ -1,21 +1,29 @@
 # Status
 
-Updated November 5, 2026. The exported accepted source is `d316a3b32ea9c9d43c46ca70357ff4ecbce02ee2`
-(1866 files), a documentation-only successor to `32d033e1`; compiled runtime `f84b23db`
-and coherent `libr4d` `92bd7719` are unchanged. The snapshot contains 149 retained A/B
-windows through `ab-20261105T174226Z`, including incomplete/failed windows without promoting their status.
-No build, GPU execution, runtime installation or deployment occurs during export.
+Updated November 7, 2026. The exported accepted source is `e90fdae86b5b86da17f6b3006d93e6c410ac83ec`
+(1868 files), a documentation-only successor to `d316a3b3`; compiled runtime `f84b23db`
+and coherent `libr4d` `92bd7719` are unchanged. The snapshot contains 153 retained A/B
+windows, now including the four November 7 DSpark/P1 windows through `ab-20261107T075513Z`.
+Incomplete and failed windows retain their original status. Export performs no build, GPU test,
+runtime installation or deployment.
 
-Current measured results and qualification limits are in
-[radiance/docs/DS41-RESULTS-20261105.md](radiance/docs/DS41-RESULTS-20261105.md).
-The controller extracts retain full local receipt hashes in
-[qualification-results-20261105.json](research/ds41/qualification-results-20261105.json).
-100K admit-all prefill gained 58.72% in prompt-processing throughput with exact replies/hashes;
-DSpark's finite 32K code ABBA gained 17.14%, without a new absolute speed record or broad promotion.
-The optional worker, smaller/dynamic admission budgets and newer kernel/overlap candidates retain
-separate gates. The 7/21/46-suite CPU batches establish component behavior only.
+[November 7 measurements](docs/ds41/DS41-RESULTS-20261107.md) and the
+[selected-field records](docs/ds41/qualification-results-20261107.json) document separately built
+ABI33 candidates. The fixed 131K/N1 C2 DSpark code ABBA gained 15.23%, with all 96 original
+code/chat replies and token counts exact; the chat pair remains exploratory. This does not
+replace the historical held-out/concurrent serving measurements.
 
-The checkpoint is a hybrid: native official MXFP4 experts, declared BF16/F32 neural conversions,
+P1 partial-wave flush passed its 192/96 GiB correctness/activity gate. Both quiet screens remained
+byte-exact but failed the overall 5% timing-drift gate, so Qwf stays OFF. The README now gives
+prefill tok/s, TTFT and generated-token-weighted decode reference means for both budgets.
+Both ran on the 256 GB host; no whole-current-configuration validation on a 128 GB machine is claimed.
+Variable RAM/cache budgets and the four-card fallback remain supported.
+
+[November 5 results](radiance/docs/DS41-RESULTS-20261105.md) retain the accepted admit-all prefill
+gain and older 32K DSpark prototype. Optional-worker combinations, full32 draft banks, CPU-tail
+reuse, new overlap and physical KV growth retain separate qualification gates.
+
+The checkpoint preserves native official MXFP4 experts, declared BF16/F32 neural conversions,
 and two additionally quantized IQ4_NL Engram tables. All 1,119 other neural mappings and seven
 integer controls passed their audit; independent official-runner equivalence is not established.
 

@@ -1,0 +1,30 @@
+{
+  "schema": "ds41-dspark-c2-evidence-v1",
+  "mode": "verify",
+  "requests": 16,
+  "receipt_sha256": "8ce971764e768dad5564c6190e49b10317b8d2d4db4857be35dc816cb604147a",
+  "request_sha256": "e97d0e48bf5f6edbe185f25675aa92b512da606be7f9db06021557407ea92c8a",
+  "log_sha256": "d3c6bbee9b0087ce98bbe3a655c445d87523e8ff94c494435521e87bdbb0a8c5",
+  "before_sha256": "719733e2a61388fb6edfa0b35d56f9a64241b75ed84bf8f1da9aa03e124cb8df",
+  "after_sha256": "82a03d1ab61b5376b66bc01e7efeee00fb02484c7f0fce9bf899e8880aa767d9",
+  "counters": {
+    "learned_publications": 344,
+    "learned_published_tokens": 533,
+    "learned_verified_tokens": 516,
+    "learned_accepted_tokens": 420,
+    "fallback_offers": 0,
+    "fallback_offered_tokens": 0,
+    "fallback_publications": 0,
+    "fallback_published_tokens": 0,
+    "fallback_verified_tokens": 0,
+    "fallback_accepted_tokens": 0,
+    "block_context_issues": 529,
+    "block_context_rows": 1349,
+    "block_query_issues": 529,
+    "block_query_rows": 1058
+  },
+  "request_verified": 516,
+  "request_accepted": 420,
+  "additional_history_bytes_per_attention_rank": 68321280,
+  "counter_scope": "known0 all-rank issues and successful ownership commits; not GPU duration or completion"
+}

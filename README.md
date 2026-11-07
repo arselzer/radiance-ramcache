@@ -64,6 +64,27 @@ tokenization and admission wait. All prefill rows use admit-all with the tested 
 These separately built ABI33 candidates leave this checkout's serving configuration and defaults
 unchanged. Four RX 9070 XTs are used; the optional worker is off.
 
+### BetterBench quick screen
+
+A local 48-request BetterBench screen used the separately built plain ABI33 prototype, four
+RX 9070 XTs, 192 GiB cache, fixed 131K context and up to eight sequences. DSpark and the worker
+were off. These are client measurements with 3 chat/code samples and 2 samples per prefill depth:
+
+| Workload | Median rate, tok/s | Median client TTFT, s |
+|---|---:|---:|
+| Code, streaming decode | 28.28 | 0.928 |
+| Chat, streaming decode | 25.91 | 1.189 |
+| Prefill, actual ~5.9K tokens | 622.89 | 9.533 |
+| Prefill, actual ~23.4K tokens | 755.56 | 31.028 |
+| Prefill, actual ~47.1K tokens | 742.61 | 63.476 |
+
+Eight-request waves at concurrency 1/4/8 delivered 23.54/30.37/33.66 tok/s **end to end**,
+including prefill and scheduling. SSE decode excludes the first content update; prefill divides
+actual prompt tokens by client TTFT. These differ from the server metrics above. This small
+screen is a baseline, without a full BetterBench score or new quality claim. The
+[screen report](docs/DS41-BETTERBENCH-SCREEN-20261107.md) gives all samples, settings and a separate
+matched workload control; installed stable/defaults are unchanged.
+
 DSpark in the recommended C2/P1 profile, fixed 131,072-token context, one stream and a 192 GiB
 expert cache on the 256 GB host:
 

@@ -19,7 +19,7 @@ seven integer Engram controls matched the official rules. Exactness checks compa
 imported baseline; they do not establish equivalence to an independent official runner. Restoring
 official FP8 Engram requires a new qualified baseline.
 
-Latest validated numbers (November 5, 2026): the recommended configuration on the `ds41-stable`
+Accepted serving measurements (November 5, 2026): the recommended configuration on the `ds41-stable`
 branch (radiance 1.15 base). On the cards, `main` (radiance 1.16) matched that line with identical replies and logits at
 the same speed, before batch admission and the expert worker were merged; those two are built and
 host-tested here. Each row comes from one or two A/B windows.
@@ -59,10 +59,39 @@ tokenization and admission wait. All prefill rows use admit-all with the tested 
   same architecture. Branches: `main` (this one), `ds41-stable` (the measured line), `ds41` (a curated
   evidence snapshot) and `ds41-research`.
 
-[Latest experiment status and qualification limits](docs/DS41-RESULTS-20261105.md) records the
-DSpark prototype's validated 32K/single-stream code gain (+17.14%) and the remaining two-batch
-integration gates. DSpark remains experimental; its code workload is separate from this table's
-held-out decode prompts, and the new result does not exceed the valid earlier DSpark speed record.
+## Latest measurements (7 November)
+
+These separately built ABI33 candidates leave this checkout's serving configuration and defaults
+unchanged. Four RX 9070 XTs are used; the optional worker is off.
+
+DSpark in the recommended C2/P1 profile, fixed 131,072-token context, one stream and a 192 GiB
+expert cache on the 256 GB host:
+
+| Original workload | Plain decode, tok/s | DSpark, tok/s | Change | Scope |
+|---|---:|---:|---:|---|
+| CODE16, cap256 | 24.81 | 28.59 | +15.23% | Matched OFF/ON/ON/OFF bracket |
+| CHAT16, cap64 | 24.55 | 25.23 | +2.76% | Exploratory single pair |
+
+All 96 replies and original prompt/generated counts matched. Rates divide generated tokens by
+decode time, then average same-treatment arms. These workloads differ from the historical
+held-out/concurrent serving measurements; they are not a new absolute-speed record.
+
+The separate P1 partial-wave-flush experiment passed full correctness/activity checks, but both
+quiet timing screens exceeded the 5% control-drift limit. Qwf stays OFF. These are descriptive
+Qwf-OFF reference means from separate windows, not a matched cache-size comparison:
+
+| Expert cache | Original prompt | Prefill, tok/s | TTFT, s | Decode, tok/s |
+|---|---|---:|---:|---:|
+| 192 GiB | 6,817 tokens | 431.09 | 15.857 | 26.50 |
+| 96 GiB | 6,817 tokens | 191.79 | 35.568 | 11.34 |
+| 192 GiB | 99,987 tokens | 682.68 | 146.523 | 21.68 |
+| 96 GiB | 99,987 tokens | 653.92 | 153.293 | 12.66 |
+
+Both budgets ran on the 256 GB host with fixed 131K context, one stream, 2,048-token chunks and
+admit-all. Decode is generated-token-weighted; startup is separate. A 96 GiB cache run on this host
+does not validate the entire current configuration on a 128 GB machine: the larger host leaves
+different room for OS page cache, staging and temporary allocations. See the
+[dated results](docs/DS41-RESULTS-20261107.md) for full OFF/ON rates, drift and exact scope.
 
 ---
 

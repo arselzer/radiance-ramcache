@@ -329,14 +329,23 @@ caveats: "The aux expert worker" below.
 
 **On 256 GB of RAM (8x 32 GB DDR4-2666) with a 192 GiB expert cache** (ab-20261030T194..., replies identical): decode **31.2 tok/s** a stream (19.9 with 96 GiB on 128 GB of DDR4-2133; 20.9 with 96 GiB on the new RAM, so the cache size, not the memory speed, is the gain: rank 0's misses fall 2,073 → 361 on the held-out prompts); **38.7 tok/s in all at 4 streams**; prefill 3,086 tokens in 28.1 s (110 tok/s) and 6,817 in 51.7 s (132 tok/s). 192 and 208 GiB measure the same.
 
-**Current DSpark prototype qualification:** at 32K and one stream, the six-server performance window
-ab-20261105T145020Z passed all 96 original code/chat replies/counts, native and origin/policy gates, joined
-stops and the independent production-normal check. Canonical code OFF/ON/ON/OFF means were
-24.917 to 29.188 tok/s (+17.14%) on prototype runtime `55a8aec7`. This is a matched gain on that stack;
-the valid earlier 29.79 result below used a different profile/metric/output era, so this is not a new
-absolute speed record. The overview's ordinary held-out 28-30 tok/s is a different workload and remains
-unchanged. No 128K/concurrent/auxiliary/cancellation/prefix-cache DSpark promotion is established.
-See [November 5 results](../../docs/DS41-RESULTS-20261105.md) for final evidence receipts and scope.
+**Latest separately built DSpark candidate (7 November):** runtime `fbc0f812`, ABI33,
+fixed 131,072-token context, one stream, 192 GiB expert cache on the 256 GB host. Both sides use
+the recommended 2,048-token C2/P1 profile. The stable engine/configuration above are unchanged.
+
+Both sides below use a **2,048 MiB pinned HOST pool per GPU**. The plain 256 MiB pool
+was not included in this window. These gains are relative to the tested plain baseline;
+comparison with the best plain configuration awaits the four-condition pool/bank/drafting test.
+
+| Original workload | Plain decode, tok/s | DSpark, tok/s | Change | Scope |
+|---|---:|---:|---:|---|
+| CODE16, cap256 | 24.81 | 28.59 | +15.23% | Matched OFF/ON/ON/OFF bracket |
+| CHAT16, cap64 | 24.55 | 25.23 | +2.76% | Exploratory single pair |
+
+All 96 original replies and both token counts matched; native/origin/policy gates, joined stops
+and production restoration passed. Rates divide generated tokens by decode time and average
+same-treatment arms. The ordinary held-out/concurrent table and earlier 32K prototype use different
+workloads/settings. No concurrent, auxiliary or prefix-cache DSpark promotion follows.
 
 **Earlier single-stream DSpark measurements and configuration.** Exact (every draft is verified; replies identical in
 every window). On 256 GB with the 192 GiB cache, against the configuration above with packed VRAM

@@ -107,6 +107,10 @@ matched workload control; installed stable/defaults are unchanged.
 DSpark in the recommended C2/P1 profile, fixed 131,072-token context, one stream and a 192 GiB
 expert cache on the 256 GB host:
 
+Both sides below use a **2,048 MiB pinned HOST pool per GPU**. The plain 256 MiB pool
+was not included in this window. These gains are relative to the tested plain baseline;
+comparison with the best plain configuration awaits the four-condition pool/bank/drafting test.
+
 | Original workload | Plain decode, tok/s | DSpark, tok/s | Change | Scope |
 |---|---:|---:|---:|---|
 | CODE16, cap256 | 24.81 | 28.59 | +15.23% | Matched OFF/ON/ON/OFF bracket |

@@ -64,6 +64,25 @@ tokenization and admission wait. All prefill rows use admit-all with the tested 
 These separately built ABI33 candidates leave this checkout's serving configuration and defaults
 unchanged. Four RX 9070 XTs are used; the optional worker is off.
 
+### Matched decode and pinned-host pool
+
+A matched held-out test found no decode slowdown between the accepted and current builds
+at the same pool size. Four RX 9070 XTs, one stream, 192 GiB cache and fixed 131K context:
+
+| Engine/profile | Pinned HOST pool per GPU, MiB | Decode, tok/s |
+|---|---:|---:|
+| Accepted ABI32, common settings | 256 | 29.07 |
+| Current ABI33, common settings | 256 | 29.27 |
+| Current ABI33, common settings | 2,048 | 26.07 |
+| Current ABI33, admit-all + insert queue 64 | 2,048 | 26.96 |
+
+All 64 original replies/counts matched and all four paired drift screens passed. The larger
+pool shifted 100 target experts per GPU into GPU-readable pinned memory; VRAM residency
+stayed constant. The published plain recommendation already uses 256 MiB. The HOST DSpark
+bank has a separate larger-pool requirement. Concurrent/prefill follow-ups remain pending.
+Rates use generated tokens divided by decode time, averaged across paired arms; the
+[replay report](docs/DS41-POOL-REPLAY-20261107.md) gives the controls and both estimators.
+
 ### BetterBench quick screen
 
 A local 48-request BetterBench screen used the separately built plain ABI33 prototype, four

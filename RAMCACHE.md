@@ -37,6 +37,14 @@ This file covers only what the fork adds.
 
 Each of these is opt-in, through a `RADIANCE_EXPERIMENTAL_*` switch or a command-line flag.
 
+## Latest measurements
+
+The [README tables](README.md#latest-measurements-7-november) now include the qualified November 7
+DSpark code gain and separate 192 GiB / 96 GiB cache reference measurements, with prefill tok/s,
+TTFT and decode. The [dated report](docs/DS41-RESULTS-20261107.md) records drift and exactness gates.
+These separately built candidates do not change this checkout's serving runtime or defaults;
+reduced-cache runs on the 256 GB host do not validate an entire 128 GB machine.
+
 ## Recommended configuration
 
 [tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md), section "Configuration".

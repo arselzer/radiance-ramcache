@@ -329,7 +329,14 @@ caveats: "The aux expert worker" below.
 
 **On 256 GB of RAM (8x 32 GB DDR4-2666) with a 192 GiB expert cache** (ab-20261030T194..., replies identical): decode **31.2 tok/s** a stream (19.9 with 96 GiB on 128 GB of DDR4-2133; 20.9 with 96 GiB on the new RAM, so the cache size, not the memory speed, is the gain: rank 0's misses fall 2,073 → 361 on the held-out prompts); **38.7 tok/s in all at 4 streams**; prefill 3,086 tokens in 28.1 s (110 tok/s) and 6,817 in 51.7 s (132 tok/s). 192 and 208 GiB measure the same.
 
-**Latest separately built DSpark candidate (7 November):** runtime `fbc0f812`, ABI33,
+**Drafter quantization pilot (8 November):** the separately built prototype retains every
+drafter expert and tests IQ2_XXS gate/up with MXFP4 or IQ2_S down weights in RAM and VRAM.
+The [root README](../../README.md#drafter-quantization-pilot-8-november) contains the five-arm
+acceptance/decode table; the [conversion recipe](../../docs/DS41-DRAFTER-QUANTIZATION-20261108.md)
+records the source, GPU commands and validation. All 80 pilot replies/counts matched base.
+These are provisional results; the target checkpoint, installed engine and defaults are unchanged.
+
+**Earlier separately built DSpark candidate (7 November):** runtime `fbc0f812`, ABI33,
 fixed 131,072-token context, one stream, 192 GiB expert cache on the 256 GB host. Both sides use
 the recommended 2,048-token C2/P1 profile. The stable engine/configuration above are unchanged.
 

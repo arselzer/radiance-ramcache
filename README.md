@@ -59,7 +59,30 @@ tokenization and admission wait. All prefill rows use admit-all with the tested 
   same architecture. Branches: `main` (this one), `ds41-stable` (the measured line), `ds41` (a curated
   evidence snapshot) and `ds41-research`.
 
-## Latest measurements (7 November)
+## Drafter quantization pilot (8 November)
+
+The separately built DSpark prototype quantizes **only the drafter**; target weights and
+arithmetic stay unchanged. All 384 drafter experts remain. Four RX 9070 XTs, 192 GiB RAM cache,
+fixed 131K context, one stream, the same controller policy, and 16 CODE requests per arm:
+
+| Drafter gate/up | Drafter down | Placement | HOST pool/GPU, MiB | Draft acceptance | Decode, tok/s |
+|---|---|---|---:|---:|---:|
+| MXFP4 | MXFP4 | RAM | 2,048 | 94.37% | 27.54 |
+| IQ2_XXS | MXFP4 | RAM | 1,387 | 93.82% | 28.65 |
+| IQ2_XXS | MXFP4 | GPU | 256 | 93.82% | 28.83 |
+| IQ2_XXS | IQ2_S | RAM | 1,159 | 93.53% | 29.00 |
+| IQ2_XXS | IQ2_S | GPU | 256 | 93.53% | 29.10 |
+
+All 80 complete replies and token counts matched the base engine. Acceptance is accepted/proposed
+draft tokens; decode excludes prefill. The full GPU expert bank reserves 1,130.625 MiB/card with
+MXFP4 down weights, or 903.0 MiB with IQ2_S down weights, saving 227.625 MiB/card. Dense weights,
+KV and transient buffers are additional. These are **single-order provisional configuration
+comparisons**, with different pool sizes and target-expert budgets; differences below 1% need
+repetition. Remaining state/hash and broader model gates block adoption. See the
+[quantization recipe and evidence](docs/DS41-DRAFTER-QUANTIZATION-20261108.md) for the source bank,
+GPU conversion commands, uniform importance weights and validation.
+
+## Earlier measurements (7 November)
 
 These separately built ABI33 candidates leave this checkout's serving configuration and defaults
 unchanged. Four RX 9070 XTs are used; the optional worker is off.

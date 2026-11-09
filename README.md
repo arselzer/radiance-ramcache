@@ -76,7 +76,27 @@ per corpus, without repeats or a drift estimate; broader qualification still
 blocks adoption. These workloads differ from short CODE4 screens and the older
 decode-only profiles. The [dated report](docs/DS41-MATCHED-DECODE-20261109.md)
 also records the rejected bank-lending and pageable-cache screens. Defaults and
-the qualified serving/cache-budget tables below are unchanged.
+the qualified serving/cache-budget tables are unchanged.
+
+
+## Adaptive decode and prefix reuse (9 November)
+
+Further prototype screens keep the same four cards, 192 GiB cache, 256 MiB HOST
+pool/GPU and fixed131K context. These remain separate from the qualified serving
+configuration and the matched plain/resident pair above.
+
+| Original workload | Candidate | Decode, tok/s | Change versus its two-row control |
+| --- | --- | ---: | ---: |
+| CODE16/cap256 | Adaptive three-row proxy | 30.08 | +3.32% |
+| Held-out8/cap64 | Proxy plus third-token gate | 31.81 | +1.37%, no held-out repeat |
+
+All104 complete replies/counts matched. CODE control drift was+.61%; the third
+gate added no measurable CODE gain beyond the proxy. A separate unchanged13-turn
+prefix-cache pair reduced summed first-token latency31.4%. With prefix caching
+enabled, a read-ahead8/0/8 bracket reduced it a further8.7% in that experiment
+(101.524→92.676→101.523s), with flat decode. These are latency measurements,
+not prompt-processing tok/s. Fresh state/lifetime and broader model gates still
+precede adoption. See the [full measurements and limits](docs/DS41-ADAPTIVE-PREFIX-20261109.md).
 
 
 ## Drafter quantization pilot (8 November)

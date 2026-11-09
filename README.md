@@ -82,21 +82,26 @@ the qualified serving/cache-budget tables are unchanged.
 ## Adaptive decode and prefix reuse (9 November)
 
 Further prototype screens keep the same four cards, 192 GiB cache, 256 MiB HOST
-pool/GPU and fixed131K context. These remain separate from the qualified serving
-configuration and the matched plain/resident pair above.
+pool/GPU and fixed131K context. The latest native-down / IQ2_S-down / native-down
+brackets use all384 resident drafter experts:
 
-| Original workload | Candidate | Decode, tok/s | Change versus its two-row control |
-| --- | --- | ---: | ---: |
-| CODE16/cap256 | Adaptive three-row proxy | 30.08 | +3.32% |
-| Held-out8/cap64 | Proxy plus third-token gate | 31.81 | +1.37%, no held-out repeat |
+| Original workload | Candidate | Decode, tok/s | Gain vs matched control mean | Control drift |
+| --- | --- | ---: | ---: | ---: |
+| CODE16/cap256 | Adaptive three-row, IQ2_S down | 30.20 | +0.58% | +0.22% |
+| Held-out8/cap64 | Third-token gate, IQ2_S down | 32.10 | +0.72% | +0.57% |
 
-All104 complete replies/counts matched. CODE control drift was+.61%; the third
-gate added no measurable CODE gain beyond the proxy. A separate unchanged13-turn
-prefix-cache pair reduced summed first-token latency31.4%. With prefix caching
-enabled, a read-ahead8/0/8 bracket reduced it a further8.7% in that experiment
-(101.524→92.676→101.523s), with flat decode. These are latency measurements,
-not prompt-processing tok/s. Fresh state/lifetime and broader model gates still
-precede adoption. See the [full measurements and limits](docs/DS41-ADAPTIVE-PREFIX-20261109.md).
+All72 complete replies/counts matched. The smaller bank frees227.625MiB/GPU and
+actually fits13 additional target expert units/card. These are small provisional
+gains with one candidate run per corpus; [controls, acceptance and limits](docs/DS41-DN-S-ADAPTIVE-20261109.md)
+remain explicit. Earlier native-down adaptive depth improved CODE3.23–3.32%
+against its two-row controls; the third gate added no measurable CODE gain.
+
+A separate unchanged13-turn prefix-cache pair reduced summed first-token latency
+31.4%. With prefix caching enabled, a read-ahead8/0/8 bracket reduced it8.7% in
+that experiment (101.524→92.676→101.523s), with flat decode. These are latency
+measurements, not prompt-processing tok/s. Fresh state/lifetime and broader model
+gates still precede adoption. See the [prefix and adaptive measurements](docs/DS41-ADAPTIVE-PREFIX-20261109.md).
+Qualified serving settings, cold-prefill throughput and96GiB-cache evidence remain unchanged.
 
 
 ## Drafter quantization pilot (8 November)

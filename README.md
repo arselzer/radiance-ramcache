@@ -59,6 +59,26 @@ tokenization and admission wait. All prefill rows use admit-all with the tested 
   same architecture. Branches: `main` (this one), `ds41-stable` (the measured line), `ds41` (a curated
   evidence snapshot) and `ds41-research`.
 
+## Matched resident-drafter screen (9 November)
+
+A separately built prototype compares the best small-pool plain profile with
+resident DSpark: four RX 9070 XT cards, one stream, 192 GiB cache, fixed 131K
+context and a 256 MiB HOST pool per GPU on both sides.
+
+| Original workload | Plain decode, tok/s | Resident DSpark, tok/s | Change | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| Held-out8, cap64 | 28.38 | 31.21 | +9.99% | 88.64% |
+| CODE16, cap256 | 24.69 | 29.04 | +17.63% | 93.82% |
+
+Rates exclude prefill and use generated tokens divided by total decode time.
+All 48 full replies and prompt/generated counts matched. This is one fresh pair
+per corpus, without repeats or a drift estimate; broader qualification still
+blocks adoption. These workloads differ from short CODE4 screens and the older
+decode-only profiles. The [dated report](docs/DS41-MATCHED-DECODE-20261109.md)
+also records the rejected bank-lending and pageable-cache screens. Defaults and
+the qualified serving/cache-budget tables below are unchanged.
+
+
 ## Drafter quantization pilot (8 November)
 
 The separately built DSpark prototype quantizes **only the drafter**; target weights and

@@ -181,6 +181,14 @@ constexpr const char* kLendHeatMarginEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_H
  * kEnv, a static plan (--deterministic) and the file tier; like the other lent slots it makes the CPU path
  * take every pass that does not arm the card path. */
 constexpr const char* kLendSlabEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB";
+/* The lent slots' read-back audit (kLendAuditEnv=1; 0 / unset / empty off, the default, and then nothing of
+ * it exists): every lent slot is copied back from the card and compared, once its copy has passed and
+ * before its unit is published (byte for byte with the bytes copied), and again before its resident is
+ * withdrawn (with a digest of what was published). A slot that differs is given up, its unit takes the CPU
+ * path, and the rank's heat policy stops; the stats line counts slots compared and differing
+ * (card_expert_stager.h, the read-back audit). Needs lent slots. Not for a timed arm: each read-back is a
+ * copy of the slot off the card that the issuing thread waits for. */
+constexpr const char* kLendAuditEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT";
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
 /* kMaxLend bounds each of kLendEnv and kLendArenaEnv, kMaxLendSlab kLendSlabEnv; the lender holds all three
  * (kMaxLendSlots). */
@@ -220,6 +228,7 @@ constexpr const char* kLogLend  = "ds41 p1: lent ring";         /* rank 0, at st
 constexpr const char* kLogLendArena = "ds41 p1: lent arena";    /* rank 0, at startup, with kLendArenaEnv */
 constexpr const char* kLogLendHeat = "ds41 p1: lent heat";      /* rank 0, at startup, with kLendHeatEnv */
 constexpr const char* kLogLendSlab = "ds41 p1: lent slab";      /* rank 0, at startup, with kLendSlabEnv */
+constexpr const char* kLogLendAudit = "ds41 p1: lent audit";    /* rank 0, at startup, with kLendAuditEnv; and every difference */
 
 /* Whether the lent arena is asked for (kEnv `p1` on, kLendArenaEnv `lend` a count from 1 to kMaxLend):
  * the deepseek41 plugin then declares at a smaller step too. A value the core refuses counts as not

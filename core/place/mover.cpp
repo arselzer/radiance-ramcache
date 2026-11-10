@@ -997,6 +997,16 @@ int Mover::mover_wait(RadEvent ev) {
     return rad_event_wait(mover_, ev);
 }
 
+int Mover::ring_readback(const RadCopySeg* segs, int n, RadEvent behind, RadEvent done) {
+    if (!mover_ || n < 1 || !segs || !done) return RAD_E_INVAL;
+    if (behind) RAD_TRY(rad_event_wait(mover_, behind));
+    for (int i = 0; i < n; ++i) {
+        RAD_TRY(rad_memcpy_async(segs[i].dst, segs[i].src, segs[i].bytes, mover_));
+        stats_.d2h_bytes += (uint64_t)segs[i].bytes;
+    }
+    return rad_event_record(done, mover_);
+}
+
 int Mover::pack_unit_for_ring(const HostPlanes& p, uint8_t* dst, int64_t cap, bool* packed,
                               int64_t bytes[2]) const {
     if (!prog_ || !dst || !packed || !bytes || p.n != 2 || cap < ds41p1::kSlotBytes) return RAD_E_INVAL;

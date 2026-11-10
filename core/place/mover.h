@@ -953,6 +953,10 @@ public:
     }
     int   ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done);
     int   mover_wait(RadEvent ev);
+    /* The lent slots' read-back audit (card_expert_stager.h): `n` segments copied from the card to pinned
+     * host memory on the mover's stream, behind `behind` (null: none) and behind every copy queued on that
+     * stream so far, and `done` recorded after them. */
+    int   ring_readback(const RadCopySeg* segs, int n, RadEvent behind, RadEvent done);
     bool  file_unit_in_slab(int32_t u) const {
         return u >= 0 && (size_t)u < unit_.size() && (unit_[(size_t)u].slab_slot >= 0 || ring_resident(u));
     }

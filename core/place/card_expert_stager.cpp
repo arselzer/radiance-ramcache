@@ -72,6 +72,13 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         return false;
     }
     r.swiglu_span = ss == 1;
+    const char* audit = get(ds41p1::kLendAuditEnv);
+    const int as = ds41p1::env_state(audit);
+    if (as < 0) {
+        if (why) *why = std::string(ds41p1::kLendAuditEnv) + "=" + audit + ": 1 is on, 0 / unset / empty off";
+        return false;
+    }
+    r.lend_audit = as == 1;
     *t = r;
     return true;
 }
@@ -467,8 +474,40 @@ int RingLender::init(LendHost* host, int n, int64_t grace_ms, int keep) {
     last_p1_ = 0;
     lent_ = true;
     any_p1_ = false;
+    audit_ = false;
+    stopped_ = false;
     st_ = Stats{};
     return 0;
+}
+
+bool RingLender::audit_ok(int k, bool publish) {
+    ++st_.audited;
+    const int r = host_->audit(k, publish);
+    if (r == 0) return true;
+    ++(r > 0 ? st_.audit_differ : st_.audit_unread);
+    stopped_ = true;
+    return false;
+}
+
+int RingLender::audit_residents() {
+    if (!host_ || !audit_) return 0;
+    int compared = 0;
+    for (int k = 0; k < n(); ++k) {
+        if (slot_[(size_t)k].st != St::Resident) continue;
+        ++compared;
+        if (audit_ok(k, false)) continue;
+        host_->publish(k, false);
+        lose(k);
+    }
+    return compared;
+}
+
+void RingLender::lose(int k) {
+    Slot& s = slot_[(size_t)k];
+    s.st = St::Lost;
+    s.cancel = false;
+    s.moved = false;
+    ++st_.lost;
 }
 
 int RingLender::residents() const {
@@ -526,9 +565,16 @@ void RingLender::poll() {
         if (s.st != St::Copying) continue;
         const int q = host_->copied(k);
         if (q == 0) continue;
+        const bool live = q > 0 && !s.cancel && !away(s);
+        /* The audit: the copy has passed and its bytes are still held; the slot has no reader yet. */
+        const bool bad = live && audit_ && !audit_ok(k, true);
         host_->drop(k);
-        if (q < 0 || s.cancel || away(s)) {
+        if (!live) {
             settle(k);
+            continue;
+        }
+        if (bad) {   /* never published: its unit stays on the CPU path */
+            lose(k);
             continue;
         }
         host_->publish(k, true);
@@ -566,10 +612,16 @@ int RingLender::begin_pass(bool p1, int64_t now_ms) {
             Slot& s = slot_[(size_t)k];
             if (s.keep) continue;   /* the slab's: no pass writes there, its resident stays */
             switch (s.st) {
-            case St::Resident:
+            case St::Resident: {
+                /* The audit: read back before the pass that takes the slot issues anything. */
+                const bool bad = audit_ && !audit_ok(k, false);
                 host_->publish(k, false);
                 ++withdrawn;
-                s.st = St::Idle;
+                if (bad) lose(k);
+                else s.st = St::Idle;
+                break;
+            }
+            case St::Lost:
                 break;
             case St::Landed:
                 host_->drop(k);
@@ -637,6 +689,10 @@ bool RingLender::settled() const {
 
 int RingLender::retarget(const int* ks, int n) {
     if (!host_ || !ks || n < 1) return 0;
+    if (stopped_) {
+        decline(Decline::Audit);
+        return 0;
+    }
     if (lent_) {
         decline(Decline::Lent);
         return 0;
@@ -655,7 +711,15 @@ int RingLender::retarget(const int* ks, int n) {
             decline(Decline::Fence);
             break;
         }
+        /* The audit: read back behind the fence (the residents' last reader), before the slot's next
+         * copy can be queued. A slot that differs is withdrawn and lost, and no further slot is handed on. */
+        const bool bad = audit_ && !audit_ok(k, false);
         host_->publish(k, false);
+        if (bad) {
+            lose(k);
+            decline(Decline::Audit);
+            break;
+        }
         host_->retarget(k);
         Slot& s = slot_[(size_t)k];
         s.st = St::Want;
@@ -1209,7 +1273,7 @@ int CardExpertPath::end_pass(RadStream s, RadEvent end) {
 /* ---- the lent ring's host ---------------------------------------------------------------------------- */
 int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots,
                               const std::vector<char*>& arena_slots, const std::vector<char*>& slab_slots,
-                              int64_t grace_ms, std::string* why) {
+                              int64_t grace_ms, bool audit, std::string* why) {
     auto no = [&](const std::string& w) { if (why) *why = w; return RAD_E_INVAL; };
     if (!on_ || lending()) return no("the card path is not on, or lends already");
     const int n = (int)units.size(), nr = (int)ring_slots.size(), na = (int)arena_slots.size();
@@ -1261,6 +1325,14 @@ int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vec
         lbuf_free_.push_back(b);
     }
     if (lend_.init(this, n, grace_ms, ns) < 0) return no("the lent ring's state");
+    /* The read-back audit: a pinned slot of host memory the card's copies are read into, and its event. */
+    if (audit) {
+        laud_buf_ = (uint8_t*)rad_dev_alloc(ds41p1::kSlotBytes, RAD_MEM_HOST_PINNED);
+        laud_ev_ = event_create(true);
+        if (!laud_buf_ || laud_ev_ < 0) return no("no pinned memory or event for the lent slots' read-back audit");
+        laud_.init(n);
+        lend_.set_audit(true);
+    }
     lstop_ = false;
     lth_ = std::thread(&CardExpertPath::lend_loop, this);
     return RAD_OK;
@@ -1330,6 +1402,8 @@ void CardExpertPath::lend_stop() {
     for (uint8_t* b : lbuf_)
         if (b) rad_dev_free(b, RAD_MEM_HOST_PINNED);
     lbuf_.clear();
+    if (laud_buf_) rad_dev_free(laud_buf_, RAD_MEM_HOST_PINNED);
+    laud_buf_ = nullptr;
 }
 
 int CardExpertPath::load(int k) {
@@ -1450,10 +1524,148 @@ int CardExpertPath::lend_retarget(const int* ks, const LendUnit* units, int n, R
     lnext_n_ = n;
     lfence_ = behind;
     lfenced_ = false;
+    laud_behind_ = behind;   /* the audit's read-back of a withdrawn resident waits on the same event */
     const int done = lend_.retarget(ks, n);
     lnext_n_ = 0;
     lfence_ = nullptr;
     return done;
+}
+
+/* ---- the lent slots' read-back audit ------------------------------------------------------------------- */
+int64_t LendAudit::first_diff(const uint8_t* a, const uint8_t* b, int64_t n) {
+    if (!a || !b || n <= 0 || !std::memcmp(a, b, (size_t)n)) return -1;
+    int64_t i = 0;
+    for (; i + kPage <= n && !std::memcmp(a + i, b + i, (size_t)kPage); i += kPage) {}
+    for (; i < n; ++i)
+        if (a[i] != b[i]) return i;
+    return -1;
+}
+
+void LendAudit::digest(const uint8_t* p, int64_t n, std::vector<uint64_t>* out) {
+    if (!p || !out) return;
+    for (int64_t at = 0; at < n; at += kPage) {
+        const int64_t len = std::min<int64_t>(kPage, n - at);
+        uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t)len;
+        int64_t i = 0;
+        for (; i + 8 <= len; i += 8) {
+            uint64_t w;
+            std::memcpy(&w, p + at + i, 8);
+            h = (h ^ w) * 0xff51afd7ed558ccdull;
+        }
+        if (i < len) {
+            uint64_t w = 0;
+            std::memcpy(&w, p + at + i, (size_t)(len - i));
+            h = (h ^ w) * 0xff51afd7ed558ccdull;
+        }
+        out->push_back(h ^ (h >> 32));
+    }
+}
+
+void LendAudit::remember(int k, const uint8_t* const w[2], const int64_t n[2]) {
+    if (k < 0 || (size_t)k >= book_.size()) return;
+    Book& b = book_[(size_t)k];
+    b.d.clear();
+    for (int i = 0; i < 2; ++i) {
+        b.n[i] = n[i];
+        digest(w[i], n[i], &b.d);
+    }
+    b.known = true;
+}
+
+int LendAudit::check(int k, const uint8_t* const w[2], const int64_t n[2], int* which, int64_t* at) const {
+    if (!known(k)) return -1;
+    const Book& b = book_[(size_t)k];
+    if (b.n[0] != n[0] || b.n[1] != n[1]) return -1;
+    std::vector<uint64_t> d;
+    d.reserve(b.d.size());
+    size_t base = 0;
+    for (int i = 0; i < 2; ++i) {
+        d.clear();
+        digest(w[i], n[i], &d);
+        if (base + d.size() > b.d.size()) return -1;
+        for (size_t j = 0; j < d.size(); ++j)
+            if (d[j] != b.d[base + j]) {
+                if (which) *which = i;
+                if (at) *at = (int64_t)j * kPage;
+                return 1;
+            }
+        base += d.size();
+    }
+    return 0;
+}
+
+/* The slot's two weights are what its copy wrote and what the kernels read: those ranges come back, on the
+ * mover's stream (every copy into a lent slot goes through it), into the pinned buffer at the same
+ * offsets, and the host waits for them. publish: the copy's event has passed, so the read-back runs behind
+ * it. Else behind laud_behind_, the compute stream's record at the end of the pass before. */
+int CardExpertPath::audit(int k, bool publish) {
+    if (!laud_buf_ || laud_ev_ < 0 || k < 0 || k >= (int)lu_.size()) return RAD_E_STATE;
+    const auto t0 = std::chrono::steady_clock::now();
+    const LendUnit& u = lu_[(size_t)k];
+    const char* const at = lat_[(size_t)k];
+    const char* const kind = k < (int)lring_.size() ? "ring" : lend_.keeps(k) ? "slab" : "arena";
+    RadCopySeg segs[2];
+    const uint8_t* back[2];
+    int64_t n[2];
+    for (int i = 0; i < 2; ++i) {
+        segs[i] = { at + u.off[i], laud_buf_ + u.off[i], u.bytes[i] };
+        back[i] = laud_buf_ + u.off[i];
+        n[i] = u.bytes[i];
+    }
+    int rc = mover_->ring_readback(segs, 2, publish ? nullptr : laud_behind_, ev_[(size_t)laud_ev_]);
+    if (rc >= 0) rc = rad_event_sync(ev_[(size_t)laud_ev_]);
+    if (rc < 0) {
+        RAD_ERR("%s: rank %d %s slot %d (lent slot %d), unit %d: the slot could not be read back %s (%d); the unit "
+                "takes the CPU path and the slot is given up", ds41p1::kLogLendAudit, rank_, kind,
+                k < (int)lring_.size() ? lring_[(size_t)k] : k, k, u.unit,
+                publish ? "after its copy" : "before its resident was withdrawn", rc);
+        c_.lend_audit_ns += ns_since(t0);
+        return rc;
+    }
+    int out = 0;
+    if (publish) {
+        /* The bytes copied: the reload buffer, laid out as the slot, or the RAM-cache lease's two weights. */
+        const int src = lsrc_[(size_t)k];
+        for (int i = 0; i < 2 && !out; ++i) {
+            const uint8_t* from = nullptr;
+            if (src >= 0) {
+                from = lbuf_[(size_t)src] + u.off[i];
+            } else if (src == -1) {
+                const Mover::HostUnit& hu = *lhu_[(size_t)k];
+                from = hu.host[i] ? hu.host[i] : (const uint8_t*)hu.dev[i];
+            }
+            if (!from) {
+                out = RAD_E_STATE;
+                break;
+            }
+            const int64_t d = LendAudit::first_diff(back[i], from, n[i]);
+            if (d < 0) continue;
+            RAD_ERR("%s: rank %d %s slot %d (lent slot %d), unit %d: the slot read back after its copy differs from "
+                    "the bytes copied at offset %lld (weight %d's byte %lld: 0x%02x on the card, 0x%02x copied); the "
+                    "unit is not published and takes the CPU path, the slot is given up and the rank's retargets stop",
+                    ds41p1::kLogLendAudit, rank_, kind, k < (int)lring_.size() ? lring_[(size_t)k] : k, k, u.unit,
+                    (long long)(u.off[i] + d), i, (long long)d, (unsigned)back[i][d], (unsigned)from[d]);
+            out = 1;
+        }
+        if (out == 0) laud_.remember(k, back, n);
+        else laud_.forget(k);
+    } else {
+        int which = 0;
+        int64_t page = 0;
+        out = laud_.check(k, back, n, &which, &page);
+        if (out > 0)
+            RAD_ERR("%s: rank %d %s slot %d (lent slot %d), unit %d: the slot read back before its resident was "
+                    "withdrawn differs from what was published there, first in the 4 KiB page at offset %lld (weight "
+                    "%d's byte %lld); the unit takes the CPU path, the slot is given up and the rank's retargets stop",
+                    ds41p1::kLogLendAudit, rank_, kind, k < (int)lring_.size() ? lring_[(size_t)k] : k, k, u.unit,
+                    (long long)(u.off[which] + page), which, (long long)page);
+        else if (out < 0)
+            RAD_ERR("%s: rank %d %s slot %d (lent slot %d), unit %d: nothing was remembered of the slot at its "
+                    "publish to compare the read-back with; the slot is given up", ds41p1::kLogLendAudit, rank_, kind,
+                    k < (int)lring_.size() ? lring_[(size_t)k] : k, k, u.unit);
+    }
+    c_.lend_audit_ns += ns_since(t0);
+    return out;
 }
 
 /* The same hand-over an armed pass's first ring copy gets (begin_pass's Mover::mover_wait on the residents'
@@ -1689,9 +1901,19 @@ std::string CardExpertPath::stats_line(int rank) const {
                           slab_in, lprimed_);
             line += buf;
         }
+        if (lend_.auditing()) {
+            std::snprintf(buf, sizeof buf,
+                          "; lent audit: %" PRIu64 " slots read back (%" PRIu64 " differ, %" PRIu64 " not read) at %.1f ms a "
+                          "slot, %" PRIu64 " slots lost, retargets %s",
+                          l.audited, l.audit_differ, l.audit_unread,
+                          l.audited ? (double)c_.lend_audit_ns * 1e-6 / (double)l.audited : 0.0, l.lost,
+                          lend_.stopped() ? "stopped" : "not stopped");
+            line += buf;
+        }
         if (t_.lend_heat > 0) {
-            uint64_t declined = 0;
-            for (uint64_t d : l.declined) declined += d;
+            uint64_t declined = 0;   /* the heat's own reasons; the audit's stop is in its part above */
+            for (int d = 0; d < RingLender::kDeclines; ++d)
+                if (d != (int)RingLender::Decline::Audit) declined += l.declined[d];
             std::snprintf(buf, sizeof buf,
                           "; lent heat: %" PRIu64 " retargets (units published at a slot another unit gave up), %" PRIu64
                           " residents withdrawn for them, %" PRIu64 " passes declined (%" PRIu64 " lent or in the grace, %" PRIu64

@@ -2756,6 +2756,668 @@ TEST(p1_lend_heat_governs_arena_and_slab_slots_alike_and_rests_through_a_take_ba
     if (a.h.violations) std::fprintf(stderr, "%s\n", a.h.first.c_str());
 }
 
+/* ---- the lent slots' read-back audit (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT; card_expert_stager.h) -------
+ *
+ * A host with the slots' bytes: each lent slot is two weights' bytes on a simulated card, a load fills a host
+ * buffer with its unit's bytes, a copy puts them on the card, and the audit reads the card back and compares
+ * with LendAudit, the engine's own compare and digests. The device can be made to corrupt a slot: a copy that
+ * lands with a byte flipped, a byte written under a resident, a slot that cannot be read back. Whatever the
+ * card holds when a unit is published or read by a pass is checked against the unit's own bytes. */
+namespace {
+struct AuditHost final : LendHost {
+    static constexpr int64_t kA = 3 * LendAudit::kPage + 100, kB = 2 * LendAudit::kPage;   /* weight 0 ends in a short page */
+    struct S {
+        std::vector<uint8_t> card, buf;
+        bool held = false, copying = false, published = false;
+        int  unit = -1, buf_unit = -1, loads = 0, copies = 0, publishes = 0, withdrawals = 0, pub_unit = -1;
+        int  audits_pub = 0, audits_out = 0, rfences = 0, renames = 0;
+    };
+    std::vector<S> s;
+    std::deque<std::pair<int, bool>> landings;
+    LendAudit book;
+    std::map<int, int64_t> flip_copy;   /* by slot: its next copy lands with the byte at this offset flipped */
+    std::set<int> unreadable;           /* slots whose read-back fails */
+    std::map<int, int> next;            /* by slot: the unit a retarget gives it */
+    int  audits = 0, violations = 0;
+    int  last_slot = -1, last_unit = -1;   /* the last difference reported: slot, unit, offset in the slot */
+    int64_t last_at = -1;
+    std::string first;
+
+    explicit AuditHost(int n) {
+        s.assign((size_t)n, S{});
+        for (int k = 0; k < n; ++k) {
+            s[(size_t)k].unit = 100 + k;
+            s[(size_t)k].card.assign((size_t)(kA + kB), 0xee);   /* whatever was there */
+        }
+        book.init(n);
+    }
+    static uint8_t byte_of(int unit, int64_t i) { return (uint8_t)((unsigned)unit * 131u + (unsigned)i * 7u + (unsigned)(i >> 9)); }
+    static bool holds(const std::vector<uint8_t>& b, int unit) {
+        for (int64_t i = 0; i < kA + kB; ++i)
+            if (b[(size_t)i] != byte_of(unit, i)) return false;
+        return true;
+    }
+    void bad(const std::string& w) {
+        if (!violations++) first = w;
+    }
+    /* A pass reads every resident from its slot: the bytes there must be the unit's. */
+    void pass_reads() {
+        for (size_t k = 0; k < s.size(); ++k)
+            if (s[k].published && !holds(s[k].card, s[k].pub_unit))
+                ++read_corrupt;
+    }
+    int read_corrupt = 0;
+    int load(int k) override {
+        S& x = s[(size_t)k];
+        if (x.held) bad("a load of slot " + std::to_string(k) + " that holds bytes");
+        x.buf.resize((size_t)(kA + kB));
+        for (int64_t i = 0; i < kA + kB; ++i) x.buf[(size_t)i] = byte_of(x.unit, i);
+        x.buf_unit = x.unit;
+        x.held = true;
+        ++x.loads;
+        landings.push_back({ k, true });
+        return 1;
+    }
+    int landed(bool* ok) override {
+        if (landings.empty()) return -1;
+        const auto d = landings.front();
+        landings.pop_front();
+        *ok = d.second;
+        return d.first;
+    }
+    int copy(int k) override {
+        S& x = s[(size_t)k];
+        if (!x.held) bad("a copy of slot " + std::to_string(k) + " with no bytes");
+        if (x.published) bad("a copy into slot " + std::to_string(k) + " under its resident");
+        x.card = x.buf;
+        const auto f = flip_copy.find(k);
+        if (f != flip_copy.end()) {
+            x.card[(size_t)f->second] ^= 0x10;
+            flip_copy.erase(f);
+        }
+        x.copying = true;
+        ++x.copies;
+        return 0;
+    }
+    int copied(int k) override { return s[(size_t)k].copying ? 1 : -1; }
+    void drop(int k) override {
+        s[(size_t)k].held = false;
+        s[(size_t)k].copying = false;
+    }
+    void publish(int k, bool on) override {
+        S& x = s[(size_t)k];
+        if (on) {
+            if (x.published) bad("slot " + std::to_string(k) + " published twice");
+            x.published = true;
+            x.pub_unit = x.unit;
+            ++x.publishes;
+        } else {
+            if (!x.published) bad("slot " + std::to_string(k) + " withdrawn unpublished");
+            x.published = false;
+            ++x.withdrawals;
+        }
+    }
+    void fence(int) override {}
+    int retarget_fence(int k) override {
+        ++s[(size_t)k].rfences;
+        return 0;
+    }
+    void retarget(int k) override {
+        const auto it = next.find(k);
+        if (it == next.end()) {
+            bad("slot " + std::to_string(k) + " given no unit");
+            return;
+        }
+        s[(size_t)k].unit = it->second;
+        ++s[(size_t)k].renames;
+    }
+    int audit(int k, bool publish) override {
+        S& x = s[(size_t)k];
+        ++audits;
+        ++(publish ? x.audits_pub : x.audits_out);
+        if (unreadable.count(k)) return -5;
+        const uint8_t* const w[2] = { x.card.data(), x.card.data() + kA };
+        const int64_t n[2] = { kA, kB };
+        if (publish) {
+            /* Behind the copy, before the publish, with the copied bytes still held. */
+            if (!x.held || !x.copying) bad("slot " + std::to_string(k) + " audited at publish without its copied bytes");
+            if (x.published) bad("slot " + std::to_string(k) + " audited at publish while published");
+            const int64_t d = LendAudit::first_diff(x.card.data(), x.buf.data(), kA + kB);
+            if (d >= 0) {
+                last_slot = k;
+                last_unit = x.unit;
+                last_at = d;
+                book.forget(k);
+                return 1;
+            }
+            book.remember(k, w, n);
+            return 0;
+        }
+        /* Before the withdrawal, while the resident is still published. */
+        if (!x.published) bad("slot " + std::to_string(k) + " audited at withdrawal with no resident");
+        int which = 0;
+        int64_t at = 0;
+        const int r = book.check(k, w, n, &which, &at);
+        if (r > 0) {
+            last_slot = k;
+            last_unit = x.pub_unit;
+            last_at = (which ? kA : 0) + at;
+        }
+        return r;
+    }
+    int published() const {
+        int n = 0;
+        for (const S& x : s) n += x.published;
+        return n;
+    }
+};
+
+/* Passes that keep the slots until the lender is settled or `most` have run; each reads its residents. */
+bool audit_settle(RingLender& l, AuditHost& h, int64_t* t, int most = 100) {
+    for (int i = 0; i < most && !l.settled(); ++i) {
+        (void)l.begin_pass(false, *t += 10);
+        h.pass_reads();
+    }
+    return l.settled();
+}
+}  // namespace
+
+TEST(p1_lend_audit_switch_is_default_off_and_accepts_only_zero_or_one) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK(!t.lend_audit);
+    for (const char* v : { "", "0", "1" }) {
+        env[ds41p1::kLendAuditEnv] = v;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.lend_audit, std::string(v) == "1");
+    }
+    for (const char* v : { "2", "01", "yes", "-1", "1 " }) {
+        env[ds41p1::kLendAuditEnv] = v;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kLendAuditEnv) != std::string::npos);
+    }
+}
+
+TEST(p1_lend_audit_bytes_first_difference_and_page_digests) {
+    const int64_t n = 3 * LendAudit::kPage + 100;
+    std::vector<uint8_t> a((size_t)n), b;
+    for (int64_t i = 0; i < n; ++i) a[(size_t)i] = (uint8_t)(i * 13 + (i >> 7));
+    b = a;
+    CHECK_EQ(LendAudit::first_diff(a.data(), b.data(), n), (int64_t)-1);
+    CHECK_EQ(LendAudit::first_diff(a.data(), b.data(), 0), (int64_t)-1);
+    for (int64_t at : { (int64_t)0, (int64_t)1, (int64_t)4095, (int64_t)4096, (int64_t)8191, (int64_t)9000, n - 1 }) {
+        b = a;
+        b[(size_t)at] ^= 0x01;
+        CHECK_EQ(LendAudit::first_diff(a.data(), b.data(), n), at);
+        if (at + 1 < n) {   /* the first of two */
+            b[(size_t)(n - 1)] ^= 0x80;
+            CHECK_EQ(LendAudit::first_diff(a.data(), b.data(), n), at);
+        }
+    }
+    /* One digest a 4 KiB page, the short last one too; a page that differs anywhere has another digest, and
+     * no other page's changes. */
+    std::vector<uint64_t> da, db;
+    LendAudit::digest(a.data(), n, &da);
+    REQUIRE(da.size() == (size_t)4);
+    LendAudit::digest(a.data(), 2 * LendAudit::kPage, &db);
+    CHECK_EQ(db.size(), (size_t)2);
+    CHECK_EQ(db[0], da[0]);
+    CHECK_EQ(db[1], da[1]);
+    std::mt19937 rng(7);
+    for (int trial = 0; trial < 2000; ++trial) {
+        const int64_t at = (int64_t)(rng() % (unsigned)n);
+        b = a;
+        b[(size_t)at] ^= (uint8_t)(1u << (rng() % 8));
+        db.clear();
+        LendAudit::digest(b.data(), n, &db);
+        REQUIRE(db.size() == da.size());
+        for (size_t p = 0; p < da.size(); ++p) CHECK_EQ(db[p] != da[p], (int64_t)p == at / LendAudit::kPage);
+    }
+    /* A short page is not its bytes followed by zeros, nor a longer page's prefix. */
+    std::vector<uint8_t> z(64, 0);
+    std::vector<uint64_t> d1, d2;
+    LendAudit::digest(z.data(), 60, &d1);
+    LendAudit::digest(z.data(), 64, &d2);
+    CHECK(d1[0] != d2[0]);
+    /* The book: a slot's two weights remembered, compared, forgotten. */
+    LendAudit book;
+    book.init(2);
+    const uint8_t* const w[2] = { a.data(), a.data() + 2 * LendAudit::kPage };
+    const int64_t wn[2] = { 2 * LendAudit::kPage, n - 2 * LendAudit::kPage };
+    int which = -1;
+    int64_t at = -1;
+    CHECK(!book.known(0));
+    CHECK(book.check(0, w, wn, &which, &at) < 0);   /* nothing remembered */
+    book.remember(0, w, wn);
+    CHECK(book.known(0));
+    CHECK(!book.known(1));
+    CHECK_EQ(book.check(0, w, wn, &which, &at), 0);
+    b = a;
+    b[(size_t)(2 * LendAudit::kPage + LendAudit::kPage + 50)] ^= 0x40;   /* weight 1's second page, the short one */
+    const uint8_t* const wb[2] = { b.data(), b.data() + 2 * LendAudit::kPage };
+    CHECK_EQ(book.check(0, wb, wn, &which, &at), 1);
+    CHECK_EQ(which, 1);
+    CHECK_EQ(at, (int64_t)LendAudit::kPage);
+    b = a;
+    b[10] ^= 0x02;
+    CHECK_EQ(book.check(0, wb, wn, &which, &at), 1);
+    CHECK_EQ(which, 0);
+    CHECK_EQ(at, (int64_t)0);
+    const int64_t other[2] = { wn[0], wn[1] - 1 };
+    CHECK(book.check(0, w, other, &which, &at) < 0);   /* not the weights that were remembered */
+    book.forget(0);
+    CHECK(book.check(0, w, wn, &which, &at) < 0);
+    CHECK(book.check(5, w, wn, &which, &at) < 0);
+    book.remember(5, w, wn);   /* out of range: ignored */
+    CHECK(!book.known(5));
+}
+
+/* With the audit off the host is never asked; with it on and nothing wrong, every publish and every
+ * withdrawal is behind one compare, nothing differs, nothing is lost and the lender does exactly what it does
+ * without it. */
+TEST(p1_lend_audit_off_reads_nothing_back_and_on_compares_every_publish_and_withdrawal) {
+    for (int on = 0; on < 2; ++on) {
+        /* Five slots: three the arena's, two the slab's. */
+        AuditHost h(5);
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, 5, 0, 2), 0);
+        CHECK(!l.auditing());
+        l.set_audit(on != 0);
+        CHECK_EQ(l.auditing(), on != 0);
+        for (int i = 0; i < 20 && l.prime() > 0; ++i) {}
+        CHECK_EQ(l.residents(), 2);
+        int64_t t = 0;
+        REQUIRE(audit_settle(l, h, &t));
+        CHECK_EQ(l.residents(), 5);
+        /* A burst that takes the slots back, the return, and a retarget of an arena slot and a slab slot. */
+        (void)l.begin_pass(true, t += 10);
+        h.pass_reads();
+        l.end_p1(t += 10);
+        CHECK_EQ(l.residents(), 2);
+        REQUIRE(audit_settle(l, h, &t));
+        const int ks[2] = { 1, 4 };
+        h.next[1] = 901;
+        h.next[4] = 904;
+        CHECK_EQ(l.retarget(ks, 2), 2);
+        REQUIRE(audit_settle(l, h, &t));
+        CHECK_EQ(h.s[1].pub_unit, 901);
+        CHECK_EQ(h.s[4].pub_unit, 904);
+        const RingLender::Stats& st = l.stats();
+        /* Publishes: 5 at first, 3 after the take-back, 2 after the retarget. Withdrawals: 3 and 2. */
+        CHECK_EQ(st.reloaded, (uint64_t)10);
+        CHECK_EQ(st.withdrawn, (uint64_t)3);
+        CHECK_EQ(st.retarget_withdrawn, (uint64_t)2);
+        CHECK_EQ(st.retargets, (uint64_t)2);
+        CHECK_EQ(st.audited, on ? (uint64_t)15 : (uint64_t)0);
+        CHECK_EQ(h.audits, on ? 15 : 0);
+        CHECK_EQ(st.audit_differ, (uint64_t)0);
+        CHECK_EQ(st.audit_unread, (uint64_t)0);
+        CHECK_EQ(st.lost, (uint64_t)0);
+        CHECK(!l.stopped());
+        CHECK_EQ(st.declined[(size_t)RingLender::Decline::Audit], (uint64_t)0);
+        for (const auto& x : h.s) {
+            CHECK_EQ(x.audits_pub, on ? x.publishes : 0);
+            CHECK_EQ(x.audits_out, on ? x.withdrawals : 0);
+        }
+        CHECK_EQ(h.read_corrupt, 0);
+        CHECK_EQ(h.violations, 0);
+        if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    }
+    /* The heat policy over the simulated host, with the audit and without: the same moves, pass for pass. */
+    std::vector<int> moved[2];
+    for (int on = 0; on < 2; ++on) {
+        HeatSim a(91, 6, 16, 2, 50, 3);
+        a.l.set_audit(on != 0);
+        std::vector<int> hot(16, 1);
+        for (int u = 9; u < 15; ++u) hot[(size_t)u] = 5;
+        for (int i = 0; i < 300; ++i) moved[on].push_back(a.pass(hot, 8, (i % 50) == 49));
+        CHECK(a.moved > 0);
+        CHECK_EQ(a.l.stats().audited,
+                 on ? a.l.stats().reloaded + a.l.stats().withdrawn + a.l.stats().retarget_withdrawn : (uint64_t)0);
+        CHECK(!a.l.stopped());
+        CHECK_EQ(a.h.violations, 0);
+    }
+    CHECK(moved[0] == moved[1]);
+}
+
+/* The device corrupts a slot's copy: the read-back before the publish catches it at the byte, the unit is
+ * never published (the CPU path computes it), the slot is given up for good, the rank's retargets stop, and
+ * the other slots go on, audited and counted. Without the audit the same run publishes the corrupt slot and
+ * a pass reads it. */
+TEST(p1_lend_audit_catches_a_corrupt_copy_before_its_unit_is_published_and_stops_the_policy) {
+    using D = RingLender::Decline;
+    const int64_t at = AuditHost::kA + 5000;   /* a byte of the second weight */
+    for (int on = 0; on < 2; ++on) {
+        AuditHost h(5);
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, 5, 0, 2), 0);
+        l.set_audit(on != 0);
+        h.flip_copy[3] = at;   /* a slab slot's first copy */
+        h.flip_copy[1] = 77;   /* and an arena slot's */
+        for (int i = 0; i < 20 && l.prime() > 0; ++i) {}
+        int64_t t = 0;
+        for (int i = 0; i < 20; ++i) {
+            (void)l.begin_pass(false, t += 10);
+            h.pass_reads();
+        }
+        if (!on) {
+            /* Nothing looks: both corrupt slots are published and read. */
+            CHECK_EQ(l.residents(), 5);
+            CHECK(h.read_corrupt > 0);
+            CHECK_EQ(l.stats().audited, (uint64_t)0);
+            CHECK(!l.stopped());
+            continue;
+        }
+        CHECK_EQ(h.read_corrupt, 0);   /* no pass ever read a corrupt slot */
+        CHECK_EQ(l.residents(), 3);
+        CHECK(l.lost(1));
+        CHECK(l.lost(3));
+        CHECK(!h.s[1].published);
+        CHECK(!h.s[3].published);
+        CHECK_EQ(h.s[1].publishes, 0);
+        CHECK_EQ(h.s[3].publishes, 0);
+        CHECK(!h.s[1].held);   /* its bytes were let go all the same */
+        CHECK(!h.s[3].held);
+        CHECK(l.stopped());
+        CHECK(!l.settled());
+        const RingLender::Stats& st = l.stats();
+        CHECK_EQ(st.audited, (uint64_t)5);
+        CHECK_EQ(st.audit_differ, (uint64_t)2);
+        CHECK_EQ(st.audit_unread, (uint64_t)0);
+        CHECK_EQ(st.lost, (uint64_t)2);
+        CHECK_EQ(st.reloaded, (uint64_t)3);
+        /* The report names the slot, the unit and the first differing offset (the arena slot's came last:
+         * the slab's was caught at bring-up). */
+        CHECK_EQ(h.last_slot, 1);
+        CHECK_EQ(h.last_unit, 101);
+        CHECK_EQ(h.last_at, (int64_t)77);
+        /* A lost slot is never loaded again: not at a return, not by a retarget. */
+        (void)l.begin_pass(true, t += 10);
+        l.end_p1(t += 10);
+        for (int i = 0; i < 20; ++i) {
+            (void)l.begin_pass(false, t += 10);
+            h.pass_reads();
+        }
+        CHECK_EQ(l.residents(), 3);
+        CHECK_EQ(h.s[1].loads, 1);
+        CHECK_EQ(h.s[3].loads, 1);
+        CHECK(l.lost(1));
+        CHECK(l.lost(3));
+        /* The other slots kept counting: two withdrawn and published again (the slab's good one stayed). */
+        CHECK_EQ(l.stats().audited, (uint64_t)9);
+        CHECK_EQ(l.stats().audit_differ, (uint64_t)2);
+        /* No retarget on this rank any more: refused whole, the host untouched, counted as the audit's. */
+        const int k = 0;
+        h.next[0] = 900;
+        const int rf0 = h.s[0].rfences;
+        CHECK_EQ(l.retarget(&k, 1), 0);
+        CHECK_EQ(h.s[0].rfences, rf0);
+        CHECK(h.s[0].published);
+        CHECK_EQ(h.s[0].unit, 100);
+        CHECK_EQ(l.stats().declined[(size_t)D::Audit], (uint64_t)1);
+        CHECK_EQ(h.read_corrupt, 0);
+        CHECK_EQ(h.violations, 0);
+        if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    }
+}
+
+/* The device writes a byte under a resident: the read-back before its withdrawal catches it, at a pass that
+ * takes the slots back and at a retarget alike; the unit is withdrawn, the slot given up, the policy stopped.
+ * A slot that cannot be read back is treated the same and counted apart. */
+TEST(p1_lend_audit_catches_a_slot_changed_under_its_resident_when_it_is_withdrawn) {
+    using D = RingLender::Decline;
+    /* At a take-back. */
+    {
+        AuditHost h(4);
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, 4, 0, 1), 0);
+        l.set_audit(true);
+        for (int i = 0; i < 20 && l.prime() > 0; ++i) {}
+        int64_t t = 0;
+        REQUIRE(audit_settle(l, h, &t));
+        CHECK_EQ(l.stats().audited, (uint64_t)4);
+        h.s[2].card[9000] ^= 0x04;   /* weight 0's third page */
+        (void)l.begin_pass(true, t += 10);
+        CHECK_EQ(l.residents(), 1);   /* the slab's stays; the three others are withdrawn, the corrupt one too */
+        CHECK(!h.s[2].published);
+        CHECK_EQ(h.s[2].withdrawals, 1);
+        CHECK(l.lost(2));
+        CHECK(!l.lost(0));
+        CHECK(l.stopped());
+        CHECK_EQ(l.stats().withdrawn, (uint64_t)3);
+        CHECK_EQ(l.stats().audited, (uint64_t)7);
+        CHECK_EQ(l.stats().audit_differ, (uint64_t)1);
+        CHECK_EQ(l.stats().lost, (uint64_t)1);
+        CHECK_EQ(h.last_slot, 2);
+        CHECK_EQ(h.last_unit, 102);
+        CHECK_EQ(h.last_at, (int64_t)2 * LendAudit::kPage);   /* the page that holds byte 9000 */
+        l.end_p1(t += 10);
+        for (int i = 0; i < 20; ++i) (void)l.begin_pass(false, t += 10);
+        CHECK_EQ(l.residents(), 3);
+        CHECK_EQ(h.s[2].loads, 1);
+        CHECK_EQ(l.stats().audited, (uint64_t)9);   /* the two that came back */
+        CHECK_EQ(h.violations, 0);
+        if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    }
+    /* At a retarget: of two slots named, the first is found changed. It is withdrawn and lost, keeps its
+     * unit's name, and the second is not touched. */
+    {
+        AuditHost h(4);
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, 4, 0, 2), 0);
+        l.set_audit(true);
+        for (int i = 0; i < 20 && l.prime() > 0; ++i) {}
+        int64_t t = 0;
+        REQUIRE(audit_settle(l, h, &t));
+        h.s[3].card[0] ^= 0x80;   /* a slab slot */
+        const int ks[2] = { 3, 1 };
+        h.next[3] = 903;
+        h.next[1] = 901;
+        CHECK_EQ(l.retarget(ks, 2), 0);
+        CHECK_EQ(h.s[3].rfences, 1);    /* fenced first: the read-back is behind the residents' last reader */
+        CHECK(!h.s[3].published);
+        CHECK_EQ(h.s[3].renames, 0);
+        CHECK_EQ(h.s[3].unit, 103);
+        CHECK(l.lost(3));
+        CHECK(h.s[1].published);
+        CHECK_EQ(h.s[1].rfences, 0);
+        CHECK_EQ(h.s[1].unit, 101);
+        CHECK(l.stopped());
+        CHECK_EQ(l.stats().retarget_withdrawn, (uint64_t)0);
+        CHECK_EQ(l.stats().audit_differ, (uint64_t)1);
+        CHECK_EQ(l.stats().declined[(size_t)D::Audit], (uint64_t)1);
+        CHECK_EQ(h.last_slot, 3);
+        CHECK_EQ(h.last_unit, 103);
+        CHECK_EQ(h.last_at, (int64_t)0);
+        for (int i = 0; i < 20; ++i) (void)l.begin_pass(false, t += 10);
+        CHECK_EQ(l.residents(), 3);
+        CHECK_EQ(h.s[3].loads, 1);
+        /* The policy's turn declines for the audit before it looks at anything else. */
+        LendHeat heat;
+        REQUIRE_EQ(heat.init(2000, 2, 10, 150), 0);
+        std::vector<int32_t> cand{ 100, 101, 102, 103, 500, 501 };
+        std::vector<uint8_t> taken(2000, 0);
+        struct Owner {
+            AuditHost* h;
+            int calls = 0;
+            int32_t slot_unit(int k) const { return h->s[(size_t)k].unit; }
+            bool eligible(int32_t) const { return true; }
+            int retarget(const int*, const int32_t*, int) { return ++calls, 0; }
+        } owner{ &h };
+        heat.begin_pass(100);
+        heat.add(500, 90);
+        CHECK(heat.warm());
+        CHECK_EQ(heat_turn(l, heat, false, false, true, cand, taken, owner), 0);
+        CHECK_EQ(owner.calls, 0);
+        CHECK_EQ(l.stats().declined[(size_t)D::Audit], (uint64_t)2);
+        CHECK(heat.dirty());   /* it did not even look */
+        CHECK_EQ(h.violations, 0);
+        if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    }
+    /* A slot that cannot be read back: at its publish it is never published, at its withdrawal it is lost. */
+    {
+        AuditHost h(3);
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, 3, 0, 0), 0);
+        l.set_audit(true);
+        h.unreadable.insert(0);
+        int64_t t = 0;
+        for (int i = 0; i < 20; ++i) (void)l.begin_pass(false, t += 10);
+        CHECK_EQ(l.residents(), 2);
+        CHECK_EQ(h.s[0].publishes, 0);
+        CHECK(l.lost(0));
+        CHECK(l.stopped());
+        CHECK_EQ(l.stats().audit_unread, (uint64_t)1);
+        CHECK_EQ(l.stats().audit_differ, (uint64_t)0);
+        h.unreadable.insert(2);
+        (void)l.begin_pass(true, t += 10);
+        CHECK(l.lost(2));
+        CHECK(!h.s[2].published);
+        CHECK_EQ(l.stats().audit_unread, (uint64_t)2);
+        CHECK_EQ(l.stats().lost, (uint64_t)2);
+        CHECK_EQ(l.stats().withdrawn, (uint64_t)2);
+        CHECK_EQ(h.violations, 0);
+        if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    }
+}
+
+/* At shutdown every slot that still holds a resident is read back as at a withdrawal: a slab slot's resident
+ * is never withdrawn by a pass, so this closes its residency. Nothing happens without the audit. */
+TEST(p1_lend_audit_reads_every_resident_back_at_shutdown) {
+    for (int on = 0; on < 2; ++on) {
+        AuditHost h(5);
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, 5, 0, 3), 0);
+        l.set_audit(on != 0);
+        for (int i = 0; i < 20 && l.prime() > 0; ++i) {}
+        int64_t t = 0;
+        REQUIRE(audit_settle(l, h, &t));
+        const uint64_t before = l.stats().audited;
+        /* A byte written under a slab resident, which no pass and no retarget ever withdraws. */
+        h.s[4].card[(size_t)(AuditHost::kA + 4097)] ^= 0x08;
+        for (int i = 0; i < 10; ++i) {
+            (void)l.begin_pass((i % 3) == 0, t += 10);
+            if ((i % 3) == 0) l.end_p1(t);
+        }
+        REQUIRE(audit_settle(l, h, &t));
+        CHECK(!l.stopped());   /* nothing has looked at slot 4 since its publish */
+        const uint64_t mid = l.stats().audited;
+        CHECK_EQ(l.audit_residents(), on ? 5 : 0);
+        if (!on) {
+            CHECK_EQ(h.audits, 0);
+            CHECK_EQ(l.residents(), 5);
+            continue;
+        }
+        CHECK(mid > before);
+        CHECK_EQ(l.stats().audited, mid + 5);
+        CHECK_EQ(l.stats().audit_differ, (uint64_t)1);
+        CHECK(l.lost(4));
+        CHECK(!h.s[4].published);
+        CHECK(l.stopped());
+        CHECK_EQ(l.residents(), 4);
+        CHECK_EQ(h.last_slot, 4);
+        CHECK_EQ(h.last_unit, 104);
+        CHECK_EQ(h.last_at, AuditHost::kA + LendAudit::kPage);
+        /* Asked again: the four that are left, and they are as they were. */
+        CHECK_EQ(l.audit_residents(), 4);
+        CHECK_EQ(l.stats().audit_differ, (uint64_t)1);
+        CHECK_EQ(h.violations, 0);
+        if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    }
+}
+
+/* Random runs: copies that land corrupt and bytes written under residents, at random, between passes of
+ * both kinds and retargets. With the audit on no pass ever reads a slot whose copy landed corrupt, every
+ * such copy and every changed resident that is withdrawn is counted, and from the first one on nothing is
+ * retargeted. */
+TEST(p1_lend_audit_stress_random_corruption_is_always_caught) {
+    int caught_total = 0;
+    for (unsigned seed = 1; seed <= 20; ++seed) {
+        std::mt19937 rng(4000 + seed);
+        const int n = 3 + (int)(rng() % 8), keep = (int)(rng() % (unsigned)(n + 1));
+        AuditHost h(n);
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, n, 0, keep), 0);
+        l.set_audit(true);
+        for (int i = 0; i < 4 * n && l.prime() > 0; ++i) {}
+        int64_t t = 0;
+        int next_unit = 1000;
+        uint64_t moved_when_stopped = 0;
+        std::set<int> dirty;   /* slots whose resident's bytes were changed and not yet withdrawn */
+        bool in_p1 = false;
+        for (int step = 0; step < 600; ++step) {
+            if (in_p1) l.end_p1(t);
+            const bool p1 = (rng() % 100) < 15;
+            /* The device's faults: a slot's next copy lands with a byte flipped; a byte is written under a
+             * resident. */
+            if ((rng() % 60) == 0) {
+                const int k = (int)(rng() % (unsigned)n);
+                if (!h.flip_copy.count(k)) h.flip_copy[k] = (int64_t)(rng() % (unsigned)(AuditHost::kA + AuditHost::kB));
+            }
+            if ((rng() % 80) == 0) {
+                const int k = (int)(rng() % (unsigned)n);
+                if (h.s[(size_t)k].published && !dirty.count(k)) {
+                    h.s[(size_t)k].card[(size_t)(rng() % (unsigned)(AuditHost::kA + AuditHost::kB))] ^= 0x20;
+                    dirty.insert(k);
+                }
+            }
+            (void)l.begin_pass(p1, t += 10);
+            in_p1 = p1;
+            /* A retarget of a random slot when the lender allows one. */
+            if (!p1 && l.settled() && (rng() % 4) == 0) {
+                const int k = (int)(rng() % (unsigned)n);
+                h.next[k] = next_unit++;
+                (void)l.retarget(&k, 1);
+                h.next.clear();
+            }
+            /* A changed resident that was withdrawn (taken back or retargeted) was caught then. */
+            for (auto it = dirty.begin(); it != dirty.end();) {
+                if (h.s[(size_t)*it].published) {
+                    ++it;
+                    continue;
+                }
+                if (!l.lost(*it)) h.bad("slot " + std::to_string(*it) + " changed under its resident and not lost at its withdrawal");
+                it = dirty.erase(it);
+            }
+            /* What this pass reads: only a slot changed under its resident can be wrong, never a copy that
+             * landed corrupt. */
+            for (size_t k = 0; k < h.s.size(); ++k)
+                if (h.s[k].published && !dirty.count((int)k) && !AuditHost::holds(h.s[k].card, h.s[k].pub_unit))
+                    h.bad("a pass read slot " + std::to_string(k) + " published from a corrupt copy");
+            /* From the first difference on, no slot is handed to another unit. */
+            if (!l.stopped()) moved_when_stopped = l.stats().retarget_withdrawn;
+            else if (l.stats().retarget_withdrawn != moved_when_stopped) h.bad("a retarget after the audit stopped the policy");
+        }
+        const RingLender::Stats& st = l.stats();
+        CHECK_EQ(st.audit_unread, (uint64_t)0);
+        CHECK_EQ(st.audit_differ, st.lost);
+        CHECK_EQ(st.audit_differ > 0, l.stopped());
+        /* Every publish and every withdrawal behind exactly one compare; a slot lost at its publish had the
+         * compare and no publish. */
+        CHECK_EQ((uint64_t)h.audits, st.audited);
+        uint64_t lost_at_publish = 0;
+        for (const auto& x : h.s) {
+            CHECK_EQ(x.audits_out, x.withdrawals);
+            CHECK(x.audits_pub == x.publishes || x.audits_pub == x.publishes + 1);
+            lost_at_publish += (uint64_t)(x.audits_pub - x.publishes);
+        }
+        CHECK(lost_at_publish <= st.lost);
+        caught_total += (int)st.audit_differ;
+        CHECK_EQ(h.violations, 0);
+        if (h.violations) {
+            std::fprintf(stderr, "seed %u (%d slots, %d kept): %s\n", seed, n, keep, h.first.c_str());
+            break;
+        }
+    }
+    CHECK(caught_total >= 20);   /* the faults did happen, in nearly every run */
+}
+
 /* ---- the lent arena ----------------------------------------------------------------------------------------
  *
  * The slots carved from the arena's top (p1::arena_slots): whole slots from the top down, each on a 4 KiB

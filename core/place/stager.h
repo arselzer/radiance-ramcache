@@ -751,6 +751,13 @@ private:
      * ring resident, recorded at its end; an armed pass's first ring copy waits on it. */
     RadEvent p1_lend_ev_ = nullptr;
     bool     p1_lend_rec_ = false;
+    /* ..._P1_LEND_AUDIT (card_expert_stager.h, the read-back audit): on for this rank's lent slots; and, at
+     * shutdown with this rank's device current and no pass in flight, every lent resident read back once
+     * more behind the last pass, before p1_stats_line counts. */
+public:
+    bool p1_lend_audits() const { return p1_ && p1_->lending() && p1_tun_.lend_audit; }
+    void p1_lend_audit_final();
+private:
     /* The lent slab (..._P1_LEND_SLAB): the most bring-up waits for a rank's slab units to be in. */
     static constexpr int64_t kP1SlabPrimeMs = 120000;
     /* The lent ring's slots (..._P1_LEND) and the arena's (`arena`, from p1_lend_arena), the hottest

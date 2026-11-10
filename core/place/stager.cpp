@@ -757,6 +757,9 @@ bool FileStager::begin_pass(const RadBatch* b) {
     p1_lend_took_ = false;
     if (p1_on() && p1_->lending()) {
         p1_lend_took_ = p1_arms || (p1_arena_full_ && p1_arena_full_());
+        /* ..._P1_LEND_AUDIT: a resident withdrawn at this pass's begin is read back behind the end of the
+         * pass before, the residents' last reader. */
+        if (p1_tun_.lend_audit) p1_->lend_audit_behind(p1_lend_rec_ ? p1_lend_ev_ : nullptr);
         (void)p1_->lender().begin_pass(p1_lend_took_, p1_now_ms());
         /* The lent slots' heat (..._P1_LEND_HEAT): the policy's turn, here only (residency changes before
          * the weight tables are brought up to date), with the heat counted through the pass before this
@@ -4845,6 +4848,9 @@ int FileStager::p1_init(const Program& prog) {
     if (t.lend_heat > 0 && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
         return refuse(fmt("%s=%d moves lent slots between units, and none is lent (%s, %s or %s)", ds41p1::kLendHeatEnv,
                           t.lend_heat, ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
+    if (t.lend_audit && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
+        return refuse(fmt("%s=1 reads lent slots back, and none is lent (%s, %s or %s)", ds41p1::kLendAuditEnv,
+                          ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
     /* The lent slab: the plan gave up residents for exactly these slots (Planner::assign_expert_tiered, which
      * read the same switch), and the mover holds them. */
     if (t.lend_slab > 0) {
@@ -5142,7 +5148,14 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
             return RAD_E_INVAL;
         }
     }
-    RAD_TRY(p1_->lend_init(units, slots, at, slab_at, t.grace_ms, why));
+    RAD_TRY(p1_->lend_init(units, slots, at, slab_at, t.grace_ms, t.lend_audit, why));
+    if (plan_->rank == 0 && t.lend_audit)
+        RAD_INFO("%s: on (%s=1): every lent slot is copied back from the card and compared, once its copy has "
+                 "passed and before its unit is published (byte for byte with the bytes copied) and again before "
+                 "its resident is withdrawn (64-bit digests a 4 KiB page of what was published, behind the pass "
+                 "before); a slot that differs is given up, its unit takes the CPU path and the rank's retargets "
+                 "stop; each read-back is %.0f MiB off the card that the issuing thread waits for, so this is not a "
+                 "timed run", ds41p1::kLogLendAudit, ds41p1::kLendAuditEnv, (double)ds41p1::kSlotBytes / 1048576.0);
     /* The units lent (the ring's, the arena's and the slab's): never the aux expert worker's (p1_lent). */
     p1_lent_.assign(plan_->units.size(), 0);
     for (int i = 0; i < n; ++i) p1_lent_[(size_t)lent[(size_t)i]] = 1;
@@ -5533,6 +5546,12 @@ int FileStager::p1_verify(int32_t li, RadStream s) {
                      pick[k].second, p1_nonres_[(size_t)pick[k].first], bad, (int)kHxEmbd, first, a[first], b[first]);
     }
     return RAD_OK;
+}
+
+void FileStager::p1_lend_audit_final() {
+    if (!p1_lend_audits()) return;
+    p1_->lend_audit_behind(p1_lend_rec_ ? p1_lend_ev_ : nullptr);
+    (void)p1_->lender().audit_residents();
 }
 
 std::string FileStager::p1_stats_line() const {

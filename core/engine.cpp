@@ -167,6 +167,12 @@ Engine::~Engine() {
                          "kept readers (..._MISS_POST; between choose and submit, in neither)",
                          (double)ep.d_miss_post_ns * 1e-3 / (double)ep.d_reads);
         }
+        /* ..._P1_LEND_AUDIT (off: nothing here): the rank's lent residents read back once more, so the line
+         * below counts every slot the run ended with. */
+        if (r->fstager.p1_lend_audits() && rad_dev_set(r->device) >= 0) {
+            r->fstager.p1_lend_audit_final();
+            (void)rad_dev_set(ranks_[0]->device);
+        }
         /* Prefill Phase 1 (place/card_expert_stager.h): each rank's line (ds41p1::kLogStats). */
         if (r->fstager.p1_on()) RAD_INFO("%s", r->fstager.p1_stats_line().c_str());
         const auto& hx = r->fstager.host_stats();

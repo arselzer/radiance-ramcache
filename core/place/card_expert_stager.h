@@ -90,14 +90,15 @@ struct Tunables {
     int  lend_heat_half = ds41p1::kDefLendHeatHalfRows;         /* the heat's half-life, in decode rows */
     int  lend_heat_margin = ds41p1::kDefLendHeatMarginPct;      /* the hysteresis, percent of the resident's heat */
     int  lend_slab = 0;                                         /* the lent slab's slots a rank (0 off) */
+    bool lend_audit = false;                                    /* every lent slot read back and compared */
     bool align_end = true;
     bool swiglu_span = false;
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
  * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-100000000 (unset: 100, or 2000 with lend_slab),
- * lend_heat_margin 100-1000, lend_slab 0-256), align "end" or "start", swiglu_span 0/off or 1/on (default
- * off). False with the reason on anything else. */
+ * lend_heat_margin 100-1000, lend_slab 0-256), align "end" or "start", swiglu_span and lend_audit 0/off or
+ * 1/on (default off). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
 /* The wave's live sorted slots, from ALL local experts' synchronized counts (their exclusive
@@ -296,6 +297,29 @@ private:
  * and ring copies have the lane and the drive to themselves; one begun before goes on. With the heat they
  * change units as the other slots do, by the same fence and only while every slot is settled.
  *
+ * The read-back audit (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT=1, default off: nothing of it exists): the
+ * card's copy of every lent unit is read back and compared, twice a residency.
+ *   at publish     once the host has seen a slot's copy pass and before its unit is published, the slot is
+ *                  copied back to pinned host memory on the DMA lane: behind the copy (the host saw its
+ *                  event), with no reader (unpublished) and no writer (the lender queues the slot's only
+ *                  copies, and a pass that writes the arena's top takes the slots back first) until the
+ *                  host has compared it byte for byte with the bytes that were copied, which the lender
+ *                  still holds. One 64-bit digest a 4 KiB page of what was read is kept (LendAudit).
+ *   at withdrawal  before a resident is published as a file-tier unit again (a pass that takes the slots
+ *                  back, or a retarget), the slot is copied back the same way behind the event the compute
+ *                  stream recorded at the end of the pass before: the residents' last reader, the wait an
+ *                  armed pass's first ring copy and a retarget's fence make. The host waits for it before
+ *                  it withdraws, so before the pass issues an op or the lender queues the slot's next
+ *                  copy; its digests are compared with the ones kept. At shutdown every slot that still
+ *                  holds a resident is read back the same way (RingLender::audit_residents), so a
+ *                  residency no pass ended, a slab slot's above all, is closed by a compare too.
+ * A slot that differs, or that cannot be read back, is lost: the host logs rank, slot, unit and the first
+ * differing offset, the unit is not published (or is withdrawn) and takes the CPU path, nothing is loaded
+ * into the slot again, and the rank's heat policy makes no further retarget (RingLender::stopped,
+ * Decline::Audit). Everything else goes on, audited and counted. The read-backs are the issuing thread's,
+ * between passes: each costs a copy of the slot off the card and a pass over its bytes, so an audited run
+ * is not a timed one.
+ *
  * RingLender is the state machine alone, against LendHost (tests/p1_stager_test.cpp drives it with
  * random landings, copy completions and failures); CardExpertPath is the engine's LendHost. */
 class LendHost {
@@ -327,6 +351,17 @@ public:
     /* Slot k's resident was withdrawn (publish(k, false)) for the unit the policy named: from here the
      * slot's load, copy and publish are that unit's. */
     virtual void retarget(int k) = 0;
+    /* The read-back audit, called only with it on (RingLender::set_audit). publish: slot k's copy has passed
+     * and its landed bytes are still held (before drop): the slot is read back and compared with them, and
+     * what it holds is remembered. Else slot k's resident is about to be withdrawn (before publish(k,
+     * false)): the slot is read back behind the residents' last reader and compared with what was
+     * remembered. 0 equal; 1 they differ (the host says where); < 0 the slot could not be read back or
+     * compared. */
+    virtual int  audit(int k, bool publish) {
+        (void)k;
+        (void)publish;
+        return 0;
+    }
 };
 
 class RingLender {
@@ -335,9 +370,9 @@ public:
      * pass took them back, this one among them); a slot is not its resident's (wanted, reading, landed,
      * copying, or failed until the next return); a draft bank's loan holds ring residents on this rank; a
      * chosen unit can no longer hold a slot; no event behind the pass before this one, or the DMA lane
-     * refused the wait. */
-    enum class Decline : uint8_t { Lent = 0, Busy = 1, Bank = 2, Candidate = 3, Fence = 4 };
-    static constexpr int kDeclines = 5;
+     * refused the wait; the read-back audit found a slot differing and stopped the policy on this rank. */
+    enum class Decline : uint8_t { Lent = 0, Busy = 1, Bank = 2, Candidate = 3, Fence = 4, Audit = 5 };
+    static constexpr int kDeclines = 6;
     struct Stats {
         uint64_t lends = 0;        /* card-path bursts that took the slots back */
         uint64_t withdrawn = 0;    /* residents published as file-tier units again for them */
@@ -350,6 +385,11 @@ public:
         uint64_t retarget_withdrawn = 0;   /* residents that gave their slots to another unit */
         uint64_t retargets = 0;            /* those units published at their slots */
         uint64_t declined[kDeclines] = {}; /* passes the policy did nothing on, by Decline */
+        /* The read-back audit's (all 0 without the switch): */
+        uint64_t audited = 0;        /* slots read back and compared, at publish and at withdrawal */
+        uint64_t audit_differ = 0;   /* of them, slots whose bytes differed */
+        uint64_t audit_unread = 0;   /* and slots that could not be read back or compared */
+        uint64_t lost = 0;           /* slots given up for either: nothing is loaded into them again */
     };
     /* n slots, the grace in ms; the last `keep` of them (0..ds41p1::kMaxLendSlab) are kept (the slab's:
      * never taken back), the others (at most 2 x ds41p1::kMaxLend) the ring's and the arena's. Every slot
@@ -372,6 +412,17 @@ public:
     int  prime();
     int  kept() const { return keep_; }
     bool keeps(int k) const { return k >= n() - keep_ && k < n(); }
+    /* The read-back audit (above), set after init: on, every publish and every withdrawal is behind
+     * LendHost::audit. stopped: it found a slot differing or unreadable, so no retarget happens on this
+     * rank any more; lost(k): slot k is such a slot. */
+    void set_audit(bool on) { audit_ = on; }
+    bool auditing() const { return audit_; }
+    bool stopped() const { return stopped_; }
+    bool lost(int k) const { return k >= 0 && k < n() && slot_[(size_t)k].st == St::Lost; }
+    /* At shutdown, with no pass in flight: every resident's slot read back and compared as at a withdrawal
+     * (a kept slot's resident is never withdrawn by a pass, so this is where its residency is closed). One
+     * that differs is withdrawn and lost as there. Nothing without the audit. Returns the slots compared. */
+    int  audit_residents();
     /* A pass that took the slots back ended at now_ms: the grace runs from here. */
     void end_p1(int64_t now_ms);
     bool lent() const { return lent_; }
@@ -399,15 +450,21 @@ private:
     /* Idle: not resident and nothing wanted (lent, or nothing yet). Want: a reload wanted, not begun
      * (no buffer). Reading: begun; Landed: its bytes in; Copying: its copy queued. cancel: a reading
      * or copying slot a card-path pass overtook, which goes back to Idle or Want once it ends. moved: the
-     * heat policy gave the slot another unit, not yet published there (the retargets count). */
-    enum class St : uint8_t { Idle, Want, Reading, Landed, Copying, Resident, Failed };
+     * heat policy gave the slot another unit, not yet published there (the retargets count). Lost: the
+     * read-back audit gave the slot up, for good. */
+    enum class St : uint8_t { Idle, Want, Reading, Landed, Copying, Resident, Failed, Lost };
     struct Slot { St st = St::Idle; bool cancel = false; bool moved = false; bool keep = false; };
     LendHost* host_ = nullptr;
     std::vector<Slot> slot_;
     int64_t grace_ = 0, last_p1_ = 0;
     int  keep_ = 0;
     bool lent_ = true, any_p1_ = false;
+    bool audit_ = false, stopped_ = false;
     Stats st_;
+    /* Slot k read back and compared (LendHost::audit); false, counted, with the policy stopped when it
+     * differs or could not be read. lose: the slot is given up. */
+    bool audit_ok(int k, bool publish);
+    void lose(int k);
     /* Slot s is lent out: the slots are, and it is not a kept one. */
     bool away(const Slot& s) const { return lent_ && !s.keep; }
     void settle(int k);
@@ -472,7 +529,8 @@ private:
  * retargets). The owner `o`: slot_unit(k), the unit lent slot k is for; eligible(u), whether u may be handed
  * a slot now; retarget(ks, units, n), which names the slots' new units to the host and calls
  * RingLender::retarget, returning the slots retargeted.
- * Nothing happens, counted by reason (RingLender::Decline), when the pass takes the slots back or they are
+ * Nothing happens, counted by reason (RingLender::Decline), once the read-back audit has stopped the policy
+ * on the rank, when the pass takes the slots back or they are
  * lent or in the grace, with a draft bank's loan, while any slot is not its resident's, without the fence's
  * event, or when a chosen unit is not eligible; and, uncounted, when nothing was counted since the last look
  * (the choice would be the same), before a half-life of rows has been counted, and when no unit off the card
@@ -485,6 +543,7 @@ int heat_turn(RingLender& l, LendHeat& h, bool took, bool bank, bool fence_ready
         l.decline(why);
         return 0;
     };
+    if (l.stopped()) return no(Decline::Audit);
     if (took || l.lent()) return no(Decline::Lent);
     if (bank) return no(Decline::Bank);
     if (!l.settled()) return no(Decline::Busy);
@@ -522,6 +581,40 @@ int heat_turn(RingLender& l, LendHeat& h, bool took, bool bank, bool fence_ready
     if (done < np) h.again();
     return done;
 }
+
+/* The read-back audit's bytes (above), device-free (tests/p1_stager_test.cpp): the byte compare of a slot
+ * read back against the bytes copied, and by lent slot the digests of what it was published holding, one a
+ * 4 KiB page of each of the unit's two weights. A digest is h = (h ^ word) x an odd constant over the page's
+ * 64-bit words, so a page that differs in one word always has another digest, and two pages that differ in
+ * more have the same one with chance 2^-64. */
+class LendAudit {
+public:
+    static constexpr int64_t kPage = 4096;
+    /* The first offset at which a[0, n) and b[0, n) differ, or -1. */
+    static int64_t first_diff(const uint8_t* a, const uint8_t* b, int64_t n);
+    /* One digest a page of p[0, n) (the last may be short), appended to *out. */
+    static void digest(const uint8_t* p, int64_t n, std::vector<uint64_t>* out);
+
+    void init(int n_slots) { book_.assign((size_t)(n_slots > 0 ? n_slots : 0), Book{}); }
+    /* Slot k was read back equal to what was copied: its two weights w[i][0, n[i]) as read. */
+    void remember(int k, const uint8_t* const w[2], const int64_t n[2]);
+    void forget(int k) {
+        if (k >= 0 && (size_t)k < book_.size()) book_[(size_t)k].known = false;
+    }
+    bool known(int k) const { return k >= 0 && (size_t)k < book_.size() && book_[(size_t)k].known; }
+    /* Slot k read back at withdrawal against what was remembered: 0 equal; 1 they differ, *which the
+     * weight and *at the offset in it of the first page that does; < 0 nothing is remembered for the slot,
+     * or not for weights of these sizes. */
+    int  check(int k, const uint8_t* const w[2], const int64_t n[2], int* which, int64_t* at) const;
+
+private:
+    struct Book {
+        bool    known = false;
+        int64_t n[2] = { 0, 0 };
+        std::vector<uint64_t> d;   /* weight 0's pages, then weight 1's */
+    };
+    std::vector<Book> book_;
+};
 
 /* ---- the engine's side ----------------------------------------------------------------------------
  *
@@ -593,7 +686,11 @@ public:
     struct LendUnit { int32_t unit = -1; int64_t off[2] = { 0, 0 }, bytes[2] = { 0, 0 }; };
     int  lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots,
                    const std::vector<char*>& arena_slots, const std::vector<char*>& slab_slots, int64_t grace_ms,
-                   std::string* why);
+                   bool audit, std::string* why);
+    /* The read-back audit (`audit` at lend_init: one pinned slot of host memory and an event more): before
+     * the lender's begin_pass, the event the compute stream recorded at the end of the pass before (null:
+     * none yet), behind which a withdrawn resident's slot is read back. */
+    void lend_audit_behind(RadEvent ev) { laud_behind_ = ev; }
     /* Bring-up: the slab's units loaded, copied and published before the first pass (RingLender::prime),
      * for at most `most_ms`; what is not in by then comes in at the passes. Returns the slab slots that
      * hold their unit. */
@@ -626,6 +723,7 @@ public:
     void fence(int k) override;
     int  retarget_fence(int k) override;
     void retarget(int k) override;
+    int  audit(int k, bool publish) override;
 
     /* Device */
     int  event_create(bool host) override;
@@ -648,6 +746,7 @@ public:
         /* The lent ring's reloads: from the RAM cache, read from the drive (and the reload thread's
          * time in them), failed reads. */
         uint64_t lend_ram = 0, lend_drive = 0, lend_drive_ns = 0, lend_read_failed = 0;
+        uint64_t lend_audit_ns = 0;   /* the issuing thread's time in the read-back audit */
     };
     Counts& counts_mut() { return c_; }
     const Counts& counts() const { return c_; }
@@ -746,6 +845,12 @@ private:
     RadEvent lfence_ = nullptr;
     bool     lfenced_ = false;
     int      lprimed_ = 0;       /* the slab slots lend_prime left holding their unit */
+    /* The read-back audit (null and -1 without the switch): a pinned slot of host memory the card's copy
+     * is read into, its event, the residents' last-reader event of this pass, and the digests. */
+    uint8_t* laud_buf_ = nullptr;
+    int      laud_ev_ = -1;
+    RadEvent laud_behind_ = nullptr;
+    LendAudit laud_;
 };
 
 /* The lent arena's slots in [lo, lo + bytes) (the activation arena's top above a level's buffers and

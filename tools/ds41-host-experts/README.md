@@ -765,6 +765,19 @@ moves residency, never a byte):
 harness's prefill gains because the profile also picks the drive-only units: its card-path chunks read 2,537-2,711
 units a rank from the drive under the sealed profile and 1,231-1,380 under `broad6414`.
 
+Prompts that are in no profile and in no capture (ab-20261110T202631Z, 8 streams, total tok/s, every reply the
+base engine's), with `agent2` = `broad6414` + the edit capture + 2 x the harness capture (13,116 tokens):
+
+| unseen set | sealed | `broad6414` | `agent2` |
+|---|---|---|---|
+| whole-file edits (Rust, Java, TypeScript, Python), 8 prompts x 384 tokens | 24.04 | 27.43 (+14.1%) | 32.55 (+35.4%) |
+| code, 16 prompts x 256 tokens | 36.92 | 44.14 (+19.6%) | 48.07 (+30.2%) |
+| chat, 16 prompts x 64 tokens | 31.20 | 34.26 (+9.8%) | 31.50 (+1.0%) |
+
+The agent harness under `agent2`, whose capture is in that profile: decode 25.34 -> 29.57 tok/s (+16.7%), TTFT sum
+65.1 -> 47.8 s, wall 114.2 -> 90.0 s. With the fifth card's online unit set (below) the unseen chat set gives 41.19
+tok/s under the sealed profile and 45.63 under `broad6414`.
+
 **A profile for your own traffic.** Serve representative requests with `--expert-stats FILE` (no device work; the
 file is written every 30 s and at shutdown; `ab_window.sh`'s `Xst` part does it for an arm), then
 
@@ -1411,7 +1424,12 @@ stager, the scheduler, the card path, the consumer skip; the plugin names the co
 beside it), and at shutdown every rank counts its
 verify passes and the passes outside the band, which must be 0 (`ab_window.sh` measures an Sg arm with
 an Lc part only with those lines and that count). A draft head (DSpark), more decode rows a step, and
-end-of-request snapshots under any speculation stay refused. Not yet measured on the cards.
+end-of-request snapshots under any speculation stay refused. Measured (ab-20261110T202631Z, one stream,
+eight whole-file edits of 250-374 reply tokens, every reply the base engine's, 0 passes outside the band
+on every rank): per-stream decode 22.30 tok/s without, 31.25 with `Sg8` (+40%; 3.70 tokens a step, 94.3%
+of the drafted tokens accepted, a verify step 119 ms against 45 ms), 33.13 with `Sg15` (+49%; 4.51 tokens a
+step, 90.9%); on the held-out prompts, which repeat nothing, `Sg8` drafts twice and changes no reply.
+Verify passes have no read-ahead yet.
 Under it libr4d's `ds41_mxfp4_device_check LIBR4D lcp [C]` holds the twin, the sparse ops (also as
 the suffix launches of the per-row cut) and every other height-dependent op (gemm_nt by the row the
 table resolves, the router's f32 projection and its 96-column split, the norms, mhc_mix, the head) to

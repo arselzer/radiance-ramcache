@@ -134,8 +134,25 @@
 # takes what fits: ~42 slots a card at Lc2048, ~18 at Lc1024); with Ql or Qe the CPU path takes every pass
 # that does not arm P1, so the M part is N_Lc or more; each needs P1. LhS: the lent slots follow live decode
 # routing (..._P1_LEND_HEAT=S, 1-8: at most S slots a rank handed to a hotter unit a pass; the half-life and
-# the margin keep their defaults, ..._P1_LEND_HEAT_HALF_ROWS and ..._P1_LEND_HEAT_MARGIN_PCT stated empty);
-# Lh needs the lent arena part (QeK). Every other arm states
+# the margin keep their defaults, ..._P1_LEND_HEAT_HALF_ROWS and ..._P1_LEND_HEAT_MARGIN_PCT stated empty,
+# but for the half-life in an Lhh arm);
+# Lh needs the lent arena part (QeK) or the lent slab's (LsN). LsN: the lent slab (..._P1_LEND_SLAB=N, 1-256:
+# N slots of VRAM of their own a card that no pass takes back, paid for by the coldest static residents and
+# holding the hottest units off the card from bring-up on; needs P1 and, as Ql / Qe, an M part of N_Lc or
+# more); La: the lent slots' read-back audit (..._P1_LEND_AUDIT=1: every lent slot copied back from the card
+# and compared before its unit is published and before its resident is withdrawn; needs Ql, Qe or Ls; not a
+# timed arm); LhhR: the heat's half-life in decode rows (..._P1_LEND_HEAT_HALF_ROWS=R, 1-100000000; needs
+# Lh; without the part the variable is stated empty: 100 rows, or 2000 beside Ls). Every arm states
+# ..._P1_LEND_SLAB and ..._P1_LEND_AUDIT (0 without the part). An Ls arm is measured only with rank 0's "ds41
+# p1: lent slab: N slots (..._P1_LEND_SLAB=N;" line at startup, an La arm only with "ds41 p1: lent audit: on
+# (..._P1_LEND_AUDIT=1)", an Lh arm only if its line states the half-life the arm asks for (and any other arm
+# without the first two); and at shutdown (lend_exit_gate, on each rank's "ds41 p1 stats, rank" line) an Ls
+# arm only if every rank's slab held all N units at bring-up ("lent slab: N slots, R residents now (N at
+# bring-up)"), an La arm only if every rank read slots back and none differed or could not be read ("lent
+# audit: A slots read back (0 differ, 0 not read)": an arm with a differing slot is set aside as unmeasured,
+# with the rank and its counts), an Lhh arm only if every rank ran with that half-life and some rank counted
+# at least that many decode rows ("heat half-life R decode rows, C counted": before that the policy cannot
+# act). Every other arm states
 # RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty (..._P1_LEND and ..._P1_LEND_ARENA 0), and every
 # arm without Lh states ..._P1_LEND_HEAT=0. A P1 arm is
 # measured only if the server logs "ds41 p1: card experts on" at startup with its threshold and chunk ("a
@@ -481,7 +498,40 @@ lcp_check() {   # name
     log "arm $name: no Lh part, but the server's lent slots follow live routing (the knob set for the window?); not measured"
     return 1
   fi
+  # LsN: rank 0's "ds41 p1: lent slab: N slots (..._P1_LEND_SLAB=N;" line at startup, in an Ls arm only.
+  local slab_lines audit_lines want_half
+  slab_lines=$(grep -c 'ds41 p1: lent slab: ' "$OUT/$name.server.log")
+  if [[ -n "${ARM_LS:-}" ]] &&
+     ! grep -qE "ds41 p1: lent slab: ${ARM_LS} slots \(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=${ARM_LS};" "$OUT/$name.server.log"; then
+    log "arm $name: Ls${ARM_LS}, but the server log has no 'ds41 p1: lent slab: ${ARM_LS} slots (..._P1_LEND_SLAB=${ARM_LS};' line ($(grep -m1 -E 'ds41 p1: lent slab|LEND_SLAB' "$OUT/$name.server.log")); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_LS:-}" && "$slab_lines" != 0 ]]; then
+    log "arm $name: no Ls part, but the server lends a slab (the knob set for the window?); not measured"
+    return 1
+  fi
+  # La: rank 0's "ds41 p1: lent audit: on (..._P1_LEND_AUDIT=1)" line at startup, in an La arm only.
+  audit_lines=$(grep -c 'ds41 p1: lent audit: on ' "$OUT/$name.server.log")
+  if [[ -n "${ARM_LA:-}" && "$audit_lines" == 0 ]]; then
+    log "arm $name: La, but the server log has no 'ds41 p1: lent audit: on (..._P1_LEND_AUDIT=1)' line ($(grep -m1 -E 'ds41 p1: lent audit|LEND_AUDIT' "$OUT/$name.server.log")); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_LA:-}" && "$audit_lines" != 0 ]]; then
+    log "arm $name: no La part, but the server reads its lent slots back (the knob set for the window?); not measured"
+    return 1
+  fi
+  # LhhR: an Lh arm's line states the half-life it runs with: the part's, else 2000 beside Ls, else 100.
+  if [[ -n "${ARM_LH:-}" ]]; then
+    want_half=${ARM_LHH:-}
+    [[ -z "$want_half" ]] && { [[ -n "${ARM_LS:-}" ]] && want_half=2000 || want_half=100; }
+    if ! grep -qE "ds41 p1: lent heat: on \(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=${ARM_LH}; half-life ${want_half} decode rows," "$OUT/$name.server.log"; then
+      log "arm $name: Lh${ARM_LH}${ARM_LHH:+ with Lhh${ARM_LHH}}, but the lent-heat line does not state a half-life of ${want_half} decode rows ($(grep -m1 -oE 'ds41 p1: lent heat: on [^:]*' "$OUT/$name.server.log")); not measured"
+      return 1
+    fi
+  fi
   [[ -n "${ARM_P1:-}" ]] && grep -m2 -E 'ds41 p1: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  [[ -n "${ARM_LS:-}" ]] && grep -m1 -E 'ds41 p1: lent slab: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  [[ -n "${ARM_LA:-}" ]] && grep -m1 -E 'ds41 p1: lent audit: on ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_QE:-}" ]] && grep -m2 -E 'ds41 p1: lent arena: |activation arena: .*lent arena' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_LH:-}" ]] && grep -m1 -E 'ds41 p1: lent heat: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # SgK / SgaK beside Lc: the admission's startup lines, in an Sg arm only (sg_gate).
@@ -642,6 +692,46 @@ sg_gate() {   # log, the arm's K (empty: no Sg part), its P1 and Cs parts (non-e
     if (( most > 16 )); then echo "a verify pass of $most rows, over the decode band's 16 ($line)"; return 1; fi
     n=$((n + 1))
   done < <(grep -E 'large-chunk prefill, rank [0-9]+: prompt-lookup verify passes' "$f")
+  return 0
+}
+
+# Ls / La / Lhh at shutdown, on each rank's "ds41 p1 stats, rank R:" line: whether the part acted.
+#   Ls   "; lent slab: N slots, R residents now (P at bring-up)": the arm's N, and all of them in at bring-up
+#        (P = N), on every rank; else the card did not hold what the arm's name says from its first token.
+#   La   "; lent audit: A slots read back (D differ, U not read)": slots read back on every rank (A > 0), and
+#        none differing or unreadable on any; a differing slot means a unit's bytes on a card were not the
+#        bytes copied there, so the arm's replies and speed are set aside whatever they look like.
+#   Lhh  "; heat half-life H decode rows, C counted": the arm's H on every rank, and some rank with C >= H
+#        (the policy acts only once a half-life of decode rows is counted).
+# Arguments: the log, the arm's Ls (N or empty), La (1 or empty), Lhh (rows or empty). 0 when the arm may be
+# measured; otherwise 1, the reason on stdout.
+lend_exit_gate() {
+  local f=$1 ls=$2 la=$3 lhh=$4 rank line n r p a d u h c warm=0
+  [[ -z "$ls$la$lhh" ]] && return 0
+  for rank in 0 1 2 3; do
+    line=$(grep -E "ds41 p1 stats, rank $rank: " "$f" | tail -1)
+    if [[ -z "$line" ]]; then echo "no 'ds41 p1 stats, rank $rank' line at shutdown"; return 1; fi
+    if [[ -n "$ls" ]]; then
+      read -r n r p <<< "$(sed -nE 's/.*; lent slab: ([0-9]+) slots, ([0-9]+) residents now \(([0-9]+) at bring-up\).*/\1 \2 \3/p' <<< "$line")"
+      if [[ -z "$p" ]]; then echo "Ls$ls, but rank $rank's stats line has no 'lent slab: N slots, R residents now (P at bring-up)' part"; return 1; fi
+      if (( n != ls )); then echo "Ls$ls, but rank $rank's slab has $n slots"; return 1; fi
+      if (( p != n )); then echo "Ls$ls, but rank $rank's slab held $p of its $n units at bring-up ($r at shutdown)"; return 1; fi
+    fi
+    if [[ -n "$la" ]]; then
+      read -r a d u <<< "$(sed -nE 's/.*; lent audit: ([0-9]+) slots read back \(([0-9]+) differ, ([0-9]+) not read\).*/\1 \2 \3/p' <<< "$line")"
+      if [[ -z "$u" ]]; then echo "La, but rank $rank's stats line has no 'lent audit: A slots read back (D differ, U not read)' part"; return 1; fi
+      if (( d != 0 )); then echo "La: rank $rank read $a lent slots back and $d differ ($u could not be read): bytes on the card were not the bytes copied there: $(grep -m1 -E "ds41 p1: lent audit: rank $rank " "$f")"; return 1; fi
+      if (( u != 0 )); then echo "La: rank $rank read $a lent slots back and $u could not be read: $(grep -m1 -E "ds41 p1: lent audit: rank $rank " "$f")"; return 1; fi
+      if (( a == 0 )); then echo "La, but rank $rank read no lent slot back"; return 1; fi
+    fi
+    if [[ -n "$lhh" ]]; then
+      read -r h c <<< "$(sed -nE 's/.*; heat half-life ([0-9]+) decode rows, ([0-9]+) counted.*/\1 \2/p' <<< "$line")"
+      if [[ -z "$c" ]]; then echo "Lhh$lhh, but rank $rank's stats line has no 'heat half-life H decode rows, C counted' part"; return 1; fi
+      if (( h != lhh )); then echo "Lhh$lhh, but rank $rank's heat ran with a half-life of $h decode rows"; return 1; fi
+      (( c >= h )) && warm=1
+    fi
+  done
+  if [[ -n "$lhh" && $warm == 0 ]]; then echo "Lhh$lhh, but no rank counted $lhh decode rows: the policy never could act"; return 1; fi
   return 0
 }
 
@@ -1215,6 +1305,14 @@ EOF2
   local qsp_exit_why
   if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit); then
     log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  # Ls / La / Lhh at exit: the slab held its units from bring-up, the audit read slots back and none
+  # differed, the heat ran with the arm's half-life and was warm (lend_exit_gate).
+  local lend_exit_why
+  if declare -F lend_exit_gate >/dev/null &&
+     ! lend_exit_why=$(lend_exit_gate "$OUT/$name.server.log" "${ARM_LS:-}" "${ARM_LA:-}" "${ARM_LHH:-}"); then
+    log "arm $name: $lend_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   # Sg beside Lc at exit: each rank's verify passes, none outside the decode band (sg_gate).
@@ -2734,7 +2832,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" sg=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qsp="" lh="" ar_rows="" ag_rows=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qsp="" lh="" ls="" la="" lhh="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
@@ -2935,6 +3033,15 @@ for a in $ARMS; do
                if [[ -n "$lh" ]]; then log "arm $a: duplicate Lh part; the arm is skipped"; skip=1; fi
                if [[ ${p#Lh} =~ ^[0-9]+$ ]] && (( 10#${p#Lh} >= 1 && 10#${p#Lh} <= 8 )); then lh=$((10#${p#Lh}))
                else log "arm $a: $p: Lh takes 1-8 (slots a rank handed to a hotter unit a pass); the arm is skipped"; skip=1; fi ;;
+      Lhh[0-9]*)                                                       # the heat's half-life in decode rows (..._P1_LEND_HEAT_HALF_ROWS=R; needs Lh)
+               if [[ -n "$lhh" ]]; then log "arm $a: duplicate Lhh part; the arm is skipped"; skip=1; fi
+               if [[ ${p#Lhh} =~ ^[0-9]{1,9}$ ]] && (( 10#${p#Lhh} >= 1 && 10#${p#Lhh} <= 100000000 )); then lhh=$((10#${p#Lhh}))
+               else log "arm $a: $p: Lhh takes 1-100000000 (the heat's half-life in decode rows); the arm is skipped"; skip=1; fi ;;
+      Ls[0-9]*)                                                        # the lent slab: N slots of VRAM of their own a card (..._P1_LEND_SLAB=N; needs P1)
+               if [[ -n "$ls" ]]; then log "arm $a: duplicate Ls part; the arm is skipped"; skip=1; fi
+               if [[ ${p#Ls} =~ ^[0-9]{1,4}$ ]] && (( 10#${p#Ls} >= 1 && 10#${p#Ls} <= 256 )); then ls=$((10#${p#Ls}))
+               else log "arm $a: $p: Ls takes 1-256 (slots of the lent slab a card); the arm is skipped"; skip=1; fi ;;
+      La)      la=1 ;;                                                 # the lent slots' read-back audit (..._P1_LEND_AUDIT=1; needs Ql, Qe or Ls)
       Ad[0-9]*) ad=${p#Ad}; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=$((10#$ad))) ;;   # admit the last N tokens' units
       Ada)     ad=all; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all) ;;       # admit every unit (as at 16 rows)
       Lp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES=${p#Lp}) ;;        # missed units read at once a layer
@@ -3374,6 +3481,7 @@ for a in $ARMS; do
       # With lent slots (QlK, QeK) the CPU path takes every pass that does not arm P1 (the copy path refuses while
       # a slot is lent): its misses up to the chunk.
       [[ -n "$ql$qe" ]] && (( ${mm:-0} < lc )) && { log "arm $a: Ql / Qe need M$lc or more (with lent slots the CPU path takes every pass that does not arm P1); the arm is skipped"; skip=1; }
+      [[ -n "$ls" && -z "$ql$qe" ]] && (( ${mm:-0} < lc )) && { log "arm $a: Ls needs M$lc or more (with lent slots the CPU path takes every pass that does not arm P1); the arm is skipped"; skip=1; }
     else
       [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 "* ]] ||
         { log "arm $a: Lc needs B1 (the CPU takes every routed unit); the arm is skipped"; skip=1; }
@@ -3425,10 +3533,24 @@ for a in $ARMS; do
   # the arena (QeK, so P1 and Lc too). Every arm states the switch (0 without the part) and its two tunables
   # empty (their defaults), so a window's VAR=val cannot turn it on or retune it; lcp_check checks the server
   # log both ways.
-  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=${lh:-0} RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS=
-        RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT=)
-  if [[ -n "$lh" && ( -z "$p1" || -z "$qe" ) ]]; then
-    log "arm $a: Lh$lh moves lent slots between units, which needs the lent arena (a QeK part, with P1); the arm is skipped"; skip=1
+  # LsN / La / LhhR (..._P1_LEND_SLAB, ..._P1_LEND_AUDIT, ..._P1_LEND_HEAT_HALF_ROWS): the lent slab, the lent
+  # slots' read-back audit and the heat's half-life. Every arm states the first two (0 without the part) and
+  # the half-life (empty without Lhh: the engine's default, 100 rows or 2000 beside the slab); lcp_check and
+  # lend_exit_gate check the server log at startup and at shutdown.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=${lh:-0} RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS=${lhh}
+        RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT=
+        RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=${ls:-0} RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT=${la:-0})
+  if [[ -n "$lh" && ( -z "$p1" || -z "$qe$ls" ) ]]; then
+    log "arm $a: Lh$lh moves lent slots between units, which needs the lent arena (a QeK part, with P1) or the lent slab (an LsN part); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$ls" && -z "$p1" ]]; then
+    log "arm $a: Ls$ls is the card expert path's lent slab, which needs P1; the arm is skipped"; skip=1
+  fi
+  if [[ -n "$la" && ( -z "$p1" || -z "$ql$qe$ls" ) ]]; then
+    log "arm $a: La reads lent slots back, which needs a lent part (QlK, QeK or LsN, with P1); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$lhh" && -z "$lh" ]]; then
+    log "arm $a: Lhh$lhh sets the heat's half-life, which needs an LhS part; the arm is skipped"; skip=1
   fi
   [[ -n "$ad" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=)
   # Fw / WpN (the CPU pool's wake-up): every arm states both switches, 0 off, so a window's VAR=val
@@ -3566,6 +3688,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
   ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp ARM_LH=$lh
+  ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh
   # Ax / AxN / Axv / AxvN / Ax0 / AxfN (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS, core/place/aux_expert_worker.h): the
   # extra card appended last to the window's mask of the four rank cards (ranks 0-3 stay the XTs), the worker on it
   # with the arm's cap (Ax0: the card visible, the worker off). Every arm states the six switches (the worker off

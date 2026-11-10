@@ -945,6 +945,12 @@ public:
         if (bytes) *bytes = file_vram_ ? 2 * file_buf_bytes_ : 0;
         return file_vram_;
     }
+    /* The lent slab (Plan::lend_slab_vram): the VRAM the plan set aside for the lender's own slots, its
+     * bytes without the tail pad in *bytes; null without the switch. */
+    char* lend_slab_region(int64_t* bytes) const {
+        if (bytes) *bytes = lend_slab_ ? lend_slab_bytes_ : 0;
+        return lend_slab_;
+    }
     int   ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done);
     int   mover_wait(RadEvent ev);
     bool  file_unit_in_slab(int32_t u) const {
@@ -1112,6 +1118,8 @@ private:
      * through, each with the event behind the copies out of it. */
     char*    file_vram_ = nullptr;
     int64_t  file_buf_bytes_ = 0;
+    char*    lend_slab_ = nullptr;        /* the lent slab's slots (Plan::lend_slab_vram), or null */
+    int64_t  lend_slab_bytes_ = 0;
     /* The file tier's relayout (set_file_relayout): a host input per thread, which holds the
      * planes' aligned span as read. */
     struct RelayIn {

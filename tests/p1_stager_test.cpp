@@ -489,11 +489,14 @@ TEST(p1_lend_heat_switch_is_default_off_and_its_tunables_keep_their_ranges) {
     CHECK_EQ(t.lend_heat, 2);
     CHECK_EQ(t.lend_heat_half, 400);
     CHECK_EQ(t.lend_heat_margin, 200);
-    for (const char* bad : { "0", "1000001", "x" }) {
+    for (const char* bad : { "0", "100000001", "1000000000000", "x" }) {
         env[ds41p1::kLendHeatHalfEnv] = bad;
         CHECK(!parse_tunables(get, &t, &why));
         CHECK(why.find(ds41p1::kLendHeatHalfEnv) != std::string::npos);
     }
+    env[ds41p1::kLendHeatHalfEnv] = "100000000";   /* ds41p1::kMaxLendHeatHalfRows */
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_heat_half, ds41p1::kMaxLendHeatHalfRows);
     env[ds41p1::kLendHeatHalfEnv] = "1000000";
     for (const char* bad : { "99", "1001", "1.5" }) {   /* below 100 a colder unit would take a slot */
         env[ds41p1::kLendHeatMarginEnv] = bad;
@@ -1271,6 +1274,10 @@ struct FakeLend final : LendHost {
     uint64_t seq = 0;                  /* host calls that matter to a retarget's order */
     int violations = 0;
     std::string first;
+    /* The lent slab: slots from keep_from on are kept. No pass takes one back, so none is ever fenced for a
+     * pass, withdrawn but in a retarget, or written by the card path (its content has no generation). */
+    int keep_from = 1 << 30;
+    bool kept(int k) const { return k >= keep_from; }
 
     FakeLend(unsigned seed, int n) : rng(seed) {
         s.assign((size_t)n, S{});
@@ -1370,7 +1377,7 @@ struct FakeLend final : LendHost {
         S& x = s[(size_t)k];
         if (on) {
             if (x.published) bad("slot " + std::to_string(k) + " published twice");
-            if (x.content_gen != gen)
+            if (!kept(k) && x.content_gen != gen)
                 bad("slot " + std::to_string(k) + " published from a copy of generation " + std::to_string(x.content_gen) +
                     " in generation " + std::to_string(gen) + " (the card path may have written it since)");
             if (x.content_unit != x.unit)
@@ -1381,6 +1388,7 @@ struct FakeLend final : LendHost {
             x.t_publish = ++seq;
         } else {
             if (!x.published) bad("slot " + std::to_string(k) + " withdrawn unpublished");
+            if (kept(k) && !x.rfenced) bad("kept slot " + std::to_string(k) + " withdrawn outside a retarget");
             x.published = false;
             x.content_gen = ~0ull;   /* the card path takes the slot (or, in a retarget, another unit does) */
             x.t_withdraw = ++seq;
@@ -1389,6 +1397,7 @@ struct FakeLend final : LendHost {
     void fence(int k) override {
         S& x = s[(size_t)k];
         if (!x.copying) bad("slot " + std::to_string(k) + " fenced with no copy queued");
+        if (kept(k)) bad("kept slot " + std::to_string(k) + " fenced for a pass");
         x.fenced_gen = gen;
         ++x.fences;
     }
@@ -1424,6 +1433,11 @@ struct FakeLend final : LendHost {
         for (const S& x : s) n += x.published;
         return n;
     }
+    int published_kept() const {
+        int n = 0;
+        for (size_t k = 0; k < s.size(); ++k) n += kept((int)k) && s[k].published;
+        return n;
+    }
 };
 
 /* A pass of either kind through the lender, the host's checks around it. */
@@ -1434,11 +1448,14 @@ int lend_pass(RingLender& l, FakeLend& h, bool p1, int64_t now) {
         if (h.s[k].copying) queued.push_back((int)k);
     std::vector<int> fences0;
     for (const auto& x : h.s) fences0.push_back(x.fences);
+    const int kept0 = h.published_kept();
     const int r = l.begin_pass(p1, now);
-    if (p1 && h.published()) h.bad("a unit published while a card-path pass runs");
+    if (p1 && h.published() != h.published_kept()) h.bad("a unit published in a slot a card-path pass takes");
+    if (p1 && h.published_kept() < kept0) h.bad("a kept slot's resident withdrawn by a card-path pass");
     if (l.residents() != h.published()) h.bad("the lender's residents and the host's published units differ");
     for (int k : queued)
-        if (p1 && h.s[(size_t)k].fenced_gen != h.gen) h.bad("slot " + std::to_string(k) + "'s queued copy not fenced");
+        if (p1 && !h.kept(k) && h.s[(size_t)k].fenced_gen != h.gen)
+            h.bad("slot " + std::to_string(k) + "'s queued copy not fenced");
     for (size_t k = 0; k < h.s.size(); ++k)
         if (!p1 && h.s[k].fences != fences0[k]) h.bad("slot " + std::to_string(k) + " fenced by a pass that keeps the slots");
     return r;
@@ -2177,9 +2194,10 @@ struct HeatSim {
     bool bank = false, fence_ready = true;
     int64_t t = 0;
     int moved = 0, most_a_pass = 0;
-    HeatSim(unsigned seed, int n, int units, int s, int half) : h(seed, n) {
+    HeatSim(unsigned seed, int n, int units, int s, int half, int keep = 0) : h(seed, n) {
         h.land_pct = h.copy_pct = 100;
-        (void)l.init(&h, n, 0);
+        h.keep_from = n - keep;
+        (void)l.init(&h, n, 0, keep);
         (void)heat.init((size_t)units, s, half, 150);
         taken.assign((size_t)units, 0);
         for (int k = 0; k < n; ++k) {
@@ -2403,6 +2421,339 @@ TEST(p1_lend_heat_counts_pure_trunk_decode_passes_and_trunk_layers_only) {
     CHECK_NEAR(EpCountsHostProbe::heat_of(fs, 1), 4.0, 1e-9);
     CHECK_NEAR(EpCountsHostProbe::heat_of(fs, 2), 2.0, 1e-9);
     EpCountsHostProbe::heat_off(fs);
+}
+
+/* ---- the lent slab (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB; card_expert_stager.h) -------------------------
+ *
+ * The lender's last `keep` slots are the slab's: VRAM no pass writes. They hold their units from bring-up on
+ * (prime), and a pass that takes the other slots back leaves them as they are. */
+TEST(p1_lend_slab_switch_is_default_off_and_sets_the_heats_default_half_life) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_slab, 0);
+    CHECK_EQ(t.lend_heat_half, 100);
+    for (const char* off : { "", "0" }) {
+        env[ds41p1::kLendSlabEnv] = off;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.lend_slab, 0);
+        CHECK_EQ(t.lend_heat_half, 100);   /* without the slab the heat's default stays */
+    }
+    for (const char* ok : { "1", "64", "128", "256" }) {
+        env[ds41p1::kLendSlabEnv] = ok;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.lend_slab, std::atoi(ok));
+        CHECK_EQ(t.lend_heat_half, 2000);   /* with it, medium-term */
+        CHECK_EQ(t.lend_heat_half, ds41p1::kDefLendHeatHalfRowsSlab);
+        CHECK_EQ(ds41p1::lend_slab_asked("1", ok), std::atoi(ok));
+        CHECK_EQ(ds41p1::lend_slab_asked("0", ok), 0);   /* the card path off: the planner gives nothing up */
+        CHECK_EQ(ds41p1::lend_slab_asked(nullptr, ok), 0);
+    }
+    for (const char* bad : { "257", "-1", "on", "1.5", " 2", "1000" }) {
+        env[ds41p1::kLendSlabEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kLendSlabEnv) != std::string::npos);
+        CHECK_EQ(ds41p1::lend_slab_asked("1", bad), 0);   /* and the planner acts on no value the core refuses */
+    }
+    CHECK_EQ(ds41p1::lend_slab_asked("1", ""), 0);
+    CHECK_EQ(ds41p1::lend_slab_asked("1", "0"), 0);
+    CHECK_EQ(ds41p1::lend_slab_asked("1", nullptr), 0);
+    /* The half-life set is the half-life, with the slab or without. */
+    env[ds41p1::kLendSlabEnv] = "128";
+    env[ds41p1::kLendHeatHalfEnv] = "100";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_heat_half, 100);
+    env[ds41p1::kLendHeatHalfEnv] = "3000000";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_heat_half, 3000000);
+    env[ds41p1::kLendHeatHalfEnv] = "";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_heat_half, 2000);
+    CHECK_EQ(ds41p1::kMaxLendSlots, 2 * ds41p1::kMaxLend + ds41p1::kMaxLendSlab);
+}
+
+TEST(p1_lend_slab_slots_hold_their_units_from_bring_up_and_no_pass_takes_them_back) {
+    /* Six slots: three the arena's, three the slab's. */
+    FakeLend h(71, 6);
+    h.keep_from = 3;
+    h.land_pct = h.copy_pct = 100;
+    RingLender l;
+    REQUIRE_EQ(l.init(&h, 6, 1000, 3), 0);
+    CHECK_EQ(l.kept(), 3);
+    CHECK(!l.keeps(2));
+    CHECK(l.keeps(3));
+    CHECK(l.keeps(5));
+    CHECK(!l.keeps(6));
+    CHECK(l.lent());
+    /* Bring-up: the slab's units go in before any pass, two buffers at a time, and nothing else moves. */
+    int rounds = 0;
+    while (l.prime() > 0 && rounds < 50) ++rounds;
+    CHECK(rounds >= 2);   /* three units through two buffers */
+    CHECK_EQ(l.prime(), 0);
+    CHECK(l.lent());      /* the arena's slots are as they were */
+    CHECK_EQ(l.residents(), 3);
+    CHECK_EQ(l.stats().reloaded, (uint64_t)3);
+    CHECK_EQ(l.stats().returns, (uint64_t)0);
+    for (int k = 0; k < 6; ++k) {
+        CHECK_EQ(l.resident(k), k >= 3);
+        CHECK_EQ(h.s[(size_t)k].published, k >= 3);
+        CHECK_EQ(h.s[(size_t)k].loads, k >= 3 ? 1 : 0);
+        if (k >= 3) CHECK_EQ(h.s[(size_t)k].pub_unit, 100 + k);   /* the unit the slot was given: the start set */
+    }
+    CHECK_EQ(h.bufs_used, 0);
+    CHECK(!l.settled());   /* the arena's slots hold nothing yet */
+    /* The very first pass takes the slots back (a prompt's first chunk): the slab's residents stay. */
+    int64_t t = 0;
+    CHECK_EQ(lend_pass(l, h, true, t += 10), 0);   /* nothing of the arena's to withdraw */
+    CHECK_EQ(l.residents(), 3);
+    CHECK_EQ(l.stats().withdrawn, (uint64_t)0);
+    l.end_p1(t += 10);
+    /* In the grace the other slots are held back; the slab's know none. */
+    lend_pass(l, h, false, t + 500);
+    CHECK(l.lent());
+    CHECK_EQ(l.residents(), 3);
+    CHECK_EQ(l.stats().held_back, (uint64_t)1);
+    /* After it the arena's units come in beside them. */
+    t += 1000;
+    for (int i = 0; i < 20 && !l.settled(); ++i) lend_pass(l, h, false, t += 10);
+    REQUIRE(l.settled());
+    CHECK_EQ(l.residents(), 6);
+    /* A pass that takes the slots back withdraws the arena's three alone, as often as it comes. */
+    for (int round = 1; round <= 5; ++round) {
+        CHECK_EQ(lend_pass(l, h, true, t += 10), 1);
+        CHECK_EQ(l.residents(), 3);
+        CHECK_EQ(h.published(), 3);
+        CHECK_EQ(h.published_kept(), 3);
+        CHECK_EQ(l.stats().withdrawn, (uint64_t)3 * (uint64_t)round);
+        CHECK_EQ(lend_pass(l, h, true, t += 10), 0);   /* a second chunk: nothing left to take */
+        l.end_p1(t += 10);
+        t += 1000;
+        for (int i = 0; i < 20 && !l.settled(); ++i) lend_pass(l, h, false, t += 10);
+        REQUIRE(l.settled());
+    }
+    for (int k = 0; k < 6; ++k) {
+        const FakeLend::S& x = h.s[(size_t)k];
+        CHECK_EQ(x.loads, k >= 3 ? 1 : 6);   /* a slab unit is loaded once and stays */
+        CHECK_EQ(x.fences, 0);
+        if (k >= 3) {
+            CHECK_EQ(x.t_withdraw, (uint64_t)0);
+            CHECK_EQ(x.pub_unit, 100 + k);
+        }
+    }
+    CHECK_EQ(l.stats().failed, (uint64_t)0);
+    CHECK_EQ(l.stats().cancelled, (uint64_t)0);
+    CHECK_EQ(h.violations, 0);
+    if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    /* The slab alone, no other slot: its units in at bring-up, and every pass kind leaves them. */
+    FakeLend h1(72, 4);
+    h1.keep_from = 0;
+    h1.land_pct = h1.copy_pct = 100;
+    RingLender l1;
+    REQUIRE_EQ(l1.init(&h1, 4, 1000, 4), 0);
+    for (int i = 0; i < 50 && l1.prime() > 0; ++i) {}
+    CHECK_EQ(l1.residents(), 4);
+    int64_t t1 = 0;
+    for (int i = 0; i < 20; ++i) {
+        lend_pass(l1, h1, (i % 3) == 0, t1 += 10);
+        if ((i % 3) == 0) l1.end_p1(t1);
+        CHECK_EQ(l1.residents(), 4);
+    }
+    for (const auto& x : h1.s) CHECK_EQ(x.loads, 1);
+    CHECK_EQ(l1.stats().withdrawn, (uint64_t)0);
+    CHECK_EQ(h1.violations, 0);
+    if (h1.violations) std::fprintf(stderr, "%s\n", h1.first.c_str());
+    /* The bounds: the ring's and the arena's as before, the slab's its own. */
+    RingLender bad;
+    CHECK(bad.init(&h, 6, 0, 7) < 0);
+    CHECK(bad.init(&h, 6, 0, -1) < 0);
+    CHECK(bad.init(&h, ds41p1::kMaxLendSlab + 1, 0, ds41p1::kMaxLendSlab + 1) < 0);
+    CHECK(bad.init(&h, 2 * ds41p1::kMaxLend + 5, 0, 4) < 0);
+    CHECK_EQ(bad.init(&h, 2 * ds41p1::kMaxLend + 4, 0, 4), 0);
+    CHECK_EQ(bad.init(&h, ds41p1::kMaxLendSlots, 0, ds41p1::kMaxLendSlab), 0);
+    CHECK_EQ(bad.kept(), ds41p1::kMaxLendSlab);
+    CHECK_EQ(bad.init(&h, ds41p1::kMaxLendSlab, 0, ds41p1::kMaxLendSlab), 0);
+}
+
+/* A slab unit whose load fails at bring-up stays on the CPU path and comes in at the next return; one still
+ * on its way when bring-up stops waiting comes in at the passes; a pass that takes the other slots back
+ * neither cancels nor fences a kept slot's load or copy in flight. */
+TEST(p1_lend_slab_units_not_in_at_bring_up_come_in_at_the_passes) {
+    FakeLend h(73, 5);
+    h.keep_from = 2;
+    h.land_pct = h.copy_pct = 100;
+    h.fail_load_once.insert(3);
+    RingLender l;
+    REQUIRE_EQ(l.init(&h, 5, 100, 3), 0);
+    for (int i = 0; i < 50 && l.prime() > 0; ++i) {}
+    CHECK_EQ(l.prime(), 0);
+    CHECK_EQ(l.residents(), 2);
+    CHECK(!l.resident(3));
+    CHECK(!h.s[3].published);
+    CHECK_EQ(l.stats().failed, (uint64_t)1);
+    /* The first pass that keeps the slots is the return: the failed one is wanted again with the arena's. */
+    int64_t t = 0;
+    for (int i = 0; i < 20 && !l.settled(); ++i) lend_pass(l, h, false, t += 10);
+    REQUIRE(l.settled());
+    CHECK_EQ(h.s[3].loads, 2);
+    CHECK_EQ(h.s[3].pub_unit, 103);
+    CHECK_EQ(h.violations, 0);
+    /* Bring-up that stops early: nothing lands while it waits. */
+    FakeLend h2(74, 5);
+    h2.keep_from = 2;
+    h2.land_pct = 0;
+    h2.copy_pct = 100;
+    RingLender l2;
+    REQUIRE_EQ(l2.init(&h2, 5, 100, 3), 0);
+    for (int i = 0; i < 10; ++i) CHECK_EQ(l2.prime(), 3);
+    CHECK_EQ(l2.residents(), 0);
+    CHECK_EQ(l2.busy(), 2);   /* two buffers reading, the third slot waits for one */
+    /* A pass that takes the slots back first: the two reads go on, uncancelled and unfenced, and their units
+     * are published at a later pass's begin although the other slots are lent out. */
+    int64_t t2 = 0;
+    lend_pass(l2, h2, true, t2 += 10);
+    l2.end_p1(t2 += 10);
+    h2.land_pct = 100;
+    lend_pass(l2, h2, true, t2 += 10);   /* landed: copied (a kept slot's copy is no pass's to fence) */
+    l2.end_p1(t2 += 10);
+    lend_pass(l2, h2, true, t2 += 10);   /* passed: published */
+    l2.end_p1(t2 += 10);
+    CHECK(l2.lent());
+    CHECK_EQ(l2.residents(), 2);
+    CHECK_EQ(h2.published_kept(), 2);
+    CHECK_EQ(l2.stats().cancelled, (uint64_t)0);
+    for (const auto& x : h2.s) CHECK_EQ(x.fences, 0);
+    /* The third's load begins once the slots are back (no reload begins beside the card path's passes). */
+    int third = -1;
+    for (int k = 2; k < 5; ++k)
+        if (!l2.resident(k)) third = k;
+    REQUIRE(third >= 2);
+    CHECK_EQ(h2.s[(size_t)third].loads, 0);
+    t2 += 100;
+    for (int i = 0; i < 20 && !l2.settled(); ++i) lend_pass(l2, h2, false, t2 += 10);
+    REQUIRE(l2.settled());
+    CHECK_EQ(l2.residents(), 5);
+    CHECK_EQ(h2.s[(size_t)third].loads, 1);
+    CHECK_EQ(h2.violations, 0);
+    if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    if (h2.violations) std::fprintf(stderr, "%s\n", h2.first.c_str());
+}
+
+TEST(p1_lend_slab_stress_random_passes_landings_and_failures_beside_kept_slots) {
+    for (unsigned seed = 1; seed <= 12; ++seed) {
+        std::mt19937 rng(9000 + seed);
+        const int n = 3 + (int)(rng() % 10), keep = 1 + (int)(rng() % (unsigned)n);
+        FakeLend h(8000 + seed, n);
+        h.keep_from = n - keep;
+        h.land_pct = 10 + (int)(rng() % 80);
+        h.copy_pct = 10 + (int)(rng() % 80);
+        const int64_t grace = (int64_t)(rng() % 60);
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, n, grace, keep), 0);
+        /* A bring-up of a few rounds, cut short at random. */
+        for (int i = (int)(rng() % 12); i > 0 && l.prime() > 0; --i) {}
+        int64_t t = 0;
+        bool in_p1 = false;
+        for (int step = 0; step < 3000; ++step) {
+            t += 1 + (int64_t)(rng() % 20);
+            if (in_p1) l.end_p1(t);
+            const bool p1 = (rng() % 100) < 25;
+            if ((rng() % 200) == 0) h.fail_load_once.insert((int)(rng() % (unsigned)n));
+            if ((rng() % 200) == 0) h.fail_copy_once.insert((int)(rng() % (unsigned)n));
+            if ((rng() % 300) == 0) h.fail_query_once.insert((int)(rng() % (unsigned)n));
+            lend_pass(l, h, p1, t);
+            in_p1 = p1;
+            /* A kept slot once published stays published: no pass and no failure elsewhere withdraws it. */
+            for (int k = n - keep; k < n; ++k)
+                if (h.s[(size_t)k].t_withdraw) h.bad("kept slot " + std::to_string(k) + " withdrawn");
+        }
+        /* Quiet again: one take-back and return (a failed slot is wanted again at a return), then every slot
+         * holds its unit. */
+        h.fail_load_once.clear();
+        h.fail_copy_once.clear();
+        h.fail_query_once.clear();
+        h.land_pct = h.copy_pct = 100;
+        if (in_p1) l.end_p1(t);
+        lend_pass(l, h, true, t += 10);
+        l.end_p1(t += 10);
+        t += grace;
+        for (int i = 0; i < 4 * n + 20 && !l.settled(); ++i) lend_pass(l, h, false, t += 1);
+        CHECK(l.settled());
+        CHECK_EQ(l.residents(), n);
+        CHECK_EQ(h.bufs_used, 0);
+        for (int k = 0; k < n; ++k) CHECK_EQ(h.s[(size_t)k].pub_unit, 100 + k);
+        CHECK_EQ(h.violations, 0);
+        if (h.violations) {
+            std::fprintf(stderr, "seed %u (%d slots, %d kept): %s\n", seed, n, keep, h.first.c_str());
+            break;
+        }
+    }
+}
+
+/* The heat policy over arena and slab slots together: one pool of slots, the coldest resident of either kind
+ * gives way first, a retarget of a slab slot keeps the fence's order (the fake host refuses any other), and
+ * a pass that takes the arena's slots back stops the policy for its burst and its grace while the slab's
+ * residents stay published through it. */
+TEST(p1_lend_heat_governs_arena_and_slab_slots_alike_and_rests_through_a_take_back) {
+    using D = RingLender::Decline;
+    /* Six slots hold units 0..5 of 16: slots 0-2 the arena's, 3-5 the slab's. */
+    HeatSim a(81, 6, 16, 2, 50, 3);
+    const std::vector<int> even(16, 1);
+    for (int i = 0; i < 200; ++i) a.pass(even, 8);
+    REQUIRE(a.l.settled());
+    CHECK_EQ(a.moved, 0);
+    /* Units 10..15 take the traffic: all six slots follow, the slab's as the arena's. */
+    std::vector<int> hot(16, 0);
+    for (int u = 10; u < 16; ++u) hot[(size_t)u] = 4;
+    for (int i = 0; i < 300; ++i) a.pass(hot, 8);
+    CHECK_EQ(a.moved, 6);
+    CHECK(a.most_a_pass <= 2);
+    REQUIRE(a.l.settled());
+    CHECK(a.held() == (std::set<int32_t>{ 10, 11, 12, 13, 14, 15 }));
+    for (size_t k = 0; k < 6; ++k) {
+        CHECK(a.h.s[k].published);
+        CHECK_EQ(a.h.s[k].pub_unit, a.h.s[k].unit);
+        CHECK_EQ(a.h.s[k].renames, 1);
+        CHECK_EQ(a.h.s[k].rfences, 1);
+    }
+    CHECK_EQ(a.l.stats().retargets, (uint64_t)6);
+    CHECK_EQ(a.l.stats().retarget_withdrawn, (uint64_t)6);
+    CHECK_EQ(a.l.stats().withdrawn, (uint64_t)0);   /* no pass took a slot back */
+    /* The traffic moves on to units 6..9, and card-path passes come while the slots are following: the policy
+     * rests (lent), the arena's residents are withdrawn, the slab's stay, and afterwards the slots go on to
+     * the hot units. */
+    std::vector<int> next(16, 0);
+    for (int u = 6; u < 10; ++u) next[(size_t)u] = 8;
+    const uint64_t lent0 = a.declined(D::Lent);
+    int moved_before = a.moved, kept_through = 0;
+    for (int i = 0; i < 400; ++i) {
+        const bool p1 = (i % 40) >= 37;   /* bursts of three passes that take the slots back */
+        const int kept0 = a.h.published_kept();
+        CHECK_EQ(a.pass(next, 8, p1), p1 ? 0 : a.moved - moved_before);
+        moved_before = a.moved;
+        if (p1) {
+            CHECK_EQ(a.h.published(), a.h.published_kept());
+            CHECK(a.h.published_kept() >= kept0);   /* a slab resident never goes for a pass */
+            kept_through += a.h.published_kept();
+        }
+    }
+    CHECK(a.declined(D::Lent) > lent0);
+    CHECK(kept_through > 0);
+    for (int i = 0; i < 200; ++i) a.pass(next, 8);
+    REQUIRE(a.l.settled());
+    const std::set<int32_t> held = a.held();
+    for (int u = 6; u < 10; ++u) CHECK(held.count(u) == 1);
+    CHECK(a.l.stats().withdrawn > 0);
+    CHECK_EQ(a.l.stats().retargets, a.l.stats().retarget_withdrawn);
+    size_t marks = 0;
+    for (uint8_t m : a.taken) marks += m;
+    CHECK_EQ(marks, (size_t)6);
+    CHECK_EQ(a.h.violations, 0);
+    if (a.h.violations) std::fprintf(stderr, "%s\n", a.h.first.c_str());
 }
 
 /* ---- the lent arena ----------------------------------------------------------------------------------------

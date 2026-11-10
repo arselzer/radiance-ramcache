@@ -12,6 +12,7 @@
 #include "planner.h"
 #include "draft_vram.h"
 #include "dspark_native_scope.h"
+#include "ds41_p1.h"   /* the lent slab: its switch and its slot */
 #include <array>
 
 #include <algorithm>
@@ -710,7 +711,8 @@ int Planner::assign_expert_tiered(Plan* p) {
      * to the host pool or file tier. Returns the VRAM cost: residents, shadow slots and staging
      * ring, and the file stager's two buffers. */
     struct Cost { int64_t used = 0, spare = 0, file = 0, residents = 0; };
-    auto fill = [&](int64_t room, int64_t cap) -> Cost {
+    /* `only` (by unit, or null): the units that may be resident, for the lent slab's fill below. */
+    auto fill = [&](int64_t room, int64_t cap, const std::vector<uint8_t>* only = nullptr) -> Cost {
         Cost k;
         for (int32_t ui : order) {
             MoveUnit& mu = p->units[(size_t)ui];
@@ -734,7 +736,7 @@ int Planner::assign_expert_tiered(Plan* p) {
             /* A resident costs its slot, or under RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED what the card
              * holds of it (vram_packed.h). The floor reads nothing, so a unit past the room is never
              * scanned; without the switch both are the slot, so this is the plain test. */
-            if (k.residents < cap && k.used + vram_floor(mu) <= room) {
+            if (k.residents < cap && (!only || (*only)[(size_t)ui]) && k.used + vram_floor(mu) <= room) {
                 const int64_t charge = vram_charge(ui, mu, p);
                 if (k.used + charge <= room) {
                     k.used += charge;
@@ -846,6 +848,60 @@ int Planner::assign_expert_tiered(Plan* p) {
                                    humanb(p->vram_budget).c_str()));
             return RAD_E_NOMEM;
         }
+    }
+
+    /* RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=N (ds41_p1.h, the lent slab): N slots of the weights pool that
+     * belong to no unit, for the card expert path's lender (FileStager::p1_lend_init). The plan above is the
+     * one without the switch. Its residents then give way from the cold end of the fill's order, N of them
+     * first and then one at a time, until the slots fit beside what stays (a packed resident frees less than
+     * the block-form slot costs, and a file buffer may grow with its layer's share), exactly as the file
+     * buffers' cap steps down. Nothing else becomes resident for it (`only`). The slots' units are the N
+     * hottest file-tier units of the plan that results, in the fill's order: the units given up, hottest
+     * first, except that the host pool, which holds the first units off the card in any plan, takes as many
+     * of them as it has slots and lets its former ones go to the file tier, where they come next. A static
+     * plan with the file tier only: a movable resident is the heat engine's, and the lender's units are
+     * file-tier units. Anything else leaves the plan as it is, and the file stager then refuses the switch. */
+    const int slab_n = in_.lend_slab >= 0 ? in_.lend_slab : ds41p1::lend_slab_asked();
+    if (slab_n > 0 && p->vram_budget > 0 && !p->dynamic && ssd_ && rc >= 0) {
+        std::vector<uint8_t> was(p->units.size(), 0);
+        for (size_t u = 0; u < p->units.size(); ++u) {
+            const MoveUnit& mu = p->units[u];
+            was[u] = mu.access == RAD_ACCESS_CONDITIONAL && !mu.preplaced() && mu.tier == Tier::VRAM;
+        }
+        const int64_t had = k.residents;
+        const int64_t slab = (int64_t)slab_n * ds41p1::kSlotBytes + RAD_ALIGN_UNIT;
+        if (had < slab_n) {
+            p->notes.push_back(fmt("the lent slab's %d slots (%s) need as many static expert residents to give "
+                                   "up, and the plan has %lld", slab_n, ds41p1::kLendSlabEnv, (long long)had));
+            return RAD_E_NOMEM;
+        }
+        int64_t cap = had - slab_n;
+        k = fill(uncapped, cap, &was);
+        while (fixed + k.used + k.spare + k.file + slab > p->vram_budget && cap > 0)
+            k = fill(uncapped, --cap, &was);
+        if (fixed + k.used + k.spare + k.file + slab > p->vram_budget) {
+            p->notes.push_back(fmt("the lent slab's %d slots need %s, beside %s of fixed weights and %s of file "
+                                   "buffers, against a weights pool of %s", slab_n, humanb(slab).c_str(),
+                                   humanb(fixed).c_str(), humanb(k.file).c_str(), humanb(p->vram_budget).c_str()));
+            return RAD_E_NOMEM;
+        }
+        std::vector<int32_t> units;
+        for (int32_t ui : order) {
+            const MoveUnit& mu = p->units[(size_t)ui];
+            if (mu.access != RAD_ACCESS_CONDITIONAL || mu.preplaced() || mu.tier == Tier::VRAM) continue;
+            p->lend_slab_given += was[(size_t)ui];
+            if ((int)units.size() < slab_n && mu.tier == Tier::SSD && mu.bytes == ds41p1::kSlotBytes &&
+                mu.weights.size() == 2)
+                units.push_back(ui);
+        }
+        if ((int)units.size() < slab_n) {
+            p->notes.push_back(fmt("the lent slab (%s=%d) holds file-tier units of %lld bytes in two weights, and "
+                                   "the plan has %zu of them", ds41p1::kLendSlabEnv, slab_n,
+                                   (long long)ds41p1::kSlotBytes, units.size()));
+            return RAD_E_INVAL;
+        }
+        p->lend_slab_units = std::move(units);
+        p->lend_slab_vram = slab;
     }
     return rc;
 }
@@ -1806,6 +1862,12 @@ std::string Plan::report(const Program& prog) const {
         s += fmt("  file buffers  %12s  %12s   (two of %s: the most one routed layer reads from "
                  "the container)\n", "-", humanb(file_stage_vram).c_str(),
                  humanb(file_layer_max).c_str());
+
+    /* The lent slab's slots, out of the weight budget too. */
+    if (lend_slab_vram)
+        s += fmt("  lent slab     %12s  %12s   (%zu slots for the card path's lender, %s; %lld static "
+                 "residents given up for them, coldest first)\n", "-", humanb(lend_slab_vram).c_str(),
+                 lend_slab_units.size(), ds41p1::kLendSlabEnv, (long long)lend_slab_given);
 
     if (slab_overhead)
         s += fmt("  slab overhead %12s  %12s   (shadow slots + the staging ring)\n", "-",

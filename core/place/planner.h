@@ -296,6 +296,16 @@ public:
      * file tier. */
     int64_t file_layer_max = 0;
     int64_t file_stage_vram = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=N (tools/ds41-host-experts/ds41_p1.h, the lent slab): VRAM of
+     * the weights pool that N slots of ds41p1::kSlotBytes and a tail pad take (`lend_slab_vram`), for which
+     * the expert fill gave up `lend_slab_given` static residents, the coldest of the ones it had placed, and
+     * the N hottest file-tier units of the plan after that, in the fill's order (`lend_slab_units`: the
+     * residents given up, but for what the host pool took of them): the units the slots hold from bring-up
+     * on (FileStager::p1_lend_init). 0 and empty without the switch, and the plan is then exactly as
+     * without it. */
+    int64_t lend_slab_vram = 0;
+    int64_t lend_slab_given = 0;
+    std::vector<int32_t> lend_slab_units;
     /* Slab VRAM no weight occupies: shadow slots (the cost of dynamic placement) and the staging
      * ring (the cost of offload). Reported separately from the tier totals. */
     int64_t slab_overhead = 0;
@@ -348,6 +358,9 @@ struct PlannerInput {
      * for the conditional units it considers for VRAM in a static plan; null leaves every weight in
      * its stored form and the plan exactly as without it. */
     std::function<int64_t(rad_weight w, bool scan, int32_t* cap, int32_t* raw)> vram_pack;
+    /* The lent slab's slots (Plan::lend_slab_vram): -1 as the environment asks (ds41p1::lend_slab_asked),
+     * else that many (0: none), for a caller that plans without it. */
+    int lend_slab = -1;
     /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (draft_vram.h): this rank's hot draft-bank experts,
      * which Planner::place_draft_bank_vram makes static VRAM residents in place of
      * --draft-bank-expert-placement host's pinned pool, parking the rest. Null (or n 0): off, and

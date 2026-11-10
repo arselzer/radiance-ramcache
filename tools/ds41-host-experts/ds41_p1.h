@@ -160,9 +160,20 @@ constexpr const char* kGraceEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS";
  * takes the ring's. The deepseek41 plugin declares at a smaller step (RadArchProbe::shape_probe_ok)
  * only beside this switch and kEnv (lend_arena_asked), so without them nothing changes. */
 constexpr const char* kLendArenaEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA";
+/* The lent slots follow live decode routing (kLendHeatEnv=S; 0 off, the default; 1-kMaxLendHeat: at most S
+ * slots a rank handed to another unit a pass). Each rank keeps, by file-tier unit, a decayed count of the
+ * decode rows routed to it (pure trunk decode passes only; it halves every kLendHeatHalfEnv decode rows,
+ * 100), and between passes, while every lent slot holds its resident, the coldest residents give their
+ * slots to the hottest units off the card whose heat is above kLendHeatMarginEnv percent (150) of the
+ * resident's plus half a row, so equal heat never swaps. Needs kLendEnv or kLendArenaEnv. Residency
+ * moves, bytes do not (card_expert_stager.h, the lent slots' heat). */
+constexpr const char* kLendHeatEnv       = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT";
+constexpr const char* kLendHeatHalfEnv   = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS";
+constexpr const char* kLendHeatMarginEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT";
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
 /* kMaxLend bounds each of kLendEnv and kLendArenaEnv; the lender holds both (2 x kMaxLend). */
 constexpr int kDefGraceMs = 1000, kMaxLend = 64;
+constexpr int kMaxLendHeat = 8, kDefLendHeatHalfRows = 100, kDefLendHeatMarginPct = 150;
 constexpr int kMinRingSlots = 4;
 
 /* The tallest layer pass the CPU path takes under the threshold, at chunk C: every pass or layer
@@ -190,6 +201,7 @@ constexpr const char* kLogStats = "ds41 p1 stats, rank";        /* each rank, at
 constexpr const char* kLogChunk = "ds41 p1 chunk:";             /* rank 0, after each card-path chunk */
 constexpr const char* kLogLend  = "ds41 p1: lent ring";         /* rank 0, at startup, with kLendEnv */
 constexpr const char* kLogLendArena = "ds41 p1: lent arena";    /* rank 0, at startup, with kLendArenaEnv */
+constexpr const char* kLogLendHeat = "ds41 p1: lent heat";      /* rank 0, at startup, with kLendHeatEnv */
 
 /* Whether the lent arena is asked for (kEnv `p1` on, kLendArenaEnv `lend` a count from 1 to kMaxLend):
  * the deepseek41 plugin then declares at a smaller step too. A value the core refuses counts as not

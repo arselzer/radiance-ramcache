@@ -535,6 +535,11 @@ set_tests_properties(ab_window_n128_test PROPERTIES LABELS "unit;fast" TIMEOUT $
 add_test(NAME ab_window_p1_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_p1_test.sh)
 set_tests_properties(ab_window_p1_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# ab_window.sh's Lh part (LhS: the lent slots follow live decode routing, ..._P1_LEND_HEAT): the server-log gate
+# on synthetic logs and the arm loop with every action stubbed. No card, no server, no model.
+add_test(NAME ab_window_lh_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_lh_test.sh)
+set_tests_properties(ab_window_lh_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 add_test(NAME ab_window_ar_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_ar_test.sh)
 set_tests_properties(ab_window_ar_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")

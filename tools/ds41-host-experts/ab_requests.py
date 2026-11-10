@@ -693,7 +693,10 @@ def lp_run(receipt, url, n, out):
     for b in reqs:
         row = {"name": b["name"], "family": family(b), "lp": [], "error": None}
         try:
-            body, chat = framed(b, url)
+            ids = None
+            if "chat_turns" in b["request"]:   # a conversation that needs no earlier reply of this run
+                ids = chat_prompt(b["request"]["chat_turns"], url, {}, None, b["request"].get("chat_system"))
+            body, chat = framed(b, url, ids)
             if chat:
                 raise ValueError("a `messages` request: the harness sends token prompts only")
             body["logprobs"] = LP_K

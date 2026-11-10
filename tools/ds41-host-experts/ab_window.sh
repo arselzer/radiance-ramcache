@@ -924,7 +924,11 @@ EOF2
     log "arm $name: Xd, but the server log has no 'expert stats: 43 routed layers' line ($(grep -m1 'expert stats' "$OUT/$name.server.log")); not measured"
     stop_server; return 1
   fi
-  if [[ -z "${ARM_XD:-}" && "$xd_lines" != 0 ]]; then
+  if [[ -n "${ARM_XS:-}" && "$xd_lines" == 0 ]]; then
+    log "arm $name: Xst, but the server log has no 'expert stats: N routed layers' line; not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_XD:-}${ARM_XS:-}" && "$xd_lines" != 0 ]]; then
     log "arm $name: no Xd part, but the server counts expert selections (--expert-stats from the window?); not measured"
     stop_server; return 1
   fi
@@ -2470,7 +2474,7 @@ for a in $ARMS; do
 # input, ~190 MB an arm of the held-out prompts; an instrument: router_score_eval scores the file
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
+  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
@@ -2565,6 +2569,7 @@ for a in $ARMS; do
                  log "arm $a: $p: a stage keeps 1-32 experts a rank; the arm is skipped"; skip=1
                fi ;;
       Xd)      xd=1 ;;                     # the draft-routing capture (--expert-stats xstats-<arm>.json)
+      Xst)     xs=1 ;;                     # the arm's routing counts alone (--expert-stats xstats-<arm>.json; no draft bank; exact, no device work)
       Dg|Dg[0-9]*)                         # DSpark's acceptance gate (DSPARK_GATE): defaults, or DgTT[wW][rR]
                if [[ $p == Dg ]]; then dg=1
                elif [[ $p =~ ^Dg([0-9]{2,3})(w([0-9]+))?(r([0-9]+))?$ ]]; then
@@ -3004,8 +3009,8 @@ for a in $ARMS; do
   fi
   # Every arm states the switch (0 is off), so a window's VAR=val cannot put the bank in VRAM.
   env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=${dv:-0} "RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET=${dv:+$hs}")
-  [[ -n "$xd" ]] && ARGS+=(--expert-stats "$(cd "$OUT" && pwd)/xstats-$a.json")
-  ARM_DV=$dv ARM_XD=$xd ARM_HS=$hs
+  [[ -n "$xd$xs" ]] && ARGS+=(--expert-stats "$(cd "$OUT" && pwd)/xstats-$a.json")
+  ARM_DV=$dv ARM_XD=$xd ARM_XS=$xs ARM_HS=$hs
   if [[ -n "$xt" && -z "$skip" ]]; then
     IFS=: read -r -a homes <<< "$ARM_HOME"
     lib=""

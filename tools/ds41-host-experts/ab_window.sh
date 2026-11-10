@@ -2626,6 +2626,7 @@ for a in $ARMS; do
       L[0-9]*) ARGS+=(--max-model-len "${p#L}"); arm_ctx=${p#L} ;;    # this arm's --max-model-len (KV for N sequences)
       Ov)      env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1) ;;    # independent dispatches overlap, decode passes
       Ov2)     env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=2) ;;    # ... in every pass issued live
+      Xwp)     ARGS+=(--weight-prefetch off) ;;                        # no weight reads beside the collectives (core/config.cpp; exact)
       Ct|Ct[0-9]*)
                ct=${p#Ct}
                env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE=${ct:-16}

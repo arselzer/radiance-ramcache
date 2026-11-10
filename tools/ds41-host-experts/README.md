@@ -718,6 +718,52 @@ whole design). The Lc2048/P1/lent-arena block holds 627 / 635 block or 665 / 674
   packed, their bytes against block_mxfp4's, weights packed and checked at load, weights over budget
   kept block, the scan.
 
+## The placement profile (`--expert-profile`, `profile_blend.py`)
+
+The profile's `decode` counts decide which experts the planner keeps on the cards and, after them, which the RAM
+cache holds and which stay on the drive (192 GiB of cache hold about nine tenths of the off-card experts on the
+256 GB box). Prompts of different kinds route to different experts, so a profile recorded on one family places
+another badly. `profile_blend.py show` on the sealed 721-token profile and on captures of three prompt sets, the
+share of each set's decode selections on a profile's hottest 715 units a rank (a card's residents in the current
+plan):
+
+| selections of \ placed by | sealed | `broad6414` | the set's own capture |
+|---|---|---|---|
+| chat, 16 prompts | 44.5% | 50.6% | 64.8% |
+| whole-file edits, 8 prompts | 29.9% | 39.8% | 80.3% |
+| agent harness, 13 requests | 49.0% | 51.0% | 75.7% |
+
+`broad6414` is the sealed profile x6 (721 tokens) + 8 chat prompts x4 (422) + 8 code prompts x1 (1,939) + the long
+prompts x4 (75). Measured against the sealed profile on the same build, every reply the base engine's (placement
+moves residency, never a byte):
+
+| set | sealed | `broad6414` | |
+|---|---|---|---|
+| code, 8 streams, 16 prompts x 256 tokens (total tok/s) | 34.69, 35.77 | 42.84, 43.44 | +22.5%; the eight prompts not in the profile +16.9% |
+| whole-file edits, 8 streams, none in the profile | 23.32, 22.81 | 27.12, 27.04 | +17.4% |
+| chat, 8 streams, 16 prompts x 64 tokens | 30.93, 31.15 | 35.31, 34.71 | +12.8%; the eight prompts not in the profile +3.6% |
+| agent harness, one stream, none in the profile | decode 25.30 tok/s, TTFT sum 64.5 s | 27.08 tok/s, 49.7 s | decode +7.0%, TTFT -23%, wall -16% |
+| held-out, 8 streams (the sealed profile's own families) | 33.90, 32.54 | 34.11, 33.93 | no loss |
+
+(Windows ab-20261110T131419Z and ab-20261110T152719Z, four RX 9070 XT, 192 GiB cache, 256 GB DDR4-2666.) The
+harness's prefill gains because the profile also picks the drive-only units: its card-path chunks read 2,537-2,711
+units a rank from the drive under the sealed profile and 1,231-1,380 under `broad6414`.
+
+**A profile for your own traffic.** Serve representative requests with `--expert-stats FILE` (no device work; the
+file is written every 30 s and at shutdown; `ab_window.sh`'s `Xst` part does it for an arm), then
+
+```
+profile_blend.py show  SEALED.json CAPTURE.json ...          # tokens of each, and the overlap table above
+profile_blend.py write OUT.json 6:SEALED.json 2:CAPTURE.json ...
+radiance ... --expert-profile OUT.json                       # ab_window.sh: part Xq<name>, EXTRA_PROFILES/<name>.json
+```
+
+The first file is a sealed decode profile of this container (its source identity is kept); every file's decode
+counts are taken times its whole-number weight. Weigh families by what will be served, not by how many tokens a
+capture happens to hold, and keep the sealed profile in the mix: the prompts a profile was recorded on gain more
+than new prompts of the same kind. A capture must be pure decode steps (no mixed steps, no draft passes) of the
+same container; `write` refuses anything else and checks its result against the engine's parser rules.
+
 ## The aux expert worker (a fifth card)
 
 `RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=<MiB>` (experimental, opt-in, off by default; `core/place/aux_expert_worker.h`,

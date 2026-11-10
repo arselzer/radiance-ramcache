@@ -1616,7 +1616,8 @@ its rows, which does not pay below ~300 rows):
   gate_up-and-down pair off the card that the CPU path can read, or one the aux expert worker holds). A
   pass that takes the slots back in the middle of a retarget cancels it as it does any reload, and the slot
   comes back with its new unit after the grace. Which experts a row routes to and every unit's bytes are
-  unchanged: residency moves, bytes do not. Needs `..._P1_LEND` or `..._P1_LEND_ARENA`. Off by default (0),
+  unchanged: residency moves, bytes do not. Needs `..._P1_LEND`, `..._P1_LEND_ARENA` or `..._P1_LEND_SLAB`
+  (the lent slab, whose slots it governs with the others: "Adaptive residency" below). Off by default (0),
   and then nothing of it exists.
 - **Unchanged.** Decode, every pass of up to 16 tokens and every layer pass below the threshold run the
   CPU path as before.
@@ -1644,8 +1645,10 @@ compared and differing, and samples skipped because the unit was evicted since i
 for every pass above 16 tokens, as before the threshold), `..._P1_LEND` (lent ring slots, 0 off; up to
 64, at most the ring's slots less two), `..._P1_LEND_ARENA` (lent arena slots, 0 off; up to 64, as many
 as fit), `..._P1_GRACE_MS` (1000; 0-60000), `..._P1_LEND_HEAT` (lent slots a rank handed to a hotter unit a
-pass, 0 off; 1-8), `..._P1_LEND_HEAT_HALF_ROWS` (the heat's half-life in decode rows, 100; 1-1000000),
-`..._P1_LEND_HEAT_MARGIN_PCT` (the hysteresis, 150; 100-1000).
+pass, 0 off; 1-8), `..._P1_LEND_HEAT_HALF_ROWS` (the heat's half-life in decode rows, 100, or 2000 beside the
+lent slab; 1-100000000), `..._P1_LEND_HEAT_MARGIN_PCT` (the hysteresis, 150; 100-1000), `..._P1_LEND_SLAB`
+(the lent slab's slots a card, 0 off; 1-256) and `..._P1_LEND_AUDIT` (the lent slots' read-back audit, 0 off;
+1): "Adaptive residency" below.
 
 Refused at startup, with the reason: an invalid switch value; P1 without an admitted LCP chunk; a
 routed band of 17 rows or more not on the P1 row (a libr4d with LCP's twin is named as such); a
@@ -1658,7 +1661,9 @@ layer whose gate_up, single `swiglu_clamped` and down cannot be named; a routed 
 the file tier nor pinned in the host pool of a static plan (`--deterministic`) as a block_mxfp4 gate_up and
 down pair; `..._P1_LEND` with no slot or unit to lend; `..._P1_LEND_ARENA` with no arena level (a plugin
 without the change), a dynamic plan, or no slot or unit to lend; with either the CPU path not taking every
-pass that does not arm P1 (`..._MISSES` below C); `..._P1_LEND_HEAT` with neither; a checkpoint interval below C. Under P1, LCP admits
+pass that does not arm P1 (`..._MISSES` below C); `..._P1_LEND_HEAT` or `..._P1_LEND_AUDIT` with no lent
+slot (ring, arena or slab); `..._P1_LEND_SLAB` unless this rank's plan set exactly that many slots aside (a
+static plan with the file tier, the switch in the environment when the plan was made); a checkpoint interval below C. Under P1, LCP admits
 `..._VRAM_PACKED=1` (the P1 row decodes the packed form; gemv_vp serves 16 rows or fewer).
 
 Log lines: rank 0's `ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of
@@ -1682,8 +1687,9 @@ Window parts (`ab_window.sh`): `P1` (needs `LcN`, `B2`..`B8` and an `M` part of 
 or more; the arm's `Mr` part serves the CPU path's passes), `QwN`, `QiN`, `QrN`, `QaN`, `QvN`, `Qs`,
 `QmN` (the threshold), `QlK` (the lent ring, K at most 2B - 2), `QeK` (the lent arena, 1-64), `QhMS` (their
 grace, the hold; needs `Ql` or `Qe`; with either the `M` part is N or more), `LhS` (the lent slots follow
-live decode routing, `..._P1_LEND_HEAT=S`, 1-8; needs `Qe`; every arm states the switch, 0 without the
-part, and its two tunables empty); a P1 arm
+live decode routing, `..._P1_LEND_HEAT=S`, 1-8; needs `Qe` or `Ls`; every arm states the switch, 0 without
+the part, and its two tunables, empty but for the half-life in an `Lhh` arm), `LsN`, `La` and `LhhR` (the
+lent slab, the read-back audit and the heat's half-life: "Adaptive residency" below); a P1 arm
 is measured only if the startup line states its threshold and chunk, a `Qe` arm only with its lent-arena
 line, a `Ql` arm only with its lent-ring
 line, an `Lh` arm only with its `lent heat: on (..._P1_LEND_HEAT=S;` line and any other arm only without one; `DEVICE_CHECKS` gains `p1` (`P1_CHECK_M`, 4096, and `P1_ROUTES`),
@@ -1732,6 +1738,121 @@ block order, so the bytes equal 16-token passes. Gate: `ds41_mxfp4_device_check 
 `p1: PASS` (rows, host rows, skip, tail, splits, waves of 1-3). On a 9070 XT with real routing at M
 1024-2048 it costs about 16.4 µs an expert-row in block form and 18.8 packed, against 2,238 for the served
 LCP twin and 30 for lcpfast's balanced twin.
+
+## Adaptive residency: the lent slab, the heat over every lent slot, the read-back audit
+
+Not yet measured on the cards. Three switches, each off by default, and with all three off no computed
+value, no plan and no pass changes. With them on, a unit's bytes and the experts a row routes to are what
+they were; only where a unit is computed moves.
+
+**What it is.** Which experts a card holds is fixed at startup from the calibration profile, but for the
+lent arena's 41-53 slots, which every large prefill pass takes back. Replays of routing traces put the
+CPU-side reads a card could save by following live routing at about 13% with 41 slots, 21-27% with 128 and
+26-47% with all of them. The lent slab gives the lender a large region of its own, the heat policy moves it
+with the traffic, and the audit checks every byte it moves.
+
+| Switch | What it does |
+|---|---|
+| `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=N` (1-256 a card; needs `..._P1=1`, `--deterministic`, the file tier) | N slots of VRAM that no pass writes, paid for by the coldest static residents, holding the hottest units off the card from bring-up on |
+| `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=S` (1-8), `..._P1_LEND_HEAT_HALF_ROWS` (1-100000000; 100, or 2000 beside the slab), `..._P1_LEND_HEAT_MARGIN_PCT` (100-1000; 150) | every lent slot (ring, arena and slab) follows a decayed count of live decode rows, at most S slots a rank a pass |
+| `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT=1` (needs a lent slot) | every lent slot read back from the card and compared before its unit is published and before its resident is withdrawn; not for a timed arm |
+
+**The slab's plan** (`Planner::assign_expert_tiered`, `Plan::lend_slab_vram`, `lend_slab_units`). The plan
+without the switch is made first. Its static residents then give way from the cold end of the fill's order,
+N first and one at a time after, until N slots of 18,800,640 bytes and a 4 KiB pad fit the same weights pool
+beside what stays; nothing else becomes resident. With block-form residents that is N residents (N + 1 where
+the pool's last free bytes do not hold the pad). With packed residents (`..._VRAM_PACKED`, the recommended
+configuration) one frees 18,001,920 bytes and a lent slot holds the block form, so N slots cost about
+N x 1.044 residents: 67 for 64, 134 for 128, 268 for 256, give or take one for the pool's slack. The slots'
+units are the N hottest file-tier units of the plan that results: the residents given up, hottest first,
+less what the host pool takes of them (it holds the first units off the card in any plan; 3 a card in the
+recommended configuration), whose former units come next. So with the heat off the cards compute what they
+computed, less the few units the packed form's difference costs, which are the hottest candidates for the
+lent arena's slots. Packed lent slots would close that gap and are not built: the weight tables mark a
+packed entry by its weight's plan, not by where it is published. The mover reserves exactly what the plan
+charged; `Plan::report` names it (`lent slab`).
+
+**At bring-up and in passes.** The slab's slots are the lender's last, and kept (`RingLender`): each rank
+loads its N units through the lender's own path before the first pass (`CardExpertPath::lend_prime`, read
+from the drive and relaid where the RAM cache is packed: 23-26 ms a unit in the lent arena's measured
+reloads, so about 7 s a card for 256, one card after another; at most 120 s a rank, the rest comes in at the
+passes). A pass that takes the ring's and the arena's slots back leaves the slab's: its
+residents stay published through it, the plugin's own ops read them at any height (block form, unmarked: the
+decode band's row at up to 16 rows, the P1 twin above), there is no grace, and a load or copy in flight is
+neither cancelled nor fenced. A kept slot's reload begins only while the other slots are not lent out, so an
+armed pass has the drive and the DMA lane to itself. Like the other lent slots, the slab makes the CPU path
+take every pass that does not arm the card path (`..._MISSES` of C or more).
+
+**The heat** is the policy above ("The lent slots follow live decode routing"), over all lent slots: the
+same counts, margin, swap budget, settled-state rule and fence. Beside the slab its half-life defaults to
+2,000 decode rows (a region this large should follow the workload, not the last few replies), and it can be
+set up to 100,000,000. Nothing moves before one half-life of decode rows has been counted, so a long
+half-life also starts late. And it moves a slot only while every lent slot holds its resident: after each
+pass that takes the arena's slots back it rests through the grace and until they are reloaded (about two
+seconds with 41 of them), the slab's slots with the rest, so under prompts that arrive faster than that
+it acts seldom; the stats line's declined passes say how often. A retargeted slot's new unit is read from the drive and relaid, as every reload
+is where the RAM cache is packed: a lent slot holds the card's block form and the lender has no way from
+the packed form to it, so the packed RAM cache is not used as a source.
+
+**The read-back audit** (`RingLender::set_audit`, `LendHost::audit`, `LendAudit`). Twice a residency the
+slot's two weights are copied back from the card to pinned host memory on the DMA lane, and the issuing
+thread waits for them:
+
+- at publish, once the host has seen the slot's copy pass and before its unit is published: byte for byte
+  against the bytes that were copied, which the lender still holds. The slot has no reader yet and no
+  writer but the copy. One 64-bit digest a 4 KiB page of what was read is kept (37 KiB a slot);
+- at withdrawal, before a resident is published as a file-tier unit again (a pass that takes the slots
+  back, or a retarget): behind the event the compute stream recorded at the end of the pass before, the
+  residents' last reader, and before anything can write the slot next (the host waits before it issues the
+  pass or queues the slot's next copy); its digests against the ones kept;
+- at shutdown, every slot that still holds a resident, as at a withdrawal: a slab resident no retarget
+  moved is never withdrawn by a pass, so this is where its residency is closed.
+
+A slot that differs, or cannot be read back, is given up: the error line `ds41 p1: lent audit: rank R <ring|
+arena|slab> slot S (lent slot K), unit U: ...` names the first differing byte's offset (at publish, with
+both bytes) or the first differing page's (at withdrawal), the unit is not published (or is withdrawn) and
+takes the CPU path, nothing is loaded into the slot again, and the rank's heat policy makes no further
+retarget (`Decline::Audit`). Everything else goes on, audited and counted. Off, none of it exists: no
+buffer, no event, no call. On, each read-back costs a copy of 18 MB off the card and a pass over it, at
+every publish and every withdrawal, on the issuing thread between passes: the first passes after each
+large prefill pay for the arena's slots coming back, so an audited arm proves bytes, not speed.
+
+Log lines: rank 0's `ds41 p1: lent slab: N slots (..._P1_LEND_SLAB=N; V of VRAM a card that no pass writes,
+for which the plan gave up G static residents, coldest first) hold rank 0's N hottest file-tier units ...
+(P loaded in T s, ...)` and `ds41 p1: lent audit: on (..._P1_LEND_AUDIT=1): ...` at startup; a warning for
+any rank whose slab was not full after bring-up; in each rank's `ds41 p1 stats, rank R:` line at shutdown
+`lent slab: N slots, R residents now (P at bring-up)` (the `lent ring:` part before it counts the ring's and
+the arena's slots alone), `lent audit: A slots read back (D differ, U not read) at M ms a slot, L slots
+lost, retargets stopped|not stopped`, and with the heat `heat half-life H decode rows, C counted`.
+
+Window parts (`ab_window.sh`): `LsN` (the slab, 1-256; needs `P1` and an `M` part of the chunk or more),
+`La` (the audit; needs `Ql`, `Qe` or `Ls`), `LhhR` (the half-life; needs `Lh`), and `LhS` now beside `Qe` or
+`Ls`. Every arm states `..._P1_LEND_SLAB` and `..._P1_LEND_AUDIT` (0 without the part) and the half-life
+(empty without `Lhh`). At startup an `Ls` arm is measured only with its `lent slab: N slots
+(..._P1_LEND_SLAB=N;` line, an `La` arm only with `lent audit: on`, an `Lh` arm only if its line states the
+half-life it asks for (`Lhh`'s, 2000 beside `Ls`, else 100), and an arm without `Ls` or `La` only without
+their lines. At shutdown (`lend_exit_gate`, on all four ranks' stats lines) an `Ls` arm is measured only if
+every slab held all N units at bring-up, an `La` arm only if every rank read slots back and none differed
+or could not be read, an `Lhh` arm only if every rank ran with that half-life and some rank counted that
+many decode rows. An arm that fails one is set aside as `<arm>.unmeasured.json` with the reason; for a
+differing slot the reason carries the rank, its counts and the audit's own error line.
+
+Host tests (cards hidden): `place_test` `the_lent_slab_is_paid_for_by_the_coldest_residents_and_holds_the_
+hottest_units_off_the_card` (the slab's plan against the plan without it: block-form and packed residents,
+a host pool with room, a dynamic plan, more slots than residents); `p1_stager_test` `p1_lend_slab_*` (the
+tunables; kept slots through bring-up, take-backs, the grace and failures; a random stress beside kept
+slots), `p1_lend_heat_governs_arena_and_slab_slots_alike_and_rests_through_a_take_back`, and `p1_lend_audit_*`
+on a host with the slots' bytes whose device can corrupt them (a copy that lands with a byte flipped is
+caught before its unit is published, a byte written under a resident at its take-back, its retarget or at
+shutdown, each with the unit withdrawn, the slot given up and the policy stopped; nothing is read back with
+the switch off; random runs); `ab_window_lh_test.sh` (the three parts' startup lines, `lend_exit_gate`, the
+arm loop).
+
+What a window has to settle before any of this is recommended: that an `Ls` arm with the heat off answers
+byte for byte as the arm without it and at its speed (it holds about N x 0.044 fewer units a card with
+packed residents, and bring-up reads N units a card from the drive); that armed prefill passes run as fast
+with residents published in the slab; that `Ls` with `Lh` gains on the prompt families it is meant for and
+loses nothing on the others; and, with `La`, that no slot ever differs.
 
 ## October31 follow-up experiments (256 GB RAM, 192 GiB cache)
 

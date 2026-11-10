@@ -758,6 +758,15 @@ bool FileStager::begin_pass(const RadBatch* b) {
     if (p1_on() && p1_->lending()) {
         p1_lend_took_ = p1_arms || (p1_arena_full_ && p1_arena_full_());
         (void)p1_->lender().begin_pass(p1_lend_took_, p1_now_ms());
+        /* The lent slots' heat (..._P1_LEND_HEAT): the policy's turn, here only (residency changes before
+         * the weight tables are brought up to date), with the heat counted through the pass before this
+         * one; then this pass's rows age it, if it is one that counts. */
+        if (p1_heat_) {
+            ++p1_lend_pass_;
+            p1_heat_policy();
+            p1_heat_pass_ = p1_heat_counts(*b);
+            if (p1_heat_pass_) p1_heat_->begin_pass(b->n_tok);
+        }
     }
     if (p1_arms) {
         const RadEvent hand[3] = { free_rec_[0] ? free_[0] : nullptr, free_rec_[1] ? free_[1] : nullptr,
@@ -979,6 +988,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         RAD_TRY(head_revoke());
         return RAD_E_STATE;
     }
+    if (p1_heat_pass_) p1_heat_count(li);   /* ..._P1_LEND_HEAT: the layer's rows by unit */
     want_.clear(); skip_.clear();
     for (int32_t u : L.units) {
         if (mover_->ring_resident(u)) {
@@ -2844,6 +2854,7 @@ int FileStager::hx_early_decide() {
         ++ep_stats_.corrupt;
         return RAD_E_STATE;
     }
+    if (p1_heat_pass_) p1_heat_count(li);   /* ..._P1_LEND_HEAT: the layer's rows by unit */
     want_.clear();
     skip_.clear();
     for (int32_t u : L.units) {
@@ -4727,6 +4738,8 @@ int FileStager::end_pass(RadStream s) {
             const int r = s ? rad_event_record(p1_lend_ev_, s) : RAD_E_STATE;
             if (r >= 0) p1_lend_rec_ = true;
             else p1_rc = r;
+            /* The heat policy's fence asks for the record of the pass right before its own. */
+            if (r >= 0 && p1_heat_) p1_lend_rec_pass_ = p1_lend_pass_;
         }
         /* The lent arena: a pass at the full plan that the card path did not take (an armed pass's own
          * end_pass does this below) wrote the arena's top with nothing of it on the DMA lane, so the
@@ -4829,6 +4842,9 @@ int FileStager::p1_init(const Program& prog) {
     p1::Tunables t;
     std::string why;
     if (!p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, &why)) return refuse(why);
+    if (t.lend_heat > 0 && t.lend <= 0 && t.lend_arena <= 0)
+        return refuse(fmt("%s=%d moves lent slots between units, and none is lent (%s or %s)", ds41p1::kLendHeatEnv,
+                          t.lend_heat, ds41p1::kLendEnv, ds41p1::kLendArenaEnv));
     if (const char* fl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST"); fl && !std::strcmp(fl, "1"))
         return refuse("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1 is not covered");
     /* Speculation: only what lcp_init took beside the chunk (lcp_spec_; ep_route_counts.h), prompt lookup
@@ -5026,6 +5042,9 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                 cand.push_back(u);
         }
     }
+    /* ..._P1_LEND_HEAT: every unit a slot may hold, as found (the policy's candidates). */
+    std::vector<int32_t> heat_cand;
+    if (t.lend_heat > 0) heat_cand = cand;
     std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t c) {
         return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)c].profile_share;
     });
@@ -5063,10 +5082,25 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
         return RAD_E_DEVICE;
     }
     p1_lend_rec_ = false;
+    /* The lent slots' heat (..._P1_LEND_HEAT=S): made only with the switch; without it none of it exists. */
+    std::unique_ptr<p1::LendHeat> heat;
+    if (t.lend_heat > 0) {
+        heat = std::make_unique<p1::LendHeat>();
+        if (heat->init(plan_->units.size(), t.lend_heat, t.lend_heat_half, t.lend_heat_margin) < 0) {
+            if (why)
+                *why = fmt("%s=%d with %s=%d and %s=%d: not a policy", ds41p1::kLendHeatEnv, t.lend_heat,
+                           ds41p1::kLendHeatHalfEnv, t.lend_heat_half, ds41p1::kLendHeatMarginEnv, t.lend_heat_margin);
+            return RAD_E_INVAL;
+        }
+    }
     RAD_TRY(p1_->lend_init(units, slots, at, t.grace_ms, why));
     /* The units lent (the ring's and the arena's): never the aux expert worker's (p1_lent). */
     p1_lent_.assign(plan_->units.size(), 0);
     for (int i = 0; i < n; ++i) p1_lent_[(size_t)cand[(size_t)i]] = 1;
+    p1_heat_ = std::move(heat);
+    p1_heat_pass_ = false;
+    p1_heat_cand_ = std::move(heat_cand);
+    p1_lend_pass_ = p1_lend_rec_pass_ = 0;
     if (at.empty()) (void)p1_->lender().begin_pass(false, p1_now_ms());   /* the first reloads begin now */
     if (plan_->rank == 0 && nk > 0) {
         double share = 0.0;
@@ -5093,7 +5127,77 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                  ds41p1::kLogLendArena, ka, ds41p1::kLendArenaEnv, t.lend_arena, arena.size(),
                  (long long)p1_arena_rows_, ka, share, (long long)p1_arena_rows_, t.grace_ms, ds41p1::kGraceEnv);
     }
+    if (plan_->rank == 0 && p1_heat_)
+        RAD_INFO("%s: on (%s=%d; half-life %d decode rows, %s; margin %d%%, %s): each rank's lent slots (rank 0: "
+                 "%d) follow live decode routing, at most %d handed to another unit a pass; a unit's heat is the "
+                 "decode rows routed to it in pure trunk decode passes, halved every %d decode rows; between "
+                 "passes, while every slot holds its resident, the coldest residents give their slots to the "
+                 "hottest lendable units off the card (rank 0: %zu lendable in all) whose heat is above %.2f x the "
+                 "resident's + %.1f rows; the DMA lane first waits behind the pass before, the withdrawn unit takes "
+                 "the CPU path, and the new one is reloaded, copied and published as any lent unit",
+                 ds41p1::kLogLendHeat, ds41p1::kLendHeatEnv, t.lend_heat, t.lend_heat_half, ds41p1::kLendHeatHalfEnv,
+                 t.lend_heat_margin, ds41p1::kLendHeatMarginEnv, n, t.lend_heat, t.lend_heat_half,
+                 p1_heat_cand_.size(), (double)t.lend_heat_margin / 100.0, p1::LendHeat::kMinRows);
     return RAD_OK;
+}
+
+/* ---- the lent slots follow live decode routing (..._P1_LEND_HEAT; card_expert_stager.h) -------------------
+ *
+ * Layer li's counts are on the host (counts_host_, checked): each of its file-tier units, a lent resident
+ * or not, takes the rows routed to its expert. Trunk layers only; the pass is a pure decode pass
+ * (p1_heat_pass_). */
+void FileStager::p1_heat_count(int32_t li) {
+    const Layer& L = layers_[(size_t)li];
+    if (L.layer < 0 || L.layer >= n_model_layers_) return;
+    for (int32_t u : L.units) {
+        const int32_t e = plan_->units[(size_t)u].expert;
+        if (e >= 0 && e < 96 && counts_host_[e] > 0) p1_heat_->add(u, counts_host_[e]);
+    }
+}
+
+bool FileStager::p1_heat_eligible(int32_t u) const {
+    if (u < 0 || (size_t)u >= plan_->units.size()) return false;
+    const MoveUnit& mu = plan_->units[(size_t)u];
+    return mu.bytes == ds41p1::kSlotBytes && mu.weights.size() == 2 && mu.offset.size() == 2 &&
+           !mover_->file_unit_in_slab(u) && mover_->host_planes_eligible(u) &&
+           !(aux_view_ && aux_view_->is_resident(u));
+}
+
+/* Between passes, right behind the lender's begin_pass: up to S of the coldest residents give their slots
+ * to hotter units off the card. Nothing happens (counted by reason, RingLender::Decline) when this pass
+ * takes the slots back or they are lent or in the grace, when a draft bank's loan holds ring residents on
+ * this rank (its targets are published the same way and are not the lender's), when any slot is not its
+ * resident's (a reload wanted or in flight, or failed until the next return), when p1_lend_ev_ was not
+ * recorded at the end of the pass right before this one (the fence would be behind nothing), or when a
+ * chosen unit can no longer hold a slot (it leaves the candidates). The order within a retarget, and why
+ * it is enough, is card_expert_stager.h's (the lent slots' heat) and RingLender::retarget's. */
+void FileStager::p1_heat_policy() {
+    /* The engine's parts of p1::heat_turn: the lent slots' units, the test of a unit, and the retarget, which
+     * lays the units out as p1_lend_init does and hands the card path the event the DMA lane waits on. */
+    struct Owner {
+        FileStager* fs;
+        int32_t slot_unit(int k) const { return fs->p1_->lend_unit(k); }
+        bool eligible(int32_t u) const { return fs->p1_heat_eligible(u); }
+        int retarget(const int* ks, const int32_t* units, int n) {
+            p1::CardExpertPath::LendUnit nu[ds41p1::kMaxLendHeat];
+            if (n < 1 || n > ds41p1::kMaxLendHeat) return 0;
+            for (int i = 0; i < n; ++i) {
+                const MoveUnit& mu = fs->plan_->units[(size_t)units[i]];
+                nu[i].unit = units[i];
+                for (int w = 0; w < 2; ++w) {
+                    nu[i].off[w] = mu.offset[(size_t)w];
+                    nu[i].bytes[w] = fs->ep_program_->weights[mu.weights[(size_t)w]].stored_bytes;
+                }
+            }
+            return fs->p1_->lend_retarget(ks, nu, n, fs->p1_lend_ev_);
+        }
+    } owner{ this };
+    /* The fence's event is p1_lend_ev_, and it must be the record of the pass right before this one
+     * (end_pass, behind lane 1's join): behind every kernel that could read a resident from its slot.
+     * p1_lent_ is the policy's `taken` and follows the slots (the aux expert worker's candidates read it). */
+    const bool fence_ready = p1_lend_ev_ && p1_lend_rec_ && p1_lend_rec_pass_ + 1 == p1_lend_pass_;
+    (void)p1::heat_turn(p1_->lender(), *p1_heat_, p1_lend_took_, bank_track_, fence_ready, p1_heat_cand_, p1_lent_,
+                        owner);
 }
 
 /* The lent arena: the engine bound the arena's smallest level (steps of up to `rows` tokens) and hands

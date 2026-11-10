@@ -763,6 +763,28 @@ private:
     std::function<bool()> p1_arena_full_;
     int64_t p1_arena_rows_ = 0;
     bool    p1_lend_took_ = false;
+    /* ---- the lent slots follow live decode routing (..._P1_LEND_HEAT=S; card_expert_stager.h, the lent
+     * slots' heat). p1_heat_ is null unless the switch is on and the slots are lent, and nothing below runs
+     * without it. p1_heat_pass_: this pass is counted (p1_heat_counts: a pure trunk decode pass), so each of
+     * its routed trunk layers adds its counts (p1_heat_count, where start_ep_routed or hx_early_decide has
+     * them on the host). p1_heat_cand_: the units a lent slot may hold (p1_lend_init's candidates, in the
+     * container's order). p1_lend_pass_: passes begun with the slots lent out; p1_lend_rec_pass_: the one at
+     * whose end p1_lend_ev_ was last recorded. The policy (p1_heat_policy, at begin_pass behind the lender's)
+     * retargets only when that is the pass before this one: the event is then behind every reader of the
+     * residents, and the DMA lane waits on it before a resident is withdrawn. */
+    std::unique_ptr<p1::LendHeat> p1_heat_;
+    bool    p1_heat_pass_ = false;
+    std::vector<int32_t> p1_heat_cand_;
+    uint64_t p1_lend_pass_ = 0, p1_lend_rec_pass_ = 0;
+    /* A pass whose rows are counted: a trunk pass of decode rows only (no prefill row, no draft pass). */
+    static bool p1_heat_counts(const RadBatch& b) {
+        return b.phase == RAD_PHASE_DECODE && b.draft_pass == 0 && b.n_tok > 0 && b.n_tok_decode == b.n_tok;
+    }
+    void p1_heat_count(int32_t li);
+    void p1_heat_policy();
+    /* Whether unit u may be handed a lent slot now: p1_lend_init's test of a unit (a whole slot's two
+     * weights, off the card, readable by the CPU path), and not one the aux expert worker holds. */
+    bool p1_heat_eligible(int32_t u) const;
     static int64_t p1_now_ms() {
         return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1024,7 +1046,8 @@ private:
     void aux_abandon();
     int  aux_fallback();
     void aux_guard(int32_t op, const RadArgs* a, int (*launch)(const RadArgs*, RadStream));
-    std::vector<uint8_t> p1_lent_;    /* by plan unit: lent to P1's ring or arena (p1_lend_init) */
+    std::vector<uint8_t> p1_lent_;    /* by plan unit: lent to P1's ring or arena (p1_lend_init; the heat
+                                       * policy's retargets move it with the slot, p1_heat_policy) */
     int  hx_init(const Program& prog);
     int  hx_init_impl(const Program& prog);
     /* The first pass's CPU work, at its gate_up's operands (start_ep_routed deferred it). */

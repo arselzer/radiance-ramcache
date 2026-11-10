@@ -132,12 +132,17 @@
 # deepseek41 plugin must come from a tree that declares at a smaller step beside the switch), hold the next
 # hottest units the same way, taken back by every step at the full plan (..._P1_LEND_ARENA, 0 off, 1-64; Qe64
 # takes what fits: ~42 slots a card at Lc2048, ~18 at Lc1024); with Ql or Qe the CPU path takes every pass
-# that does not arm P1, so the M part is N_Lc or more; each needs P1. Every other arm states
-# RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty (..._P1_LEND and ..._P1_LEND_ARENA 0). A P1 arm is
+# that does not arm P1, so the M part is N_Lc or more; each needs P1. LhS: the lent slots follow live decode
+# routing (..._P1_LEND_HEAT=S, 1-8: at most S slots a rank handed to a hotter unit a pass; the half-life and
+# the margin keep their defaults, ..._P1_LEND_HEAT_HALF_ROWS and ..._P1_LEND_HEAT_MARGIN_PCT stated empty);
+# Lh needs the lent arena part (QeK). Every other arm states
+# RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty (..._P1_LEND and ..._P1_LEND_ARENA 0), and every
+# arm without Lh states ..._P1_LEND_HEAT=0. A P1 arm is
 # measured only if the server logs "ds41 p1: card experts on" at startup with its threshold and chunk ("a
 # pure prefill pass's layer of N to C rows") (and a plain arm only without it), a Ql arm "ds41 p1: lent
-# ring: K of the ring's", a Qe arm "ds41 p1: lent arena: N slots (..._P1_LEND_ARENA=K;" (and any other
-# arm neither), and runs only on the libr4d.so
+# ring: K of the ring's", a Qe arm "ds41 p1: lent arena: N slots (..._P1_LEND_ARENA=K;", an Lh arm "ds41
+# p1: lent heat: on (..._P1_LEND_HEAT=S;" (and any other
+# arm none of them), and runs only on the libr4d.so
 # (sha256) on which `p1` in DEVICE_CHECKS passed (ds41_mxfp4_device_check TALL_LIBR4D p1 P1_CHECK_M
 # P1_ROUTES on card 0, "p1: PASS" its last line; P1_CHECK_M 4096 by default, P1_ROUTES a p0_tables.py routes
 # file, none by default); an Lc2048 arm needs LCP_CHECK_C=2048 as before. The window log takes each P1 arm's
@@ -464,8 +469,21 @@ lcp_check() {   # name
     log "arm $name: no Qe part, but the server lends the arena (the knob set for the window?); not measured"
     return 1
   fi
+  # LhS: rank 0's "ds41 p1: lent heat: on (..._P1_LEND_HEAT=S;" line at startup, in an Lh arm only.
+  local heat_lines
+  heat_lines=$(grep -c 'ds41 p1: lent heat: ' "$OUT/$name.server.log")
+  if [[ -n "${ARM_LH:-}" ]] &&
+     ! grep -qE "ds41 p1: lent heat: on \(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=${ARM_LH};" "$OUT/$name.server.log"; then
+    log "arm $name: Lh${ARM_LH}, but the server log has no 'ds41 p1: lent heat: on (..._P1_LEND_HEAT=${ARM_LH};' line ($(grep -m1 -E 'ds41 p1: lent heat|LEND_HEAT' "$OUT/$name.server.log")); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_LH:-}" && "$heat_lines" != 0 ]]; then
+    log "arm $name: no Lh part, but the server's lent slots follow live routing (the knob set for the window?); not measured"
+    return 1
+  fi
   [[ -n "${ARM_P1:-}" ]] && grep -m2 -E 'ds41 p1: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_QE:-}" ]] && grep -m2 -E 'ds41 p1: lent arena: |activation arena: .*lent arena' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  [[ -n "${ARM_LH:-}" ]] && grep -m1 -E 'ds41 p1: lent heat: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # SgK / SgaK beside Lc: the admission's startup lines, in an Sg arm only (sg_gate).
   local sg_why
   if declare -F sg_gate >/dev/null && ! sg_why=$(sg_gate "$OUT/$name.server.log" "${ARM_LC:+${ARM_SG:-}}" "${ARM_P1:-}" "${ARM_CS:-}" start); then
@@ -2716,7 +2734,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" sg=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qsp="" lh="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
@@ -2913,6 +2931,10 @@ for a in $ARMS; do
                  [[ $qk == LEND_ARENA ]] && qe=$((10#$qn))
                else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
       Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
+      Lh[0-9]*)                                                        # the lent slots follow live decode routing (..._P1_LEND_HEAT=S; needs Qe)
+               if [[ -n "$lh" ]]; then log "arm $a: duplicate Lh part; the arm is skipped"; skip=1; fi
+               if [[ ${p#Lh} =~ ^[0-9]+$ ]] && (( 10#${p#Lh} >= 1 && 10#${p#Lh} <= 8 )); then lh=$((10#${p#Lh}))
+               else log "arm $a: $p: Lh takes 1-8 (slots a rank handed to a hotter unit a pass); the arm is skipped"; skip=1; fi ;;
       Ad[0-9]*) ad=${p#Ad}; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=$((10#$ad))) ;;   # admit the last N tokens' units
       Ada)     ad=all; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all) ;;       # admit every unit (as at 16 rows)
       Lp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES=${p#Lp}) ;;        # missed units read at once a layer
@@ -3399,6 +3421,15 @@ for a in $ARMS; do
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
           RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0)
   fi
+  # LhS (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT): the lent slots follow live decode routing, in an arm that lends
+  # the arena (QeK, so P1 and Lc too). Every arm states the switch (0 without the part) and its two tunables
+  # empty (their defaults), so a window's VAR=val cannot turn it on or retune it; lcp_check checks the server
+  # log both ways.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=${lh:-0} RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS=
+        RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT=)
+  if [[ -n "$lh" && ( -z "$p1" || -z "$qe" ) ]]; then
+    log "arm $a: Lh$lh moves lent slots between units, which needs the lent arena (a QeK part, with P1); the arm is skipped"; skip=1
+  fi
   [[ -n "$ad" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=)
   # Fw / WpN (the CPU pool's wake-up): every arm states both switches, 0 off, so a window's VAR=val
   # cannot turn them on for an arm whose name does not say so; arm() checks the server log both ways.
@@ -3534,7 +3565,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp ARM_LH=$lh
   # Ax / AxN / Axv / AxvN / Ax0 / AxfN (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS, core/place/aux_expert_worker.h): the
   # extra card appended last to the window's mask of the four rank cards (ranks 0-3 stay the XTs), the worker on it
   # with the arm's cap (Ax0: the card visible, the worker off). Every arm states the six switches (the worker off

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <climits>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +42,9 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kLendEnv, 0, ds41p1::kMaxLend, &r.lend },
         { ds41p1::kLendArenaEnv, 0, ds41p1::kMaxLend, &r.lend_arena },
         { ds41p1::kGraceEnv, 0, 60000, &r.grace_ms },
+        { ds41p1::kLendHeatEnv, 0, ds41p1::kMaxLendHeat, &r.lend_heat },
+        { ds41p1::kLendHeatHalfEnv, 1, 1000000, &r.lend_heat_half },
+        { ds41p1::kLendHeatMarginEnv, 100, 1000, &r.lend_heat_margin },
     };
     for (const K& k : ks) {
         const char* v = get(k.env);
@@ -519,6 +523,10 @@ void RingLender::poll() {
         host_->publish(k, true);
         s.st = St::Resident;
         ++st_.reloaded;
+        if (s.moved) {   /* the unit the heat policy gave the slot is in */
+            s.moved = false;
+            ++st_.retargets;
+        }
     }
 }
 
@@ -595,6 +603,123 @@ int RingLender::begin_pass(bool p1, int64_t now_ms) {
 void RingLender::end_p1(int64_t now_ms) {
     any_p1_ = true;
     last_p1_ = now_ms;
+}
+
+/* ---- the lent slots' heat ---------------------------------------------------------------------------------- */
+bool RingLender::settled() const {
+    if (!host_ || lent_) return false;
+    for (const Slot& s : slot_)
+        if (s.st != St::Resident || s.cancel) return false;
+    return true;
+}
+
+int RingLender::retarget(const int* ks, int n) {
+    if (!host_ || !ks || n < 1) return 0;
+    if (lent_) {
+        decline(Decline::Lent);
+        return 0;
+    }
+    if (!settled()) {
+        decline(Decline::Busy);
+        return 0;
+    }
+    int done = 0;
+    for (int i = 0; i < n; ++i) {
+        const int k = ks[i];
+        if (k < 0 || k >= this->n() || slot_[(size_t)k].st != St::Resident) continue;   /* no slot, or named twice */
+        /* The order is the fence's: the DMA lane waits behind the resident's last reader first, then the
+         * resident is withdrawn, then the slot changes its unit; its reload comes last. */
+        if (host_->retarget_fence(k) < 0) {
+            decline(Decline::Fence);
+            break;
+        }
+        host_->publish(k, false);
+        host_->retarget(k);
+        Slot& s = slot_[(size_t)k];
+        s.st = St::Want;
+        s.cancel = false;
+        s.moved = true;
+        ++st_.retarget_withdrawn;
+        ++done;
+    }
+    if (done) pump();
+    return done;
+}
+
+int LendHeat::init(size_t n_units, int max_pairs, int half_rows, int margin_pct) {
+    if (max_pairs < 1 || max_pairs > ds41p1::kMaxLendHeat || half_rows < 1 || margin_pct < 100) return -1;
+    h_.assign(n_units, 0.0);
+    scale_ = 1.0;
+    half_ = (double)half_rows;
+    margin_ = (double)margin_pct / 100.0;
+    seen_ = 0.0;
+    max_ = max_pairs;
+    dirty_ = false;
+    return 0;
+}
+
+void LendHeat::begin_pass(int64_t rows) {
+    if (rows <= 0) return;
+    seen_ += (double)rows;
+    /* A pass of very many half-lives leaves nothing of the older counts either way: bounded, so the scale
+     * stays finite. */
+    scale_ *= std::exp2(std::min((double)rows / half_, 400.0));
+    if (scale_ > 0x1p+500) {
+        const double inv = 1.0 / scale_;
+        for (double& x : h_) x *= inv;
+        scale_ = 1.0;
+    }
+}
+
+int LendHeat::choose(const int32_t* slot_unit, int n_slots, const int32_t* cand, size_t n_cand, const uint8_t* taken,
+                     Pair* out) const {
+    if (!slot_unit || !cand || !out || n_slots < 1 || max_ < 1) return 0;
+    const int want = std::min(max_, n_slots);
+    /* The coldest slots, coldest first. */
+    int    cold[ds41p1::kMaxLendHeat];
+    double cold_h[ds41p1::kMaxLendHeat];
+    int    nc = 0;
+    for (int k = 0; k < n_slots; ++k) {
+        const int32_t u = slot_unit[k];
+        if (u < 0 || (size_t)u >= h_.size()) return 0;   /* a slot with no unit of this plan: nothing moves */
+        const double h = h_[(size_t)u];
+        if (nc == want && h >= cold_h[nc - 1]) continue;
+        int at = nc < want ? nc++ : nc - 1;
+        for (; at > 0 && h < cold_h[at - 1]; --at) {
+            cold[at] = cold[at - 1];
+            cold_h[at] = cold_h[at - 1];
+        }
+        cold[at] = k;
+        cold_h[at] = h;
+    }
+    /* The hottest candidates off the card, hottest first; none at or below what the coldest slot asks. */
+    const double floor0 = margin_ * cold_h[0] + kMinRows * scale_;
+    int32_t hot[ds41p1::kMaxLendHeat];
+    double  hot_h[ds41p1::kMaxLendHeat];
+    int     nh = 0;
+    for (size_t i = 0; i < n_cand; ++i) {
+        const int32_t u = cand[i];
+        if (u < 0 || (size_t)u >= h_.size()) continue;
+        const double h = h_[(size_t)u];
+        if (h <= floor0 || (nh == want && h <= hot_h[nh - 1]) || (taken && taken[(size_t)u])) continue;
+        bool twice = false;
+        for (int j = 0; j < nh; ++j) twice = twice || hot[j] == u;
+        if (twice) continue;
+        int at = nh < want ? nh++ : nh - 1;
+        for (; at > 0 && h > hot_h[at - 1]; --at) {
+            hot[at] = hot[at - 1];
+            hot_h[at] = hot_h[at - 1];
+        }
+        hot[at] = u;
+        hot_h[at] = h;
+    }
+    int n = 0;
+    for (; n < nc && n < nh; ++n) {
+        if (!(hot_h[n] > margin_ * cold_h[n] + kMinRows * scale_)) break;
+        out[n].slot = cold[n];
+        out[n].unit = hot[n];
+    }
+    return n;
 }
 
 /* ---- the engine's side ------------------------------------------------------------------------------ */
@@ -1254,6 +1379,61 @@ void CardExpertPath::fence(int k) {
             rank_, k);
 }
 
+/* ---- the lent slots' heat: the retargets ---------------------------------------------------------------- */
+int CardExpertPath::lend_retarget(const int* ks, const LendUnit* units, int n, RadEvent behind) {
+    if (!lending() || !ks || !units || n < 1) return 0;
+    if (!lend_.settled()) return lend_.retarget(ks, n);   /* refused there, with the reason counted */
+    bool ok = n <= ds41p1::kMaxLendHeat;
+    for (int i = 0; ok && i < n; ++i) {
+        const int k = ks[i];
+        const LendUnit& u = units[i];
+        ok = k >= 0 && k < (int)lu_.size() && lsrc_[(size_t)k] == -2 && u.unit >= 0;
+        for (int j = 0; ok && j < i; ++j) ok = ks[j] != k && units[j].unit != u.unit;
+        for (size_t j = 0; ok && j < lu_.size(); ++j) ok = lu_[j].unit != u.unit;   /* no unit in two slots */
+        for (int w = 0; ok && w < 2; ++w)
+            ok = u.off[w] >= 0 && u.bytes[w] > 0 && u.off[w] + u.bytes[w] <= ds41p1::kSlotBytes;
+    }
+    if (!ok) {
+        lend_.decline(RingLender::Decline::Candidate);
+        return 0;
+    }
+    if (!behind) {
+        lend_.decline(RingLender::Decline::Fence);
+        return 0;
+    }
+    for (int i = 0; i < n; ++i) {
+        lnext_k_[i] = ks[i];
+        lnext_[i] = units[i];
+    }
+    lnext_n_ = n;
+    lfence_ = behind;
+    lfenced_ = false;
+    const int done = lend_.retarget(ks, n);
+    lnext_n_ = 0;
+    lfence_ = nullptr;
+    return done;
+}
+
+/* The same hand-over an armed pass's first ring copy gets (begin_pass's Mover::mover_wait on the residents'
+ * last-reader event): the mover's stream is the one queue every slot copy goes through, so with this wait
+ * queued now, a copy queued at any later pass runs behind the event, which the compute stream records at
+ * the end of the pass before this one, after the last kernel that could read slot k's resident. */
+int CardExpertPath::retarget_fence(int k) {
+    if (k < 0 || k >= (int)lu_.size() || !lfence_) return RAD_E_STATE;
+    if (lfenced_) return RAD_OK;
+    RAD_TRY(mover_->mover_wait(lfence_));
+    lfenced_ = true;
+    return RAD_OK;
+}
+
+void CardExpertPath::retarget(int k) {
+    for (int i = 0; i < lnext_n_; ++i)
+        if (lnext_k_[i] == k) {
+            lu_[(size_t)k] = lnext_[i];
+            return;
+        }
+}
+
 std::vector<char*> arena_slots(char* lo, int64_t bytes, int max) {
     std::vector<char*> out;
     if (!lo || bytes <= 0 || max <= 0) return out;
@@ -1458,6 +1638,19 @@ std::string CardExpertPath::stats_line(int rank) const {
                       c_.lend_drive ? (double)c_.lend_drive_ns * 1e-6 / (double)c_.lend_drive : 0.0, l.failed, l.cancelled,
                       l.held_back);
         line += buf;
+        if (t_.lend_heat > 0) {
+            uint64_t declined = 0;
+            for (uint64_t d : l.declined) declined += d;
+            std::snprintf(buf, sizeof buf,
+                          "; lent heat: %" PRIu64 " retargets (units published at a slot another unit gave up), %" PRIu64
+                          " residents withdrawn for them, %" PRIu64 " passes declined (%" PRIu64 " lent or in the grace, %" PRIu64
+                          " a slot busy, %" PRIu64 " draft bank, %" PRIu64 " candidate, %" PRIu64 " no fence)",
+                          l.retargets, l.retarget_withdrawn, declined, l.declined[(size_t)RingLender::Decline::Lent],
+                          l.declined[(size_t)RingLender::Decline::Busy], l.declined[(size_t)RingLender::Decline::Bank],
+                          l.declined[(size_t)RingLender::Decline::Candidate],
+                          l.declined[(size_t)RingLender::Decline::Fence]);
+            line += buf;
+        }
     }
     return line;
 }

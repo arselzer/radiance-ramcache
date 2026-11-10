@@ -56,6 +56,7 @@
 #include "mover.h"
 #include "../sched/p1_chunk.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -85,13 +86,16 @@ struct Tunables {
     int  lend = 0;
     int  lend_arena = 0;
     int  grace_ms = ds41p1::kDefGraceMs;
+    int  lend_heat = 0;                                         /* 0 off; else retargets a rank a pass */
+    int  lend_heat_half = ds41p1::kDefLendHeatHalfRows;         /* the heat's half-life, in decode rows */
+    int  lend_heat_margin = ds41p1::kDefLendHeatMarginPct;      /* the hysteresis, percent of the resident's heat */
     bool align_end = true;
     bool swiglu_span = false;
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
- * grace_ms 0-60000), align "end" or "start", swiglu_span 0/off or 1/on (default off).
- * False with the reason on anything else. */
+ * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-1000000, lend_heat_margin 100-1000), align "end" or
+ * "start", swiglu_span 0/off or 1/on (default off). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
 /* The wave's live sorted slots, from ALL local experts' synchronized counts (their exclusive
@@ -256,6 +260,30 @@ private:
  * writes are not behind the DMA lane, the mover's stream waits on the end of every such step (as on an
  * armed pass's end), so a later reload copy lands only after the step's last reader of the arena.
  *
+ * The lent slots' heat (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=S, default 0: off, the slots keep the units
+ * the profile gave them): which units hold the lent slots follows live decode routing. LendHeat keeps, by
+ * plan unit of the rank, a decayed count of the decode rows routed to it (FileStager counts each routed
+ * trunk layer of a pure decode pass where it learns the layer's counts). Between passes, at the begin of a
+ * pass that does not take the slots back and only while the lender is settled (every slot holds its
+ * resident: nothing wanted, in flight, landed, copying, cancelled or failed, the slots not lent), up to S
+ * of the coldest residents give their slots to the hottest lendable units off the card whose heat is above
+ * the margin times the resident's plus half a row (RingLender::retarget):
+ *   1. the DMA lane waits on an event recorded on the compute stream at the end of the pass before this
+ *      one (LendHost::retarget_fence; the residents' last-reader event that an armed pass's first ring
+ *      copy waits on, by the same Mover::mover_wait). That pass's end is behind every kernel that could
+ *      read the residents from their slots, and the lane is one queue, so every copy queued from here on
+ *      runs behind them: the retargeted slot's own copy, queued passes later when its load has landed, too;
+ *   2. the resident is published as a file-tier unit again, as a pass that takes the slots back does it
+ *      (LendHost::publish(k, false)), before the run phase brings this pass's weight tables up to date: no
+ *      kernel issued from here on reads the slot until its next unit is published there;
+ *   3. the slot is the new unit's (LendHost::retarget) and wants a reload: the existing path loads it,
+ *      copies it into the slot on the DMA lane and publishes it at a later pass's begin once the host has
+ *      seen the copy pass. Until then both units take the CPU path.
+ * A pass that takes the slots back in the middle of this finds the slot wanted, reading, landed or copying
+ * and treats it as any other (cancelled, a queued copy fenced), and the slot reloads its new unit after the
+ * grace. Nothing else changes: which experts a row routes to and every unit's bytes are as without the
+ * switch, a lent resident is computed by the plugin's own ops wherever it sits.
+ *
  * RingLender is the state machine alone, against LendHost (tests/p1_stager_test.cpp drives it with
  * random landings, copy completions and failures); CardExpertPath is the engine's LendHost. */
 class LendHost {
@@ -278,10 +306,26 @@ public:
      * that pass must wait for it (an arena slot: the compute stream waits on its event; a ring slot
      * needs nothing, the card path's own copies run behind it on the DMA lane). */
     virtual void fence(int k) = 0;
+    /* The heat policy is about to hand slot k, a resident's, to another unit while decode keeps the slots
+     * (RingLender::retarget): the slot's next copy must not begin before the last kernel that could read
+     * the resident's bytes there has finished. The host makes the DMA lane wait on an event recorded on the
+     * compute stream behind the pass before this one, so every copy queued from here on runs behind that
+     * pass. 0 done; < 0 it cannot (no such event, or the lane did not take the wait): nothing changes. */
+    virtual int  retarget_fence(int k) = 0;
+    /* Slot k's resident was withdrawn (publish(k, false)) for the unit the policy named: from here the
+     * slot's load, copy and publish are that unit's. */
+    virtual void retarget(int k) = 0;
 };
 
 class RingLender {
 public:
+    /* Why the heat policy did nothing on a pass (stats().declined): the slots are lent or in the grace (a
+     * pass took them back, this one among them); a slot is not its resident's (wanted, reading, landed,
+     * copying, or failed until the next return); a draft bank's loan holds ring residents on this rank; a
+     * chosen unit can no longer hold a slot; no event behind the pass before this one, or the DMA lane
+     * refused the wait. */
+    enum class Decline : uint8_t { Lent = 0, Busy = 1, Bank = 2, Candidate = 3, Fence = 4 };
+    static constexpr int kDeclines = 5;
     struct Stats {
         uint64_t lends = 0;        /* card-path bursts that took the slots back */
         uint64_t withdrawn = 0;    /* residents published as file-tier units again for them */
@@ -290,6 +334,10 @@ public:
         uint64_t failed = 0;       /* loads or copies that failed: their units left on the CPU path */
         uint64_t cancelled = 0;    /* loads or copies a card-path pass overtook, never published */
         uint64_t held_back = 0;    /* passes that found the grace still running */
+        /* The heat policy's (retarget, decline; all 0 without the switch): */
+        uint64_t retarget_withdrawn = 0;   /* residents that gave their slots to another unit */
+        uint64_t retargets = 0;            /* those units published at their slots */
+        uint64_t declined[kDeclines] = {}; /* passes the policy did nothing on, by Decline */
     };
     /* n slots (1..2 x ds41p1::kMaxLend: the ring's and the arena's), the grace in ms. Every slot starts
      * empty and lent, as after a card-path pass long ago: the first pass that does not take the slots
@@ -313,12 +361,27 @@ public:
     bool resident(int k) const { return k >= 0 && k < n() && slot_[(size_t)k].st == St::Resident; }
     const Stats& stats() const { return st_; }
 
+    /* ---- the heat policy's part (the lent slots' heat, above) ----
+     * settled: the slots are not lent and every one holds its resident: nothing wanted, in flight, landed,
+     * copying, cancelled or failed. Only then may a slot change its unit. */
+    bool settled() const;
+    /* Between passes, after begin_pass(false, ..): the residents of slots ks[0..n) give them to other
+     * units. Refused whole (0, counted in declined) unless settled(). For each slot in order: the host
+     * fences it (retarget_fence; a refusal stops here, counted, the slots before it stay retargeted),
+     * withdraws its resident (publish(k, false)) and names the slot's new unit (retarget); the slot then
+     * wants a reload, begun at once where the host has a buffer and otherwise as buffers come free. A slot
+     * named twice or out of range is skipped. Returns the slots retargeted. */
+    int  retarget(const int* ks, int n);
+    /* The policy did nothing this pass, for a reason only its caller knows (or the lender's own). */
+    void decline(Decline why) { ++st_.declined[(size_t)why]; }
+
 private:
     /* Idle: not resident and nothing wanted (lent, or nothing yet). Want: a reload wanted, not begun
      * (no buffer). Reading: begun; Landed: its bytes in; Copying: its copy queued. cancel: a reading
-     * or copying slot a card-path pass overtook, which goes back to Idle or Want once it ends. */
+     * or copying slot a card-path pass overtook, which goes back to Idle or Want once it ends. moved: the
+     * heat policy gave the slot another unit, not yet published there (the retargets count). */
     enum class St : uint8_t { Idle, Want, Reading, Landed, Copying, Resident, Failed };
-    struct Slot { St st = St::Idle; bool cancel = false; };
+    struct Slot { St st = St::Idle; bool cancel = false; bool moved = false; };
     LendHost* host_ = nullptr;
     std::vector<Slot> slot_;
     int64_t grace_ = 0, last_p1_ = 0;
@@ -328,6 +391,111 @@ private:
     void poll();
     void pump();
 };
+
+/* The lent slots' heat (above): a rank's decayed counts of decode rows by plan unit, and the policy's
+ * choice. Pure and device-free (tests/p1_stager_test.cpp). The decay is a growing scale: a count is stored
+ * times the scale of its pass and every pass multiplies the scale by 2^(rows / half), so heat(u) =
+ * stored / scale halves every `half` decode rows with nothing swept (the stored values are divided back
+ * once in ~500 half-lives). */
+class LendHeat {
+public:
+    struct Pair { int slot = -1; int32_t unit = -1; };
+    /* The hysteresis' constant: a candidate needs more than margin x the resident's heat plus this many
+     * rows, so a unit never seen does not take a slot from another never seen, and equal heat never swaps. */
+    static constexpr double kMinRows = 0.5;
+    /* n_units plan units; at most max_pairs (1..ds41p1::kMaxLendHeat) retargets a pass; the half-life in
+     * decode rows; the margin in percent (100 or more). < 0 on anything else. */
+    int  init(size_t n_units, int max_pairs, int half_rows, int margin_pct);
+    int  max_pairs() const { return max_; }
+    /* A counted pass of `rows` decode rows begins: everything counted so far ages by them. */
+    void begin_pass(int64_t rows);
+    /* `rows` of the pass's rows were routed to plan unit u. */
+    void add(int32_t u, int32_t rows) {
+        if (u < 0 || (size_t)u >= h_.size() || rows <= 0) return;
+        h_[(size_t)u] += (double)rows * scale_;
+        dirty_ = true;
+    }
+    double heat(int32_t u) const { return u >= 0 && (size_t)u < h_.size() ? h_[(size_t)u] / scale_ : 0.0; }
+    /* One half-life of decode rows has been counted: before that the counts say too little to move a unit. */
+    bool warm() const { return seen_ >= half_; }
+    /* Something was counted since the policy last looked (looked); again: look once more without it. */
+    bool dirty() const { return dirty_; }
+    void looked() { dirty_ = false; }
+    void again() { dirty_ = true; }
+    /* The retargets wanted now. slot_unit[k]: the unit lent slot k holds (n_slots of them); cand: the
+     * units a slot may hold; taken: by plan unit, nonzero for one that holds a slot now (never chosen).
+     * Pairs the coldest slot with the hottest candidate, the next coldest with the next hottest, up to
+     * max_pairs, each only while heat(candidate) > margin x heat(slot's unit) + kMinRows; ties go to the
+     * lower slot and the earlier candidate. Returns the pairs written to out (room for max_pairs). */
+    int  choose(const int32_t* slot_unit, int n_slots, const int32_t* cand, size_t n_cand, const uint8_t* taken,
+                Pair* out) const;
+
+private:
+    std::vector<double> h_;        /* by plan unit: its counts, each times the scale of its pass */
+    double scale_ = 1.0, half_ = (double)ds41p1::kDefLendHeatHalfRows, margin_ = 1.5, seen_ = 0.0;
+    int    max_ = 0;
+    bool   dirty_ = false;
+};
+
+/* The heat policy's turn between passes, right behind the lender's begin_pass: FileStager::p1_heat_policy is
+ * this over the engine's parts, tests/p1_stager_test.cpp runs the same over the fakes. `took`: this pass
+ * takes the slots back; `bank`: a draft bank's loan holds ring residents on the rank; `fence_ready`: the
+ * residents' last-reader event is the record of the pass right before this one (so the DMA lane's wait on
+ * it puts every later slot copy behind every reader of the residents). cand: the units a slot may hold (one
+ * found ineligible leaves it); taken: by plan unit, nonzero for one that holds a slot (kept with the
+ * retargets). The owner `o`: slot_unit(k), the unit lent slot k is for; eligible(u), whether u may be handed
+ * a slot now; retarget(ks, units, n), which names the slots' new units to the host and calls
+ * RingLender::retarget, returning the slots retargeted.
+ * Nothing happens, counted by reason (RingLender::Decline), when the pass takes the slots back or they are
+ * lent or in the grace, with a draft bank's loan, while any slot is not its resident's, without the fence's
+ * event, or when a chosen unit is not eligible; and, uncounted, when nothing was counted since the last look
+ * (the choice would be the same), before a half-life of rows has been counted, and when no unit off the card
+ * is enough hotter than a resident. Returns the slots retargeted. */
+template <class Owner>
+int heat_turn(RingLender& l, LendHeat& h, bool took, bool bank, bool fence_ready, std::vector<int32_t>& cand,
+              std::vector<uint8_t>& taken, Owner& o) {
+    using Decline = RingLender::Decline;
+    auto no = [&](Decline why) {
+        l.decline(why);
+        return 0;
+    };
+    if (took || l.lent()) return no(Decline::Lent);
+    if (bank) return no(Decline::Bank);
+    if (!l.settled()) return no(Decline::Busy);
+    if (!h.dirty() || !h.warm()) return 0;
+    h.looked();
+    const int n = l.n();
+    if (n < 1 || n > 2 * ds41p1::kMaxLend) return 0;
+    int32_t slot_unit[2 * ds41p1::kMaxLend];
+    for (int k = 0; k < n; ++k) slot_unit[k] = o.slot_unit(k);
+    LendHeat::Pair pair[ds41p1::kMaxLendHeat];
+    const int np = h.choose(slot_unit, n, cand.data(), cand.size(), taken.data(), pair);
+    if (np <= 0) return 0;
+    if (!fence_ready) {
+        h.again();
+        return no(Decline::Fence);
+    }
+    int     ks[ds41p1::kMaxLendHeat];
+    int32_t us[ds41p1::kMaxLendHeat];
+    for (int i = 0; i < np; ++i) {
+        if (!o.eligible(pair[i].unit)) {
+            cand.erase(std::remove(cand.begin(), cand.end(), pair[i].unit), cand.end());
+            h.again();
+            return no(Decline::Candidate);
+        }
+        ks[i] = pair[i].slot;
+        us[i] = pair[i].unit;
+    }
+    const int done = o.retarget(ks, us, np);
+    for (int i = 0; i < np; ++i) {
+        const int32_t was = slot_unit[ks[i]], now = o.slot_unit(ks[i]);
+        if (now == was) continue;
+        if (was >= 0 && (size_t)was < taken.size()) taken[(size_t)was] = 0;
+        if (now >= 0 && (size_t)now < taken.size()) taken[(size_t)now] = 1;
+    }
+    if (done < np) h.again();
+    return done;
+}
 
 /* ---- the engine's side ----------------------------------------------------------------------------
  *
@@ -406,6 +574,15 @@ public:
     char* lend_slot(int k) const { return k >= 0 && k < (int)lat_.size() ? lat_[(size_t)k] : nullptr; }
     int  lend_arena_slots() const { return (int)(lat_.size() - lring_.size()); }
     int32_t lend_unit(int k) const { return k >= 0 && k < (int)lu_.size() ? lu_[(size_t)k].unit : -1; }
+    /* The heat policy's retargets (FileStager::p1_heat_policy, between passes): lent slots ks[i], each a
+     * resident's, go to units[i] (laid out as lend_init's; n at most ds41p1::kMaxLendHeat, slots and units
+     * distinct, no unit one a slot holds). `behind`: an event recorded on the compute stream at the end of
+     * the pass before this one, so behind every reader of the residents so far; the DMA lane waits on it
+     * before anything changes (retarget_fence), and the slots' copies, queued once their loads have landed,
+     * run behind it. Returns the slots retargeted (their residents withdrawn, their reloads wanted); 0
+     * with nothing changed when the lender is not settled, an argument is refused or the lane did not take
+     * the wait (RingLender::Stats::declined says which). */
+    int  lend_retarget(const int* ks, const LendUnit* units, int n, RadEvent behind);
     /* LendHost */
     int  load(int k) override;
     int  landed(bool* ok) override;
@@ -414,6 +591,8 @@ public:
     void drop(int k) override;
     void publish(int k, bool on) override;
     void fence(int k) override;
+    int  retarget_fence(int k) override;
+    void retarget(int k) override;
 
     /* Device */
     int  event_create(bool host) override;
@@ -526,6 +705,13 @@ private:
     std::thread lth_;
     void lend_loop();
     void lend_stop();
+    /* lend_retarget's call in flight: the slots and their next units, the event the DMA lane waits on,
+     * and whether it waits already (one wait covers every copy queued after it). */
+    int      lnext_k_[ds41p1::kMaxLendHeat] = {};
+    LendUnit lnext_[ds41p1::kMaxLendHeat];
+    int      lnext_n_ = 0;
+    RadEvent lfence_ = nullptr;
+    bool     lfenced_ = false;
 };
 
 /* The lent arena's slots in [lo, lo + bytes) (the activation arena's top above a level's buffers and

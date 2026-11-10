@@ -1609,6 +1609,31 @@ its rows, which does not pay below ~300 rows):
   (the 39 residents Lc2048 costs against Lc1024) and 17 at Lc1024 (ab-20261031T011849Z, T022949Z). At Lc4096
   the cap of 64 fits at 512-8192 (ab-20261103T090558Z). The plugin must come from a tree with the change
   (arch/deepseek41). Off by default.
+- **The lent slots follow live decode routing** (`..._P1_LEND_HEAT=S`; not yet measured on the cards). The
+  lent ring's and the lent arena's units are chosen once, at startup, by the calibration profile's share,
+  and live traffic routes differently. Under the switch each rank keeps, by file-tier unit, a decayed count
+  of the decode rows routed to it (`p1::LendHeat`; counted where the file stager learns a routed trunk
+  layer's counts, in pure trunk decode passes only: no prefill row, no draft pass; it halves every
+  `..._P1_LEND_HEAT_HALF_ROWS` decode rows, 100, by a growing scale, nothing swept). Between passes, at the
+  begin of a pass that does not take the slots back and only while the lender is settled (every lent slot
+  holds its resident; nothing wanted, in flight, cancelled or failed, the grace over), up to S of the
+  coldest residents give their slots to the hottest lendable units off the card whose heat is above
+  `..._P1_LEND_HEAT_MARGIN_PCT` percent (150) of the resident's plus half a row, so equal heat never swaps;
+  nothing moves before one half-life of rows has been counted. A retarget (`RingLender::retarget`) first has
+  the mover's stream wait on the event the compute stream recorded at the end of the pass before (the same
+  hand-over an armed pass's first ring copy gets, `Mover::mover_wait`; that pass's end is behind every
+  kernel that could read the resident from its slot, and every slot copy goes through that one stream),
+  then publishes the resident as a file-tier unit again, as a take-back does, before the pass's weight
+  tables are brought up to date, then names the slot's new unit and lets the existing reload path load it,
+  copy it and publish it at a later pass's begin; until then both units take the CPU path. It does nothing,
+  and counts why, when the pass takes the slots back or they are lent or in the grace, when a slot is busy
+  or failed, when a draft bank's loan holds ring residents on the rank, when the event was not recorded at
+  the end of the pass right before, or when a chosen unit can no longer hold a slot (not a whole
+  gate_up-and-down pair off the card that the CPU path can read, or one the aux expert worker holds). A
+  pass that takes the slots back in the middle of a retarget cancels it as it does any reload, and the slot
+  comes back with its new unit after the grace. Which experts a row routes to and every unit's bytes are
+  unchanged: residency moves, bytes do not. Needs `..._P1_LEND` or `..._P1_LEND_ARENA`. Off by default (0),
+  and then nothing of it exists.
 - **Unchanged.** Decode, every pass of up to 16 tokens and every layer pass below the threshold run the
   CPU path as before.
 
@@ -1634,7 +1659,9 @@ compared and differing, and samples skipped because the unit was evicted since i
 `..._P1_ALIGN` (`end` or `start`), `..._P1_MIN_ROWS` (the threshold, 320; 17-4096: 17 is the card path
 for every pass above 16 tokens, as before the threshold), `..._P1_LEND` (lent ring slots, 0 off; up to
 64, at most the ring's slots less two), `..._P1_LEND_ARENA` (lent arena slots, 0 off; up to 64, as many
-as fit), `..._P1_GRACE_MS` (1000; 0-60000).
+as fit), `..._P1_GRACE_MS` (1000; 0-60000), `..._P1_LEND_HEAT` (lent slots a rank handed to a hotter unit a
+pass, 0 off; 1-8), `..._P1_LEND_HEAT_HALF_ROWS` (the heat's half-life in decode rows, 100; 1-1000000),
+`..._P1_LEND_HEAT_MARGIN_PCT` (the hysteresis, 150; 100-1000).
 
 Refused at startup, with the reason: an invalid switch value; P1 without an admitted LCP chunk; a
 routed band of 17 rows or more not on the P1 row (a libr4d with LCP's twin is named as such); a
@@ -1647,30 +1674,35 @@ layer whose gate_up, single `swiglu_clamped` and down cannot be named; a routed 
 the file tier nor pinned in the host pool of a static plan (`--deterministic`) as a block_mxfp4 gate_up and
 down pair; `..._P1_LEND` with no slot or unit to lend; `..._P1_LEND_ARENA` with no arena level (a plugin
 without the change), a dynamic plan, or no slot or unit to lend; with either the CPU path not taking every
-pass that does not arm P1 (`..._MISSES` below C); a checkpoint interval below C. Under P1, LCP admits
+pass that does not arm P1 (`..._MISSES` below C); `..._P1_LEND_HEAT` with neither; a checkpoint interval below C. Under P1, LCP admits
 `..._VRAM_PACKED=1` (the P1 row decodes the packed form; gemv_vp serves 16 rows or fewer).
 
 Log lines: rank 0's `ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of
 N to C rows ...` at startup (the threshold, the CPU path's bound, ring, tunables, pooled units), with a
 lent ring `ds41 p1: lent ring: K of the ring's S slots ...`, with a lent arena `activation arena: steps of up
 to 256 tokens take E of A; the L above them and a 1 MiB guard go to prefill Phase 1's lent arena` and
-`ds41 p1: lent arena: N slots (..._P1_LEND_ARENA=K; F fit) ...`; the scheduler's
+`ds41 p1: lent arena: N slots (..._P1_LEND_ARENA=K; F fit) ...`, with the heat `ds41 p1: lent heat: on
+(..._P1_LEND_HEAT=S; half-life H decode rows, ...; margin M%, ...) ...`; the scheduler's
 `ds41 p1: a lone prompt's chunks are aligned to ...`; rank 0's `ds41 p1 chunk: rows R, layers L, wall S s
 (issue), rank 0 drive units D, G GB/s, MemAvailable M MiB` after each card-path chunk; each rank's
 `ds41 p1 stats, rank R: ...` at shutdown (chunks, layers, units RAM / drive, read-ahead posted / used /
 dropped, waves, ring copies and DMA GB, drive units, GB and busy % of the chunks' wall time, the issuing
 thread's waits, the packer's ms a unit, admitted units, leases at pass end (must be 0), with a lent ring
 its residents, bursts that took them back, returns, reloads by source, failures and overtaken reloads,
+with the heat `lent heat: N retargets (...), W residents withdrawn for them, D passes declined (lent or in
+the grace, a slot busy, draft bank, candidate, no fence)`,
 touched experts split into VRAM residents / slab / ring); the large-chunk line names the threshold and the
 CPU path's bound, and each chunk line the layers left below the threshold.
 
 Window parts (`ab_window.sh`): `P1` (needs `LcN`, `B2`..`B8` and an `M` part of min(N, threshold - 1)
 or more; the arm's `Mr` part serves the CPU path's passes), `QwN`, `QiN`, `QrN`, `QaN`, `QvN`, `Qs`,
 `QmN` (the threshold), `QlK` (the lent ring, K at most 2B - 2), `QeK` (the lent arena, 1-64), `QhMS` (their
-grace, the hold; needs `Ql` or `Qe`; with either the `M` part is N or more); a P1 arm
+grace, the hold; needs `Ql` or `Qe`; with either the `M` part is N or more), `LhS` (the lent slots follow
+live decode routing, `..._P1_LEND_HEAT=S`, 1-8; needs `Qe`; every arm states the switch, 0 without the
+part, and its two tunables empty); a P1 arm
 is measured only if the startup line states its threshold and chunk, a `Qe` arm only with its lent-arena
 line, a `Ql` arm only with its lent-ring
-line; `DEVICE_CHECKS` gains `p1` (`P1_CHECK_M`, 4096, and `P1_ROUTES`),
+line, an `Lh` arm only with its `lent heat: on (..._P1_LEND_HEAT=S;` line and any other arm only without one; `DEVICE_CHECKS` gains `p1` (`P1_CHECK_M`, 4096, and `P1_ROUTES`),
 and a P1 arm runs only on the libr4d.so its `p1: PASS` was on; `LCP_CHECK_C=2048` for Lc2048 arms. The
 prompt receipts `Up1len` (five documents of ~1K, ~2K, ~5K, ~8K and ~16K tokens, `max_tokens` 16, from
 license texts the long receipts do not use) and `Up1reply` (the ~2K and ~5K ones at 256 tokens) are made
@@ -1691,7 +1723,15 @@ CPU path, loads and copies a card-path pass overtakes never published, decode be
 runs, every copy still queued fenced when a pass takes the slots back), the lent arena (its slots whole,
 aligned and inside the arena's top; a simulated card's two streams in random order, where no reload copy
 ever lands inside a full step's activations and every resident read finds its unit, 300 runs, while the
-same runs without the fence or the end's hand-over find the race) and the mover's ring residents
+same runs without the fence or the end's hand-over find the race), the lent slots' heat (a retarget of a
+settled lender fences, withdraws, renames, reloads, copies and publishes in that order; refused while lent,
+in the grace, busy or failed, and when the host cannot fence, with nothing changed; a card-path pass in the
+middle of one cancels it and the slot comes back with its new unit; 1,000 retargets with random landings
+and card-path passes between them; the decay by half-lives of decode rows; no swap at equal heat or at
+exactly the margin; the slots following a shift in routing, each once, and resting while it is steady;
+which passes and layers the file stager counts; and on the simulated card's two streams, decode lagging
+the host, no copy for a slot's next unit ever under a queued reader of the unit before, 300 runs, while the
+same runs without the retarget's fence find the race) and the mover's ring residents
 (published at their slots, never aliased or borrowed, file-tier
 again once taken back); the tunables; the end-aligned chunks for every length to 20,000; the admission
 against the sorted order.

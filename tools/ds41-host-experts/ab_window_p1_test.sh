@@ -12,7 +12,14 @@
 #      and Qe without P1 are skipped; Lc4096 with explicit Pci4096 works cold or cached, while
 #      a missing/short interval, another prefix-only part without Pc, or Lc4112 are refused;
 #   3. balanced-kernel receipts state their actual requested-height coverage; an M2048 balance
-#      oracle cannot authorize Mb+Lc4096 even when the independent LCP oracle covered 4096.
+#      oracle cannot authorize Mb+Lc4096 even when the independent LCP oracle covered 4096;
+#   4. SgK / SgaK (prompt-lookup speculation) beside Lc, P1 and Cs: sg_gate on synthetic logs (an Sg arm
+#      is measured only with the file stager's, the scheduler's, the card path's and the consumer skip's
+#      admission lines naming its K, an arm without the part only without them, and at exit only with no
+#      pass outside the decode band and no verify pass over 16 rows); in the arm loop the adopted fast
+#      arm with Sg8, Sga8 or Sg15 on top is launched with the speculation's arguments and every other
+#      switch as without it, with N2 Sg7 too, and Sg16, N2 with Sg8 and N8 with Sg2 (more than 16 decode
+#      rows a step) are skipped with the reason.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -59,6 +66,56 @@ expect 1 "P1 with Qe32 on a server that took 64"                      p1arena 10
 expect 1 "P1 without Qe on a server that lends the arena"             p1arena 1024 1 320 ""
 expect 0 "P1 with Ql10 and Qe64, both lines"                          p1both 1024 1 320 10 64
 expect 1 "P1 with Qe64 alone on a server that lends the ring too"     p1both 1024 1 320 "" 64
+
+# SgK beside Lc: the admission's startup lines and the exit counts (sg_gate), alone and through lcp_check.
+eval "$(sed -n '/^sg_gate() {/,/^}/p' "$W")"
+declare -F sg_gate >/dev/null || { echo "FAIL no sg_gate in $W"; exit 1; }
+sg_stager() { echo "I[0] large-chunk prefill: prompt-lookup speculation admitted (--num-speculative-tokens $1, no draft head): a verify step is a decode pass of at most $(( $1 + 1 )) rows, inside the decode band of 16 (...)"; }
+sg_sched() { echo "I large-chunk prefill: prompt-lookup speculation admitted (--num-speculative-tokens $1, --max-num-seqs 1, no draft head): a step is one prompt's pure prefill chunk, ..."; }
+sg_p1() { echo "I[0] ds41 p1: prompt-lookup speculation admitted (--num-speculative-tokens $1, no draft head): a verify step of at most $(( $1 + 1 )) decode rows never arms the card path; ..."; }
+sg_cs() { echo "I consumer skip: prompt-lookup speculation admitted (--num-speculative-tokens $1, no draft head): a verify step of at most $(( $1 + 1 )) decode rows runs every layer on every row ..."; }
+sg_exit() { echo "I large-chunk prefill, rank $1: prompt-lookup verify passes $2, $(( $2 * 5 )) rows (at most $3 a pass); passes outside the decode band $4"; }
+mk sgall "$lc_line" "$(p1_line 320)" "$(sg_stager 8)" "$(sg_sched 8)" "$(sg_p1 8)" "$(sg_cs 8)"
+mk sgnocs "$lc_line" "$(p1_line 320)" "$(sg_stager 8)" "$(sg_sched 8)" "$(sg_p1 8)"
+mk sgnop1 "$lc_line" "$(p1_line 320)" "$(sg_stager 8)" "$(sg_sched 8)" "$(sg_cs 8)"
+mk sgnosched "$lc_line" "$(p1_line 320)" "$(sg_stager 8)" "$(sg_p1 8)" "$(sg_cs 8)"
+mk sgnostager "$lc_line" "$(p1_line 320)" "$(sg_sched 8)" "$(sg_p1 8)" "$(sg_cs 8)"
+mk sgrefused "E[0] RADIANCE_EXPERIMENTAL_DS41_LCP=2048 (large-chunk prefill) refused: speculation is on (a window of 8): verify steps and DSpark's drafter are not covered"
+for r in 0 1 2 3; do sg_exit $r 40 9 0; done > "$OUT/sgexit-good.server.log"
+{ sg_exit 0 40 9 0; sg_exit 1 40 9 1; sg_exit 2 40 9 0; sg_exit 3 40 9 0; } > "$OUT/sgexit-outside.server.log"
+{ sg_exit 0 40 9 0; sg_exit 1 40 17 0; } > "$OUT/sgexit-tall.server.log"
+echo "I large-chunk prefill, rank 0: prompt-lookup verify passes 40 (an older line)" > "$OUT/sgexit-odd.server.log"
+: > "$OUT/sgexit-none.server.log"
+sgexpect() {   # want(0/1) what log K P1 CS stage
+  local want=$1 what=$2 rc
+  sg_gate "$OUT/$3.server.log" "$4" "$5" "$6" "$7" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want"; fi
+}
+sgexpect 0 "Sg8 with P1 and Cs, every admission line"                 sgall      8 1 1 start
+sgexpect 0 "Sg8 with P1, no Cs part: the consumer skip's line is not asked for" sgnocs 8 1 "" start
+sgexpect 1 "Sg8 with Cs, no consumer skip admission line"             sgnocs     8 1 1 start
+sgexpect 1 "Sg8 with P1, no card path admission line"                 sgnop1     8 1 1 start
+sgexpect 1 "Sg8, no scheduler admission line"                         sgnosched  8 1 1 start
+sgexpect 1 "Sg8, no file stager admission line"                       sgnostager 8 1 1 start
+sgexpect 1 "Sg7 on a server that admitted depth 8"                    sgall      7 1 1 start
+sgexpect 1 "Sg8 on a server that refused the speculation"             sgrefused  8 1 1 start
+sgexpect 1 "no Sg part on a server that took the speculation"         sgall      "" 1 1 start
+sgexpect 0 "no Sg part, no admission line"                            p1def      "" 1 1 start
+sgexpect 0 "Sg8 at exit: every rank's verify passes inside the band"  sgexit-good 8 1 1 exit
+sgexpect 1 "Sg8 at exit: a rank with a pass outside the band"         sgexit-outside 8 1 1 exit
+sgexpect 1 "Sg8 at exit: a verify pass of 17 rows"                    sgexit-tall 8 1 1 exit
+sgexpect 1 "Sg8 at exit: a line without its counts"                   sgexit-odd 8 1 1 exit
+sgexpect 0 "Sg8 at exit: no verify pass ran (nothing to refuse)"      sgexit-none 8 1 1 exit
+# ...and through lcp_check, which names the arm's K only beside an Lc part.
+sglc() {   # want(0/1) what log LC SG CS
+  local want=$1 what=$2 rc
+  ARM_LC=$4 ARM_P1=1 ARM_QM=320 ARM_QL="" ARM_QE="" ARM_SG=$5 ARM_CS=$6 lcp_check "$3" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want ($(tail -1 "$OUT/window.log"))"; fi
+}
+sglc 0 "lcp_check: the P1 arm with Sg8 and Cs, its lines"            sgall  1024 8 1
+sglc 1 "lcp_check: the P1 arm with Sg8, no consumer skip line"       sgnocs 1024 8 1
+sglc 1 "lcp_check: the P1 arm without Sg on a server that took it"   sgall  1024 "" 1
+sglc 0 "lcp_check: the P1 arm without Sg, as before"                 p1def  1024 "" 1
 
 # Qsp's startup and useful-work gates, independent of ordinary P1 startup admission.
 eval "$(sed -n '/^qsp_gate() {/,/^}/p' "$W")"
@@ -144,14 +201,25 @@ NOINT4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Cs-Mb1-Lm8192
 LOWINT4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pci2048-Cs-Mb1-Lm8192
 NOPC4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pci4096-Pce-Cs-Mb1-Lm8192
 OVER4K=$pre-M4112-$mid-B6-${post%-Lc1024}-Lc4112-P1-Qe64-Pci8192-Cs-Mb1-Lm8192
+# The fast arm the windows run (Lc2048, P1, Qe64, Mb1, Rb, Vp, Cs) and prompt-lookup speculation on top of it.
+FAST=$pre-M2048-$mid-B6-$post2k-P1-Qe64-Mb1-Rb-Vp-Cs
+SG8=$FAST-Sg8
+SGA8=$FAST-Sga8
+SG15=$FAST-Sg15
+SG16=$FAST-Sg16
+N2SG7=$FAST-N2-Sg7
+N2SG8=$FAST-N2-Sg8
+N8SG2=$FAST-Sg2-N8
+SG0=$FAST-Sg0
 ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP $COLD4K $PC4K $NOINT4K $LOWINT4K $NOPC4K $OVER4K"
+ARMS="$ARMS $FAST $SG8 $SGA8 $SG15 $SG16 $N2SG7 $N2SG8 $N8SG2 $SG0"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE
@@ -236,6 +304,49 @@ done
 for a in "$REF" "$NEW" "$NEWG" "$Q17" "$BIG" "$BIGG" "$COLD4K" "$PC4K"; do
   if grep -q "LOG: arm $a: .*\(skipped\|refused\)" "$T/loop.txt"; then bad "arm $a: $(grep -m1 "LOG: arm $a: " "$T/loop.txt")"; fi
 done
+
+# Prompt-lookup speculation on the fast arm: launched with the speculation's arguments and the drafter left
+# out, every other switch as the fast arm states it; skipped where a step of decode rows passes 16.
+fast=$(section "$FAST")
+[[ -n "$fast" ]] || bad "the fast arm was not launched: $(grep -m3 "arm $FAST" "$T/loop.txt")"
+[[ "$fast" == *"  ARM_SG: "$'\n'* || "$fast" == *"  ARM_SG: " ]] && ok "the fast arm names no speculation" || bad "the fast arm's ARM_SG is not empty"
+[[ "$fast" != *"--num-speculative-tokens"* ]] && ok "the fast arm adds no speculation argument" || bad "the fast arm passes --num-speculative-tokens"
+sgarm() {   # arm, K, --max-num-seqs or empty, adaptive (non-empty)
+  local a=$1 k=$2 n=$3 ad=$4 sec v
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "arm $a not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; return; fi
+  if grep -q "LOG: arm $a: .*\(skipped\|refused\)" "$T/loop.txt"; then bad "arm $a: $(grep -m1 "LOG: arm $a: " "$T/loop.txt")"; fi
+  [[ "$sec" == *"--num-speculative-tokens $k --spec-ngram $k"* ]] && ok "Sg$k${n:+ N$n}: $k drafts by prompt lookup" || bad "Sg$k${n:+ N$n}: no --num-speculative-tokens $k --spec-ngram $k"
+  if [[ -n "$ad" ]]; then
+    [[ "$sec" == *"--draft-window adaptive"* ]] && ok "Sga$k: the adaptive window" || bad "Sga$k: no --draft-window adaptive"
+  fi
+  [[ -z "$n" || "$sec" == *"--max-num-seqs $n"* ]] && ok "Sg$k${n:+ N$n}: its sequences" || bad "Sg$k N$n: no --max-num-seqs $n"
+  grep -qx "  ARM_SG: $k" <<< "$sec" && ok "Sg$k${n:+ N$n}: the arm is gated on its admission lines (ARM_SG=$k)" || bad "Sg$k${n:+ N$n}: ARM_SG is '$(grep '  ARM_SG:' <<< "$sec")'"
+  has "Sg$k${n:+ N$n}" "$sec" RADIANCE_EXPERIMENTAL_DS41_LOOKUP_ALONE 1
+  # Every switch the fast arm states, the speculating arm states alike.
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA \
+           RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE \
+           RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS \
+           RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP \
+           RADIANCE_EXPERIMENTAL_PREFIX_EORS RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW; do
+    has "Sg$k${n:+ N$n} as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+  [[ "$sec" == *"--max-num-batched-tokens 2048"* ]] && ok "Sg$k${n:+ N$n}: chunks of 2048" || bad "Sg$k${n:+ N$n}: no --max-num-batched-tokens 2048"
+}
+sgarm "$SG8" 8 "" ""
+sgarm "$SGA8" 8 "" 1
+sgarm "$SG15" 15 "" ""
+sgarm "$N2SG7" 7 2 ""
+for a in "$SG16" "$N2SG8" "$N8SG2"; do
+  if [[ -n "$(section "$a")" ]]; then bad "arm $a was launched"
+  elif grep -q "LOG: arm $a: Sg[0-9]* beside Lc2048: .*more than the 16 decode rows a step.*skipped" "$T/loop.txt"; then
+    ok "skipped: $(grep -m1 "LOG: arm $a: " "$T/loop.txt" | sed "s|LOG: arm $a: ||" | cut -c1-110)..."
+  else bad "arm $a neither launched nor skipped for its rows: $(grep -m1 "LOG: arm $a: " "$T/loop.txt")"; fi
+done
+# Sg0 is no speculation: launched, not gated.
+sec=$(section "$SG0")
+if [[ -z "$sec" ]]; then bad "the Sg0 arm was not launched: $(grep -m3 "arm $SG0" "$T/loop.txt")"
+else grep -qx "  ARM_SG: " <<< "$sec" && ok "Sg0: no speculation, no gate" || bad "Sg0: ARM_SG is '$(grep '  ARM_SG:' <<< "$sec")'"; fi
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do

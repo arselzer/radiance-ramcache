@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace rad {
 
@@ -96,6 +97,68 @@ inline int64_t ds41_lcp_rows() {
 inline int  lcp_admitted_ranks() { return detail::g_lcp_admitted.load(std::memory_order_acquire); }
 inline void lcp_note_admitted() { detail::g_lcp_admitted.fetch_add(1, std::memory_order_acq_rel); }
 inline void lcp_admitted_reset_for_test(int ranks) { detail::g_lcp_admitted.store(ranks, std::memory_order_release); }
+
+/* ---- prompt-lookup speculation beside large-chunk prefill ------------------------------------------
+ *
+ * Large-chunk prefill, prefill Phase 1 and the consumer skip were each admitted for two kinds of step: a
+ * prompt's pure prefill chunk, and decode rows, one a sequence. Speculation adds a third, the verify step:
+ * a decode pass of 1 + n rows of one sequence (its token and n drafts), every row sampled, the rejected
+ * rows rolled back. The three switches take it in one case only:
+ *
+ *   - no draft head is declared (RAD_DRAFT_NONE): the core drafts by prompt lookup alone, from the
+ *     sequence's own tokens on the host, and runs no pass of its own. A drafter's context and query passes
+ *     (DSpark's read every prompt row's taps, and route through stages of their own) stay refused;
+ *   - a step of decode rows fits the decode band: --max-num-seqs x (1 + --num-speculative-tokens) <=
+ *     kEpRouteMaxRows. Those are the rows moe_gemm_ggml_mxfp4_gemv and the packed residents' gemv_vp
+ *     serve, and the lm_head's gemv row (logits_gemm_ggml_*_gemv: every decode row is sampled, so the
+ *     head runs at the step's height), so a verify step runs the kernels a 16-token pass runs.
+ *
+ * Why such a step keeps the engine's bits without speculation (FileStager::lcp_init, Scheduler::lcp_init,
+ * the consumer skip in Scheduler::init and deepseek41's cut_declare each take it on this argument):
+ * LCP's admission already holds every op of the program, the head and the sampler included, to one
+ * kernel at every height of its range or to a pair known to agree, so a row's bits do not depend on the
+ * pass that computes it (a 1-row decode pass, a verify pass, a chunk); the file stager treats a pass by
+ * its rows (the CPU path takes a decode pass of 2..16 rows as it takes several sequences' rows today),
+ * never arms the card path for it (FileStager::p1_pass_arms: no decode row, no speculation) and admits
+ * every unit it routes to; the batch builder cuts no step with a decode or speculative row, and a verify
+ * row at position p reads window keys at p - W + 1 .. p, all at or past the prompt's end less the
+ * window, where a cut prompt's keys are whole (consumer_skip.h). Rollback is the base engine's.
+ *
+ * None: no speculation. Lookup: admitted. Drafter / Rows: refused, for a declared draft head or a step
+ * of more decode rows than the band. */
+enum class LcpSpec { None = 0, Lookup, Drafter, Rows };
+/* The rows of the largest step of decode rows: every sequence its token and n_spec drafts. */
+inline int64_t ds41_verify_rows(int64_t max_seqs, int64_t n_spec) {
+    return (max_seqs > 0 ? max_seqs : 1) * (1 + (n_spec > 0 ? n_spec : 0));
+}
+inline LcpSpec ds41_lcp_spec(int64_t max_seqs, int64_t n_spec, bool drafter) {
+    if (drafter) return LcpSpec::Drafter;
+    if (n_spec == 0) return LcpSpec::None;
+    return n_spec > 0 && max_seqs >= 1 && ds41_verify_rows(max_seqs, n_spec) <= kEpRouteMaxRows ? LcpSpec::Lookup
+                                                                                                 : LcpSpec::Rows;
+}
+/* LcpSpec::Rows said: the rows asked for against the band, and the depth that fits (the refusals' text). */
+inline std::string ds41_lcp_spec_rows_why(int64_t max_seqs, int64_t n_spec) {
+    const int64_t fit = kEpRouteMaxRows / (max_seqs > 0 ? max_seqs : 1) - 1;
+    std::string s = "--max-num-seqs " + std::to_string(max_seqs) + " x (1 + " + std::to_string(n_spec) +
+                    " drafts) makes steps of up to " + std::to_string(ds41_verify_rows(max_seqs, n_spec)) +
+                    " decode rows, and prompt lookup's verify steps are covered up to " +
+                    std::to_string(kEpRouteMaxRows) + ", the decode band (the rows the routed GEMM's gemv / gemv_vp "
+                    "and the lm_head's gemv serve); ";
+    s += fit >= 1 ? "--num-speculative-tokens " + std::to_string(fit) + " or less fits this --max-num-seqs"
+                  : "no depth fits this --max-num-seqs";
+    return s;
+}
+/* Whether a pass is one the argument above covers, in a deployment that took LcpSpec::Lookup: a trunk
+ * pass with speculative rows is decode rows only, at most kEpRouteMaxRows of them, uncut and with no
+ * large-chunk admission row; a pass without speculative rows is whatever it was before. The file stager
+ * counts the passes that are not (FileStager::HostStats::spec_off, which must stay 0). */
+inline bool ds41_verify_pass_covered(bool decode, int32_t draft_pass, int64_t n_spec, int64_t n_tok,
+                                     int64_t n_tok_decode, bool cut, int64_t lcp_admit_row) {
+    if (draft_pass != 0) return false;   /* a drafter's own pass: no draft head was declared */
+    if (n_spec <= 0) return true;
+    return decode && n_tok > 0 && n_tok <= kEpRouteMaxRows && n_tok_decode == n_tok && !cut && lcp_admit_row <= 0;
+}
 
 /* The largest pass the counts contract admits: C under LCP, kEpRouteTallRows with EXACT_TALL, else
  * kEpRouteMaxRows. */

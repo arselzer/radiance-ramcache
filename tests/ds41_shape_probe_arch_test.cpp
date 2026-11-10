@@ -146,13 +146,14 @@ struct Decl {
 };
 /* deepseek41's declare for `rank` of four at `max_tok` rows a step (one sequence, as the P1 arms
  * serve), a sizing declare when `probe`, under the current environment. */
-std::unique_ptr<Decl> declare(int rank, int64_t max_tok, bool probe, int64_t max_ctx = 4096) {
+std::unique_ptr<Decl> declare(int rank, int64_t max_tok, bool probe, int64_t max_ctx = 4096, int max_spec = 0) {
     auto d = std::make_unique<Decl>();
     d->b.kv_block_of = block_of;
     RadBuildCtx ctx = build_ctx(rank, kWorld);
     ctx.max_tok = max_tok;
     ctx.max_ctx = max_ctx;
     ctx.max_seqs = 1;
+    ctx.max_spec = max_spec;   /* no drafter in this metadata: prompt lookup alone */
     ctx.shape_probe = probe ? 1 : 0;
     MetaKV meta = flash_meta();
     d->err = stderr_of([&] { d->rc = deepseek41::declare(&d->b, meta.meta(), &ctx); });
@@ -457,6 +458,50 @@ TEST(a_step_of_the_levels_rows_stays_inside_its_buffers) {
         CHECK(!overruns(real->b, probe->b, big->b, rank, nullptr).empty());
         CHECK(overruns(real->b, real->b, big->b, rank, nullptr).empty());
     }
+}
+
+/* Prompt-lookup speculation beside the lent arena (core/place/ep_route_counts.h): with drafts declared
+ * (the window group and the compressor's ring deeper by them, the head and the logits at 1 + drafts
+ * rows) a sizing declare still lays the real graph over the level's rows, and a verify step -- 2 to
+ * 1 + drafts decode rows of one sequence, every row sampled -- stays inside the 256-row level's buffers
+ * like any step of its rows, so it never writes into the arena's top, where the card path's lent slots
+ * hold residents' weights. The core picks that level for it: a step's rows are its sequences' 1 + drafts
+ * (Engine::arena_step), at most 16 here. */
+TEST(a_verify_step_stays_inside_the_small_levels_buffers) {
+    Env e{ WINDOW_SWITCHES };
+    for (const int spec : { 8, 15 })
+        for (int rank = 0; rank < kWorld; ++rank) {
+            auto real = declare(rank, 2048, false, 4096, spec);
+            REQUIRE_EQ(real->rc, RAD_OK);
+            REQUIRE(real->m != nullptr);
+            CHECK(real->m->cut_on);   /* the consumer suffix is declared beside prompt lookup */
+            CHECK_EQ(real->m->g.max_logit_rows, (int64_t)(1 + spec));
+            auto probe = declare(rank, 256, true, 4096, spec);
+            REQUIRE_EQ(probe->rc, RAD_OK);
+            const std::string why = differs(real->b, probe->b);
+            CHECK(why.empty());
+            if (!why.empty()) std::fprintf(stderr, "  rank %d, depth %d: %s\n", rank, spec, why.c_str());
+            CHECK(probe->err.empty());
+            for (int rows = 1; rows <= 1 + spec; ++rows) {
+                auto k = kit(real->b, { rows }, {});
+                CHECK_EQ(k->b.n_spec, rows - 1);
+                CHECK_EQ(k->b.n_out, (int64_t)rows);
+                std::string fail;
+                const std::vector<std::string> past = overruns(real->b, probe->b, k->b, rank, &fail);
+                CHECK(fail.empty());
+                CHECK(past.empty());
+                if (!fail.empty() || !past.empty())
+                    std::fprintf(stderr, "  rank %d, depth %d, a verify step of %d rows: %s%s\n", rank, spec, rows,
+                                 fail.c_str(), past.empty() ? "" : past[0].c_str());
+            }
+            /* The chunks beside them, as without speculation. */
+            for (const std::pair<int, int32_t> c : { std::pair<int, int32_t>{ 256, 0 }, { 256, 1040 }, { 37, 300 } }) {
+                auto k = kit(real->b, {}, { c.first }, c.second);
+                std::string fail;
+                CHECK(overruns(real->b, probe->b, k->b, rank, &fail).empty());
+                CHECK(fail.empty());
+            }
+        }
 }
 
 TEST(beside_lcp_a_level_sizes_the_compressors_work_rows_for_itself) {

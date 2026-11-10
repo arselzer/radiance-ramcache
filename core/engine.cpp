@@ -268,6 +268,13 @@ Engine::~Engine() {
                      r->index, (unsigned long long)hx.lcp_hit_admit, (unsigned long long)hx.lcp_hit_ro,
                      (unsigned long long)hx.lcp_miss_admit, (unsigned long long)hx.lcp_miss_ro,
                      (unsigned long long)hx.lcp_miss_dropped);
+        /* Prompt-lookup speculation beside large-chunk prefill (ep_route_counts.h; FileStager::begin_pass):
+         * the count outside the band must be 0 (ab_window.sh sets an Sg arm with any aside). */
+        if (hx.spec_passes || hx.spec_off)
+            RAD_INFO("large-chunk prefill, rank %d: prompt-lookup verify passes %llu, %llu rows (at most %llu a "
+                     "pass); passes outside the decode band %llu",
+                     r->index, (unsigned long long)hx.spec_passes, (unsigned long long)hx.spec_rows,
+                     (unsigned long long)hx.spec_max_rows, (unsigned long long)hx.spec_off);
         if (hx.early)
             RAD_INFO("host experts, early issue: %llu layers issued their card ops ahead of their counts "
                      "sync and waited %.1f ms for the counts at their gathers (%.1f us a layer; also in "

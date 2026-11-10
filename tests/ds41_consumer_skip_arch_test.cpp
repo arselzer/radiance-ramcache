@@ -118,13 +118,14 @@ struct Decl {
 };
 /* deepseek41's declare for `rank` of four at 16 rows a step, under the current environment. */
 std::unique_ptr<Decl> declare(int rank, MetaKV meta, int max_spec = 0, int world = kWorld,
-                              int64_t max_tok = 16) {
+                              int64_t max_tok = 16, int64_t max_seqs = 0) {
     auto d = std::make_unique<Decl>();
     d->b.kv_block_of = block_of;
     RadBuildCtx ctx = build_ctx(rank, world);
     ctx.max_tok = max_tok;
     ctx.max_ctx = 8192;
     ctx.max_spec = max_spec;
+    if (max_seqs > 0) ctx.max_seqs = max_seqs;   /* build_ctx's own: 8 */
     d->err = stderr_of([&] { d->rc = deepseek41::declare(&d->b, meta.meta(), &ctx); });
     d->m = deepseek41::models[rank].get();
     return d;
@@ -267,6 +268,80 @@ TEST(ds41_consumer_skip_refuses_a_graph_off_the_contract) {
     REQUIRE_EQ(d->rc, (int)RAD_OK);
     CHECK_EQ(d->b.consumer.boundary, 30);
     CHECK_EQ(d->m->cut_b, 30);
+}
+
+/* Speculation without a draft head is prompt lookup alone, and the suffix is declared beside it where
+ * a step of decode rows fits the decode band (--max-num-seqs x (1 + drafts) <= 16; core/place/
+ * ep_route_counts.h): the same boundary and window as without speculation (the window group keeps
+ * window + drafts positions, the attention reads the window), with a line on rank 0. More rows are
+ * refused with the bound. A verify step then runs every layer and the head on every row, exactly the
+ * ops it issues without the switch, and a cut pass with a decode or speculative row fails the step. */
+TEST(ds41_consumer_skip_is_declared_beside_prompt_lookup_inside_the_decode_band) {
+    struct Fit { int64_t seqs; int spec; };
+    for (const Fit f : { Fit{ 1, 8 }, Fit{ 1, 15 }, Fit{ 2, 7 }, Fit{ 8, 1 } }) {
+        Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
+        for (int rank = 0; rank < kWorld; ++rank) {
+            auto d = declare(rank, flash_meta(), f.spec, kWorld, 16, f.seqs);
+            REQUIRE_EQ(d->rc, (int)RAD_OK);
+            CHECK(!d->m->dsp.on);
+            CHECK_EQ(d->b.consumer_calls, 1);
+            CHECK_EQ(d->b.consumer.n_layer, 40);
+            CHECK_EQ(d->b.consumer.boundary, 20);
+            CHECK_EQ(d->b.consumer.window, 128);
+            CHECK(d->m->cut_on);
+            const bool line = d->err.find("consumer suffix declared beside prompt-lookup speculation") !=
+                              std::string::npos;
+            CHECK_EQ(line, rank == 0);
+        }
+    }
+    for (const Fit f : { Fit{ 1, 16 }, Fit{ 2, 8 }, Fit{ 8, 2 }, Fit{ 16, 1 } }) {
+        Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
+        auto d = declare(0, flash_meta(), f.spec, kWorld, 16, f.seqs);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        CHECK_EQ(d->b.consumer_calls, 0);
+        CHECK(!d->m->cut_on);
+        CHECK(d->err.find("consumer skip refused: speculation is on (--max-num-seqs") != std::string::npos);
+        CHECK(d->err.find("covered up to 16, the decode band") != std::string::npos);
+    }
+    /* A verify step (one sequence, its token and 8 drafts: 9 decode rows, each sampled) with the suffix
+     * declared issues what it issues with the switch off: every layer, the head on its 9 rows. */
+    std::vector<std::string> off_ops;
+    {
+        Env env({});
+        auto d = declare(0, flash_meta(), 8, kWorld, 16, 1);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        CHECK(!d->m->cut_on);
+        auto v = kit(d->b, { 9 }, {});
+        auto r = run_passes(d->b, deepseek41::step, { v.get() }, 0, kWorld);
+        REQUIRE(steps_ok(r));
+        off_ops = issued_ops(d->b, *r[0]);
+    }
+    {
+        Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
+        auto d = declare(0, flash_meta(), 8, kWorld, 16, 1);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        REQUIRE(d->m->cut_on);
+        auto v = kit(d->b, { 9 }, {});
+        CHECK_EQ(v->b.n_spec, 8);
+        CHECK_EQ(v->b.n_out, (int64_t)9);
+        auto r = run_passes(d->b, deepseek41::step, { v.get() }, 0, kWorld);
+        REQUIRE(steps_ok(r));
+        const std::vector<std::string> on_ops = issued_ops(d->b, *r[0]);
+        CHECK(on_ops == off_ops);
+        CHECK(count_issued(on_ops, "attn_sparse_sink") > 0);
+        CHECK_EQ(count_issued(on_ops, "gather_rows"), 1);
+        CHECK_EQ(count_issued(on_ops, "logits_gemm") + count_issued(on_ops, "logits_gemm_ggml"), 1);
+        /* A cut handed to a step with a decode or speculative row is refused, whole-pass or per row. */
+        auto c = kit(d->b, { 9 }, {});
+        c->b.consumer_full = 30;
+        c->b.consumer_end = 400;
+        auto rc = run_passes(d->b, deepseek41::step, { c.get() }, 0, kWorld);
+        CHECK(rc[0]->step_fail.find("consumer suffix") != std::string::npos);
+        auto p = chunk(d->b, 1024, 30);
+        p->b.n_spec = 1;
+        auto rp = run_passes(d->b, deepseek41::step, { p.get() }, 0, kWorld);
+        CHECK(rp[0]->step_fail.find("consumer suffix") != std::string::npos);
+    }
 }
 
 /* The cut pass against the full pass, at the boundary (its keys alone: window, compressor, index

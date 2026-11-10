@@ -9288,12 +9288,22 @@ TEST(lcp_is_refused_where_chunks_would_not_be_c_or_share_a_step) {
         f.cfg.max_seqs = 4;
         refused(f, "--max-num-seqs 4");
     }
-    {   /* speculation */
+    {   /* speculation with a draft head, whatever its rows */
+        for (const int kind : { (int)RAD_DRAFT_BLOCK, (int)RAD_DRAFT_SERIAL }) {
+            LcpOn on(1024, 1);
+            Fixture f;
+            lcp_fixture(f, 1024, 2048);
+            f.cfg.n_spec = 2;
+            f.prog.drafter.kind = kind;
+            refused(f, "speculation is on: verify steps and a drafter's passes are not covered");
+        }
+    }
+    {   /* prompt lookup in steps of more decode rows than the decode band (17 here) */
         LcpOn on(1024, 1);
         Fixture f;
         lcp_fixture(f, 1024, 2048);
-        f.cfg.n_spec = 2;
-        refused(f, "speculation");
+        f.cfg.n_spec = 16;
+        refused(f, "speculation is on: --max-num-seqs 1 x (1 + 16 drafts) makes steps of up to 17 decode rows");
     }
     {   /* KV streaming: a ring of the context on the card */
         LcpOn on(1024, 1);
@@ -9479,6 +9489,165 @@ TEST(lcp_row_cut_makes_the_checkpoints_below_the_target_whole) {
             CHECK_EQ(cs.ckpt_cut, (uint64_t)0);
         }
         CHECK(cs.rows_skipped > 0);
+    }
+}
+
+/* ================================================================== prompt lookup beside large-chunk prefill */
+/* Prompt-lookup speculation beside large-chunk prefill and the consumer skip (ep_route_counts.h,
+ * Scheduler::lcp_init): taken when no draft head is declared and --max-num-seqs x (1 + drafts) fits the
+ * decode band of 16 rows. What the exactness argument stands on, held here step by step over whole
+ * requests with random acceptance: a step is one prompt's pure prefill chunk -- no draft in it, cut and
+ * given its admission row exactly as without speculation -- or decode rows only, at most the admitted
+ * bound, never cut, with no admission row; and the prompt's chunks are the ones an engine without
+ * speculation cuts. */
+namespace {
+
+struct SpecRun {
+    int chunks = 0, cut_chunks = 0, verify = 0, plain = 0, bad = 0;
+    int64_t max_rows = 0, out = 0;
+    std::vector<std::tuple<uint64_t, int32_t, int32_t, int32_t, bool>> pf;   /* seq, ctx, tokens, admit row, cut */
+};
+
+/* Runs the fixture's requests to their end. Before each step every decoding request is handed `depth`
+ * drafts (the lookup's proposal; none when depth is 0), and each verify accepts a random count. */
+SpecRun spec_run(Fixture& f, const std::vector<uint64_t>& ids, int depth, int64_t bound, uint32_t seed) {
+    SpecRun r;
+    uint32_t rng = seed;
+    const int32_t draft[RAD_SCHED_MAX_SPEC] = { 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36 };
+    for (int k = 0; k < 4000; ++k) {
+        if (depth > 0)
+            for (uint64_t id : ids) {
+                const Request* q = f.sch.find(id);
+                if (q && q->state == ReqState::Running && q->n_computed >= (int64_t)q->prompt.size())
+                    (void)f.sch.set_draft(id, draft, depth);
+            }
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        int pf = 0, dec = 0;
+        for (const StepEntry& e : p.e) (e.is_prefill ? pf : dec) += 1;
+        const bool cut = b->consumer_full != 0 || b->consumer_row0 != nullptr;
+        if (pf) {
+            /* A chunk: no decode or speculative row beside it, no draft in it. */
+            r.bad += dec != 0 || b->n_spec != 0 || b->n_seq_decode != 0 || b->n_tok_decode != 0 ||
+                     b->phase != RAD_PHASE_PREFILL;
+            for (const StepEntry& e : p.e) r.bad += e.n_spec != 0 || e.n_tokens < 1;
+            ++r.chunks;
+            r.cut_chunks += cut;
+            r.pf.emplace_back(p.e[0].seq, p.e[0].ctx_len, p.e[0].n_tokens, b->lcp_admit_row, cut);
+        } else {
+            /* Decode rows only: inside the admitted bound and the decode band, uncut, no admission row,
+             * every row sampled. */
+            int64_t rows = 0;
+            for (const StepEntry& e : p.e) {
+                rows += 1 + e.n_spec;
+                r.bad += e.n_tokens != 1 + e.n_spec || e.n_spec > depth;
+            }
+            r.bad += b->phase != RAD_PHASE_DECODE || b->n_tok != rows || b->n_tok_decode != b->n_tok ||
+                     b->n_seq_decode != b->n_seq || b->n_out != rows || rows > bound || rows > kEpRouteMaxRows ||
+                     cut || b->lcp_admit_row != 0 || b->draft_pass != 0;
+            r.bad += !ds41_verify_pass_covered(b->phase == RAD_PHASE_DECODE, b->draft_pass, b->n_spec, b->n_tok,
+                                               b->n_tok_decode, cut, b->lcp_admit_row);
+            (b->n_spec > 0 ? r.verify : r.plain) += 1;
+            r.max_rows = std::max<int64_t>(r.max_rows, rows);
+        }
+        CHECK_OK(f.commit(7, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
+    }
+    for (uint64_t id : ids)
+        if (const Request* q = f.sch.find(id)) r.out += (int64_t)q->output.size();
+    return r;
+}
+
+}  /* namespace */
+
+TEST(lcp_takes_prompt_lookup_verify_steps_inside_the_decode_band) {
+    /* One sequence at depth 8 (the A/B's C2-Sg8 shape: 9 rows a verify step), depth 15 (the band's
+     * edge), and the same prompt without speculation: the chunks, their cuts and admission rows are
+     * the unspeculated engine's. */
+    std::vector<std::tuple<uint64_t, int32_t, int32_t, int32_t, bool>> base;
+    for (const int depth : { 0, 8, 15 }) {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.n_spec = depth;
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 16 };
+        f.cfg.consumer_skip = 1;
+        int rc = 0;
+        const std::string log = info_of([&] { rc = f.start(); });
+        REQUIRE_EQ(rc, RAD_OK);
+        REQUIRE_EQ(f.sch.lcp_rows(), (int64_t)1024);
+        CHECK_EQ(f.sch.lcp_spec_rows(), depth ? (int64_t)(1 + depth) : (int64_t)0);
+        REQUIRE(f.sch.consumer_on());
+        CHECK_EQ(has(log, "large-chunk prefill: prompt-lookup speculation admitted"), depth > 0);
+        CHECK_EQ(has(log, "consumer skip: prompt-lookup speculation admitted"), depth > 0);
+        const uint64_t id = f.submit(3086, 200);
+        REQUIRE(id != 0);
+        const SpecRun r = spec_run(f, { id }, depth, 1 + depth, 12345u + (uint32_t)depth);
+        CHECK_EQ(r.bad, 0);
+        CHECK(r.chunks >= 4);
+        CHECK(r.cut_chunks >= 2);
+        if (depth == 0) {
+            CHECK_EQ(r.verify, 0);
+            base = r.pf;
+        } else {
+            CHECK(r.verify > 10);
+            CHECK_EQ(r.max_rows, (int64_t)(1 + depth));
+            CHECK(r.pf == base);
+        }
+    }
+    /* Two sequences at depth 7 beside prefill alone: steps of up to 16 decode rows, and a chunk still
+     * alone in its step while the other sequence decodes. */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.n_spec = 7;
+        f.cfg.max_seqs = 2;
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 16 };
+        f.cfg.consumer_skip = 1;
+        setenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE", "1", 1);
+        const int rc = f.start();
+        unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK_EQ(f.sch.lcp_spec_rows(), (int64_t)16);
+        REQUIRE(f.sch.consumer_on());
+        const uint64_t a = f.submit(1500, 120), b = f.submit(2300, 120);
+        REQUIRE(a != 0 && b != 0);
+        const SpecRun r = spec_run(f, { a, b }, 7, 16, 777u);
+        CHECK_EQ(r.bad, 0);
+        CHECK(r.verify > 10);
+        CHECK_EQ(r.max_rows, (int64_t)16);
+        CHECK(r.chunks >= 5);
+    }
+}
+
+/* The consumer skip takes speculation only beside large-chunk prefill's own admission of it: at 16-token
+ * passes without LCP nothing holds a verify pass's rows to a 1-row pass's bits, and a draft head's
+ * context reads every prompt row. Refused, every layer then runs on every row, as before. */
+TEST(the_consumer_skip_takes_speculation_only_beside_lcps_admission) {
+    struct Case { int64_t lcp; int n_spec; int drafter; bool on; };
+    const Case cases[] = {
+        { 0, 0, RAD_DRAFT_NONE, true },      { 0, 4, RAD_DRAFT_NONE, false },
+        { 0, 4, RAD_DRAFT_BLOCK, false },    { 0, 4, RAD_DRAFT_SERIAL, false },
+        { 1024, 0, RAD_DRAFT_NONE, true },   { 1024, 8, RAD_DRAFT_NONE, true },
+        { 1024, 15, RAD_DRAFT_NONE, true },
+    };
+    for (const Case& c : cases) {
+        LcpOn on(c.lcp, 1);
+        Fixture f;
+        lcp_fixture(f, c.lcp ? c.lcp : 16, c.lcp ? 2048 : 256);
+        f.cfg.n_spec = c.n_spec;
+        f.prog.drafter.kind = c.drafter;
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 16 };
+        f.cfg.consumer_skip = 1;
+        int rc = 0;
+        const std::string log = info_of([&] { rc = f.start(); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK_EQ(f.sch.consumer_on(), c.on);
+        if (!c.on) {
+            CHECK(has(log, "consumer skip: refused -- speculation is on"));
+            CHECK_EQ(has(log, "only beside large-chunk prefill"), c.drafter == RAD_DRAFT_NONE);
+        }
     }
 }
 

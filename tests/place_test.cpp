@@ -5431,6 +5431,214 @@ TEST(packed_vram_residents_are_charged_what_the_card_holds) {
     CHECK(p1.report(f.prog).find("vram packed") != std::string::npos);
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB (ds41_p1.h, the lent slab): N slots of the weights pool that belong
+ * to no unit. The plan without the switch gives up residents from the cold end of the fill's order until the
+ * slots are paid for, nothing else changes tier but through that, and the slots' units are the N hottest
+ * units that then sit on the file tier. */
+namespace {
+struct SlabPlans {
+    std::vector<float> share;   /* by unit of the plan */
+    static std::vector<RadFileProfile> profile(int layers, int experts) {
+        /* A share of its own for every unit, so the fill's order is the shares' alone. */
+        std::vector<RadFileProfile> rows;
+        const int n = layers * experts;
+        for (int l = 0; l < layers; ++l)
+            for (int e = 0; e < experts; ++e) {
+                RadFileProfile r{};
+                r.layer = l;
+                r.expert = e;
+                r.share = (float)(1 + ((l * experts + e) * 7919) % n) / 100000.0f;
+                rows.push_back(r);
+            }
+        return rows;
+    }
+};
+/* What a slab plan must be against the plan without it: `given` residents fewer, the coldest; every unit that
+ * stayed resident was one; the slots' units the n hottest file-tier units, each one slot's size in two
+ * weights; the pool's bytes within the budget with the slab's. *out: the residents given up. */
+void check_slab_plan(const Plan& base, const Plan& p, int n, int* out) {
+    *out = 0;
+    REQUIRE(base.units.size() == p.units.size());
+    CHECK_EQ(p.lend_slab_units.size(), (size_t)n);
+    CHECK_EQ(p.lend_slab_vram, (int64_t)n * 18800640 + (int64_t)RAD_ALIGN_UNIT);
+    int given = 0;
+    float coldest_kept = 1e9f, hottest_given = -1.0f;
+    for (size_t u = 0; u < p.units.size(); ++u) {
+        const MoveUnit& a = base.units[u];
+        const MoveUnit& b = p.units[u];
+        if (a.expert < 0) {
+            CHECK(a.tier == b.tier);
+            continue;
+        }
+        if (b.tier == Tier::VRAM) {
+            CHECK(a.tier == Tier::VRAM);   /* nothing became resident for it */
+            coldest_kept = std::min(coldest_kept, b.profile_share);
+        } else if (a.tier == Tier::VRAM) {
+            ++given;
+            hottest_given = std::max(hottest_given, b.profile_share);
+        }
+    }
+    CHECK_EQ((int64_t)given, p.lend_slab_given);
+    CHECK(given >= n);
+    CHECK(coldest_kept > hottest_given);   /* the cold end of the order went */
+    std::vector<uint8_t> in_slab(p.units.size(), 0);
+    float coldest_slab = 1e9f;
+    for (int32_t u : p.lend_slab_units) {
+        REQUIRE(u >= 0 && (size_t)u < p.units.size());
+        const MoveUnit& mu = p.units[(size_t)u];
+        CHECK(!in_slab[(size_t)u]);
+        in_slab[(size_t)u] = 1;
+        CHECK(mu.tier == Tier::SSD);
+        CHECK_EQ(mu.bytes, (int64_t)18800640);
+        CHECK_EQ(mu.weights.size(), (size_t)2);
+        CHECK(!mu.movable);
+        coldest_slab = std::min(coldest_slab, mu.profile_share);
+    }
+    for (size_t u = 0; u < p.units.size(); ++u) {
+        const MoveUnit& mu = p.units[u];
+        if (mu.expert < 0 || in_slab[u] || mu.tier != Tier::SSD) continue;
+        CHECK(mu.profile_share < coldest_slab);   /* no hotter file-tier unit was left out */
+    }
+    CHECK(p.totals.bytes[(int)Tier::VRAM] + p.slab_overhead + p.file_stage_vram + p.lend_slab_vram <= p.vram_budget);
+    *out = given;
+}
+}  /* namespace */
+
+TEST(the_lent_slab_is_paid_for_by_the_coldest_residents_and_holds_the_hottest_units_off_the_card) {
+    FileBufferUnitsEnv cap("1");
+    Fixture f;
+    build_ds41_like(f, 8, 48, kGuBlock, kDnBlock);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 4000;
+    c.host_pool_mib = 210;   /* the file tier's staging and windows, no room for a pooled expert */
+    c.weights_disk_tier = true;
+    c.deterministic = true;
+    const std::vector<RadFileProfile> prof = SlabPlans::profile(8, 48);
+
+    PlannerInput in0{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    in0.lend_slab = 0;
+    Plan p0;
+    CHECK_OK(Planner(in0).plan(&p0));
+    const int r0 = vram_residents(p0);
+    CHECK(r0 > 150);
+    CHECK_EQ(p0.lend_slab_vram, (int64_t)0);
+    CHECK_EQ(p0.lend_slab_given, (int64_t)0);
+    CHECK(p0.lend_slab_units.empty());
+    CHECK(p0.report(f.prog).find("lent slab") == std::string::npos);
+    /* Asked through the environment and not asked there: the plan without it, unit for unit. */
+    PlannerInput inenv = in0;
+    inenv.lend_slab = -1;
+    Plan penv;
+    CHECK_OK(Planner(inenv).plan(&penv));
+    CHECK(penv.lend_slab_units.empty());
+    REQUIRE(penv.units.size() == p0.units.size());
+    for (size_t u = 0; u < p0.units.size(); ++u) CHECK(penv.units[u].tier == p0.units[u].tier);
+    CHECK_EQ(penv.file_stage_vram, p0.file_stage_vram);
+
+    /* Block-form residents: a resident frees a slot's bytes, so N slots take N residents (one more where
+     * the pool's last free bytes do not hold the tail pad). */
+    for (int n : { 1, 16, 64, 128 }) {
+        PlannerInput in = in0;
+        in.lend_slab = n;
+        Plan p;
+        CHECK_OK(Planner(in).plan(&p));
+        CHECK(p.fits());
+        int given = 0;
+        check_slab_plan(p0, p, n, &given);
+        CHECK(p.report(f.prog).find("lent slab") != std::string::npos);
+        CHECK(given <= n + 1);
+        CHECK_EQ(vram_residents(p), r0 - given);
+        CHECK_EQ(p.file_stage_vram, p0.file_stage_vram);   /* capped at one unit either way */
+        /* With no pooled expert the slots' units are residents the plan gave up, the hottest of them. */
+        for (int32_t u : p.lend_slab_units) CHECK(p0.units[(size_t)u].tier == Tier::VRAM);
+    }
+
+    /* Packed residents (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED): one frees 18,001,920 bytes and a slot holds
+     * the block form's 18,800,640, so N slots cost about N x 1.0444 residents. */
+    FakePack fake;
+    fake.prog = &f.prog;
+    PlannerInput inp0 = in0;
+    inp0.vram_pack = fake.fn();
+    Plan pp0;
+    CHECK_OK(Planner(inp0).plan(&pp0));
+    const int rp0 = vram_residents(pp0);
+    CHECK(rp0 > r0);
+    for (int n : { 16, 64, 128 }) {
+        PlannerInput in = inp0;
+        in.lend_slab = n;
+        Plan p;
+        CHECK_OK(Planner(in).plan(&p));
+        CHECK(p.fits());
+        int given = 0;
+        check_slab_plan(pp0, p, n, &given);
+        /* Less at most one where the plan without it left a resident's room unspent, plus the tail pad. */
+        const int need = (int)(((int64_t)n * 18800640 + 18001919) / 18001920);
+        CHECK(given >= need - 1);
+        CHECK(given <= need + 1);
+        if (n >= 64) CHECK(given > n);
+        CHECK_EQ(vram_residents(p), rp0 - given);
+        CHECK_EQ(p.vram_packed.units, (int64_t)(rp0 - given));   /* what stayed is packed as it was */
+        for (int32_t u : p.lend_slab_units) {
+            CHECK(pp0.units[(size_t)u].tier == Tier::VRAM);
+            CHECK_EQ(p.units[(size_t)u].vram_bytes, (int64_t)0);   /* a lent unit keeps its stored form */
+        }
+    }
+
+    /* A host pool with room for a few experts holds the first units off the card, as in any plan; the slots'
+     * units are the hottest on the file tier behind them. */
+    Config cpool = c;
+    cpool.host_pool_mib = 210 + 3 * 18;
+    PlannerInput inq0{&f.prog, &cpool, 0, 1, prof.data(), (int64_t)prof.size()};
+    inq0.lend_slab = 0;
+    Plan q0;
+    CHECK_OK(Planner(inq0).plan(&q0));
+    int pooled0 = 0;
+    for (const MoveUnit& mu : q0.units) pooled0 += mu.expert >= 0 && mu.tier == Tier::HostPinned;
+    CHECK(pooled0 >= 1);
+    PlannerInput inq = inq0;
+    inq.lend_slab = 16;
+    Plan q;
+    CHECK_OK(Planner(inq).plan(&q));
+    CHECK(q.fits());
+    int qgiven = 0;
+    check_slab_plan(q0, q, 16, &qgiven);
+    CHECK(qgiven >= 16);
+    int pooled = 0;
+    float coldest_pooled = 1e9f, hottest_slab = -1.0f;
+    for (const MoveUnit& mu : q.units)
+        if (mu.expert >= 0 && mu.tier == Tier::HostPinned) {
+            ++pooled;
+            coldest_pooled = std::min(coldest_pooled, mu.profile_share);
+        }
+    for (int32_t u : q.lend_slab_units) hottest_slab = std::max(hottest_slab, q.units[(size_t)u].profile_share);
+    CHECK_EQ(pooled, pooled0);
+    CHECK(coldest_pooled > hottest_slab);
+
+    /* More slots than residents, or than the pool's room: no plan. */
+    PlannerInput inbig = in0;
+    inbig.lend_slab = r0 + 1;
+    Plan pbig;
+    CHECK(Planner(inbig).plan(&pbig) != RAD_OK || !pbig.fits());
+    CHECK(!pbig.notes.empty());
+
+    /* A dynamic plan's residents are the heat engine's: the switch changes nothing there (and the file
+     * stager refuses it, finding no slot set aside). */
+    Config cdyn = c;
+    cdyn.deterministic = false;
+    PlannerInput ind0{&f.prog, &cdyn, 0, 1, prof.data(), (int64_t)prof.size()};
+    ind0.lend_slab = 0;
+    Plan d0;
+    CHECK_OK(Planner(ind0).plan(&d0));
+    PlannerInput ind = ind0;
+    ind.lend_slab = 16;
+    Plan d;
+    CHECK_OK(Planner(ind).plan(&d));
+    CHECK(d.lend_slab_units.empty());
+    CHECK_EQ(d.lend_slab_vram, (int64_t)0);
+    CHECK_EQ(vram_residents(d), vram_residents(d0));
+}
+
 TEST(a_packed_weight_over_its_budget_stays_block_and_is_charged_so) {
     FileBufferUnitsEnv cap("1");
     Fixture f;

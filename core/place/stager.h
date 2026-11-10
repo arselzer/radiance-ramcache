@@ -730,7 +730,7 @@ private:
      * three launches (launched) and runs its waves behind its down projection (after_op). */
     int  p1_state_ = 0;
     int64_t p1_min_rows_ = ds41p1::kDefMinRows;   /* ..._P1_MIN_ROWS as lcp_init read it */
-    bool    p1_lend_asked_ = false;               /* ..._P1_LEND or ..._P1_LEND_ARENA > 0 as lcp_init read it */
+    bool    p1_lend_asked_ = false;               /* ..._P1_LEND, ..._P1_LEND_ARENA or ..._P1_LEND_SLAB > 0 as lcp_init read it */
     bool bank_track_ = false;
     uint64_t bank_selected_ = 0; // real selected file-tier units skipped because bank loan is resident
     /* The rows the CPU path takes under P1: every layer pass below the threshold (ds41p1::cpu_rows). */
@@ -751,8 +751,11 @@ private:
      * ring resident, recorded at its end; an armed pass's first ring copy waits on it. */
     RadEvent p1_lend_ev_ = nullptr;
     bool     p1_lend_rec_ = false;
+    /* The lent slab (..._P1_LEND_SLAB): the most bring-up waits for a rank's slab units to be in. */
+    static constexpr int64_t kP1SlabPrimeMs = 120000;
     /* The lent ring's slots (..._P1_LEND) and the arena's (`arena`, from p1_lend_arena), the hottest
-     * file-tier units to the ring first. */
+     * file-tier units to the ring first; and the lent slab's (..._P1_LEND_SLAB: the mover's region, the
+     * plan's units, loaded here before the first pass), which take their units ahead of both. */
     int  p1_lend_init(const p1::Tunables& t, const std::vector<char*>& arena, std::string* why);
     /* The lent arena (..._P1_LEND_ARENA): asked for (p1_init then waits for p1_lend_arena), p1_init's
      * tunables, whether the step being issued runs at the full plan, and the level its slots sit above.
@@ -1046,7 +1049,7 @@ private:
     void aux_abandon();
     int  aux_fallback();
     void aux_guard(int32_t op, const RadArgs* a, int (*launch)(const RadArgs*, RadStream));
-    std::vector<uint8_t> p1_lent_;    /* by plan unit: lent to P1's ring or arena (p1_lend_init; the heat
+    std::vector<uint8_t> p1_lent_;    /* by plan unit: lent to P1's ring, arena or slab (p1_lend_init; the heat
                                        * policy's retargets move it with the slot, p1_heat_policy) */
     int  hx_init(const Program& prog);
     int  hx_init_impl(const Program& prog);

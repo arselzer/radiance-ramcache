@@ -178,6 +178,7 @@ Mover::~Mover() {
         if (static_vram_) rad_dev_free(static_vram_, RAD_MEM_DEVICE);
         if (stage_) rad_dev_free(stage_, RAD_MEM_HOST_PINNED);
         if (file_vram_) rad_dev_free(file_vram_, RAD_MEM_DEVICE);
+        if (lend_slab_) rad_dev_free(lend_slab_, RAD_MEM_DEVICE);
         if (windows_) rad_dev_free(windows_, RAD_MEM_HOST_PINNED);
     }
     /* The pageable region is always ours: Pools has no pageable pool, since pageable memory is
@@ -563,6 +564,20 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             return RAD_E_NOMEM;
         }
         std::memset(calm_, 0, 8 << 20);
+    }
+
+    /* ---- the lent slab (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB; ds41_p1.h) -----------------------
+     *
+     * Exactly what the plan charged the weights pool for it: whole slots and a tail pad, which belong to
+     * no unit. The card expert path's lender publishes file-tier units there (set_ring_resident). */
+    if (plan.lend_slab_vram > 0) {
+        lend_slab_ = (char*)reserve("lent slab", plan.lend_slab_vram, RAD_MEM_DEVICE);
+        if (!lend_slab_) {
+            RAD_ERR("mover: no VRAM for the lent slab's %zu slots (%s)", plan.lend_slab_units.size(),
+                    humanb(plan.lend_slab_vram).c_str());
+            return RAD_E_NOMEM;
+        }
+        lend_slab_bytes_ = plan.lend_slab_vram - RAD_ALIGN_UNIT;
     }
 
     /* ---- streams, events, move records ------------------------------------------------------ */

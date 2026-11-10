@@ -21,7 +21,7 @@ bool whole(const char* v, int lo, int hi, int* out) {
     if (!v || !*v) return true;   /* unset: the default stays */
     long long n = 0;
     for (const char* p = v; *p; ++p) {
-        if (*p < '0' || *p > '9' || n > 1000000) return false;
+        if (*p < '0' || *p > '9' || n > 100000000) return false;
         n = n * 10 + (*p - '0');
     }
     if (n < lo || n > hi) return false;
@@ -43,11 +43,14 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kLendArenaEnv, 0, ds41p1::kMaxLend, &r.lend_arena },
         { ds41p1::kGraceEnv, 0, 60000, &r.grace_ms },
         { ds41p1::kLendHeatEnv, 0, ds41p1::kMaxLendHeat, &r.lend_heat },
-        { ds41p1::kLendHeatHalfEnv, 1, 1000000, &r.lend_heat_half },
+        { ds41p1::kLendSlabEnv, 0, ds41p1::kMaxLendSlab, &r.lend_slab },
+        /* Behind the slab: unset, the half-life's default follows it. */
+        { ds41p1::kLendHeatHalfEnv, 1, ds41p1::kMaxLendHeatHalfRows, &r.lend_heat_half },
         { ds41p1::kLendHeatMarginEnv, 100, 1000, &r.lend_heat_margin },
     };
     for (const K& k : ks) {
         const char* v = get(k.env);
+        if (k.at == &r.lend_heat_half && r.lend_slab > 0) r.lend_heat_half = ds41p1::kDefLendHeatHalfRowsSlab;
         if (!whole(v, k.lo, k.hi, k.at)) {
             if (why) *why = std::string(k.env) + "=" + v + ": a whole number from " + std::to_string(k.lo) +
                             " to " + std::to_string(k.hi);
@@ -449,10 +452,17 @@ int CardExpertStager::slot_of(const void* entry) const {
 }
 
 /* ---- the lent ring ------------------------------------------------------------------------------------- */
-int RingLender::init(LendHost* host, int n, int64_t grace_ms) {
-    if (!host || n < 1 || n > 2 * ds41p1::kMaxLend || grace_ms < 0) return -1;
+int RingLender::init(LendHost* host, int n, int64_t grace_ms, int keep) {
+    if (!host || n < 1 || grace_ms < 0 || keep < 0 || keep > n || keep > ds41p1::kMaxLendSlab ||
+        n - keep > 2 * ds41p1::kMaxLend)
+        return -1;
     host_ = host;
     slot_.assign((size_t)n, Slot{});
+    keep_ = keep;
+    for (int k = n - keep; k < n; ++k) {
+        slot_[(size_t)k].keep = true;
+        slot_[(size_t)k].st = St::Want;
+    }
     grace_ = grace_ms;
     last_p1_ = 0;
     lent_ = true;
@@ -475,13 +485,14 @@ int RingLender::busy() const {
 
 /* Slot k's load or copy ended without a resident: Idle while lent; Want for one a card-path pass
  * overtook (whatever became of it: its ring slot may hold the card path's bytes now, so it reloads from
- * the start); else it failed, and its unit stays on the CPU path until the next return. */
+ * the start); else it failed, and its unit stays on the CPU path until the next return. A kept slot is
+ * never lent or overtaken: its load or copy failed. */
 void RingLender::settle(int k) {
     Slot& s = slot_[(size_t)k];
-    const bool overtaken = s.cancel || lent_;
+    const bool gone = away(s), overtaken = s.cancel || gone;
     ++(overtaken ? st_.cancelled : st_.failed);
     s.cancel = false;
-    s.st = lent_ ? St::Idle : overtaken ? St::Want : St::Failed;
+    s.st = gone ? St::Idle : overtaken ? St::Want : St::Failed;
 }
 
 /* Landed loads copied (or let go, overtaken), passed copies published (or let go). */
@@ -490,7 +501,7 @@ void RingLender::poll() {
     for (int k; (k = host_->landed(&ok)) >= 0;) {
         if (k >= n() || slot_[(size_t)k].st != St::Reading) continue;   /* not a load begun here */
         Slot& s = slot_[(size_t)k];
-        if (!ok || s.cancel || lent_) {
+        if (!ok || s.cancel || away(s)) {
             host_->drop(k);
             settle(k);
             continue;
@@ -500,7 +511,7 @@ void RingLender::poll() {
     for (int k = 0; k < n(); ++k) {
         Slot& s = slot_[(size_t)k];
         if (s.st == St::Landed) {
-            if (lent_) {
+            if (away(s)) {
                 host_->drop(k);
                 settle(k);
                 continue;
@@ -516,7 +527,7 @@ void RingLender::poll() {
         const int q = host_->copied(k);
         if (q == 0) continue;
         host_->drop(k);
-        if (q < 0 || s.cancel || lent_) {
+        if (q < 0 || s.cancel || away(s)) {
             settle(k);
             continue;
         }
@@ -553,6 +564,7 @@ int RingLender::begin_pass(bool p1, int64_t now_ms) {
         int withdrawn = 0;
         for (int k = 0; k < n(); ++k) {
             Slot& s = slot_[(size_t)k];
+            if (s.keep) continue;   /* the slab's: no pass writes there, its resident stays */
             switch (s.st) {
             case St::Resident:
                 host_->publish(k, false);
@@ -603,6 +615,16 @@ int RingLender::begin_pass(bool p1, int64_t now_ms) {
 void RingLender::end_p1(int64_t now_ms) {
     any_p1_ = true;
     last_p1_ = now_ms;
+}
+
+int RingLender::prime() {
+    if (!host_ || !keep_) return 0;
+    poll();
+    pump();   /* while the other slots are lent out only the kept ones want a load */
+    int on_the_way = 0;
+    for (const Slot& s : slot_)
+        on_the_way += s.keep && (s.st == St::Want || s.st == St::Reading || s.st == St::Landed || s.st == St::Copying);
+    return on_the_way;
 }
 
 /* ---- the lent slots' heat ---------------------------------------------------------------------------------- */
@@ -1186,14 +1208,15 @@ int CardExpertPath::end_pass(RadStream s, RadEvent end) {
 
 /* ---- the lent ring's host ---------------------------------------------------------------------------- */
 int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots,
-                              const std::vector<char*>& arena_slots, int64_t grace_ms, std::string* why) {
+                              const std::vector<char*>& arena_slots, const std::vector<char*>& slab_slots,
+                              int64_t grace_ms, std::string* why) {
     auto no = [&](const std::string& w) { if (why) *why = w; return RAD_E_INVAL; };
     if (!on_ || lending()) return no("the card path is not on, or lends already");
-    const int n = (int)units.size(), nr = (int)ring_slots.size();
-    if (n < 1 || nr > ds41p1::kMaxLend || (int)arena_slots.size() > ds41p1::kMaxLend ||
-        nr + (int)arena_slots.size() != n)
-        return no("a lent ring of " + std::to_string(nr) + " slots and " + std::to_string(arena_slots.size()) +
-                  " arena slots for " + std::to_string(n) + " units");
+    const int n = (int)units.size(), nr = (int)ring_slots.size(), na = (int)arena_slots.size();
+    const int ns = (int)slab_slots.size();
+    if (n < 1 || nr > ds41p1::kMaxLend || na > ds41p1::kMaxLend || ns > ds41p1::kMaxLendSlab || nr + na + ns != n)
+        return no("a lent ring of " + std::to_string(nr) + " slots, " + std::to_string(na) + " arena slots and " +
+                  std::to_string(ns) + " slab slots for " + std::to_string(n) + " units");
     std::vector<uint8_t> used((size_t)st_.n_slots(), 0);
     std::vector<char*> at((size_t)n, nullptr);
     for (int k = 0; k < n; ++k) {
@@ -1202,13 +1225,16 @@ int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vec
             if (r < 0 || r >= st_.n_slots() || used[(size_t)r]++) return no("lent ring slot " + std::to_string(r));
             at[(size_t)k] = ring_ + (int64_t)r * ds41p1::kSlotBytes;
         } else {
-            /* An arena slot: aligned, and clear of the ring and of every other lent slot. */
-            char* const a = arena_slots[(size_t)(k - nr)];
+            /* An arena or slab slot: aligned, and clear of the ring and of every other lent slot. */
+            const bool slab = k >= nr + na;
+            char* const a = slab ? slab_slots[(size_t)(k - nr - na)] : arena_slots[(size_t)(k - nr)];
             const char* const ring_end = ring_ + (int64_t)st_.n_slots() * ds41p1::kSlotBytes;
             bool clear = a && ((uintptr_t)a & 4095) == 0 && (a + ds41p1::kSlotBytes <= ring_ || a >= ring_end);
             for (int j = nr; clear && j < k; ++j)
                 clear = a + ds41p1::kSlotBytes <= at[(size_t)j] || at[(size_t)j] + ds41p1::kSlotBytes <= a;
-            if (!clear) return no("lent arena slot " + std::to_string(k - nr) + " overlaps the ring or another slot");
+            if (!clear)
+                return no(std::string(slab ? "lent slab slot " : "lent arena slot ") +
+                          std::to_string(slab ? k - nr - na : k - nr) + " overlaps the ring or another slot");
             at[(size_t)k] = a;
         }
         const LendUnit& u = units[(size_t)k];
@@ -1234,10 +1260,26 @@ int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vec
         lplanes_.emplace_back(new Mover::HostPlanes());
         lbuf_free_.push_back(b);
     }
-    if (lend_.init(this, n, grace_ms) < 0) return no("the lent ring's state");
+    if (lend_.init(this, n, grace_ms, ns) < 0) return no("the lent ring's state");
     lstop_ = false;
     lth_ = std::thread(&CardExpertPath::lend_loop, this);
     return RAD_OK;
+}
+
+/* The slab's units before the first pass. Nothing reads or writes the slots yet, so each step is the
+ * lender's own (a load, its copy on the DMA lane, the publish once the host has seen the copy pass); the
+ * wait between steps is this thread's alone. */
+int CardExpertPath::lend_prime(int64_t most_ms) {
+    if (!lending() || lend_.kept() < 1) return 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (lend_.prime() > 0) {
+        if ((int64_t)(ns_since(t0) / 1000000) >= most_ms) break;
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+    int in = 0;
+    for (int k = lend_.n() - lend_.kept(); k < lend_.n(); ++k) in += lend_.resident(k);
+    lprimed_ = in;
+    return in;
 }
 
 /* The reload thread: a unit's two extents read whole from the container (Mover::read_piece, beside the
@@ -1630,14 +1672,23 @@ std::string CardExpertPath::stats_line(int rank) const {
     }
     if (lending()) {
         const RingLender::Stats& l = lend_.stats();
+        /* The ring's and the arena's slots here; the slab's (kept) in their own part below. */
+        int slab_in = 0;
+        for (int k = lend_.n() - lend_.kept(); k < lend_.n(); ++k) slab_in += lend_.resident(k);
         std::snprintf(buf, sizeof buf,
                       "; lent ring: %d slots (%d in the activation arena), %d residents now; %" PRIu64 " bursts took them back (%" PRIu64
                       " residents withdrawn), %" PRIu64 " returns, %" PRIu64 " reloaded (RAM cache %" PRIu64 ", drive %" PRIu64
                       " at %.1f ms a unit), %" PRIu64 " failed, %" PRIu64 " overtaken, %" PRIu64 " passes held back by the grace",
-                      lend_.n(), lend_arena_slots(), lend_.residents(), l.lends, l.withdrawn, l.returns, l.reloaded, c_.lend_ram, c_.lend_drive,
+                      lend_.n() - lend_.kept(), lend_arena_slots(), lend_.residents() - slab_in, l.lends, l.withdrawn, l.returns,
+                      l.reloaded, c_.lend_ram, c_.lend_drive,
                       c_.lend_drive ? (double)c_.lend_drive_ns * 1e-6 / (double)c_.lend_drive : 0.0, l.failed, l.cancelled,
                       l.held_back);
         line += buf;
+        if (lend_.kept() > 0) {
+            std::snprintf(buf, sizeof buf, "; lent slab: %d slots, %d residents now (%d at bring-up)", lend_.kept(),
+                          slab_in, lprimed_);
+            line += buf;
+        }
         if (t_.lend_heat > 0) {
             uint64_t declined = 0;
             for (uint64_t d : l.declined) declined += d;

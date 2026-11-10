@@ -170,10 +170,27 @@ constexpr const char* kLendArenaEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA"
 constexpr const char* kLendHeatEnv       = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT";
 constexpr const char* kLendHeatHalfEnv   = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS";
 constexpr const char* kLendHeatMarginEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT";
+/* The lent slab (kLendSlabEnv=N; 0 off, the default; 1-kMaxLendSlab): N slots of VRAM of their own a rank,
+ * which no pass ever takes back. The planner pays for them out of the same weights pool by giving up static
+ * residents from the cold end of its order: N where a resident costs a slot, about N / 22 more where
+ * residents are held packed (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: a lent slot holds the block form). The
+ * slots' units are the N hottest file-tier units of the plan that results, which are the residents given up
+ * but for what the host pool takes of them, and they are loaded at bring-up, before the first pass. So
+ * without kLendHeatEnv the cards compute what they computed, less the few units the packed form's
+ * difference costs; with it the slots follow live decode routing as the arena's and the ring's do. Needs
+ * kEnv, a static plan (--deterministic) and the file tier; like the other lent slots it makes the CPU path
+ * take every pass that does not arm the card path. */
+constexpr const char* kLendSlabEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB";
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
-/* kMaxLend bounds each of kLendEnv and kLendArenaEnv; the lender holds both (2 x kMaxLend). */
-constexpr int kDefGraceMs = 1000, kMaxLend = 64;
+/* kMaxLend bounds each of kLendEnv and kLendArenaEnv, kMaxLendSlab kLendSlabEnv; the lender holds all three
+ * (kMaxLendSlots). */
+constexpr int kDefGraceMs = 1000, kMaxLend = 64, kMaxLendSlab = 256;
+constexpr int kMaxLendSlots = 2 * kMaxLend + kMaxLendSlab;
+/* The heat's half-life in decode rows: kDefLendHeatHalfRows without the lent slab, kDefLendHeatHalfRowsSlab
+ * with it (a region of that size should follow the workload, not the last few replies), 1 to
+ * kMaxLendHeatHalfRows where kLendHeatHalfEnv sets it. */
 constexpr int kMaxLendHeat = 8, kDefLendHeatHalfRows = 100, kDefLendHeatMarginPct = 150;
+constexpr int kDefLendHeatHalfRowsSlab = 2000, kMaxLendHeatHalfRows = 100000000;
 constexpr int kMinRingSlots = 4;
 
 /* The tallest layer pass the CPU path takes under the threshold, at chunk C: every pass or layer
@@ -202,6 +219,7 @@ constexpr const char* kLogChunk = "ds41 p1 chunk:";             /* rank 0, after
 constexpr const char* kLogLend  = "ds41 p1: lent ring";         /* rank 0, at startup, with kLendEnv */
 constexpr const char* kLogLendArena = "ds41 p1: lent arena";    /* rank 0, at startup, with kLendArenaEnv */
 constexpr const char* kLogLendHeat = "ds41 p1: lent heat";      /* rank 0, at startup, with kLendHeatEnv */
+constexpr const char* kLogLendSlab = "ds41 p1: lent slab";      /* rank 0, at startup, with kLendSlabEnv */
 
 /* Whether the lent arena is asked for (kEnv `p1` on, kLendArenaEnv `lend` a count from 1 to kMaxLend):
  * the deepseek41 plugin then declares at a smaller step too. A value the core refuses counts as not
@@ -217,6 +235,21 @@ inline bool lend_arena_asked(const char* p1, const char* lend) {
 }
 /* The same from the environment, kEnv read once (state()). */
 inline bool lend_arena_asked() { return state() == 1 && lend_arena_asked("1", std::getenv(kLendArenaEnv)); }
+
+/* The lent slab's slots as asked for (kEnv `p1` on, kLendSlabEnv `slab` a count from 1 to kMaxLendSlab), else
+ * 0: the planner gives up residents for that many slots (Planner::assign_expert_tiered), and the core's
+ * tunables refuse any other value, so a count the planner did not act on never starts. */
+inline int lend_slab_asked(const char* p1, const char* slab) {
+    if (env_state(p1) != 1 || !slab || !*slab) return 0;
+    long n = 0;
+    for (const char* p = slab; *p; ++p) {
+        if (*p < '0' || *p > '9' || n > kMaxLendSlab) return 0;
+        n = n * 10 + (*p - '0');
+    }
+    return n >= 1 && n <= kMaxLendSlab ? (int)n : 0;
+}
+/* The same from the environment, read at each call (the planner's, once a plan). */
+inline int lend_slab_asked() { return lend_slab_asked(std::getenv(kEnv), std::getenv(kLendSlabEnv)); }
 
 /* ---- the device check (package K) --------------------------------------------------------------
  *

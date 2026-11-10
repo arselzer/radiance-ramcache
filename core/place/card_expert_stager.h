@@ -89,13 +89,15 @@ struct Tunables {
     int  lend_heat = 0;                                         /* 0 off; else retargets a rank a pass */
     int  lend_heat_half = ds41p1::kDefLendHeatHalfRows;         /* the heat's half-life, in decode rows */
     int  lend_heat_margin = ds41p1::kDefLendHeatMarginPct;      /* the hysteresis, percent of the resident's heat */
+    int  lend_slab = 0;                                         /* the lent slab's slots a rank (0 off) */
     bool align_end = true;
     bool swiglu_span = false;
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
- * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-1000000, lend_heat_margin 100-1000), align "end" or
- * "start", swiglu_span 0/off or 1/on (default off). False with the reason on anything else. */
+ * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-100000000 (unset: 100, or 2000 with lend_slab),
+ * lend_heat_margin 100-1000, lend_slab 0-256), align "end" or "start", swiglu_span 0/off or 1/on (default
+ * off). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
 /* The wave's live sorted slots, from ALL local experts' synchronized counts (their exclusive
@@ -284,6 +286,16 @@ private:
  * grace. Nothing else changes: which experts a row routes to and every unit's bytes are as without the
  * switch, a lent resident is computed by the plugin's own ops wherever it sits.
  *
+ * The lent slab (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=N, default 0: off): N slots of VRAM of their own,
+ * which the planner set aside by giving up static residents (Plan::lend_slab_vram) and which hold the N
+ * hottest file-tier units of that plan (Plan::lend_slab_units). No pass writes there, so these slots are
+ * kept: a pass that takes the ring's and the arena's slots back leaves them, their residents stay published
+ * through it (the plugin's ops read them at any height: block form, unmarked) and they know no grace. Their
+ * units are loaded at bring-up, before the first pass (RingLender::prime), by the path every reload takes.
+ * A kept slot's reload begins only while the other slots are not lent out, so an armed pass's drive reads
+ * and ring copies have the lane and the drive to themselves; one begun before goes on. With the heat they
+ * change units as the other slots do, by the same fence and only while every slot is settled.
+ *
  * RingLender is the state machine alone, against LendHost (tests/p1_stager_test.cpp drives it with
  * random landings, copy completions and failures); CardExpertPath is the engine's LendHost. */
 class LendHost {
@@ -339,19 +351,27 @@ public:
         uint64_t retargets = 0;            /* those units published at their slots */
         uint64_t declined[kDeclines] = {}; /* passes the policy did nothing on, by Decline */
     };
-    /* n slots (1..2 x ds41p1::kMaxLend: the ring's and the arena's), the grace in ms. Every slot starts
-     * empty and lent, as after a card-path pass long ago: the first pass that does not take the slots
-     * begins the reloads. */
-    int  init(LendHost* host, int n, int64_t grace_ms);
+    /* n slots, the grace in ms; the last `keep` of them (0..ds41p1::kMaxLendSlab) are kept (the slab's:
+     * never taken back), the others (at most 2 x ds41p1::kMaxLend) the ring's and the arena's. Every slot
+     * that is not kept starts empty and lent, as after a card-path pass long ago: the first pass that does
+     * not take the slots begins the reloads. A kept slot starts wanting its unit (prime). */
+    int  init(LendHost* host, int n, int64_t grace_ms, int keep = 0);
     int  n() const { return (int)slot_.size(); }
     /* A pass begins at now_ms; p1: it takes the slots back (it arms the card path, or with the lent
-     * arena runs at the full plan). With p1 every resident is published as a file-tier unit again and
-     * every load or copy in flight is cancelled, each copy still queued fenced first (LendHost::fence);
-     * returns 1 when some resident was (the pass's first ring copy must wait on the residents' last
-     * reader). Without, once the grace has run out the reloads begin; landed loads are copied, passed
-     * copies published, and further loads begun as buffers come free. Never fails: a host call that
-     * fails leaves its unit on the CPU path. */
+     * arena runs at the full plan). With p1 every resident but a kept slot's is published as a file-tier
+     * unit again and every load or copy in flight for such a slot is cancelled, each copy still queued
+     * fenced first (LendHost::fence); returns 1 when some resident was (the pass's first ring copy must
+     * wait on the residents' last reader). Without, once the grace has run out the reloads begin; landed
+     * loads are copied, passed copies published, and further loads begun as buffers come free. Never
+     * fails: a host call that fails leaves its unit on the CPU path. */
     int  begin_pass(bool p1, int64_t now_ms);
+    /* Bring-up, before the first pass: the kept slots' loads worked on (landed ones copied, passed copies
+     * published, further loads begun), whatever the other slots' state. Returns the kept slots still on
+     * their way (wanted, reading, landed or copying); the caller calls again until 0, or stops and leaves
+     * the rest to the passes. */
+    int  prime();
+    int  kept() const { return keep_; }
+    bool keeps(int k) const { return k >= n() - keep_ && k < n(); }
     /* A pass that took the slots back ended at now_ms: the grace runs from here. */
     void end_p1(int64_t now_ms);
     bool lent() const { return lent_; }
@@ -381,12 +401,15 @@ private:
      * or copying slot a card-path pass overtook, which goes back to Idle or Want once it ends. moved: the
      * heat policy gave the slot another unit, not yet published there (the retargets count). */
     enum class St : uint8_t { Idle, Want, Reading, Landed, Copying, Resident, Failed };
-    struct Slot { St st = St::Idle; bool cancel = false; bool moved = false; };
+    struct Slot { St st = St::Idle; bool cancel = false; bool moved = false; bool keep = false; };
     LendHost* host_ = nullptr;
     std::vector<Slot> slot_;
     int64_t grace_ = 0, last_p1_ = 0;
+    int  keep_ = 0;
     bool lent_ = true, any_p1_ = false;
     Stats st_;
+    /* Slot s is lent out: the slots are, and it is not a kept one. */
+    bool away(const Slot& s) const { return lent_ && !s.keep; }
     void settle(int k);
     void poll();
     void pump();
@@ -418,6 +441,9 @@ public:
     double heat(int32_t u) const { return u >= 0 && (size_t)u < h_.size() ? h_[(size_t)u] / scale_ : 0.0; }
     /* One half-life of decode rows has been counted: before that the counts say too little to move a unit. */
     bool warm() const { return seen_ >= half_; }
+    /* The half-life and the decode rows counted so far (the stats line's). */
+    double half_rows() const { return half_; }
+    double seen_rows() const { return seen_; }
     /* Something was counted since the policy last looked (looked); again: look once more without it. */
     bool dirty() const { return dirty_; }
     void looked() { dirty_ = false; }
@@ -465,8 +491,8 @@ int heat_turn(RingLender& l, LendHeat& h, bool took, bool bank, bool fence_ready
     if (!h.dirty() || !h.warm()) return 0;
     h.looked();
     const int n = l.n();
-    if (n < 1 || n > 2 * ds41p1::kMaxLend) return 0;
-    int32_t slot_unit[2 * ds41p1::kMaxLend];
+    if (n < 1 || n > ds41p1::kMaxLendSlots) return 0;
+    int32_t slot_unit[ds41p1::kMaxLendSlots];
     for (int k = 0; k < n; ++k) slot_unit[k] = o.slot_unit(k);
     LendHeat::Pair pair[ds41p1::kMaxLendHeat];
     const int np = h.choose(slot_unit, n, cand.data(), cand.size(), taken.data(), pair);
@@ -557,22 +583,29 @@ public:
     int  run(RadStream s);
     bool layer_open() const { return st_.layer_open(); }
 
-    /* ---- the lent ring and the lent arena (RingLender's host) ----
+    /* ---- the lent ring, the lent arena and the lent slab (RingLender's host) ----
      * lend_init: units[k] (its two weights' offsets and sizes in the unit's layout, as the plan lays it
      * out) lent ring slot ring_slots[k] for k below their count, then the arena slots arena_slots[k -
-     * that count] (whole ds41p1::kSlotBytes slots of the activation arena's lent top, arena_slots);
-     * their reloads begin at the first pass that does not take the slots back. < 0 with *why when it
-     * cannot run (the caller refuses the switch then). */
+     * that count] (whole ds41p1::kSlotBytes slots of the activation arena's lent top, arena_slots), then
+     * the slab's slots slab_slots[..] (whole slots of the mover's lent slab region, kept: never taken
+     * back); the ring's and the arena's reloads begin at the first pass that does not take the slots back,
+     * the slab's at lend_prime. < 0 with *why when it cannot run (the caller refuses the switch then). */
     struct LendUnit { int32_t unit = -1; int64_t off[2] = { 0, 0 }, bytes[2] = { 0, 0 }; };
     int  lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots,
-                   const std::vector<char*>& arena_slots, int64_t grace_ms, std::string* why);
+                   const std::vector<char*>& arena_slots, const std::vector<char*>& slab_slots, int64_t grace_ms,
+                   std::string* why);
+    /* Bring-up: the slab's units loaded, copied and published before the first pass (RingLender::prime),
+     * for at most `most_ms`; what is not in by then comes in at the passes. Returns the slab slots that
+     * hold their unit. */
+    int  lend_prime(int64_t most_ms);
+    int  lend_slab_slots() const { return lend_.kept(); }
     bool lending() const { return lend_.n() > 0; }
     RingLender& lender() { return lend_; }
     const RingLender& lender() const { return lend_; }
     /* Lent slot k's ring slot, or -1 (an arena slot); its address; the arena's lent slots. */
     int  lend_ring_slot(int k) const { return k >= 0 && k < (int)lring_.size() ? lring_[(size_t)k] : -1; }
     char* lend_slot(int k) const { return k >= 0 && k < (int)lat_.size() ? lat_[(size_t)k] : nullptr; }
-    int  lend_arena_slots() const { return (int)(lat_.size() - lring_.size()); }
+    int  lend_arena_slots() const { return (int)(lat_.size() - lring_.size()) - lend_.kept(); }
     int32_t lend_unit(int k) const { return k >= 0 && k < (int)lu_.size() ? lu_[(size_t)k].unit : -1; }
     /* The heat policy's retargets (FileStager::p1_heat_policy, between passes): lent slots ks[i], each a
      * resident's, go to units[i] (laid out as lend_init's; n at most ds41p1::kMaxLendHeat, slots and units
@@ -712,6 +745,7 @@ private:
     int      lnext_n_ = 0;
     RadEvent lfence_ = nullptr;
     bool     lfenced_ = false;
+    int      lprimed_ = 0;       /* the slab slots lend_prime left holding their unit */
 };
 
 /* The lent arena's slots in [lo, lo + bytes) (the activation arena's top above a level's buffers and

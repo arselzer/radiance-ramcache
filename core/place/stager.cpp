@@ -1619,7 +1619,7 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
         p1::Tunables t;
         if (p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, nullptr)) {
             p1_min_rows_ = t.min_rows;
-            p1_lend_asked_ = t.lend > 0 || t.lend_arena > 0;
+            p1_lend_asked_ = t.lend > 0 || t.lend_arena > 0 || t.lend_slab > 0;
         }
     }
     /* Speculation (ep_route_counts.h, "prompt-lookup speculation beside large-chunk prefill"): taken only
@@ -4842,9 +4842,25 @@ int FileStager::p1_init(const Program& prog) {
     p1::Tunables t;
     std::string why;
     if (!p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, &why)) return refuse(why);
-    if (t.lend_heat > 0 && t.lend <= 0 && t.lend_arena <= 0)
-        return refuse(fmt("%s=%d moves lent slots between units, and none is lent (%s or %s)", ds41p1::kLendHeatEnv,
-                          t.lend_heat, ds41p1::kLendEnv, ds41p1::kLendArenaEnv));
+    if (t.lend_heat > 0 && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
+        return refuse(fmt("%s=%d moves lent slots between units, and none is lent (%s, %s or %s)", ds41p1::kLendHeatEnv,
+                          t.lend_heat, ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
+    /* The lent slab: the plan gave up residents for exactly these slots (Planner::assign_expert_tiered, which
+     * read the same switch), and the mover holds them. */
+    if (t.lend_slab > 0) {
+        int64_t slab_bytes = 0;
+        const char* const slab = mover_->lend_slab_region(&slab_bytes);
+        if ((int)plan_->lend_slab_units.size() != t.lend_slab || !slab ||
+            slab_bytes < (int64_t)t.lend_slab * ds41p1::kSlotBytes)
+            return refuse(fmt("%s=%d: this rank's plan set %zu slots aside for it (%s of VRAM); it does only in a "
+                              "static plan (--deterministic) with the file tier and a weights budget, and with the "
+                              "switch in the environment when the plan was made",
+                              ds41p1::kLendSlabEnv, t.lend_slab, plan_->lend_slab_units.size(),
+                              humanb(slab ? slab_bytes : 0).c_str()));
+    } else if (!plan_->lend_slab_units.empty() || plan_->lend_slab_vram > 0) {
+        return refuse(fmt("the plan set %zu slots aside for the lent slab and %s is not set now",
+                          plan_->lend_slab_units.size(), ds41p1::kLendSlabEnv));
+    }
     if (const char* fl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST"); fl && !std::strcmp(fl, "1"))
         return refuse("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1 is not covered");
     /* Speculation: only what lcp_init took beside the chunk (lcp_spec_; ep_route_counts.h), prompt lookup
@@ -4967,7 +4983,7 @@ int FileStager::p1_init(const Program& prog) {
     /* With the lent arena the lending waits for the arena's top (p1_lend_arena, once the engine has bound
      * its level), and the ring's slots join it there. */
     p1_arena_asked_ = t.lend_arena > 0;
-    if (t.lend > 0 && !p1_arena_asked_ && p1_lend_init(t, {}, &why) < 0) {
+    if ((t.lend > 0 || t.lend_slab > 0) && !p1_arena_asked_ && p1_lend_init(t, {}, &why) < 0) {
         p1_.reset();
         return refuse(why);
     }
@@ -5045,6 +5061,36 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
     /* ..._P1_LEND_HEAT: every unit a slot may hold, as found (the policy's candidates). */
     std::vector<int32_t> heat_cand;
     if (t.lend_heat > 0) heat_cand = cand;
+    /* ..._P1_LEND_SLAB: the slab's slots and their units, which the plan chose (Plan::lend_slab_units: its
+     * hottest file-tier units once it had given up residents for the slots). Each must be a unit a slot can
+     * hold; the ring's and the arena's slots then take the hottest of the others. */
+    std::vector<int32_t> slab_units;
+    std::vector<char*> slab_at;
+    if (t.lend_slab > 0) {
+        int64_t slab_bytes = 0;
+        char* const slab = mover_->lend_slab_region(&slab_bytes);
+        std::vector<uint8_t> is_cand(plan_->units.size(), 0), in_slab(plan_->units.size(), 0);
+        for (int32_t u : cand) is_cand[(size_t)u] = 1;
+        for (int32_t u : plan_->lend_slab_units) {
+            if (u < 0 || (size_t)u >= plan_->units.size() || !is_cand[(size_t)u] || in_slab[(size_t)u]) {
+                if (why)
+                    *why = fmt("%s=%d: unit %d, which the plan gave the lent slab, is not a unit a slot can hold (a "
+                               "trunk layer's file-tier unit of %lld bytes in two weights that the CPU path reads)",
+                               ds41p1::kLendSlabEnv, t.lend_slab, (int)u, (long long)ds41p1::kSlotBytes);
+                return RAD_E_INVAL;
+            }
+            in_slab[(size_t)u] = 1;
+            slab_units.push_back(u);
+        }
+        if (!slab || (int)slab_units.size() != t.lend_slab ||
+            slab_bytes < (int64_t)t.lend_slab * ds41p1::kSlotBytes) {
+            if (why) *why = fmt("%s=%d: the plan set %zu slots aside", ds41p1::kLendSlabEnv, t.lend_slab, slab_units.size());
+            return RAD_E_INVAL;
+        }
+        for (int i = 0; i < t.lend_slab; ++i) slab_at.push_back(slab + (int64_t)i * ds41p1::kSlotBytes);
+        cand.erase(std::remove_if(cand.begin(), cand.end(), [&](int32_t u) { return in_slab[(size_t)u] != 0; }),
+                   cand.end());
+    }
     std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t c) {
         return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)c].profile_share;
     });
@@ -5063,12 +5109,15 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                        t.lend_arena, cand.size(), std::max(k, 0));
         return RAD_E_INVAL;
     }
-    const int nk = std::max(k, 0), n = nk + std::max(ka, 0);
+    /* The lent slots' units in the lender's order: the ring's, the arena's, the slab's. */
+    const int nk = std::max(k, 0), nra = nk + std::max(ka, 0), ns = (int)slab_units.size(), n = nra + ns;
+    std::vector<int32_t> lent(cand.begin(), cand.begin() + nra);
+    lent.insert(lent.end(), slab_units.begin(), slab_units.end());
     std::vector<p1::CardExpertPath::LendUnit> units((size_t)n);
     for (int i = 0; i < n; ++i) {
-        const MoveUnit& mu = plan_->units[(size_t)cand[(size_t)i]];
+        const MoveUnit& mu = plan_->units[(size_t)lent[(size_t)i]];
         p1::CardExpertPath::LendUnit& lu = units[(size_t)i];
-        lu.unit = cand[(size_t)i];
+        lu.unit = lent[(size_t)i];
         for (int w = 0; w < 2; ++w) {
             lu.off[w] = mu.offset[(size_t)w];
             lu.bytes[w] = ep_program_->weights[mu.weights[(size_t)w]].stored_bytes;
@@ -5093,15 +5142,36 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
             return RAD_E_INVAL;
         }
     }
-    RAD_TRY(p1_->lend_init(units, slots, at, t.grace_ms, why));
-    /* The units lent (the ring's and the arena's): never the aux expert worker's (p1_lent). */
+    RAD_TRY(p1_->lend_init(units, slots, at, slab_at, t.grace_ms, why));
+    /* The units lent (the ring's, the arena's and the slab's): never the aux expert worker's (p1_lent). */
     p1_lent_.assign(plan_->units.size(), 0);
-    for (int i = 0; i < n; ++i) p1_lent_[(size_t)cand[(size_t)i]] = 1;
+    for (int i = 0; i < n; ++i) p1_lent_[(size_t)lent[(size_t)i]] = 1;
     p1_heat_ = std::move(heat);
     p1_heat_pass_ = false;
     p1_heat_cand_ = std::move(heat_cand);
     p1_lend_pass_ = p1_lend_rec_pass_ = 0;
     if (at.empty()) (void)p1_->lender().begin_pass(false, p1_now_ms());   /* the first reloads begin now */
+    /* The lent slab's units are in before the first pass: no pass writes its slots, so nothing waits for a
+     * step below the full plan, and the card then holds them from the first token on. One that is not in
+     * within the bound (or failed) takes the CPU path until a later pass's begin publishes it. */
+    if (ns > 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const int in = p1_->lend_prime(kP1SlabPrimeMs);
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        double share = 0.0;
+        for (int32_t u : slab_units) share += plan_->units[(size_t)u].profile_share;
+        if (in < ns)
+            RAD_WARN("%s: rank %d: %d of the %d slots hold their unit after %.1f s of bring-up; the others' units "
+                     "take the CPU path until their reloads are in", ds41p1::kLogLendSlab, plan_->rank, in, ns, secs);
+        if (plan_->rank == 0)
+            RAD_INFO("%s: %d slots (%s=%d; %s of VRAM a card that no pass writes, for which the plan gave up %lld "
+                     "static residents, coldest first) hold rank 0's %d hottest file-tier units of that plan (profile "
+                     "share %.4f) as decode residents from bring-up on (%d loaded in %.1f s, read from the drive "
+                     "where the RAM cache does not hold the card's block form); no pass takes them back and they "
+                     "know no grace; a unit not loaded, or whose load failed, takes the CPU path",
+                     ds41p1::kLogLendSlab, ns, ds41p1::kLendSlabEnv, t.lend_slab, humanb(plan_->lend_slab_vram).c_str(),
+                     (long long)plan_->lend_slab_given, ns, share, in, secs);
+    }
     if (plan_->rank == 0 && nk > 0) {
         double share = 0.0;
         for (int i = 0; i < nk; ++i) share += plan_->units[(size_t)cand[(size_t)i]].profile_share;
@@ -5117,7 +5187,7 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
     }
     if (plan_->rank == 0 && !at.empty()) {
         double share = 0.0;
-        for (int i = nk; i < n; ++i) share += plan_->units[(size_t)cand[(size_t)i]].profile_share;
+        for (int i = nk; i < nra; ++i) share += plan_->units[(size_t)cand[(size_t)i]].profile_share;
         RAD_INFO("%s: %d slots (%s=%d; %zu fit) in the activation arena's top, above the buffers of steps of up "
                  "to %lld tokens and the guard, hold rank 0's next %d hottest file-tier units (profile share "
                  "%.4f) as decode residents; a step at the full plan (above %lld tokens: every card-path pass "
@@ -5474,6 +5544,11 @@ std::string FileStager::p1_stats_line() const {
                 (unsigned long long)p1_touched_,
                 (unsigned long long)(p1_touched_ >= ring + p1_slab_ ? p1_touched_ - ring - p1_slab_ : 0),
                 (unsigned long long)p1_slab_, (unsigned long long)ring, (unsigned long long)p1_order_moved_);
+    /* ..._P1_LEND_HEAT: the half-life the policy ran with and the decode rows it counted (it acts only once
+     * a half-life of them is in). */
+    if (p1_heat_)
+        line += fmt("; heat half-life %lld decode rows, %lld counted", (long long)p1_heat_->half_rows(),
+                    (long long)p1_heat_->seen_rows());
     return line;
 }
 

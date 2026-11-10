@@ -53,6 +53,12 @@ $(O)/ds41_mxfp4_device_check: $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_expe
 	$(HIPCC) $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_experts_dc.o -o $@ -ldl
 mxfp4-check: $(O)/ds41_mxfp4_device_check
 
+# The AxF arms' simulated tenant of the aux worker's extra card (work/aux-dyn/SPEC.md §8.4). Run only in a GPU window,
+# only on the extra card (ab_window.sh starts it); never by a host test.
+$(O)/aux_tenant: aux_tenant.hip
+	$(HIPCC) -O2 -std=c++17 --offload-arch=gfx1201 -o $@ aux_tenant.hip
+aux-tenant: $(O)/aux_tenant
+
 # Same n128 oracle cases as the SIMT emulator, over a built libr4d. Run only in a GPU window.
 $(O)/ds41_n128_device_check: $(TREE)/tests/r4d_emu/test_ds41n128.cpp $(TREE)/libr4d/r4d_ds41_elem.h
 	$(HIPCC) $(HIPFLAGS) -DDS41_N128_DEVICE -I$(TREE)/abi -I$(TREE)/libr4d -o $@ $< -ldl

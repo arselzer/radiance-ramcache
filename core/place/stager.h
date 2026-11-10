@@ -579,13 +579,35 @@ public:
         int64_t loaded = 0, cached = 0, packed = 0, skipped = 0;
         double  share = 0;
     };
+    /* `abort` (card sharing, work/aux-dyn/SPEC.md A.5): set by the control thread's startup watch, the load stops
+     * before its next unit (what loaded stays loaded; the engine then releases the arena). */
     int  aux_load(aux::Worker* w, int r, const std::vector<int32_t>& list, int64_t first, int64_t quota,
-                  AuxLoadStats* st, std::string* why);
+                  AuxLoadStats* st, std::string* why, const std::atomic<bool>* abort = nullptr);
     int  aux_warm(aux::Worker* w, int r, std::string* why);
     void aux_bind(aux::Lane* lane, const aux::RankView* view, const aux::Config& cfg);
     void aux_unbind();
     bool aux_bound() const { return aux_ != nullptr; }
     const aux::Stats& aux_stats() const { return aux_stats_; }
+    /* ---- the dynamic worker (work/aux-dyn/SPEC.md; unset, none of it runs: a null and a flag test) ----------
+     * aux_set_dynamic  after aux_bind: the gate (card sharing; null without a controller) with this rank's entry,
+     *                  and the online set's candidates by plan unit (null: not counted); the hit array sized to the
+     *                  plan.
+     * aux_swap_hits    the step boundary (ranks parked): this rank's hits for `empty` (the same size, zeroed);
+     *                  returns the tokens of the passes counted since the last hand-off, zeroed.
+     * aux_hit_tokens / aux_guard_tripped  the boundary's reads (ranks parked).
+     * aux_layer_index  by plan unit: its routed layer's index (the tables' li), -1.
+     * aux_warm_unit    the control thread's warm-up at an acquire: aux_warm's job on unit u of routed layer li with
+     *                  the new arena's tables, its rows against the CPU pool's.
+     * aux_source       the control thread's copy source: unit u's packed slots from the RAM cache (a read-only lease
+     *                  into *hu), checked as aux_load checks them; false otherwise (nothing held). */
+    void aux_set_dynamic(aux::Gate* gate, int rank, const std::vector<uint8_t>* cand);
+    uint64_t aux_swap_hits(std::vector<uint32_t>* empty);
+    uint64_t aux_hit_tokens() const { return aux_hit_tok_; }
+    bool aux_guard_tripped() const { return aux_guard_bad_; }
+    std::vector<int32_t> aux_layer_index() const;
+    int  aux_warm_unit(aux::Lane* lane, int32_t u, int32_t li, const void* gu_tab, const void* dn_tab, std::string* why);
+    bool aux_source(int32_t u, const ds41aux::Layout& L, Mover::HostUnit* hu, const uint8_t** gu, int64_t* gu_n,
+                    const uint8_t** dn, int64_t* dn_n);
     /* Whether unit u is lent to prefill Phase 1's ring or arena (p1_lend_init). */
     bool p1_lent(int32_t u) const { return u >= 0 && (size_t)u < p1_lent_.size() && p1_lent_[(size_t)u] != 0; }
     size_t aux_routed_layers() const { return layers_.size(); }
@@ -967,6 +989,24 @@ private:
     std::vector<AuxRows> aux_rows_;
     bool    aux_guard_bad_ = false;   /* a launch the rank made was not the resolved row: no more jobs */
     aux::Stats aux_stats_;
+    /* The dynamic worker (aux_set_dynamic): the gate and this rank's entry, held from hx_choose's decision to the
+     * layer's last lane call (aux_lane_enter / aux_lane_leave); the online set's counting. */
+    aux::Gate* aux_gate_ = nullptr;
+    int        aux_gate_rank_ = 0;
+    bool       aux_in_lane_ = false;
+    bool       aux_online_ = false;
+    std::vector<uint8_t>  aux_cand_;   /* by plan unit: an online candidate */
+    std::vector<uint32_t> aux_hits_;   /* by plan unit: rows routed to it since the last hand-off */
+    uint64_t   aux_hit_tok_ = 0;       /* tokens of the counted passes since then */
+    bool aux_lane_enter();
+    /* Inline: unset (no gate) it is the flag test alone. */
+    void aux_lane_leave() {
+        if (!aux_in_lane_) return;
+        aux_gate_->leave(aux_gate_rank_);
+        aux_in_lane_ = false;
+    }
+    int  aux_warm_job(aux::Lane* lane, int32_t u, int32_t li, Mover::HostUnit* hu, const void* gu_tab,
+                      const void* dn_tab, int r, std::string* why);
     int  aux_prepare(int* appended);
     void aux_submit();
     int  aux_finish();

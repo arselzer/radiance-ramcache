@@ -29,7 +29,8 @@
 set(RAD_TESTS_NO_CORE kv_growth_test arch_test glm5next_test nemotron35_test mapped_slab_pregrow_test draft_policy_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
                       ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test
-                      ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test ds41_ag_rows_arch_test)
+                      ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test ds41_ag_rows_arch_test
+                      aux_share_test aux_online_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -553,6 +554,12 @@ set_tests_properties(ab_window_ba_test PROPERTIES LABELS "unit;fast" TIMEOUT ${R
 add_test(NAME ab_window_longctx_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_longctx_test.sh)
 set_tests_properties(ab_window_longctx_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# The aux worker's card sharing and online set (work/aux-dyn/SPEC.md §7.1-7.2): pure, no core. aux_online_test
+# holds the C++ planner to the replay's swaps on tests/data/aux_online/fixture.bin (written by
+# work/aux-dyn/replay/q5_engine_rule.py --fixture from 200 held-out decode tokens of the Oct 29 traces).
+target_compile_definitions(aux_online_test PRIVATE
+  RAD_AUX_ONLINE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/data/aux_online/fixture.bin")
+
 # ab_window.sh's aux expert worker parts (Ax / AxN / Axv / Ax0 / AxfN): the arm loop with every action stubbed,
 # arm()'s startup-line guards on lines in the engine's format, aux_find on fabricated KFD topologies, the extra
 # card's client and exit gates, and the DEVICE_CHECKS=aux section with stub checks. No card, no server, no model.

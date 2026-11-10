@@ -59,6 +59,38 @@ tokenization and admission wait. All prefill rows use admit-all with the tested 
   same architecture. Branches: `main` (this one), `ds41-stable` (the measured line), `ds41` (a curated
   evidence snapshot) and `ds41-research`.
 
+## Placement profiles, prompt-lookup drafting and the worker's online set (10 November)
+
+Measured on the `ds41-stable` line in five A/B windows (four RX 9070 XT, 192 GiB cache); on `main` the same
+commits are built and host-tested. Every reply in every arm equals the base engine's. Rates in this section are
+tokens over the wall time of each wave of requests (prefill included), so they read lower than the table above.
+
+**Placement profile.** `--expert-profile` decides which experts stay on the cards and which the RAM cache holds,
+and prompts of different kinds route to different experts: the sealed 721-token profile keeps 30% of a file-edit
+workload's expert selections on the cards, a profile recorded on that workload 80%.
+`tools/ds41-host-experts/profile_blend.py` blends routing counts recorded with `--expert-stats` into one profile.
+Prompts that are in no profile, 8 streams:
+
+| Unseen prompts (tok/s) | Sealed profile | Blend of sealed, chat, code | Plus edit and agent-harness counts |
+|---|---:|---:|---:|
+| Whole-file edits | 24.0 | 27.4 (+14%) | 32.6 (+35%) |
+| Code | 36.9 | 44.1 (+20%) | 48.1 (+30%) |
+| Chat | 31.2 | 34.3 (+10%) | 31.5 (+1%) |
+
+Agent-harness turns with the prefix cache, one stream, under the last profile (which holds their counts): decode
+25.3 to 29.6 tok/s and 65.1 to 47.8 s summed time to first token, because the profile also decides which experts
+are read from the drive during prefill. Placement only: no reply changes.
+
+**Prompt-lookup drafting on the recommended configuration.** Large-chunk prefill, card-path prefill and the
+consumer skip now take speculation by prompt lookup (no draft model) while
+`--max-num-seqs` x (1 + `--num-speculative-tokens`) is at most 16. Whole-file edits at one stream: 22.3 tok/s
+without, 31.3 with 8 drafted tokens (+40%), 33.1 with 15 (+49%); prompts that repeat nothing are unchanged.
+End-of-request snapshots and taller verify steps (more streams) are not covered yet.
+
+**The expert worker's online unit set.** The optional fifth card now follows live routing and can be shared with
+another tenant (released in 4.5 ms). Against its static set: held-out 8 streams 37.8 to 40.0 tok/s, chat 36.2 to
+41.4, agent-harness decode 29.5 to 33.9 tok/s; with the blended profile the unseen chat prompts reach 45.6.
+
 ## Matched resident-drafter screen (9 November)
 
 A separately built prototype compares the best small-pool plain profile with

@@ -717,6 +717,30 @@ bool FileStager::begin_pass(const RadBatch* b) {
     lcp_admit_row_ = lcp_ ? std::max<int32_t>(b->lcp_admit_row, 0) : 0;
     if (b->consumer_row0 && n_model_layers_ > 0) pass_row0_.assign(b->consumer_row0, b->consumer_row0 + n_model_layers_);
     else pass_row0_.clear();
+    /* Prompt-lookup speculation beside LCP (lcp_init took it; ep_route_counts.h): every pass with
+     * speculative rows must be the verify step the admission covers, and no drafter pass may come. Counted,
+     * and said once: the shutdown line's count outside the band must be 0 (ab_window.sh sets the arm aside
+     * otherwise). */
+    if (lcp_ && lcp_spec_ && (b->n_spec > 0 || b->draft_pass != 0)) {
+        const bool cut = b->consumer_full != 0 || b->consumer_row0 != nullptr;
+        if (b->n_spec > 0 && b->draft_pass == 0) {
+            ++hx_stats_.spec_passes;
+            hx_stats_.spec_rows += (uint64_t)std::max<int64_t>(b->n_tok, 0);
+            hx_stats_.spec_max_rows = std::max<uint64_t>(hx_stats_.spec_max_rows, (uint64_t)std::max<int64_t>(b->n_tok, 0));
+        }
+        if (!ds41_verify_pass_covered(b->phase == RAD_PHASE_DECODE, b->draft_pass, b->n_spec, b->n_tok,
+                                      b->n_tok_decode, cut, b->lcp_admit_row) ||
+            b->n_tok > lcp_spec_rows_) {
+            if (hx_stats_.spec_off++ == 0)
+                RAD_ERR("large-chunk prefill: a pass outside the verify steps prompt-lookup speculation was "
+                        "admitted for (phase %d, draft pass %d, %lld tokens, %lld of them decode rows, %d "
+                        "speculative, %s, admission row %d; covered: a trunk decode pass of at most %lld rows, "
+                        "uncut): its rows are not shown to be the engine's without speculation",
+                        (int)b->phase, (int)b->draft_pass, (long long)b->n_tok, (long long)b->n_tok_decode,
+                        (int)b->n_spec, cut ? "cut by the consumer skip" : "uncut", (int)b->lcp_admit_row,
+                        (long long)lcp_spec_rows_);
+        }
+    }
     hx_defer_li_ = -1;
     hx_wake_li_ = -1;
     /* Prefill Phase 1: a pure prefill pass of the threshold's rows or more runs every routed expert row
@@ -1564,7 +1588,9 @@ const char* lcp_family(const std::string& op, const char* name) {
  * resolved to the gemv or its twin, and the twin as this libr4d declares it reaches C (a libr4d that
  * does not know the switch has no twin, or one bounded at 48, and is refused here: the switch is
  * verified, not assumed); every other op runs one kernel at every height or one of lcp_family's
- * pairs. Refused with the reason, too: EXACT_TALL set to anything but 1 beside it, speculation, the
+ * pairs. Refused with the reason, too: EXACT_TALL set to anything but 1 beside it, speculation other
+ * than prompt lookup alone in steps of at most 16 decode rows (ds41_lcp_spec: the verify steps the
+ * bands below cover), the
  * fetch lists (sized for 48 rows) and the packed VRAM residents (whose gemv serves 16 rows). What
  * the CPU path needs (every routed unit the CPU's: ..._POLICY=all, ..._MISSES >= C, the file buffers
  * capped) is hx_init's; the chunk geometry and the sequences a step holds are the scheduler's
@@ -1586,6 +1612,10 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
             p1_lend_asked_ = t.lend > 0 || t.lend_arena > 0;
         }
     }
+    /* Speculation (ep_route_counts.h, "prompt-lookup speculation beside large-chunk prefill"): taken only
+     * as prompt lookup alone (no draft head declared) whose steps of decode rows fit the decode band, where
+     * the band checks below cover a verify step as they cover a 16-token pass; refused as before otherwise. */
+    const LcpSpec spec = ds41_lcp_spec(prog.ctx.max_seqs, prog.ctx.max_spec, prog.drafter.kind != RAD_DRAFT_NONE);
     if (xt && *xt && std::strcmp(xt, "1") != 0)
         why = fmt("%s=%s beside it: large-chunk prefill keeps EXACT_TALL's pins at every height; leave it unset "
                   "(or empty) or 1", kExactTallEnv, xt);
@@ -1593,7 +1623,10 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
         why = fmt("--max-num-batched-tokens is %lld: give %lld, the chunk the switch was set for (a step of "
                   "another size would run passes the bands below were not checked at, or fewer rows a chunk)",
                   (long long)T, (long long)C);
-    else if (prog.ctx.max_spec > 0)
+    else if (prog.ctx.max_spec > 0 && spec == LcpSpec::Rows)
+        why = fmt("speculation is on (a window of %d): %s", prog.ctx.max_spec,
+                  ds41_lcp_spec_rows_why(prog.ctx.max_seqs, prog.ctx.max_spec).c_str());
+    else if (prog.ctx.max_spec > 0 && spec != LcpSpec::Lookup)
         why = fmt("speculation is on (a window of %d): verify steps and DSpark's drafter are not covered",
                   prog.ctx.max_spec);
     else if (const char* fl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST"); fl && !std::strcmp(fl, "1"))
@@ -1754,12 +1787,16 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
         n_pairs += f.second.first;
     }
     lcp_pair_ops_ = n_pairs;
+    lcp_spec_ = spec == LcpSpec::Lookup ? prog.ctx.max_spec : 0;
+    lcp_spec_rows_ = lcp_spec_ ? ds41_verify_rows(prog.ctx.max_seqs, prog.ctx.max_spec) : 0;
     return RAD_OK;
 }
 
 int FileStager::tall_init(const Program& prog) {
     ep_rows_ = kEpRouteMaxRows;
     lcp_ = 0;
+    lcp_spec_ = 0;
+    lcp_spec_rows_ = 0;
     const int64_t lcp = ds41_lcp_state();
     if (lcp < 0) {
         const char* v = std::getenv(kLcpEnv);
@@ -1970,9 +2007,25 @@ int FileStager::hx_init(const Program& prog) {
     const int rc = packed_ok();
     if (rc >= 0 && lcp_) {
         lcp_note_admitted();
-        if (plan_->rank == 0) lcp_report();
+        if (plan_->rank == 0) {
+            lcp_report();
+            lcp_spec_report();
+        }
     }
     return rc;
+}
+
+/* Prompt-lookup speculation taken beside an admitted LCP (rank 0; ep_route_counts.h): ab_window.sh
+ * measures an Sg arm with an Lc part only with this line. */
+void FileStager::lcp_spec_report() const {
+    if (!lcp_spec_) return;
+    RAD_INFO("large-chunk prefill: prompt-lookup speculation admitted (--num-speculative-tokens %d, no draft "
+             "head): a verify step is a decode pass of at most %lld rows, inside the decode band of %lld (%s=%lld's "
+             "band checks hold the routed GEMMs, the head and every other op to the kernels of a 16-token pass at "
+             "that height); the CPU path takes its routed units by rows like any decode pass of that height, the "
+             "card path never arms for it, and it admits every unit it routes to; a drafter's passes and steps of "
+             "more decode rows stay refused",
+             lcp_spec_, (long long)lcp_spec_rows_, (long long)kEpRouteMaxRows, kLcpEnv, (long long)lcp_);
 }
 
 /* The startup line of an admitted LCP (rank 0): ab_window.sh measures an Lc arm only with it, and a
@@ -4778,7 +4831,19 @@ int FileStager::p1_init(const Program& prog) {
     if (!p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, &why)) return refuse(why);
     if (const char* fl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST"); fl && !std::strcmp(fl, "1"))
         return refuse("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1 is not covered");
-    if (prog.ctx.max_spec > 0) return refuse("speculation is on");
+    /* Speculation: only what lcp_init took beside the chunk (lcp_spec_; ep_route_counts.h), prompt lookup
+     * alone in steps of at most 16 decode rows. Such a step never arms the card path (p1_pass_arms: no
+     * decode row, no speculation), so its routed layers run as without the switch: the residents, the
+     * lent slots' among them, in the plugin's own ops on the decode band's rows, every other unit on the
+     * CPU path; and its arena level is the small one (Engine::arena_step sizes a step by its sequences'
+     * 1 + drafts rows), so it never takes the lent arena's slots back. A drafter's passes, and steps of
+     * more decode rows, are refused as before. */
+    if (prog.ctx.max_spec > 0 && !lcp_spec_) {
+        const LcpSpec spec = ds41_lcp_spec(prog.ctx.max_seqs, prog.ctx.max_spec, prog.drafter.kind != RAD_DRAFT_NONE);
+        return refuse(spec == LcpSpec::Rows
+                          ? "speculation is on: " + ds41_lcp_spec_rows_why(prog.ctx.max_seqs, prog.ctx.max_spec)
+                          : std::string("speculation is on"));
+    }
     /* Set but empty is off (ab_window.sh states the switch on every arm without Rt). */
     if (const char* rte = std::getenv("RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE"); rt_ || (rte && *rte))
         return refuse("RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE is on: its records follow the CPU path's choice");
@@ -4901,6 +4966,11 @@ int FileStager::p1_init(const Program& prog) {
                  (long long)p1_cpu_rows(), p1_->ring_slots(), (long long)ds41p1::kSlotBytes,
                  (double)p1_->ring_slots() * (double)ds41p1::kSlotBytes / 1048576.0, t.wave, t.inflight, t.ready,
                  t.ahead, t.verify, t.align_end ? "prompt's end" : "chunk grid (start)", p1_pool_units_);
+    if (plan_->rank == 0 && lcp_spec_)
+        RAD_INFO("ds41 p1: prompt-lookup speculation admitted (--num-speculative-tokens %d, no draft head): a verify "
+                 "step of at most %lld decode rows never arms the card path; its residents run in the plugin's own ops "
+                 "on the decode band's rows and every other routed unit on the CPU path, as in any decode pass",
+                 lcp_spec_, (long long)lcp_spec_rows_);
     return RAD_OK;
 }
 

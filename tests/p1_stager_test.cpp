@@ -1471,6 +1471,23 @@ TEST(p1_lend_decode_beside_the_card_path_sees_residency_change_only_between_pass
     CHECK_EQ(l.residents(), 4);
     lend_pass(l, h, FileStager::p1_pass_arms(mixed, 320, 1024), t += 5);
     CHECK_EQ(l.residents(), 4);   /* a mixed step keeps them */
+    /* Prompt lookup's verify steps (speculation beside the card path, core/place/ep_route_counts.h): a decode
+     * pass of 2..16 rows of one sequence with speculative rows never arms, at any threshold the switch takes,
+     * so it keeps the residents as a decode pass does and computes them in the plugin's own ops. */
+    for (int64_t rows = 2; rows <= 16; ++rows) {
+        RadBatch verify{};
+        verify.phase = RAD_PHASE_DECODE;
+        verify.n_tok = rows;
+        verify.n_tok_decode = rows;
+        verify.n_seq = verify.n_seq_decode = 1;
+        verify.n_spec = (int32_t)rows - 1;
+        for (int64_t thr : { 17, 64, 320, 1024 }) CHECK(!FileStager::p1_pass_arms(verify, thr, 1024));
+        CHECK(!FileStager::p1_pass_arms(verify, ds41p1::kMinArmRows, 4096));
+        const int before = h.published();
+        lend_pass(l, h, FileStager::p1_pass_arms(verify, 320, 1024), t += 5);
+        CHECK_EQ(l.residents(), 4);
+        CHECK_EQ(h.published(), before);
+    }
     CHECK_EQ(lend_pass(l, h, FileStager::p1_pass_arms(chunk, 320, 1024), t += 5), 1);
     l.end_p1(t += 2000);
     /* Decode steps between two chunks of a long prompt: lent, nothing published, nothing read again. */

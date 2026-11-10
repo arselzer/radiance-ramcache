@@ -73,12 +73,14 @@ static bool any_kv_streams(const Config& cfg, const std::vector<BatchBuilder::Ra
  * even without the prefix cache) that is a multiple of C, or with --prefill-span one that C is a
  * multiple of, spanned to at least C. A step holds one sequence's chunk unless prefill runs alone
  * (a C-token chunk holds the card ~10 s, and decode rows beside it would wait that long anyway).
- * Refused, too, with speculation, with KV streaming (a streamed group keeps a ring of its context on
+ * Refused, too, with speculation other than prompt lookup alone in steps of at most 16 decode rows
+ * (ds41_lcp_spec), with KV streaming (a streamed group keeps a ring of its context on
  * the card, which a C-token chunk's window and keys were never checked against), and unless every
  * rank's file stager took it (its line says what it admitted, or why not). No ranks (tests) skips
  * that last check. */
 int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vector<BatchBuilder::RankIO>& ranks) {
     lcp_ = 0;
+    lcp_spec_rows_ = 0;
     const size_t world = ranks.size();
     const int64_t C = ds41_lcp_rows();
     if (ds41_lcp_state() < 0) {
@@ -90,6 +92,12 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
     const int64_t I = geo_.checkpoint_interval;
     const bool periodic = I > 0 && (!geo_.window_ckpt || geo_.window_periodic);
     const bool spans = geo_.span > 1;
+    /* Speculation (ep_route_counts.h, "prompt-lookup speculation beside large-chunk prefill"): prompt
+     * lookup alone whose steps of decode rows fit the decode band is taken; a draft head, or more rows,
+     * is refused as before. A chunk still runs alone in its step (below), so a step is one prompt's pure
+     * prefill chunk, which carries no draft (step(): a prefill entry's n_spec is 0), or decode rows only,
+     * at most max_seqs x (1 + n_spec) of them. */
+    const LcpSpec spec = ds41_lcp_spec(cfg.max_seqs, cfg.n_spec, prog.drafter.kind != RAD_DRAFT_NONE);
     std::string why;
     if (cfg.max_tok != C)
         why = fmt("--max-num-batched-tokens %lld: give %lld", (long long)cfg.max_tok, (long long)C);
@@ -104,7 +112,9 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
                   (long long)(geo_.span * I), (long long)((C + I - 1) / I), (long long)C);
     else if (periodic && spans && I >= C && I % C != 0)
         why = fmt("the checkpoint interval %lld is not a multiple of the chunk %lld", (long long)I, (long long)C);
-    else if (cfg.n_spec != 0 || prog.drafter.kind != RAD_DRAFT_NONE)
+    else if (spec == LcpSpec::Rows)
+        why = "speculation is on: " + ds41_lcp_spec_rows_why(cfg.max_seqs, cfg.n_spec);
+    else if (spec == LcpSpec::Drafter)
         why = "speculation is on: verify steps and a drafter's passes are not covered";
     else if (any_kv_streams(cfg, ranks))
         why = "KV streaming (--kv-resident) is not covered: a streamed group keeps a ring of its context on the "
@@ -121,6 +131,7 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
         return RAD_E_INVAL;
     }
     lcp_ = C;
+    lcp_spec_rows_ = spec == LcpSpec::Lookup ? ds41_verify_rows(cfg.max_seqs, cfg.n_spec) : 0;
     /* Prefill Phase 1 (RADIANCE_EXPERIMENTAL_DS41_P1=1, the file stager's p1_init): chunks aligned to the
      * prompt's end unless ..._P1_ALIGN=start or --prefix-resume exact; a checkpoint interval of at least
      * C (end-aligned chunks then write a snapshot only where one ends on it, and at the prompt's tail). */
@@ -174,6 +185,12 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
              : fmt("the units the prompt's last %lld tokens select, as the chunks reach them; earlier rows borrow "
                    "read-only (RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=%lld)", (long long)admit, (long long)admit).c_str(),
              cfg.max_seqs > 1 ? "; a chunk runs alone in its step (decode rows wait for it)" : "");
+    if (lcp_spec_rows_ > 0)
+        RAD_INFO("large-chunk prefill: prompt-lookup speculation admitted (--num-speculative-tokens %d, "
+                 "--max-num-seqs %lld, no draft head): a step is one prompt's pure prefill chunk, which carries no "
+                 "draft, or decode rows only, at most %lld of them (the decode band holds %lld); a verify step is "
+                 "never cut and takes no admission row",
+                 cfg.n_spec, (long long)cfg.max_seqs, (long long)lcp_spec_rows_, (long long)kEpRouteMaxRows);
     return RAD_OK;
 }
 
@@ -777,9 +794,20 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             else if (streams)
                 why = "KV streaming (--kv-resident) is not covered: a streamed group holds a ring of "
                       "its context, not the whole windows the derivation reads";
-            else if (cfg.n_spec != 0 || prog.drafter.kind != RAD_DRAFT_NONE)
-                why = "speculation is on: a drafter's context reads every prompt row's hidden state, "
-                      "and verify steps are not covered";
+            /* Speculation: taken only beside large-chunk prefill's own admission of it (lcp_spec_rows_:
+             * prompt lookup alone, steps of at most 16 decode rows; ep_route_counts.h). Prompt lookup reads
+             * the sequence's tokens, no hidden state; a step with a decode or speculative row is never cut
+             * (BatchBuilder::build), and a verify row at position p reads its layer's window keys at
+             * p - W + 1 .. p, at or past the prompt's end less the window, where every layer's keys are
+             * whole (consumer_skip.h: complete from T - W; a prefix hit's snapshot likewise). Without
+             * large-chunk prefill nothing holds a verify pass's rows to a 1-row pass's bits: refused. */
+            else if ((cfg.n_spec != 0 || prog.drafter.kind != RAD_DRAFT_NONE) && lcp_spec_rows_ <= 0)
+                why = std::string("speculation is on: a drafter's context reads every prompt row's hidden state, "
+                                  "and verify steps are not covered") +
+                      (prog.drafter.kind == RAD_DRAFT_NONE && cfg.n_spec > 0 && lcp_ <= 0
+                           ? fmt(" (prompt lookup's are only beside large-chunk prefill, %s, whose admission "
+                                 "holds every op to one kernel form at every pass height)", kLcpEnv)
+                           : std::string());
             else if (cfg.kld())
                 why = "--kld-record / --kld-ref score every prompt row";
             else if (prog.pooled_buf)
@@ -857,6 +885,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                              lcp_ > 0 ? "; under large-chunk prefill a whole chunk is cut or not, which keeps "
                                         "few layer-rows cut (the plugin did not declare the per-row grain)"
                                       : "");
+                if (lcp_spec_rows_ > 0)
+                    RAD_INFO("consumer skip: prompt-lookup speculation admitted (--num-speculative-tokens %d, no "
+                             "draft head): a verify step of at most %lld decode rows runs every layer on every row "
+                             "(no step with a decode or speculative row is cut) and reads each layer's window keys "
+                             "only from the prompt's end less the %d-row window on, where a cut prompt's are whole",
+                             cfg.n_spec, (long long)lcp_spec_rows_, d.window);
                 if (ckpts && cs_band_ != 0) {
                     /* What one whole checkpoint costs at this shape, on an idle grid: the
                      * layer-passes its cone runs in full (layers B .. n-2) on the passes before

@@ -466,6 +466,13 @@ lcp_check() {   # name
   fi
   [[ -n "${ARM_P1:-}" ]] && grep -m2 -E 'ds41 p1: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_QE:-}" ]] && grep -m2 -E 'ds41 p1: lent arena: |activation arena: .*lent arena' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # SgK / SgaK beside Lc: the admission's startup lines, in an Sg arm only (sg_gate).
+  local sg_why
+  if declare -F sg_gate >/dev/null && ! sg_why=$(sg_gate "$OUT/$name.server.log" "${ARM_LC:+${ARM_SG:-}}" "${ARM_P1:-}" "${ARM_CS:-}" start); then
+    log "arm $name: $sg_why ($(grep -m2 -E 'speculation is on|prompt-lookup speculation' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
+    return 1
+  fi
+  [[ -n "${ARM_LC:-}" && -n "${ARM_SG:-}" ]] && grep -E 'prompt-lookup speculation admitted' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   return 0
 }
 
@@ -578,6 +585,46 @@ kld_finish() {   # name; the run is SERVER_PID
     return 0
   fi
   python3 -I "$HERE/ab_requests.py" --kld-compare "$KLD_REF" "$OUT/kld-$name" 2>&1 | tee -a "$OUT/window.log"
+}
+
+# SgK / SgaK beside Lc (prompt-lookup speculation beside large-chunk prefill; core/place/ep_route_counts.h):
+# the engine takes it only where a step of decode rows fits the decode band, --max-num-seqs x (1 + K) <= 16
+# (the arm loop skips any other Sg arm with an Lc part),
+# and says so at startup: rank 0's file stager, the scheduler, the card path (P1) and the consumer skip (Cs),
+# each naming K. An Sg arm with an Lc part is measured only with those lines, and an arm without an Sg part
+# only without them. At exit every rank's file stager counts its verify passes and the passes outside the
+# band it was admitted for: any outside, or a verify pass of more than 16 rows, sets the arm aside.
+sg_gate() {   # log, the arm's K (empty: no Sg part), its P1 and Cs parts (non-empty: on), start/exit
+  local f=$1 sg=$2 p1=$3 cs=$4 stage=${5:-start} n line most outside
+  if [[ -z "$sg" || "$sg" == 0 ]]; then
+    if grep -q 'prompt-lookup speculation admitted' "$f"; then
+      echo "no Sg part, but the server took prompt-lookup speculation beside large-chunk prefill"; return 1
+    fi
+    return 0
+  fi
+  if [[ "$stage" != exit ]]; then
+    grep -qE "large-chunk prefill: prompt-lookup speculation admitted \(--num-speculative-tokens $sg, no draft head\): a verify step is a decode pass" "$f" ||
+      { echo "Sg$sg with Lc, but rank 0's file stager has no 'large-chunk prefill: prompt-lookup speculation admitted (--num-speculative-tokens $sg, no draft head)' line"; return 1; }
+    grep -qE "large-chunk prefill: prompt-lookup speculation admitted \(--num-speculative-tokens $sg, --max-num-seqs [0-9]+, no draft head\)" "$f" ||
+      { echo "Sg$sg with Lc, but the scheduler has no 'large-chunk prefill: prompt-lookup speculation admitted (--num-speculative-tokens $sg, --max-num-seqs N, no draft head)' line"; return 1; }
+    if [[ -n "$p1" ]] && ! grep -qE "ds41 p1: prompt-lookup speculation admitted \(--num-speculative-tokens $sg, " "$f"; then
+      echo "Sg$sg with P1, but the card path has no 'ds41 p1: prompt-lookup speculation admitted' line"; return 1
+    fi
+    if [[ -n "$cs" ]] && ! grep -qE "consumer skip: prompt-lookup speculation admitted \(--num-speculative-tokens $sg, " "$f"; then
+      echo "Sg$sg with Cs, but the scheduler has no 'consumer skip: prompt-lookup speculation admitted' line"; return 1
+    fi
+    return 0
+  fi
+  n=0
+  while IFS= read -r line; do
+    most=$(sed -nE 's/.*prompt-lookup verify passes [0-9]+, [0-9]+ rows \(at most ([0-9]+) a pass\); passes outside the decode band ([0-9]+).*/\1/p' <<< "$line")
+    outside=$(sed -nE 's/.*prompt-lookup verify passes [0-9]+, [0-9]+ rows \(at most ([0-9]+) a pass\); passes outside the decode band ([0-9]+).*/\2/p' <<< "$line")
+    if [[ -z "$most" || -z "$outside" ]]; then echo "a 'prompt-lookup verify passes' line without its counts ($line)"; return 1; fi
+    if (( outside > 0 )); then echo "$outside passes outside the decode band the speculation was admitted for ($line)"; return 1; fi
+    if (( most > 16 )); then echo "a verify pass of $most rows, over the decode band's 16 ($line)"; return 1; fi
+    n=$((n + 1))
+  done < <(grep -E 'large-chunk prefill, rank [0-9]+: prompt-lookup verify passes' "$f")
+  return 0
 }
 
 # Qsp must be active on every rank and reduce actual wave work, rather than only enable a switch.
@@ -1151,6 +1198,15 @@ EOF2
   if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit); then
     log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  # Sg beside Lc at exit: each rank's verify passes, none outside the decode band (sg_gate).
+  if [[ -n "${ARM_SG:-}" && -n "${ARM_LC:-}" ]]; then
+    local sg_exit_why
+    grep -E 'large-chunk prefill, rank [0-9]+: prompt-lookup verify passes' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+    if ! sg_exit_why=$(sg_gate "$OUT/$name.server.log" "$ARM_SG" "${ARM_P1:-}" "${ARM_CS:-}" exit); then
+      log "arm $name: Sg${ARM_SG} beside Lc${ARM_LC}, but $sg_exit_why; not measured (results kept as $name.unmeasured.json)"
+      [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    fi
   fi
   # P1 at exit: each rank's "ds41 p1 stats, rank" line counts the leases its passes still held at their
   # end (released there: a source not let go in order) and, with a Qv part, the expert-rows the host
@@ -2430,7 +2486,10 @@ for a in $ARMS; do
 # profile before serving; ZN fail the N-th plane mirror read (tests the fallback to the container);
 # A / AN read a layer's missed planes on a worker while the card's ops are issued (passes of N+
 # tokens; A is every pass); Q[gnc] the arm's power settings (see power_set); SgK / SgaK prompt-lookup
-# speculation, K drafts a step (fixed / adaptive window); Er the token embedding in host RAM; Xp / Xh
+# speculation, K drafts a step (fixed / adaptive window; beside an Lc part only where --max-num-seqs x
+# (1 + K) is at most 16, the decode band the engine takes prompt lookup beside large-chunk prefill, P1 and
+# Cs in: any other such arm is skipped, and the arm is measured only with the admission's startup lines and
+# no verify pass outside the band at exit, sg_gate); Er the token embedding in host RAM; Xp / Xh
 # / Xi miss reads on threads started per call / on 4 KiB pages / relaid via scratch (the old ways,
 # as A/B switches); Ds / DsN / Dsa DSpark speculation from $DRAFT_BANK at depth 5 / capped at N
 # drafts a step (Ds0: the bank loaded, drafting off) / with the adaptive window (the bank pins its
@@ -2656,7 +2715,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba=""
+  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" sg=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -2712,8 +2771,10 @@ for a in $ARMS; do
       Rm[0-9]*) ARGS+=(--expert-plane-mirror-min-rows "${p#Rm}") ;;
       Rd[0-9]*) ARGS+=(--expert-plane-mirror-decode-share "0.${p#Rd}") ;;
       Sga[0-9]*) ARGS+=(--num-speculative-tokens "${p#Sga}" --spec-ngram "${p#Sga}" --draft-window adaptive)
+                 sg=${p#Sga}
                  env+=(RADIANCE_EXPERIMENTAL_DS41_LOOKUP_ALONE=1) ;;   # the plugin leaves its drafter out
       Sg[0-9]*) ARGS+=(--num-speculative-tokens "${p#Sg}" --spec-ngram "${p#Sg}")
+                sg=${p#Sg}
                 env+=(RADIANCE_EXPERIMENTAL_DS41_LOOKUP_ALONE=1) ;;
       R|R[0-9]*)
                if [[ -z "$MIRROR" ]]; then log "arm $a: $p needs MIRROR=<directory of the checkpoint's model-*.safetensors>"; skip=1; fi
@@ -3254,6 +3315,22 @@ for a in $ARMS; do
   # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one but an
   # Lc arm, where it is unset (LCP keeps its pins; the core refuses EXACT_TALL=0 beside it).
   # RADIANCE_EXPERIMENTAL_DS41_LCP: an Lc arm's chunk, 0 in every other arm.
+  # SgK / SgaK beside Lc: the engine takes prompt-lookup speculation beside large-chunk prefill (and P1 and
+  # Cs on top of it) only where a step of decode rows fits the decode band, --max-num-seqs x (1 + K) <= 16;
+  # anything else it refuses to start, so the arm is skipped here with the reason. arm() then measures the arm
+  # only with the admission's startup lines and no pass outside the band at exit (sg_gate).
+  ARM_SG=
+  if [[ -n "$sg" ]] && ! [[ $sg =~ ^[0-9]{1,3}$ ]]; then
+    log "arm $a: Sg / Sga take a number of drafts; the arm is skipped"; skip=1; sg=""
+  fi
+  [[ -n "$sg" ]] && sg=$((10#$sg))
+  if [[ -n "$lc" && -n "$sg" && "$sg" != 0 ]]; then
+    sgn=${nseq:-${MAX_SEQS:-1}}
+    if [[ $sgn =~ ^[0-9]{1,4}$ ]] && (( 10#$sgn >= 1 && 10#$sgn * (sg + 1) <= 16 )); then ARM_SG=$sg
+    else
+      log "arm $a: Sg$sg beside Lc$lc: --max-num-seqs $sgn x (1 + $sg drafts) is more than the 16 decode rows a step that prompt lookup's verify steps are covered to (the decode band; the engine refuses large-chunk prefill there); the arm is skipped"; skip=1
+    fi
+  fi
   if [[ -n "$lc" ]]; then
     [[ -n "$xt$bt" ]] && { log "arm $a: Lc goes with neither Xt nor BT (it sets the step itself); the arm is skipped"; skip=1; }
     if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc > 2048 )); then

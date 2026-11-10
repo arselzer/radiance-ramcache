@@ -584,6 +584,9 @@ public:
     int64_t consumer_ckpt_policy() const { return cs_band_; }
     /* Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP): C once init admitted it, else 0. */
     int64_t lcp_rows() const { return lcp_; }
+    /* Prompt-lookup speculation taken beside it (lcp_init; core/place/ep_route_counts.h, LcpSpec::Lookup):
+     * the rows of the largest step of decode rows, max_seqs x (1 + n_spec), at most 16; 0 without. */
+    int64_t lcp_spec_rows() const { return lcp_spec_rows_; }
     /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT (batch_rows_): the rows a step of whole prompts admitted
      * together may hold once init took the switch, else 0; and its shutdown line (nothing while off). */
     static constexpr const char* kBatchAdmitEnv = "RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT";
@@ -997,8 +1000,10 @@ private:
      * (consumer_ckpt_policy). */
     bool    cs_on_ = false;
     int64_t cs_band_ = 0;
-    /* Large-chunk prefill, as lcp_init decided it (lcp_rows). */
+    /* Large-chunk prefill, as lcp_init decided it (lcp_rows), and the prompt-lookup speculation it took
+     * beside it (lcp_spec_rows; 0 without). */
     int64_t lcp_ = 0;
+    int64_t lcp_spec_rows_ = 0;
     /* Prefill Phase 1's end-aligned chunks (RADIANCE_EXPERIMENTAL_DS41_P1=1 with ..._P1_ALIGN end, the
      * default; sched/p1_chunk.h): a lone prompt's chunks at the whole step are cut so its last chunk
      * is full; off under --prefix-resume exact (its resume grid is the start-aligned chunks') and

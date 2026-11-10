@@ -30,6 +30,7 @@
 #include "ds41_index_memory.h"
 #include "ista_dialect.h"
 #include "../../core/sched/tbo.h"
+#include "../../core/place/ep_route_counts.h"   /* ds41_lcp_spec: the speculation the cut is declared beside */
 #include "../../tools/ds41-host-experts/ds41_p1.h"   /* the lent arena's switch (probe) */
 
 #include <algorithm>
@@ -2639,21 +2640,32 @@ static constexpr int32_t kCutRowGrain = 16;
  * Refused (a line on rank 0 says why) for a graph off that shape: a kv source or an Engram layer
  * past the boundary, a candidate layer past it, a layer past it reading another source's keys,
  * the DSpark drafter (its context reads every prompt row's taps at its target layers) or any
- * speculation, and an engine that does not carry the cut (the weak reference is null). */
+ * speculation but prompt lookup alone in steps of at most 16 decode rows (ds41_lcp_spec), and an
+ * engine that does not carry the cut (the weak reference is null). */
 static void cut_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP");
     if (!v || std::strcmp(v, "1")) return;
     const auto& c = m.c;
     int B = -1;
     for (int64_t s : c.kv_src) B = std::max(B, (int)s);
+    /* Speculation without a draft head is prompt lookup alone (the core drafts from the sequence's
+     * tokens: no pass, no tap), and the graph meets the contract under it as without: a verify step is
+     * decode rows, which run every layer (step() fails a cut pass that speculates), and its row at
+     * position p reads this layer's window keys at p - W + 1 .. p only -- the window group keeps W +
+     * max_spec positions so that a pass's own stores evict none of them, and the attention's window stays
+     * W. Declared for the steps the engine takes it for (core/place/ep_route_counts.h: at most 16 decode
+     * rows a step); the scheduler takes it only beside large-chunk prefill. */
+    const ::rad::LcpSpec spec = ::rad::ds41_lcp_spec(ctx->max_seqs, ctx->max_spec, m.dsp.on);
     std::string why;
     if (B < 0 || B >= (int)c.n_layer - 1) {
         why = "no kv source before the last layer, so no layer to cut";
     } else if (c.window < 1) {
         why = "no window";
-    } else if (m.dsp.on || ctx->max_spec > 0) {
+    } else if (m.dsp.on || (ctx->max_spec > 0 && spec != ::rad::LcpSpec::Lookup)) {
         why = "speculation is on (the DSpark drafter's context reads every prompt row's taps at its "
               "target layers)";
+        if (!m.dsp.on && spec == ::rad::LcpSpec::Rows)
+            why = "speculation is on (" + ::rad::ds41_lcp_spec_rows_why(ctx->max_seqs, ctx->max_spec) + ")";
     } else if (c.cand > B) {
         why = "the candidate layer " + std::to_string(c.cand) + " is past the boundary";
     } else {
@@ -2693,6 +2705,15 @@ static void cut_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                         "index keys; a cut pass runs layers [0, F) in full and layer F's key ops alone\n",
                 B + 1, (long long)c.n_layer - 1, (long long)c.window, B);
     rad_note(b, "consumer suffix declared: boundary %d, window %lld", B, (long long)c.window);
+    if (spec == ::rad::LcpSpec::Lookup) {
+        if (ctx->rank == 0 && !m.probe)
+            fprintf(stderr, "radiance: deepseek41: consumer suffix declared beside prompt-lookup speculation "
+                            "(--num-speculative-tokens %d, no drafter): verify steps of at most %lld decode rows "
+                            "run every layer; the window group keeps %lld positions, the attention reads %lld\n",
+                    ctx->max_spec, (long long)::rad::ds41_verify_rows(ctx->max_seqs, ctx->max_spec),
+                    (long long)(c.window + m.g.max_spec), (long long)c.window);
+        rad_note(b, "consumer suffix declared beside prompt-lookup speculation of depth %d", ctx->max_spec);
+    }
 }
 
 /* RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1: the compressed and index key caches declared

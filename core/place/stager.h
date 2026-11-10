@@ -342,6 +342,11 @@ public:
          * (read-only); missed units relaid into the cache, computed and let go (read-only), and
          * admitted ones not relaid because ..._LCP_INSERTQ units were already queued (dropped). */
         uint64_t lcp_hit_admit = 0, lcp_hit_ro = 0, lcp_miss_admit = 0, lcp_miss_ro = 0, lcp_miss_dropped = 0;
+        /* Prompt-lookup speculation beside large-chunk prefill (ep_route_counts.h; begin_pass): the
+         * trunk passes with speculative rows (verify steps), their rows and the tallest, and the passes
+         * outside what the admission covers (ds41_verify_pass_covered, or more rows than the admitted
+         * bound; a drafter's pass): 0, or the arm's replies are not shown exact. */
+        uint64_t spec_passes = 0, spec_rows = 0, spec_max_rows = 0, spec_off = 0;
         /* Pool jobs that run the many-row kernel (HostExpertPool::many_from: four or more rows of
          * one expert with ..._HOST_EXPERTS_MAX_ROWS above 4), and their rows. */
         uint64_t many_jobs = 0, many_rows = 0;
@@ -706,11 +711,13 @@ private:
     /* RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (large-chunk prefill, ep_route_counts.h): ep_rows_ = C when the
      * bands say chunks of C give 16-token passes' bits (stager.cpp: the routed GEMMs on the gemv rows,
      * the twin reaching C; any other op on one kernel or on a known byte-identical pair), the step is
-     * C, and nothing beside it is outside what was proven (EXACT_TALL other than 1, speculation, the
-     * fetch lists, the packed VRAM residents); refused otherwise, with the reason. hx_init then
-     * requires the CPU to take every routed unit, and says what was admitted (lcp_report). */
+     * C, and nothing beside it is outside what was proven (EXACT_TALL other than 1, speculation other
+     * than prompt lookup alone in steps of at most 16 decode rows, the fetch lists, the packed VRAM
+     * residents); refused otherwise, with the reason. hx_init then requires the CPU to take every
+     * routed unit, and says what was admitted (lcp_report, and lcp_spec_report for the speculation). */
     int  lcp_init(const Program& prog, int64_t C);
     void lcp_report() const;
+    void lcp_spec_report() const;
     /* ---- prefill Phase 1 (card_expert_stager.h) -------------------------------------------------
      *
      * Under RADIANCE_EXPERIMENTAL_DS41_P1=1 (p1_state_ 1, read at lcp_init with the threshold
@@ -799,6 +806,10 @@ private:
     uint16_t* p1_vh_ = nullptr;          /* the host's */
     RadEvent  p1_vev_ = nullptr;
     int64_t lcp_ = 0;                  /* C once lcp_init admitted it, else 0 */
+    /* Prompt-lookup speculation lcp_init took beside it (ep_route_counts.h, LcpSpec::Lookup): the depth
+     * and the rows of the largest step of decode rows (at most kEpRouteMaxRows); 0 without speculation. */
+    int     lcp_spec_ = 0;
+    int64_t lcp_spec_rows_ = 0;
     int64_t lcp_reach_ = 0;            /* the twin's bound, as its bands state it */
     int     lcp_moe_ = 0, lcp_twin_ = 0, lcp_split_ = 0, lcp_runs_ = 0, lcp_ops_ = 0, lcp_pair_ops_ = 0;
     std::string lcp_pairs_;            /* the multi-kernel ops admitted, by family */

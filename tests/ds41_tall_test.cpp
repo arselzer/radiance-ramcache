@@ -99,6 +99,10 @@ struct EpCountsHostProbe {
         fs.hx_bg_q_.clear();
     }
     static void set_insertq(FileStager& fs, int n) { fs.hx_lcp_insertq_ = n; }
+    /* Prompt-lookup speculation as lcp_init took it (0: none), and a begun pass's admission row. */
+    static int lcp_spec(const FileStager& fs) { return fs.lcp_spec_; }
+    static int64_t lcp_spec_rows(const FileStager& fs) { return fs.lcp_spec_rows_; }
+    static int32_t admit_row(const FileStager& fs) { return fs.lcp_admit_row_; }
     static const FileStager::HostStats& stats(const FileStager& fs) { return fs.hx_stats_; }
 };
 
@@ -680,12 +684,29 @@ TEST(lcp_init_refuses_what_was_not_proven_at_the_chunk) {
         p.ctx.max_tok = 512;
         refused(p, "--max-num-batched-tokens is 512");
     }
-    /* Speculation. */
-    {
+    /* Speculation outside what the bands cover (ep_route_counts.h, ds41_lcp_spec): a declared draft head,
+     * whatever the rows; steps of more decode rows than the decode band, one sequence or several. */
+    for (const int kind : { (int)RAD_DRAFT_BLOCK, (int)RAD_DRAFT_SERIAL }) {
         Program p;
         lcp_program(p, r, 1024);
-        p.ctx.max_spec = 3;
-        refused(p, "speculation");
+        p.ctx.max_seqs = 1;
+        p.ctx.max_spec = 5;
+        p.drafter.kind = (RadDraftKind)kind;
+        refused(p, "speculation is on (a window of 5): verify steps and DSpark's drafter are not covered");
+    }
+    struct { int64_t seqs; int spec; const char* fit; } over[] = {
+        { 1, 16, "--num-speculative-tokens 15 or less" }, { 2, 8, "--num-speculative-tokens 7 or less" },
+        { 4, 4, "--num-speculative-tokens 3 or less" },   { 8, 2, "--num-speculative-tokens 1 or less" },
+        { 16, 1, "no depth fits" },                       { 32, 1, "no depth fits" },
+    };
+    for (const auto& o : over) {
+        Program p;
+        lcp_program(p, r, 1024);
+        p.ctx.max_seqs = o.seqs;
+        p.ctx.max_spec = o.spec;
+        refused(p, "speculation is on");
+        CHECK(has(err, "covered up to 16, the decode band"));
+        CHECK(has(err, o.fit));
     }
     /* EXACT_TALL set to anything but 1 beside it. */
     {
@@ -722,6 +743,198 @@ TEST(lcp_init_refuses_what_was_not_proven_at_the_chunk) {
         CHECK_EQ(init_of(fs, p, &err), (int)RAD_E_INVAL);
         CHECK(has(err, "a multiple of 16"));
     }
+}
+
+/* Prompt-lookup speculation beside LCP (ep_route_counts.h): taken when no draft head is declared and a
+ * step of decode rows, --max-num-seqs x (1 + drafts), fits the decode band of 16. The head and the
+ * sampler run at a verify step's height (every decode row is sampled), so their ops range over [1, rows]:
+ * the band rule that holds a chunk's ops holds them, and a head on two kernels in that range is refused. */
+TEST(lcp_init_admits_prompt_lookup_speculation_inside_the_decode_band) {
+    Rows r;
+    Env xt("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL", nullptr);
+    Lcp on(2048);
+    struct { int64_t seqs; int spec; } fits[] = { { 1, 1 }, { 1, 8 }, { 1, 15 }, { 2, 7 }, { 4, 3 }, { 8, 1 } };
+    for (const auto& c : fits) {
+        const int64_t rows = c.seqs * (1 + c.spec);
+        FileStager fs;
+        Program p;
+        lcp_program(p, r, 2048);
+        p.ctx.max_seqs = c.seqs;
+        p.ctx.max_spec = c.spec;
+        /* The lm_head and a sampler op, ranged over the rows a step of decode rows samples. */
+        p.ops.push_back(an_op(r, "logits_gemm_ggml", nullptr, rows, { { rows, kQGemv } }));
+        p.ops.push_back(an_op(r, "row_topk", nullptr, rows, { { rows, kNorm } }));
+        std::string err;
+        CHECK_EQ(init_of(fs, p, &err), (int)RAD_OK);
+        CHECK_EQ(EpCountsHostProbe::lcp(fs), (int64_t)2048);
+        CHECK_EQ(EpCountsHostProbe::lcp_spec(fs), c.spec);
+        CHECK_EQ(EpCountsHostProbe::lcp_spec_rows(fs), rows);
+        CHECK(rows <= kEpRouteMaxRows);
+        /* The head on two kernels inside the verify step's range: not shown to give a row the same bits. */
+        if (rows > 1) {
+            FileStager f2;
+            Program q;
+            lcp_program(q, r, 2048);
+            q.ctx.max_seqs = c.seqs;
+            q.ctx.max_spec = c.spec;
+            q.ops.push_back(an_op(r, "logits_gemm_ggml", nullptr, rows, { { 1, kQGemv }, { rows, kQTiled } }));
+            CHECK_EQ(init_of(f2, q, &err), (int)RAD_E_INVAL);
+            CHECK(has(err, "logits_gemm_ggml"));
+            CHECK(has(err, "nothing here says the two give a row the same bits"));
+            CHECK_EQ(EpCountsHostProbe::lcp_spec(f2), 0);
+        }
+    }
+    /* Without speculation nothing is recorded, and a later init without it forgets an earlier one's. */
+    {
+        FileStager fs;
+        Program p;
+        lcp_program(p, r, 2048);
+        p.ctx.max_seqs = 1;
+        p.ctx.max_spec = 8;
+        CHECK_OK(EpCountsHostProbe::tall_init(fs, p));
+        CHECK_EQ(EpCountsHostProbe::lcp_spec_rows(fs), (int64_t)9);
+        p.ctx.max_spec = 0;
+        CHECK_OK(EpCountsHostProbe::tall_init(fs, p));
+        CHECK_EQ(EpCountsHostProbe::lcp_spec(fs), 0);
+        CHECK_EQ(EpCountsHostProbe::lcp_spec_rows(fs), (int64_t)0);
+    }
+    /* The predicate itself, over every deployment shape: admitted exactly when no draft head is declared
+     * and the decode rows fit; no speculation is None whatever the sequences. */
+    for (int64_t seqs = 1; seqs <= 40; ++seqs)
+        for (int spec = 0; spec <= 40; ++spec) {
+            const LcpSpec got = ds41_lcp_spec(seqs, spec, false);
+            const LcpSpec want = spec == 0 ? LcpSpec::None : seqs * (spec + 1) <= 16 ? LcpSpec::Lookup : LcpSpec::Rows;
+            CHECK(got == want);
+            CHECK(ds41_lcp_spec(seqs, spec, true) == LcpSpec::Drafter);
+            if (got == LcpSpec::Lookup) CHECK(ds41_verify_rows(seqs, spec) <= kEpRouteMaxRows);
+        }
+    CHECK(ds41_lcp_spec(1, -1, false) == LcpSpec::Rows);   /* an unresolved depth is not admitted */
+    CHECK(ds41_lcp_spec(0, 3, false) == LcpSpec::Rows);
+}
+
+/* A verify step under an admitted LCP is a decode-band pass to the file stager: routed reads only, no
+ * admission row (it admits every unit it routes to, as a decode pass does), never armed for the card
+ * path, and counted; any pass with speculative rows outside that shape -- more rows than the admitted
+ * bound, prefill or mixed rows beside them, a cut, an admission row, a drafter's pass -- is counted as
+ * outside the band (the shutdown line's count, which must stay 0) and said once. */
+TEST(a_verify_pass_under_lcp_is_a_decode_band_pass) {
+    Rows r;
+    Env xt("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL", nullptr);
+    Lcp on(2048);
+    auto verify = [](int64_t rows, int spec) {
+        RadBatch b{};
+        b.phase = RAD_PHASE_DECODE;
+        b.n_tok = rows;
+        b.n_tok_decode = rows;
+        b.n_seq = 1;
+        b.n_seq_decode = 1;
+        b.n_spec = spec;
+        return b;
+    };
+    FileStager fs;
+    Program p;
+    lcp_program(p, r, 2048);
+    p.ctx.max_seqs = 1;
+    p.ctx.max_spec = 8;
+    CHECK_OK(EpCountsHostProbe::tall_init(fs, p));
+    REQUIRE(EpCountsHostProbe::tables(fs, 2048));
+    EpCountsHostProbe::set_capped(fs, true);
+    const FileStager::HostStats& st = EpCountsHostProbe::stats(fs);
+    /* Every height a verify step of depth 8 can have, and the plain decode step between them. */
+    uint64_t rows_seen = 0;
+    for (int64_t rows = 1; rows <= 9; ++rows) {
+        RadBatch b = verify(rows, (int)rows - 1);
+        CHECK(fs.begin_pass(&b));
+        CHECK(EpCountsHostProbe::routed(fs));
+        CHECK_EQ(EpCountsHostProbe::admit_row(fs), (int32_t)0);
+        CHECK(!FileStager::p1_pass_arms(b, 17, 2048));
+        CHECK(!FileStager::p1_pass_arms(b, 320, 2048));
+        if (rows > 1) rows_seen += (uint64_t)rows;
+    }
+    CHECK_EQ(st.spec_passes, (uint64_t)8);   /* the 1-row pass has no speculative row */
+    CHECK_EQ(st.spec_rows, rows_seen);
+    CHECK_EQ(st.spec_max_rows, (uint64_t)9);
+    CHECK_EQ(st.spec_off, (uint64_t)0);
+    /* A chunk, and its admission row, are not verify passes. */
+    {
+        RadBatch b{};
+        b.phase = RAD_PHASE_PREFILL;
+        b.n_tok = 2048;
+        b.n_seq = 1;
+        b.lcp_admit_row = 1900;
+        CHECK(fs.begin_pass(&b));
+        CHECK_EQ(EpCountsHostProbe::admit_row(fs), (int32_t)1900);
+        CHECK_EQ(st.spec_passes, (uint64_t)8);
+        CHECK_EQ(st.spec_off, (uint64_t)0);
+    }
+    /* Outside the covered shape, each counted. */
+    uint64_t off = 0;
+    std::string said;
+    auto outside = [&](RadBatch b, const char* what) {
+        const std::string err = stderr_of([&] { CHECK(fs.begin_pass(&b)); });
+        if (off == 0) said = err;
+        else CHECK(!has(err, "a pass outside the verify steps"));   /* said once */
+        ++off;
+        CHECK_EQ(st.spec_off, off);
+        if (st.spec_off != off) fprintf(stderr, "    not counted: %s\n", what);
+    };
+    outside(verify(10, 9), "more rows than --max-num-seqs x (1 + drafts)");
+    CHECK(has(said, "a pass outside the verify steps prompt-lookup speculation was admitted for"));
+    outside(verify(17, 8), "past the decode band");
+    {
+        RadBatch b = verify(9, 8);
+        b.phase = RAD_PHASE_MIXED;
+        b.n_tok = 9 + 7;
+        b.n_seq = 2;
+        outside(b, "a prefill chunk beside the verify rows");
+    }
+    {
+        RadBatch b = verify(9, 8);
+        b.phase = RAD_PHASE_PREFILL;
+        outside(b, "speculative rows in a prefill pass");
+    }
+    {
+        RadBatch b = verify(9, 8);
+        b.consumer_full = 21;
+        outside(b, "a cut verify pass");
+    }
+    {
+        RadBatch b = verify(9, 8);
+        b.lcp_admit_row = 3;
+        outside(b, "a verify pass with an admission row");
+    }
+    {
+        RadBatch b = verify(5, 0);
+        b.draft_pass = 1;
+        outside(b, "a drafter's query pass");
+    }
+    {
+        RadBatch b = verify(5, 0);
+        b.draft_pass = -1;
+        outside(b, "a drafter's context pass");
+    }
+    /* The predicate the count stands on. */
+    CHECK(ds41_verify_pass_covered(true, 0, 8, 9, 9, false, 0));
+    CHECK(ds41_verify_pass_covered(true, 0, 15, 16, 16, false, 0));
+    CHECK(!ds41_verify_pass_covered(true, 0, 16, 17, 17, false, 0));
+    CHECK(!ds41_verify_pass_covered(false, 0, 8, 9, 9, false, 0));
+    CHECK(!ds41_verify_pass_covered(true, 0, 8, 16, 9, false, 0));
+    CHECK(!ds41_verify_pass_covered(true, 0, 8, 9, 9, true, 0));
+    CHECK(!ds41_verify_pass_covered(true, 0, 8, 9, 9, false, 5));
+    CHECK(!ds41_verify_pass_covered(true, 1, 0, 5, 0, false, 0));
+    CHECK(ds41_verify_pass_covered(false, 0, 0, 2048, 0, true, 1900));   /* no speculative row: as before */
+
+    /* Without the admission (no speculation in the deployment) nothing is counted, whatever the pass. */
+    FileStager plain;
+    Program q;
+    lcp_program(q, r, 2048);
+    CHECK_OK(EpCountsHostProbe::tall_init(plain, q));
+    REQUIRE(EpCountsHostProbe::tables(plain, 2048));
+    EpCountsHostProbe::set_capped(plain, true);
+    RadBatch b = verify(9, 8);
+    CHECK(plain.begin_pass(&b));
+    CHECK_EQ(EpCountsHostProbe::stats(plain).spec_passes, (uint64_t)0);
+    CHECK_EQ(EpCountsHostProbe::stats(plain).spec_off, (uint64_t)0);
 }
 
 /* A chunk reads only the experts it routes to under LCP (the file buffers are capped, so the card's

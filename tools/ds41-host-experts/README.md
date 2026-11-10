@@ -1379,9 +1379,23 @@ chunks of C tokens, each giving every row the bits of the same tokens in 16-toke
 `..._FILE_BUFFER_UNITS`), chunks of C (the default checkpoint interval 2048 serves C up to 2048;
 above it, `--checkpoint-interval C`; with the prefix cache and a smaller interval, `--prefill-span
 C/I`), and a step a chunk alone; the server refuses anything else at startup with the reason (also
-speculation, KV streaming, `..._FETCH_LIST`, `..._VRAM_PACKED` without `..._P1=1` and
+speculation but prompt lookup alone in the decode band, below; KV streaming, `..._FETCH_LIST`,
+`..._VRAM_PACKED` without `..._P1=1` and
 `..._EXACT_TALL` other than 1), and refuses a libr4d.so whose twin does not reach C (so a run home
 with an old plugin cannot mix sums).
+
+Prompt-lookup speculation beside it (and beside `..._P1=1` and `..._CONSUMER_SKIP=1` on top; arm parts
+`SgK` / `SgaK`; `core/place/ep_route_counts.h`): taken where no draft head is declared
+(`..._LOOKUP_ALONE=1` on a container with the DSpark stages) and a step of decode rows fits the decode
+band, `--max-num-seqs` x (1 + `--num-speculative-tokens`) ≤ 16, the rows the routed GEMM's gemv /
+gemv_vp and the lm_head's gemv serve. A verify step is then a decode pass of at most 16 rows of the
+kernels the band checks already hold to a 16-token pass's bits; it is never cut, never arms the card
+path and takes no admission row. Startup says so ("prompt-lookup speculation admitted": rank 0's file
+stager, the scheduler, the card path, the consumer skip; the plugin names the consumer suffix it declared
+beside it), and at shutdown every rank counts its
+verify passes and the passes outside the band, which must be 0 (`ab_window.sh` measures an Sg arm with
+an Lc part only with those lines and that count). A draft head (DSpark), more decode rows a step, and
+end-of-request snapshots under any speculation stay refused. Not yet measured on the cards.
 Under it libr4d's `ds41_mxfp4_device_check LIBR4D lcp [C]` holds the twin, the sparse ops (also as
 the suffix launches of the per-row cut) and every other height-dependent op (gemm_nt by the row the
 table resolves, the router's f32 projection and its 96-column split, the norms, mhc_mix, the head) to
@@ -1592,7 +1606,8 @@ Refused at startup, with the reason: an invalid switch value; P1 without an admi
 routed band of 17 rows or more not on the P1 row (a libr4d with LCP's twin is named as such); a
 band of up to 16 rows not on the gemv or gemv_vp; `FILE_BUFFER_UNITS` unset or below 2 (fewer than 4 ring
 slots); the CPU path not taking the layer passes below the threshold (host experts with `..._POLICY=all`,
-`..._MISSES` of min(C, threshold - 1) or more: 319 at the default, 16 at 17); speculation (so no DSpark
+`..._MISSES` of min(C, threshold - 1) or more: 319 at the default, 16 at 17); speculation other than the
+prompt lookup large-chunk prefill took (lookup alone, at most 16 decode rows a step; so no DSpark
 bank serves beside P1 or its lent ring); `..._FETCH_LIST`; the route trace; the DSpark head tail; a routed
 layer whose gate_up, single `swiglu_clamped` and down cannot be named; a routed unit off the card neither on
 the file tier nor pinned in the host pool of a static plan (`--deterministic`) as a block_mxfp4 gate_up and

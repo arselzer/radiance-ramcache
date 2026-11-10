@@ -624,7 +624,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       --vision-tower-placement vram --ngram-placement disk --max-model-len 512 \
       --max-num-batched-tokens 16 --max-num-seqs ${MAX_SEQS:-1} --kv-cache-dtype bf16 \
       --num-speculative-tokens 0 --spec-ngram 0 ${ARM_NOPC---no-prefix-cache} --deterministic \
-      --host 127.0.0.1 --port $PORT --expert-profile "$PROFILE" ${EXTRA_ARGS:-} "${ARGS[@]}" >"$OUT/$name.server.log" 2>&1 &
+      --host 127.0.0.1 --port $PORT --expert-profile "${ARM_PROFILE:-$PROFILE}" ${EXTRA_ARGS:-} "${ARGS[@]}" >"$OUT/$name.server.log" 2>&1 &
   SERVER_PID=$!
   # Memory guard: stops this server (never anything else) if the host runs short.
   ( while kill -0 "$SERVER_PID" 2>/dev/null; do
@@ -2475,7 +2475,7 @@ for a in $ARMS; do
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
-  ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
+  ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= ARM_PROFILE= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
   f5="" ARM_BEFORE_PROMPTS= ARM_BEFORE_N= ARM_BEFORE_CONC= ARM_OBS_CONC=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   fn128=""
@@ -2627,6 +2627,8 @@ for a in $ARMS; do
       Ov)      env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1) ;;    # independent dispatches overlap, decode passes
       Ov2)     env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=2) ;;    # ... in every pass issued live
       Xwp)     ARGS+=(--weight-prefetch off) ;;                        # no weight reads beside the collectives (core/config.cpp; exact)
+      Xq?*)    ARM_PROFILE=${EXTRA_PROFILES:-/home/as/ds41-claude-build/work/extra-profiles}/${p#Xq}.json   # this arm's --expert-profile
+               [[ -f "$ARM_PROFILE" ]] || { log "arm $a: $p: no profile $ARM_PROFILE; the arm is skipped"; skip=1; } ;;
       Ct|Ct[0-9]*)
                ct=${p#Ct}
                env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE=${ct:-16}

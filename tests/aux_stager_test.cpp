@@ -46,6 +46,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <deque>
 #include <vector>
 
 #define REQUIRE_OK(expr) REQUIRE((expr) >= 0)
@@ -1231,10 +1232,20 @@ TEST(device_lane_on_the_host_backend) {
     CHECK(lane.drain(1'000'000'000LL));
 }
 
+/* A leaked lane's queue may still hold the record's copy into its workspace (submit queues it before the step
+ * that fails), so the workspace must outlive the lane, as the worker's arena does (Worker::~Worker leaks both):
+ * kept to the process exit here too. A stack buffer freed at the test's scope end was written after its free
+ * now and then (aux_stager_test crashed once in 13 runs). */
+std::vector<char>& leaked_workspace(size_t bytes) {
+    static std::deque<std::vector<char>> kept;
+    kept.emplace_back(bytes, 0);
+    return kept.back();
+}
+
 TEST(device_lane_a_failed_step_fails_the_job_and_retires_the_lane) {
     for (int at = 0; at < 3; ++at) {
         const ds41aux::Ws w = ds41aux::ws();
-        std::vector<char> ws((size_t)w.bytes, 0);
+        std::vector<char>& ws = leaked_workspace((size_t)w.bytes);
         rad::aux::DeviceLane lane(4, 2, ws.data(), 64);
         std::string why;
         REQUIRE_OK(lane.init(&why));
@@ -1265,7 +1276,7 @@ TEST(device_lane_a_failed_step_fails_the_job_and_retires_the_lane) {
     }
     /* A job outside the worker's shape is refused before anything is queued. */
     const ds41aux::Ws w = ds41aux::ws();
-    std::vector<char> ws((size_t)w.bytes, 0);
+    std::vector<char>& ws = leaked_workspace((size_t)w.bytes);
     rad::aux::DeviceLane lane(4, 3, ws.data(), 64);
     std::string why;
     REQUIRE_OK(lane.init(&why));
@@ -1325,7 +1336,7 @@ TEST(device_lane_an_idle_lane_whose_queue_stopped_is_not_drained) {
  * drained), so neither its buffers nor the arena are given back under those copies. */
 TEST(device_lane_a_loader_record_that_fails_retires_the_lane) {
     const ds41aux::Ws w = ds41aux::ws();
-    std::vector<char> ws((size_t)w.bytes, 0);
+    std::vector<char>& ws = leaked_workspace((size_t)w.bytes);
     rad::aux::DeviceLane lane(4, 2, ws.data(), 64);
     std::string why;
     REQUIRE_OK(lane.init(&why));

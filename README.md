@@ -59,6 +59,15 @@ tokenization and admission wait. All prefill rows use admit-all with the tested 
   same architecture. Branches: `main` (this one), `ds41-stable` (the measured line), `ds41` (a curated
   evidence snapshot) and `ds41-research`.
 
+## Adaptive expert residency, now in the recommended configuration (11 November)
+
+256 VRAM slots a card whose experts follow live decode routing (`RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=256`,
+`..._P1_LEND_HEAT=4`, `..._P1_LEND_HEAT_HALF_ROWS=300`; seeded from `--expert-profile`, reloaded from the RAM cache,
+paused after long prefills). Measured on `ds41-stable`, every reply identical to the base engine's and 1,824 slot
+swaps read back with no byte different: code at 8 streams 37.0 to 47.0 tok/s (+27%), 53.9 with a blended profile
+(+46%); whole-file edits +20% (+53% with the profile); chat +3%; agent-harness turns 6.5% slower to first token
+alone and 7% faster with the profile, decode +9%.
+
 ## Placement profiles, prompt-lookup drafting and the worker's online set (10 November)
 
 Measured on the `ds41-stable` line in five A/B windows (four RX 9070 XT, 192 GiB cache); on `main` the same

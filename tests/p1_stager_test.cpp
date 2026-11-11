@@ -1279,6 +1279,10 @@ struct FakeLend final : LendHost {
      * pass, withdrawn but in a retarget, or written by the card path (its content has no generation). */
     int keep_from = 1 << 30;
     bool kept(int k) const { return k >= keep_from; }
+    /* The rest (RingLender::set_rest): whether drive reads are held, how often that changed, the load_ram
+     * calls. A drive read begun is not let land while held (the reload thread's hold). */
+    bool held = false;
+    int  hold_calls = 0, ram_calls = 0;
 
     FakeLend(unsigned seed, int n) : rng(seed) {
         s.assign((size_t)n, S{});
@@ -1290,7 +1294,7 @@ struct FakeLend final : LendHost {
     }
     void step() {
         for (size_t k = 0; k < s.size(); ++k) {
-            if (s[k].reading && (int)(rng() % 100) < land_pct) {
+            if (s[k].reading && !(held && s[k].src == 1) && (int)(rng() % 100) < land_pct) {
                 s[k].reading = false;
                 landings.push_back({ (int)k, !fail_load_once.erase((int)k) });
             }
@@ -1299,15 +1303,26 @@ struct FakeLend final : LendHost {
     }
     void settle_all() {   /* the background catches up: every read lands, every copy passes */
         for (size_t k = 0; k < s.size(); ++k) {
-            if (s[k].reading) {
+            if (s[k].reading && !(held && s[k].src == 1)) {
                 s[k].reading = false;
                 landings.push_back({ (int)k, !fail_load_once.erase((int)k) });
             }
             if (s[k].copying) s[k].copy_done = true;
         }
     }
+    int load_ram(int k) override {
+        ++ram_calls;
+        if (refuse.count(k)) return -1;
+        return ram[(size_t)k] ? load(k) : 0;
+    }
+    void hold_drive(bool on) override {
+        if (on == held) bad(std::string("drive reads ") + (on ? "held" : "let go") + " twice");
+        held = on;
+        ++hold_calls;
+    }
     int load(int k) override {
         if (refuse.count(k)) return -1;
+        if (held && !ram[(size_t)k]) bad("slot " + std::to_string(k) + "'s drive read begun in the rest");
         if (s[(size_t)k].src) bad("a load of slot " + std::to_string(k) + " that holds a source");
         if (ram[(size_t)k]) {
             s[(size_t)k].src = 2;
@@ -2359,6 +2374,169 @@ TEST(p1_lend_heat_the_policy_declines_and_counts_why_and_goes_on_when_the_reason
     CHECK_EQ(s.moved, 1);
     CHECK_EQ(s.h.violations, 0);
     if (s.h.violations) std::fprintf(stderr, "%s\n", s.h.first.c_str());
+}
+
+/* ---- the rest after a long prefill (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS; card_expert_stager.h) ------
+ *
+ * From a pass that takes the slots back until the rest after the last such pass has run out: no lent reload
+ * reads the drive (the RAM cache's go ahead, a drive read already begun is held), and the heat policy
+ * declines with its own reason. Without the rest the lender is as it was. */
+TEST(p1_lend_rest_tunable_defaults_with_the_heat_or_the_slab_and_keeps_its_range) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_rest_ms, 0);   /* neither the heat nor the slab: none */
+    env[ds41p1::kLendEnv] = "10";
+    env[ds41p1::kLendArenaEnv] = "41";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_rest_ms, 0);   /* the ring and the arena alone: as before */
+    env[ds41p1::kLendHeatEnv] = "2";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_rest_ms, ds41p1::kDefLendRestMs);
+    env.erase(ds41p1::kLendHeatEnv);
+    env[ds41p1::kLendSlabEnv] = "256";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_rest_ms, 5000);
+    for (const char* ok : { "0", "1", "30000", "600000" }) {
+        env[ds41p1::kLendRestEnv] = ok;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.lend_rest_ms, std::atoi(ok));
+    }
+    env[ds41p1::kLendRestEnv] = "";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_rest_ms, 5000);
+    for (const char* bad : { "600001", "-1", "5s", " 1" }) {
+        env[ds41p1::kLendRestEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kLendRestEnv) != std::string::npos);
+    }
+}
+
+TEST(p1_lend_rest_holds_drive_reloads_back_after_a_long_prefill_and_lets_the_ram_cache_reload) {
+    for (const int64_t rest : { (int64_t)0, (int64_t)1000 }) {
+        /* Four slots: 0 and 1 the arena's, 2 and 3 the slab's; the units of 0 and 2 hit the RAM cache. */
+        FakeLend h(81, 4);
+        h.keep_from = 2;
+        h.land_pct = h.copy_pct = 100;
+        h.ram[0] = h.ram[2] = 1;
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, 4, 100, 2), 0);
+        l.set_rest(rest);
+        CHECK_EQ(l.rest_ms(), rest);
+        /* Bring-up is no rest: both slab units, the drive's among them. */
+        for (int i = 0; i < 50 && l.prime() > 0; ++i) {}
+        CHECK_EQ(l.residents(), 2);
+        CHECK(!l.resting());
+        int64_t t = 0;
+        for (int i = 0; i < 20 && !l.settled(); ++i) lend_pass(l, h, false, t += 10);
+        REQUIRE(l.settled());
+        CHECK_EQ(h.hold_calls, 0);
+        /* A long prefill: two card-path chunks. The slab stays published; drive reads are held from the first. */
+        lend_pass(l, h, true, t += 10);
+        CHECK_EQ(h.held, rest > 0);
+        CHECK_EQ(l.resting(), rest > 0);
+        lend_pass(l, h, true, t += 10);
+        l.end_p1(t += 10);
+        const int64_t end = t;
+        CHECK_EQ(l.residents(), 2);
+        CHECK(l.resident(2) && l.resident(3));
+        /* Past the grace, inside the rest: the RAM cache's unit comes back, the drive's waits. */
+        for (t = end + 200; t < end + 900; t += 50) lend_pass(l, h, false, t);
+        CHECK(l.resident(0));
+        if (rest > 0) {
+            CHECK(l.resting());
+            CHECK(h.held);
+            CHECK(!l.resident(1));
+            CHECK_EQ(h.s[1].loads, 1);   /* its one load is the first return's */
+            CHECK(l.stats().rested >= 10);
+            CHECK_EQ(l.stats().rest_ram, (uint64_t)1);
+            CHECK(h.ram_calls >= 10);
+            CHECK(!l.settled());
+        } else {   /* without the rest: as before, both are back after the grace */
+            CHECK(l.resident(1));
+            CHECK_EQ(h.s[1].loads, 2);
+            CHECK_EQ(l.stats().rested, (uint64_t)0);
+            CHECK_EQ(h.ram_calls, 0);
+            CHECK_EQ(h.hold_calls, 0);
+        }
+        /* After the rest: the drive's unit reloads, and drive reads are let go. */
+        for (t = end + 1000; t < end + 1200 && !l.settled(); t += 10) lend_pass(l, h, false, t);
+        REQUIRE(l.settled());
+        CHECK(!l.resting());
+        CHECK(!h.held);
+        CHECK_EQ(h.s[1].loads, 2);
+        CHECK_EQ(l.residents(), 4);
+        /* A retarget of a slab slot to a unit the drive gives, its read begun before a long prefill: the read
+         * is held through the chunks and the rest (a kept slot's load is never cancelled), lands after it,
+         * and the slot holds its new unit. */
+        h.land_pct = 0;
+        h.next[3] = 200;
+        const int k3 = 3;
+        REQUIRE_EQ(l.retarget(&k3, 1), 1);
+        CHECK(h.s[3].reading);
+        h.land_pct = 100;
+        lend_pass(l, h, true, t += 10);
+        lend_pass(l, h, true, t += 10);
+        l.end_p1(t += 10);
+        const int64_t end2 = t;
+        for (t = end2 + 200; t < end2 + 900; t += 50) lend_pass(l, h, false, t);
+        if (rest > 0) {
+            CHECK(h.s[3].reading);
+            CHECK(!l.resident(3));
+            CHECK(l.resident(0) && l.resident(2));
+        } else {
+            CHECK(l.resident(3));
+        }
+        for (t = end2 + 1000; t < end2 + 1200 && !l.settled(); t += 10) lend_pass(l, h, false, t);
+        REQUIRE(l.settled());
+        CHECK(l.resident(3));
+        CHECK_EQ(h.s[3].pub_unit, 200);
+        CHECK_EQ(l.stats().retargets, (uint64_t)1);
+        CHECK_EQ(l.stats().failed, (uint64_t)0);
+        CHECK_EQ(h.violations, 0);
+        if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    }
+}
+
+TEST(p1_lend_rest_the_heat_declines_through_a_long_prefill_and_its_rest_then_moves) {
+    using D = RingLender::Decline;
+    for (const int64_t rest : { (int64_t)0, (int64_t)100 }) {
+        HeatSim s(61, 2, 8, 1, 16);
+        s.l.set_rest(rest);
+        std::vector<int> hot(8, 0);
+        hot[5] = 8;
+        hot[6] = 9;
+        const std::vector<int> none(8, 0);
+        for (int i = 0; i < 4; ++i) CHECK_EQ(s.pass(none, 8), 0);
+        REQUIRE(s.l.settled());
+        REQUIRE(s.heat.warm());
+        /* A card-path chunk: declined, with the rest as a long prefill, without it as lent. */
+        CHECK_EQ(s.pass(hot, 0, true), 0);
+        CHECK_EQ(s.declined(D::Prefill), rest > 0 ? (uint64_t)1 : (uint64_t)0);
+        CHECK_EQ(s.declined(D::Lent), rest > 0 ? (uint64_t)0 : (uint64_t)1);
+        /* Decode after it, 10 ms a pass: the hot units take a slot only once the rest has run out. */
+        int passes = 0;
+        while (s.moved == 0 && passes < 40) {
+            (void)s.pass(hot, 8);
+            ++passes;
+        }
+        CHECK_EQ(s.moved, 1);
+        if (rest > 0) {
+            CHECK(passes >= 9 && passes <= 11);
+            CHECK(s.declined(D::Prefill) >= (uint64_t)9);
+        } else {
+            CHECK(passes <= 2);   /* the grace is 0: the first turn that is settled */
+            CHECK_EQ(s.declined(D::Prefill), (uint64_t)0);
+        }
+        CHECK(s.held().count(6) == 1);
+        CHECK_EQ(s.h.violations, 0);
+        if (s.h.violations) std::fprintf(stderr, "%s\n", s.h.first.c_str());
+    }
 }
 
 /* FileStager's side of the heat: which passes count (a trunk pass of decode rows only), and what a routed

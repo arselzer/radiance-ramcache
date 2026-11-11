@@ -91,13 +91,15 @@ struct Tunables {
     int  lend_heat_margin = ds41p1::kDefLendHeatMarginPct;      /* the hysteresis, percent of the resident's heat */
     int  lend_slab = 0;                                         /* the lent slab's slots a rank (0 off) */
     bool lend_audit = false;                                    /* every lent slot read back and compared */
+    int  lend_rest_ms = 0;                                      /* the rest after a long prefill (0 none) */
     bool align_end = true;
     bool swiglu_span = false;
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
  * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-100000000 (unset: 100, or 2000 with lend_slab),
- * lend_heat_margin 100-1000, lend_slab 0-256), align "end" or "start", swiglu_span and lend_audit 0/off or
+ * lend_heat_margin 100-1000, lend_slab 0-256, lend_rest_ms 0-600000 (unset: 5000 with lend_heat or lend_slab, else
+ * 0)), align "end" or "start", swiglu_span and lend_audit 0/off or
  * 1/on (default off). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
@@ -344,6 +346,9 @@ public:
     virtual int  copied(int k) = 0;
     /* Slot k's landed bytes may go (its buffer back to the reload thread, or its RAM-cache lease). */
     virtual void drop(int k) = 0;
+    /* The rest (RingLender::set_rest): on, a load already begun that reads the drive does not start its
+     * read until it is off again (one the RAM cache gives goes on); off, it does. */
+    virtual void hold_drive(bool on) { (void)on; }
     /* Slot k's unit published at its slot (on), or as a file-tier unit again (off). */
     virtual void publish(int k, bool on) = 0;
     /* A pass that takes the slots back found slot k's copy still queued: whatever writes the slot in
@@ -379,8 +384,8 @@ public:
      * copying, or failed until the next return); a draft bank's loan holds ring residents on this rank; a
      * chosen unit can no longer hold a slot; no event behind the pass before this one, or the DMA lane
      * refused the wait; the read-back audit found a slot differing and stopped the policy on this rank. */
-    enum class Decline : uint8_t { Lent = 0, Busy = 1, Bank = 2, Candidate = 3, Fence = 4, Audit = 5 };
-    static constexpr int kDeclines = 6;
+    enum class Decline : uint8_t { Lent = 0, Busy = 1, Bank = 2, Candidate = 3, Fence = 4, Audit = 5, Prefill = 6 };
+    static constexpr int kDeclines = 7;
     struct Stats {
         uint64_t lends = 0;        /* card-path bursts that took the slots back */
         uint64_t withdrawn = 0;    /* residents published as file-tier units again for them */
@@ -398,6 +403,9 @@ public:
         uint64_t audit_differ = 0;   /* of them, slots whose bytes differed */
         uint64_t audit_unread = 0;   /* and slots that could not be read back or compared */
         uint64_t lost = 0;           /* slots given up for either: nothing is loaded into them again */
+        /* The rest's (all 0 without it): passes at which a slot's reload waited for the drive, loads begun
+         * from the RAM cache during it. */
+        uint64_t rested = 0, rest_ram = 0;
     };
     /* n slots, the grace in ms; the last `keep` of them (0..ds41p1::kMaxLendSlab) are kept (the slab's:
      * never taken back), the others (at most 2 x ds41p1::kMaxLend) the ring's and the arena's. Every slot
@@ -424,6 +432,14 @@ public:
      * LendHost::audit. stopped: it found a slot differing or unreadable, so no retarget happens on this
      * rank any more; lost(k): slot k is such a slot. */
     void set_audit(bool on) { audit_ = on; }
+    /* The rest after a long prefill (ds41p1::kLendRestEnv), set after init: from a pass that takes the slots
+     * back until ms after the last such pass ended (end_p1), no load that reads the drive begins (pump asks
+     * LendHost::load_ram instead of load, and the host holds a drive read already queued, hold_drive), and
+     * the heat policy declines (Decline::Prefill, heat_turn). 0: none, the lender as without it. resting:
+     * now, as of the last begin_pass or end_p1. */
+    void set_rest(int64_t ms) { rest_ = ms > 0 ? ms : 0; }
+    int64_t rest_ms() const { return rest_; }
+    bool resting() const { return rest_ > 0 && any_p1_ && (p1_now_ || now_ - last_p1_ < rest_); }
     bool auditing() const { return audit_; }
     bool stopped() const { return stopped_; }
     bool lost(int k) const { return k >= 0 && k < n() && slot_[(size_t)k].st == St::Lost; }
@@ -464,7 +480,9 @@ private:
     struct Slot { St st = St::Idle; bool cancel = false; bool moved = false; bool keep = false; };
     LendHost* host_ = nullptr;
     std::vector<Slot> slot_;
-    int64_t grace_ = 0, last_p1_ = 0;
+    int64_t grace_ = 0, last_p1_ = 0, rest_ = 0, now_ = 0;
+    bool    p1_now_ = false, held_ = false;   /* a pass that took the slots is running; the host holds drive reads */
+    void hold(bool on);
     int  keep_ = 0;
     bool lent_ = true, any_p1_ = false;
     bool audit_ = false, stopped_ = false;
@@ -552,6 +570,7 @@ int heat_turn(RingLender& l, LendHeat& h, bool took, bool bank, bool fence_ready
         return 0;
     };
     if (l.stopped()) return no(Decline::Audit);
+    if (l.rest_ms() > 0 && (took || l.resting())) return no(Decline::Prefill);
     if (took || l.lent()) return no(Decline::Lent);
     if (bank) return no(Decline::Bank);
     if (!l.settled()) return no(Decline::Busy);
@@ -699,6 +718,8 @@ public:
      * the lender's begin_pass, the event the compute stream recorded at the end of the pass before (null:
      * none yet), behind which a withdrawn resident's slot is read back. */
     void lend_audit_behind(RadEvent ev) { laud_behind_ = ev; }
+    /* The rest after a long prefill (RingLender::set_rest), for the lender. */
+    void lend_set_rest(int64_t ms) { lend_.set_rest(ms); }
     /* Bring-up: the slab's units loaded, copied and published before the first pass (RingLender::prime),
      * for at most `most_ms`; what is not in by then comes in at the passes. Returns the slab slots that
      * hold their unit. */
@@ -724,6 +745,7 @@ public:
     /* LendHost */
     int  load(int k) override;
     int  load_ram(int k) override;
+    void hold_drive(bool on) override;
     int  landed(bool* ok) override;
     int  copy(int k) override;
     int  copied(int k) override;
@@ -851,7 +873,7 @@ private:
     std::deque<std::pair<int, bool>> ldone_;
     std::mutex lmu_;
     std::condition_variable lcv_;
-    bool lstop_ = false;
+    bool lstop_ = false, lhold_ = false;   /* lhold_: drive jobs wait (hold_drive) */
     std::thread lth_;
     void lend_loop();
     void lend_stop();

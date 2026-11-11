@@ -47,10 +47,13 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         /* Behind the slab: unset, the half-life's default follows it. */
         { ds41p1::kLendHeatHalfEnv, 1, ds41p1::kMaxLendHeatHalfRows, &r.lend_heat_half },
         { ds41p1::kLendHeatMarginEnv, 100, 1000, &r.lend_heat_margin },
+        /* Behind the heat and the slab: unset, the rest is theirs (0 without both). */
+        { ds41p1::kLendRestEnv, 0, ds41p1::kMaxLendRestMs, &r.lend_rest_ms },
     };
     for (const K& k : ks) {
         const char* v = get(k.env);
         if (k.at == &r.lend_heat_half && r.lend_slab > 0) r.lend_heat_half = ds41p1::kDefLendHeatHalfRowsSlab;
+        if (k.at == &r.lend_rest_ms && (r.lend_heat > 0 || r.lend_slab > 0)) r.lend_rest_ms = ds41p1::kDefLendRestMs;
         if (!whole(v, k.lo, k.hi, k.at)) {
             if (why) *why = std::string(k.env) + "=" + v + ": a whole number from " + std::to_string(k.lo) +
                             " to " + std::to_string(k.hi);
@@ -472,6 +475,8 @@ int RingLender::init(LendHost* host, int n, int64_t grace_ms, int keep) {
     }
     grace_ = grace_ms;
     last_p1_ = 0;
+    rest_ = now_ = 0;
+    p1_now_ = held_ = false;
     lent_ = true;
     any_p1_ = false;
     audit_ = false;
@@ -587,13 +592,28 @@ void RingLender::poll() {
     }
 }
 
-/* Loads for the slots that want one, as far as the host has buffers. */
+/* The rest's hold on the host's drive reads, as it changes. */
+void RingLender::hold(bool on) {
+    if (rest_ <= 0 || on == held_) return;
+    held_ = on;
+    host_->hold_drive(on);
+}
+
+/* Loads for the slots that want one, as far as the host has buffers; in the rest only those the RAM
+ * cache gives. */
 void RingLender::pump() {
+    const bool rest = resting();
+    hold(rest);
+    bool waited = false;
     for (int k = 0; k < n(); ++k) {
         Slot& s = slot_[(size_t)k];
         if (s.st != St::Want) continue;
-        const int r = host_->load(k);
-        if (r == 0) continue;
+        const int r = rest ? host_->load_ram(k) : host_->load(k);
+        if (r == 0) {
+            waited = waited || rest;
+            continue;
+        }
+        if (r > 0 && rest) ++st_.rest_ram;
         if (r < 0) {
             s.st = St::Failed;
             ++st_.failed;
@@ -602,11 +622,16 @@ void RingLender::pump() {
         s.st = St::Reading;
         s.cancel = false;
     }
+    if (waited) ++st_.rested;
 }
 
 int RingLender::begin_pass(bool p1, int64_t now_ms) {
     if (!host_) return 0;
+    now_ = now_ms;
     if (p1) {
+        /* The rest: from here on, no drive read of the lender's begins until it is over. */
+        p1_now_ = true;
+        hold(true);
         int withdrawn = 0;
         for (int k = 0; k < n(); ++k) {
             Slot& s = slot_[(size_t)k];
@@ -648,6 +673,8 @@ int RingLender::begin_pass(bool p1, int64_t now_ms) {
         poll();   /* overtaken loads and copies that have ended give their buffers back */
         return withdrawn ? 1 : 0;
     }
+    p1_now_ = false;
+    hold(resting());
     if (lent_) {
         if (any_p1_ && now_ms - last_p1_ < grace_) {
             ++st_.held_back;
@@ -667,6 +694,8 @@ int RingLender::begin_pass(bool p1, int64_t now_ms) {
 void RingLender::end_p1(int64_t now_ms) {
     any_p1_ = true;
     last_p1_ = now_ms;
+    now_ = now_ms;
+    p1_now_ = false;
 }
 
 int RingLender::prime() {
@@ -1364,11 +1393,14 @@ void CardExpertPath::lend_loop() {
     for (;;) {
         LendJob job;
         {
+            /* The rest (hold_drive): a drive job waits, a RAM-cache job goes ahead of it. */
             std::unique_lock<std::mutex> lk(lmu_);
-            lcv_.wait(lk, [&] { return lstop_ || !lq_.empty(); });
+            auto go = [&](const LendJob& j) { return !lhold_ || j.ram; };
+            lcv_.wait(lk, [&] { return lstop_ || std::any_of(lq_.begin(), lq_.end(), go); });
             if (lstop_) return;
-            job = lq_.front();
-            lq_.pop_front();
+            const auto it = std::find_if(lq_.begin(), lq_.end(), go);
+            job = *it;
+            lq_.erase(it);
         }
         const int k = job.k, b = job.b;
         const auto t0 = std::chrono::steady_clock::now();
@@ -1428,6 +1460,14 @@ void CardExpertPath::lend_stop() {
 }
 
 int CardExpertPath::load(int k) { return load_from(k, true); }
+
+void CardExpertPath::hold_drive(bool on) {
+    {
+        std::lock_guard<std::mutex> lk(lmu_);
+        lhold_ = on;
+    }
+    lcv_.notify_all();
+}
 
 int CardExpertPath::load_ram(int k) { return load_from(k, false); }
 
@@ -1949,13 +1989,13 @@ std::string CardExpertPath::stats_line(int rank) const {
                       " residents withdrawn), %" PRIu64 " returns, %" PRIu64 " reloaded (RAM cache %" PRIu64 ", drive %" PRIu64
                       " at %.1f ms a unit), %" PRIu64 " failed, %" PRIu64 " overtaken, %" PRIu64 " passes held back by the grace"
                       "; lent reloads: %" PRIu64 " from the RAM cache (%" PRIu64 " relaid from the packed form at %.1f ms a unit), %" PRIu64
-                      " from the drive",
+                      " from the drive, %" PRIu64 " passes held back by the rest (%" PRIu64 " loads from the RAM cache in it)",
                       lend_.n() - lend_.kept(), lend_arena_slots(), lend_.residents() - slab_in, l.lends, l.withdrawn, l.returns,
                       l.reloaded, c_.lend_ram + c_.lend_ram_packed, c_.lend_drive,
                       c_.lend_drive ? (double)c_.lend_drive_ns * 1e-6 / (double)c_.lend_drive : 0.0, l.failed, l.cancelled,
                       l.held_back, c_.lend_ram + c_.lend_ram_packed, c_.lend_ram_packed,
                       c_.lend_ram_packed ? (double)c_.lend_ram_packed_ns * 1e-6 / (double)c_.lend_ram_packed : 0.0,
-                      c_.lend_drive);
+                      c_.lend_drive, l.rested, l.rest_ram);
         line += buf;
         if (lend_.kept() > 0) {
             std::snprintf(buf, sizeof buf, "; lent slab: %d slots, %d residents now (%d at bring-up)", lend_.kept(),
@@ -1977,9 +2017,11 @@ std::string CardExpertPath::stats_line(int rank) const {
                 if (d != (int)RingLender::Decline::Audit) declined += l.declined[d];
             std::snprintf(buf, sizeof buf,
                           "; lent heat: %" PRIu64 " retargets (units published at a slot another unit gave up), %" PRIu64
-                          " residents withdrawn for them, %" PRIu64 " passes declined (%" PRIu64 " lent or in the grace, %" PRIu64
-                          " a slot busy, %" PRIu64 " draft bank, %" PRIu64 " candidate, %" PRIu64 " no fence)",
-                          l.retargets, l.retarget_withdrawn, declined, l.declined[(size_t)RingLender::Decline::Lent],
+                          " residents withdrawn for them, %" PRIu64 " passes declined (%" PRIu64 " in a long prefill or its rest, %" PRIu64
+                          " lent or in the grace, %" PRIu64 " a slot busy, %" PRIu64 " draft bank, %" PRIu64 " candidate, %" PRIu64
+                          " no fence)",
+                          l.retargets, l.retarget_withdrawn, declined, l.declined[(size_t)RingLender::Decline::Prefill],
+                          l.declined[(size_t)RingLender::Decline::Lent],
                           l.declined[(size_t)RingLender::Decline::Busy], l.declined[(size_t)RingLender::Decline::Bank],
                           l.declined[(size_t)RingLender::Decline::Candidate],
                           l.declined[(size_t)RingLender::Decline::Fence]);

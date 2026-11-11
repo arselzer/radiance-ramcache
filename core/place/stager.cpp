@@ -5148,6 +5148,20 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
             return RAD_E_INVAL;
         }
     }
+    /* The heat's prior (..._P1_LEND_HEAT_PRIOR_ROWS, one half-life unset): the plan's profile shares, as if that
+     * many decode rows had been routed so (the deployment's --expert-profile, else the container's profile). */
+    int prior_units = 0, prior_lendable = 0;
+    double prior_rows_lendable = 0.0;
+    if (heat && t.lend_heat_prior > 0) {
+        std::vector<float> share(plan_->units.size(), 0.0f);
+        for (size_t u = 0; u < plan_->units.size(); ++u) share[u] = plan_->units[u].profile_share;
+        prior_units = heat->seed(share, (double)t.lend_heat_prior);
+        for (int32_t u : heat_cand)
+            if (heat->heat(u) > 0.0) {
+                ++prior_lendable;
+                prior_rows_lendable += heat->heat(u);
+            }
+    }
     RAD_TRY(p1_->lend_init(units, slots, at, slab_at, t.grace_ms, t.lend_audit, why));
     /* The rest after a long prefill (..._P1_LEND_REST_MS; by default with the heat or the slab only). */
     p1_->lend_set_rest(t.lend_rest_ms);
@@ -5223,8 +5237,18 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                  ds41p1::kLogLendArena, ka, ds41p1::kLendArenaEnv, t.lend_arena, arena.size(),
                  (long long)p1_arena_rows_, ka, share, (long long)p1_arena_rows_, t.grace_ms, ds41p1::kGraceEnv);
     }
-    if (plan_->rank == 0 && p1_heat_)
-        RAD_INFO("%s: on (%s=%d; half-life %d decode rows, %s; margin %d%%, %s): each rank's lent slots (rank 0: "
+    if (plan_->rank == 0 && p1_heat_) {
+        /* What the heat starts from: the prior's rows and where its shares came from, or none. */
+        const std::string prior =
+            t.lend_heat_prior <= 0 ? fmt("prior 0 decode rows, %s=0: the heat starts from nothing", ds41p1::kLendHeatPriorEnv)
+            : prior_units == 0
+                ? fmt("prior %d decode rows, %s: none, the plan has no profile shares", t.lend_heat_prior,
+                      ds41p1::kLendHeatPriorEnv)
+                : fmt("prior %d decode rows, %s, of %s's shares: %d units seeded, %d of rank 0's lendable ones with "
+                      "%.1f rows of heat", t.lend_heat_prior, ds41p1::kLendHeatPriorEnv,
+                      plan_->profile_from.empty() ? "the plan's profile" : plan_->profile_from.c_str(), prior_units,
+                      prior_lendable, prior_rows_lendable);
+        RAD_INFO("%s: on (%s=%d; half-life %d decode rows, %s; margin %d%%, %s; %s): each rank's lent slots (rank 0: "
                  "%d) follow live decode routing, at most %d handed to another unit a pass; a unit's heat is the "
                  "decode rows routed to it in pure trunk decode passes, halved every %d decode rows; between "
                  "passes, while every slot holds its resident, the coldest residents give their slots to the "
@@ -5232,8 +5256,9 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                  "resident's + %.1f rows; the DMA lane first waits behind the pass before, the withdrawn unit takes "
                  "the CPU path, and the new one is reloaded, copied and published as any lent unit",
                  ds41p1::kLogLendHeat, ds41p1::kLendHeatEnv, t.lend_heat, t.lend_heat_half, ds41p1::kLendHeatHalfEnv,
-                 t.lend_heat_margin, ds41p1::kLendHeatMarginEnv, n, t.lend_heat, t.lend_heat_half,
+                 t.lend_heat_margin, ds41p1::kLendHeatMarginEnv, prior.c_str(), n, t.lend_heat, t.lend_heat_half,
                  p1_heat_cand_.size(), (double)t.lend_heat_margin / 100.0, p1::LendHeat::kMinRows);
+    }
     return RAD_OK;
 }
 

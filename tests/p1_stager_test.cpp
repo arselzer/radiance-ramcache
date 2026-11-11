@@ -2376,6 +2376,97 @@ TEST(p1_lend_heat_the_policy_declines_and_counts_why_and_goes_on_when_the_reason
     if (s.h.violations) std::fprintf(stderr, "%s\n", s.h.first.c_str());
 }
 
+/* ---- the heat's prior (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_PRIOR_ROWS; ds41_p1.h) -----------------------
+ *
+ * The heat starts from the plan's profile shares as if that many decode rows had been routed so, and the prior
+ * ages as a count does: a blended profile seeds the adaptive region and live routing takes over. */
+TEST(p1_lend_heat_prior_tunable_defaults_to_the_half_life) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_heat_prior, 100);    /* the half-life without the slab */
+    env[ds41p1::kLendSlabEnv] = "256";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_heat_prior, 2000);   /* and beside it */
+    env[ds41p1::kLendHeatHalfEnv] = "300";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_heat_prior, 300);    /* the half-life set */
+    for (const char* ok : { "0", "1", "600", "100000000" }) {
+        env[ds41p1::kLendHeatPriorEnv] = ok;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.lend_heat_prior, std::atoi(ok));
+        CHECK_EQ(t.lend_heat_half, 300);
+    }
+    env[ds41p1::kLendHeatPriorEnv] = "";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.lend_heat_prior, 300);
+    for (const char* bad : { "100000001", "-1", "1e3", "half" }) {
+        env[ds41p1::kLendHeatPriorEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kLendHeatPriorEnv) != std::string::npos);
+    }
+}
+
+TEST(p1_lend_heat_prior_seeds_the_profile_shares_and_ages_as_a_count) {
+    LendHeat h;
+    REQUIRE_EQ(h.init(6, 2, 100, 150), 0);
+    std::vector<float> share = { 0.0f, 0.05f, 0.25f, 0.0f, 0.01f, 0.5f, 0.3f /* past the units */ };
+    CHECK_EQ(h.seed(share, 100.0), 4);
+    CHECK_EQ(h.heat(0), 0.0);
+    CHECK_NEAR(h.heat(1), 100.0 * 6 * 0.05, 1e-4);   /* rows x experts a row x share */
+    CHECK_NEAR(h.heat(2), 150.0, 1e-4);
+    CHECK_NEAR(h.heat(4), 6.0, 1e-4);
+    CHECK_NEAR(h.heat(5), 300.0, 1e-4);
+    CHECK(!h.warm());          /* nothing counted: the prior does not warm it */
+    CHECK(!h.dirty());
+    CHECK_EQ(h.seen_rows(), 0.0);
+    h.begin_pass(100);         /* one half-life of rows: the prior halves */
+    CHECK_NEAR(h.heat(2), 75.0, 1e-4);
+    h.add(0, 40);
+    CHECK_NEAR(h.heat(0), 40.0, 1e-9);
+    h.begin_pass(200);
+    CHECK_NEAR(h.heat(2), 18.75, 1e-4);
+    CHECK_NEAR(h.heat(0), 10.0, 1e-9);
+    LendHeat z;   /* a weight of 0, and a plan with no shares: nothing */
+    REQUIRE_EQ(z.init(6, 2, 100, 150), 0);
+    CHECK_EQ(z.seed(share, 0.0), 0);
+    CHECK_EQ(z.seed(std::vector<float>(6, 0.0f), 100.0), 0);
+    for (int u = 0; u < 6; ++u) CHECK_EQ(z.heat(u), 0.0);
+}
+
+TEST(p1_lend_heat_prior_a_profile_hot_unit_takes_a_slot_before_a_live_one_and_live_routing_takes_over) {
+    /* Two slots hold units 0 and 1 of 8 (no share); unit 7 takes one row a pass live, unit 6 none, but the
+     * profile gives 6 a share. Without the prior the first slot goes to 7; with it to 6, and 7 still takes the
+     * other once its live heat is enough. */
+    for (const bool with : { false, true }) {
+        HeatSim s(91, 2, 8, 1, 16);
+        if (with) {
+            std::vector<float> share(8, 0.0f);
+            share[6] = 0.1f;   /* 16 rows x 6 x 0.1: 9.6 rows of heat */
+            CHECK_EQ(s.heat.seed(share, 16.0), 1);
+        }
+        std::vector<int> live(8, 0);
+        live[7] = 1;
+        int first = -1;
+        for (int i = 0; i < 40 && s.moved < 2; ++i) {
+            const int before = s.moved;
+            (void)s.pass(live, 8);
+            if (before == 0 && s.moved == 1)
+                for (const auto& x : s.h.s)
+                    if (x.unit >= 2) first = x.unit;
+        }
+        CHECK_EQ(first, with ? 6 : 7);
+        if (with) CHECK(s.held() == (std::set<int32_t>{ 6, 7 }));
+        CHECK_EQ(s.h.violations, 0);
+        if (s.h.violations) std::fprintf(stderr, "%s\n", s.h.first.c_str());
+    }
+}
+
 /* ---- the rest after a long prefill (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS; card_expert_stager.h) ------
  *
  * From a pass that takes the slots back until the rest after the last such pass has run out: no lent reload

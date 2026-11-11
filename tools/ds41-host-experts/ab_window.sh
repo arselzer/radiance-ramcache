@@ -532,6 +532,12 @@ lcp_check() {   # name
       log "arm $name: Lh${ARM_LH}${ARM_LHH:+ with Lhh${ARM_LHH}}, but the lent-heat line does not state a half-life of ${want_half} decode rows ($(grep -m1 -oE 'ds41 p1: lent heat: on [^:]*' "$OUT/$name.server.log")); not measured"
       return 1
     fi
+    # The prior the heat starts from (..._P1_LEND_HEAT_PRIOR_ROWS stated empty: one half-life of the profile's
+    # shares): a radiance whose line states none has no prior.
+    if ! grep -qE "ds41 p1: lent heat: on \(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=${ARM_LH}; .*; prior ${want_half} decode rows, RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_PRIOR_ROWS" "$OUT/$name.server.log"; then
+      log "arm $name: Lh${ARM_LH}, but the lent-heat line does not state a prior of ${want_half} decode rows (one half-life) ($(grep -m1 -oE 'ds41 p1: lent heat: on [^:]*' "$OUT/$name.server.log")); not measured"
+      return 1
+    fi
   fi
   # LrMS: the rest the arm runs with (the part's, else 5000 beside Lh or Ls, else 0) and its startup line.
   local want_rest=${ARM_LR:-}
@@ -3565,7 +3571,7 @@ for a in $ARMS; do
   # the half-life (empty without Lhh: the engine's default, 100 rows or 2000 beside the slab); lcp_check and
   # lend_exit_gate check the server log at startup and at shutdown.
   env+=(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=${lh:-0} RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS=${lhh}
-        RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT=
+        RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_PRIOR_ROWS=
         RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=${ls:-0} RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT=${la:-0}
         RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS=${lr})
   if [[ -n "$lr" && ( -z "$p1" || -z "$ql$qe$ls" ) ]]; then

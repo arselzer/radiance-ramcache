@@ -89,6 +89,7 @@ struct Tunables {
     int  lend_heat = 0;                                         /* 0 off; else retargets a rank a pass */
     int  lend_heat_half = ds41p1::kDefLendHeatHalfRows;         /* the heat's half-life, in decode rows */
     int  lend_heat_margin = ds41p1::kDefLendHeatMarginPct;      /* the hysteresis, percent of the resident's heat */
+    int  lend_heat_prior = -1;                                  /* the prior's weight in decode rows (-1: the half-life) */
     int  lend_slab = 0;                                         /* the lent slab's slots a rank (0 off) */
     bool lend_audit = false;                                    /* every lent slot read back and compared */
     int  lend_rest_ms = 0;                                      /* the rest after a long prefill (0 none) */
@@ -98,7 +99,7 @@ struct Tunables {
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
  * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-100000000 (unset: 100, or 2000 with lend_slab),
- * lend_heat_margin 100-1000, lend_slab 0-256, lend_rest_ms 0-600000 (unset: 5000 with lend_heat or lend_slab, else
+ * lend_heat_margin 100-1000, lend_heat_prior 0-100000000 (unset: the half-life), lend_slab 0-256, lend_rest_ms 0-600000 (unset: 5000 with lend_heat or lend_slab, else
  * 0)), align "end" or "start", swiglu_span and lend_audit 0/off or
  * 1/on (default off). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
@@ -522,6 +523,25 @@ public:
         dirty_ = true;
     }
     double heat(int32_t u) const { return u >= 0 && (size_t)u < h_.size() ? h_[(size_t)u] / scale_ : 0.0; }
+    /* The prior (ds41p1::kLendHeatPriorEnv), before the first pass: unit u starts as if `rows` decode rows had
+     * been routed to it; it ages as a count does. Neither warms the heat nor marks it counted. */
+    void prior(int32_t u, double rows) {
+        if (u < 0 || (size_t)u >= h_.size() || !(rows > 0.0)) return;
+        h_[(size_t)u] += rows * scale_;
+    }
+    /* The prior from a profile: share[u] (by plan unit; a unit's share of its layer's decode selections, as
+     * Planner gives MoveUnit::profile_share) over `rows` decode rows, each routing ds41p1::kExpertsPerRow
+     * experts a layer: prior(u, rows x kExpertsPerRow x share[u]). Returns the units seeded. */
+    int  seed(const std::vector<float>& share, double rows) {
+        int n = 0;
+        for (size_t u = 0; u < share.size() && u < h_.size(); ++u) {
+            const double r = rows * (double)ds41p1::kExpertsPerRow * (double)share[u];
+            if (!(r > 0.0)) continue;
+            prior((int32_t)u, r);
+            ++n;
+        }
+        return n;
+    }
     /* One half-life of decode rows has been counted: before that the counts say too little to move a unit. */
     bool warm() const { return seen_ >= half_; }
     /* The half-life and the decode rows counted so far (the stats line's). */

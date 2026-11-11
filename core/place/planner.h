@@ -306,6 +306,8 @@ public:
     int64_t lend_slab_vram = 0;
     int64_t lend_slab_given = 0;
     std::vector<int32_t> lend_slab_units;
+    /* PlannerInput::profile_from, where the units' profile_share came from (empty: none was given). */
+    std::string profile_from;
     /* Slab VRAM no weight occupies: shadow slots (the cost of dynamic placement) and the staging
      * ring (the cost of offload). Reported separately from the tier totals. */
     int64_t slab_overhead = 0;
@@ -339,6 +341,9 @@ struct PlannerInput {
      * fine and costs about a point of hit rate. See Planner::rank_units. */
     const RadFileProfile* profile = nullptr;
     int64_t               n_profile = 0;
+    /* Where `profile` came from, for the logs (Plan::profile_from): "--expert-profile FILE" or "the
+     * container's profile"; empty without one. */
+    std::string           profile_from;
     /* The weights are in a container, which the file and mapped tiers read in place. A checkpoint
      * served directly is neither grouped by movement unit nor aligned for O_DIRECT, so with this
      * false both tiers are closed (spec §4.3). */

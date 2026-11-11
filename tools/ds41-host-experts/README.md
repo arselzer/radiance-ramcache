@@ -1771,6 +1771,7 @@ with the traffic, and the audit checks every byte it moves.
 |---|---|
 | `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=N` (1-256 a card; needs `..._P1=1`, `--deterministic`, the file tier) | N slots of VRAM that no pass writes, paid for by the coldest static residents, holding the hottest units off the card from bring-up on |
 | `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=S` (1-8), `..._P1_LEND_HEAT_HALF_ROWS` (1-100000000; 100, or 2000 beside the slab), `..._P1_LEND_HEAT_MARGIN_PCT` (100-1000; 150) | every lent slot (ring, arena and slab) follows a decayed count of live decode rows, at most S slots a rank a pass |
+| `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_PRIOR_ROWS=R` (0-100000000; unset: the half-life) | the heat starts from the plan's profile shares as if R decode rows had been routed so |
 | `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS=MS` (0-600000; unset: 5000 beside the heat or the slab, else 0) | from a card-path prefill pass until MS ms after the last one, the heat moves nothing and no lent reload reads the drive |
 | `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT=1` (needs a lent slot) | every lent slot read back from the card and compared before its unit is published and before its resident is withdrawn; not for a timed arm |
 
@@ -1823,6 +1824,23 @@ gives_the_drive_reloads_slot_bytes`). A unit the cache does not hold (or whose l
 is read from the drive as before. Bring-up, returns after the grace and retargets all take this path. The
 stats line's `lent reloads: R from the RAM cache (P relaid from the packed form at M ms a unit), D from the
 drive` part counts them (R includes block-form leases).
+
+**The prior from the profile** (`LendHeat::seed`, `..._P1_LEND_HEAT_PRIOR_ROWS`). The slab's start set and
+the ring's and the arena's already came from the deployment's profile: `Plan::lend_slab_units` follows the
+fill's order (`Planner::rank_units`, by `MoveUnit::profile_share`, which is `--expert-profile`'s where one is
+given, else the container's), and `p1_lend_init` sorts the other lent units by the same shares. The heat
+started from zero, so its first counts alone decided, after one half-life, against residents whose heat
+was 0. Now each unit's heat starts at R x 6 x its share (R decode rows of 6 routed experts a layer, the share
+of its layer's decode selections), and that prior ages as a count does: halved after a half-life of live
+rows. Unset, R is one half-life (2,000 rows beside the slab), so a blended profile holds about as much as
+the last half-life of live routing at the start and half as much after it; 0 turns it off. It neither warms
+the heat (nothing moves before a half-life of live rows) nor counts as rows on the stats line. The startup
+line states it: `ds41 p1: lent heat: on (...; margin 150%, ...; prior R decode rows,
+..._P1_LEND_HEAT_PRIOR_ROWS, of --expert-profile FILE's shares: U units seeded, L of rank 0's lendable ones
+with H rows of heat)`, or `prior ...: none, the plan has no profile shares`, or `prior 0 ...`. Host tests:
+`p1_lend_heat_prior_*` (the tunable; the seed's arithmetic and aging; a profile-hot unit takes a slot before
+a live one, which takes the next). `ab_window.sh` states `..._P1_LEND_HEAT_PRIOR_ROWS` empty in every arm
+and measures an `Lh` arm only if its heat line states a prior of one half-life.
 
 **The rest after a long prefill** (`RingLender::set_rest`, `resting`, `LendHost::load_ram`, `hold_drive`;
 `..._P1_LEND_REST_MS`, 5000 ms by default beside the heat or the slab, 0 and nothing of it otherwise). The

@@ -5179,8 +5179,9 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
         if (plan_->rank == 0)
             RAD_INFO("%s: %d slots (%s=%d; %s of VRAM a card that no pass writes, for which the plan gave up %lld "
                      "static residents, coldest first) hold rank 0's %d hottest file-tier units of that plan (profile "
-                     "share %.4f) as decode residents from bring-up on (%d loaded in %.1f s, read from the drive "
-                     "where the RAM cache does not hold the card's block form); no pass takes them back and they "
+                     "share %.4f) as decode residents from bring-up on (%d loaded in %.1f s, from the RAM cache where it "
+                     "holds the unit, relaid from the packed form where it is packed, else read from the drive); no "
+                     "pass takes them back and they "
                      "know no grace; a unit not loaded, or whose load failed, takes the CPU path",
                      ds41p1::kLogLendSlab, ns, ds41p1::kLendSlabEnv, t.lend_slab, humanb(plan_->lend_slab_vram).c_str(),
                      (long long)plan_->lend_slab_given, ns, share, in, secs);
@@ -5191,8 +5192,9 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
         RAD_INFO("%s: %d of the ring's %d slots (%d of them past the file buffers' alias bases; %s=%d) hold "
                  "rank 0's %d hottest file-tier units (profile share %.4f) as decode residents outside the card "
                  "path's passes; a pass that arms it takes them back, and %d ms after its last pass (%s) they are "
-                 "reloaded in the background (from the RAM cache where it holds the card's block form, else read "
-                 "from the drive and relaid into two pinned buffers of %.0f MiB) and published again; a unit not "
+                 "reloaded in the background (from the RAM cache where it holds the unit, its block form as it is or "
+                 "the packed form relaid, else read from the drive and relaid, into two pinned buffers of %.0f MiB) "
+                 "and published again; a unit not "
                  "yet reloaded, or whose reload failed, takes the CPU path",
                  ds41p1::kLogLend, nk, n_slots, n_slots - alias_slots, ds41p1::kLendEnv, t.lend, nk, share, t.grace_ms,
                  ds41p1::kGraceEnv,
@@ -5205,8 +5207,9 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                  "to %lld tokens and the guard, hold rank 0's next %d hottest file-tier units (profile share "
                  "%.4f) as decode residents; a step at the full plan (above %lld tokens: every card-path pass "
                  "among them) takes them back, its ops behind any reload copy still queued, and %d ms after the "
-                 "last such step (%s) they are reloaded in the background as the lent ring's are (from the drive "
-                 "where the RAM cache is packed) and published again; a unit not yet reloaded takes the CPU path",
+                 "last such step (%s) they are reloaded in the background as the lent ring's are (from the RAM cache "
+                 "where it holds the unit, relaid from the packed form where it is packed, else from the drive) and "
+                 "published again; a unit not yet reloaded takes the CPU path",
                  ds41p1::kLogLendArena, ka, ds41p1::kLendArenaEnv, t.lend_arena, arena.size(),
                  (long long)p1_arena_rows_, ka, share, (long long)p1_arena_rows_, t.grace_ms, ds41p1::kGraceEnv);
     }

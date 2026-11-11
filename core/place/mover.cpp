@@ -983,6 +983,42 @@ int Mover::relay_unit_block(const HostPlanes& p, uint8_t* dst, int64_t cap) cons
     return RAD_OK;
 }
 
+int Mover::relay_packed_unit_block(const HostUnit& hu, uint8_t* dst, int64_t cap,
+                                   std::vector<uint8_t>* scales) const {
+    if (!prog_ || !plan_ || !dst || !scales || !hu.packed || hu.n != 2 || hu.unit < 0 ||
+        (size_t)hu.unit >= plan_->units.size())
+        return RAD_E_INVAL;
+    const MoveUnit& mu = plan_->units[(size_t)hu.unit];
+    if (mu.weights.size() != 2) return RAD_E_INVAL;
+    int64_t sc_off[2] = { 0, 0 }, sc_bytes = 0;
+    int klass[2] = { -1, -1 };
+    for (int k = 0; k < 2; ++k) {
+        const WeightInfo& w = prog_->weights[mu.weights[(size_t)k]];
+        klass[k] = w.stored_bytes == ds41p1::kGuBlockBytes ? 0 : w.stored_bytes == ds41p1::kDnBlockBytes ? 1 : -1;
+        if (klass[k] < 0 || hu.bytes[k] != w.stored_bytes || !hu.host[k] || hu.slot[k] <= 0) return RAD_E_STATE;
+        sc_off[k] = sc_bytes;
+        sc_bytes += (int64_t)kPackedShape[klass[k]][0] * (kPackedShape[klass[k]][1] / 32);
+    }
+    if (klass[0] == klass[1]) return RAD_E_STATE;
+    if ((int64_t)scales->size() < sc_bytes) scales->resize((size_t)sc_bytes);
+    HostPlanes p;
+    p.unit = hu.unit;
+    p.n = 2;
+    for (int k = 0; k < 2; ++k) {
+        const int c = klass[k], N = kPackedShape[c][0], K = kPackedShape[c][1];
+        ds41hx::Mx view;
+        uint8_t* const sc = scales->data() + sc_off[k];
+        if (!ds41hx::packed_view(hu.host[k], (size_t)hu.slot[k], N, K, &view) || !ds41hx::packed_scales(view, sc))
+            return RAD_E_STATE;
+        p.w[k] = mu.weights[(size_t)k];
+        p.rows[k] = N;
+        p.cols[k] = K;
+        p.codes[k] = view.codes;
+        p.scales[k] = sc;
+    }
+    return relay_unit_block(p, dst, cap);
+}
+
 int Mover::ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done) {
     if (!mover_ || n < 0 || (n > 0 && !segs) || !done) return RAD_E_INVAL;
     for (int i = 0; i < n_waits; ++i)

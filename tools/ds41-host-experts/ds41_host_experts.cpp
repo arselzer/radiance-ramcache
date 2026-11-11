@@ -1046,6 +1046,24 @@ bool pk_check(const Mx& w, const uint8_t* scales) {
     return ex.i == ex.n;   /* each raw round used once, in order: the list is ascending */
 }
 
+/* packed_scales: every round through pk_round, written out as the planar scales. */
+bool pk_unpack(const Mx& w, uint8_t* scales) {
+    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
+    const size_t PB = (size_t)(8 * RF + (t + 3) / 4);
+    PkRounds ex = pk_rounds_from(w, 0);
+    alignas(32) uint8_t sb[32];
+    for (int n = 0; n < w.N; ++n) {
+        const uint8_t* const pk = w.pk + (size_t)n * PB;
+        uint8_t* const sc = scales + (size_t)n * (size_t)UK;
+        for (int r = 0; r < R; ++r) {
+            const int tb = r < RF ? 32 : t;
+            const uint8_t* const s = pk_round(ex, (uint32_t)n * (uint32_t)R + (uint32_t)r, pk + (size_t)8 * r, tb, w.e0, sb);
+            std::memcpy(sc + (size_t)32 * r, s, (size_t)tb);
+        }
+    }
+    return ex.i == ex.n;
+}
+
 void swiglu8(const float* silu, const uint16_t* gu, uint16_t* y, int n, float limit) {
     const __m256 lo = _mm256_set1_ps(-limit), hi = _mm256_set1_ps(limit);
     const __m256i r7fff = _mm256_set1_epi32(0x7fff), one = _mm256_set1_epi32(1);
@@ -1258,6 +1276,13 @@ bool packed_scales_equal(const Mx& w, const uint8_t* scales) {
         (w.n_exc && (!w.exc_idx || !w.exc_raw)))
         return false;
     return pk_check(w, scales);
+}
+
+bool packed_scales(const Mx& w, uint8_t* scales) {
+    if (!w.pk || !w.codes || !scales || w.N <= 0 || w.K <= 0 || w.K % 32 || w.n_exc < 0 ||
+        (w.n_exc && (!w.exc_idx || !w.exc_raw)))
+        return false;
+    return pk_unpack(w, scales);
 }
 
 void swiglu(const float* silu, const uint16_t* gu, uint16_t* y, int n, float limit) {

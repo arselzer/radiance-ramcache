@@ -698,6 +698,9 @@ sg_gate() {   # log, the arm's K (empty: no Sg part), its P1 and Cs parts (non-e
 # Ls / La / Lhh at shutdown, on each rank's "ds41 p1 stats, rank R:" line: whether the part acted.
 #   Ls   "; lent slab: N slots, R residents now (P at bring-up)": the arm's N, and all of them in at bring-up
 #        (P = N), on every rank; else the card did not hold what the arm's name says from its first token.
+#        And the "; lent reloads: R from the RAM cache (P relaid from the packed form ...), D from the drive"
+#        part on every rank: a radiance without it reloads every lent unit from the drive where the RAM cache
+#        is packed, which is not the arm the name says.
 #   La   "; lent audit: A slots read back (D differ, U not read)": slots read back on every rank (A > 0), and
 #        none differing or unreadable on any; a differing slot means a unit's bytes on a card were not the
 #        bytes copied there, so the arm's replies and speed are set aside whatever they look like.
@@ -716,6 +719,9 @@ lend_exit_gate() {
       if [[ -z "$p" ]]; then echo "Ls$ls, but rank $rank's stats line has no 'lent slab: N slots, R residents now (P at bring-up)' part"; return 1; fi
       if (( n != ls )); then echo "Ls$ls, but rank $rank's slab has $n slots"; return 1; fi
       if (( p != n )); then echo "Ls$ls, but rank $rank's slab held $p of its $n units at bring-up ($r at shutdown)"; return 1; fi
+      if ! grep -qE '; lent reloads: [0-9]+ from the RAM cache \([0-9]+ relaid from the packed form at [0-9.]+ ms a unit\), [0-9]+ from the drive' <<< "$line"; then
+        echo "Ls$ls, but rank $rank's stats line has no 'lent reloads: R from the RAM cache (P relaid from the packed form ...), D from the drive' part"; return 1
+      fi
     fi
     if [[ -n "$la" ]]; then
       read -r a d u <<< "$(sed -nE 's/.*; lent audit: ([0-9]+) slots read back \(([0-9]+) differ, ([0-9]+) not read\).*/\1 \2 \3/p' <<< "$line")"

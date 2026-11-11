@@ -1789,10 +1789,10 @@ packed entry by its weight's plan, not by where it is published. The mover reser
 charged; `Plan::report` names it (`lent slab`).
 
 **At bring-up and in passes.** The slab's slots are the lender's last, and kept (`RingLender`): each rank
-loads its N units through the lender's own path before the first pass (`CardExpertPath::lend_prime`, read
-from the drive and relaid where the RAM cache is packed: 23-26 ms a unit in the lent arena's measured
-reloads, so about 7 s a card for 256, one card after another; at most 120 s a rank, the rest comes in at the
-passes). A pass that takes the ring's and the arena's slots back leaves the slab's: its
+loads its N units through the lender's own path before the first pass (`CardExpertPath::lend_prime`: from
+the RAM cache where it holds the unit, else read from the drive and relaid, 12-26 ms a unit in the lent
+arena's measured reloads, so up to about 7 s a card for 256, one card after another; at most 120 s a rank,
+the rest comes in at the passes). A pass that takes the ring's and the arena's slots back leaves the slab's: its
 residents stay published through it, the plugin's own ops read them at any height (block form, unmarked: the
 decode band's row at up to 16 rows, the P1 twin above), there is no grace, and a load or copy in flight is
 neither cancelled nor fenced. A kept slot's reload begins only while the other slots are not lent out, so an
@@ -1806,9 +1806,22 @@ set up to 100,000,000. Nothing moves before one half-life of decode rows has bee
 half-life also starts late. And it moves a slot only while every lent slot holds its resident: after each
 pass that takes the arena's slots back it rests through the grace and until they are reloaded (about two
 seconds with 41 of them), the slab's slots with the rest, so under prompts that arrive faster than that
-it acts seldom; the stats line's declined passes say how often. A retargeted slot's new unit is read from the drive and relaid, as every reload
-is where the RAM cache is packed: a lent slot holds the card's block form and the lender has no way from
-the packed form to it, so the packed RAM cache is not used as a source.
+it acts seldom; the stats line's declined passes say how often.
+
+**Reloads from the packed RAM cache** (`CardExpertPath::load_from`, `Mover::relay_packed_unit_block`,
+`ds41hx::packed_scales`). A lent slot holds the card's block form (block_mxfp4), the packed RAM cache
+(`..._PACKED_CACHE=1`) the CPU kernels' packed form, so a lease cannot be the copy's source as a block-form
+cache's is. But the packed form is lossless: it keeps the release's codes plane as it is and every block's
+e8m0 as a 2-bit code against one base or, in a raw round, as it is (the cache's insert checks the round
+trip). So where the packed cache holds the unit, the lender borrows its lease (read-only, no LRU move), the
+reload thread widens the scales back to the release's plane (`ds41hx::packed_scales`, the kernels' own
+widening) and relays the two planes into the reload buffer with the same relayout as a drive reload's, and
+the lease goes once that has landed; the copy, the audit and the publish are a drive reload's. No drive
+read, and the slot's bytes are the drive reload's byte for byte (`p1_lend_reload_from_the_packed_ram_cache_
+gives_the_drive_reloads_slot_bytes`). A unit the cache does not hold (or whose lease is not a packed unit's)
+is read from the drive as before. Bring-up, returns after the grace and retargets all take this path. The
+stats line's `lent reloads: R from the RAM cache (P relaid from the packed form at M ms a unit), D from the
+drive` part counts them (R includes block-form leases).
 
 **The read-back audit** (`RingLender::set_audit`, `LendHost::audit`, `LendAudit`). Twice a residency the
 slot's two weights are copied back from the card to pinned host memory on the DMA lane, and the issuing

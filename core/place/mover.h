@@ -966,6 +966,15 @@ public:
                ring_res_[(size_t)u].load(std::memory_order_relaxed) != nullptr;
     }
     int   relay_unit_block(const HostPlanes& p, uint8_t* dst, int64_t cap) const;
+    /* relay_packed_unit_block  a packed RAM-cache lease of one unit (borrow_host_unit with packed_cache():
+     *                   hu.packed, its two weights in the plan's order) in the stored block form into dst,
+     *                   as relay_unit_block makes it from the drive's planes. The packed form keeps the
+     *                   release's codes plane as it is and every block's e8m0 exactly (the cache's insert
+     *                   checks the round trip; ds41hx::packed_scales is its inverse), so the planes handed
+     *                   to the relayout are the drive's, byte for byte. scales: the caller's scratch
+     *                   (resized; both weights' scales). Pure and thread-safe while the lease is held (the
+     *                   lent ring's reload thread). */
+    int   relay_packed_unit_block(const HostUnit& hu, uint8_t* dst, int64_t cap, std::vector<uint8_t>* scales) const;
     int   pack_unit_for_ring(const HostPlanes& p, uint8_t* dst, int64_t cap, bool* packed,
                              int64_t bytes[2]) const;   /* bytes: gate_up's and down's, as written */
     char* file_buffer(int i) const {

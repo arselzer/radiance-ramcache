@@ -22,6 +22,7 @@
 #include "place/stager.h"
 #include "sched/consumer_skip.h"
 #include "sched/p1_chunk.h"
+#include "../tools/ds41-host-experts/ds41_host_experts.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -3909,6 +3910,169 @@ TEST(p1_lend_ring_residents_are_published_at_their_slots_and_aliased_never) {
 }
 
 /* ---- the admission predicate --------------------------------------------------------------------------- */
+/* The lent slots' reload from the packed RAM cache (CardExpertPath::load_from, Mover::relay_packed_unit_block):
+ * a unit the packed cache holds is relaid from its lease into the reload buffer instead of read from the drive.
+ * The packed form keeps the release's codes plane and every block's e8m0 (ds41hx::packed_scales undoes the
+ * packing's scales), so the planes the relayout gets are the drive's and the slot's bytes are the same: here
+ * a unit of the real shapes with random codes and scales that leave raw rounds in both weights (the down's
+ * last round short), packed as the cache's insert packs it, relaid both ways and compared byte for byte, with
+ * the same relayout (llama.cpp's block_mxfp4, the card's form) on both sides, with gate_up first and with down
+ * first; and a lease that is not a packed unit's is refused, never relaid. */
+TEST(p1_lend_reload_from_the_packed_ram_cache_gives_the_drive_reloads_slot_bytes) {
+    const int64_t gu = ds41p1::kGuBlockBytes, dn = ds41p1::kDnBlockBytes;
+    const int shape[2][2] = { { 4608, 5120 }, { 5120, 2304 } };   /* gate_up, down: [N, K] */
+    const int cap[2] = { 512, 320 };                               /* the packed cache's raw rounds */
+    for (int order = 0; order < 2; ++order) {
+        Program prog;
+        prog.weights.resize(1);
+        auto weight = [&](const std::string& name, int64_t bytes) {
+            WeightInfo w;
+            w.name = name;
+            w.decl.dtype = RAD_U8;
+            w.decl.rank = 1;
+            w.decl.shape[0] = bytes;
+            w.decl.access = RAD_ACCESS_CONDITIONAL;
+            w.decl.shard = RAD_SHARD_NONE;
+            w.decl.group.layer = 7;
+            w.decl.group.expert = 0;
+            w.logical_bytes = w.stored_bytes = bytes;
+            w.align = RAD_ALIGN_UNIT;
+            w.layout_tag = "ggml_mxfp4";
+            prog.weights.push_back(w);
+            return (rad_weight)(prog.weights.size() - 1);
+        };
+        Plan plan;
+        plan.rank = 0;
+        plan.world_size = 1;
+        plan.dynamic = false;
+        SlabClass sc;
+        sc.name = "expert";
+        sc.stride = ds41p1::kSlotBytes;
+        sc.n_units = 1;
+        plan.classes.push_back(sc);
+        MoveUnit mu;
+        mu.layer = 7;
+        mu.expert = 0;
+        mu.slab_class = 0;
+        mu.bytes = mu.slot_bytes = ds41p1::kSlotBytes;
+        mu.access = RAD_ACCESS_CONDITIONAL;
+        mu.tier = Tier::HostPinned;
+        mu.site = Site::DeviceZeroCopy;
+        const rad_weight wg = weight("blk.7.ffn_gate_up", gu), wd = weight("blk.7.ffn_down", dn);
+        if (order == 0) {
+            mu.weights = { wg, wd };
+            mu.offset = { 0, gu };
+        } else {
+            mu.weights = { wd, wg };
+            mu.offset = { 0, dn };
+        }
+        plan.units.push_back(mu);
+        plan.unit_of_weight.assign(prog.weights.size(), -1);
+        for (rad_weight w : plan.units[0].weights) plan.unit_of_weight[w] = 0;
+        Mover m;
+        MoverConfig mc;
+        /* llama.cpp's block_mxfp4 from the release's planes: per 32 values the e8m0, then 16 bytes, value j < 16
+         * in the low nibble of byte j and j + 16 in its high nibble. */
+        m.set_file_relayout([](const WeightInfo& w, const RadTensor* pt, void* dst, int64_t dst_bytes) -> int {
+            const int c = w.stored_bytes == ds41p1::kGuBlockBytes ? 0 : w.stored_bytes == ds41p1::kDnBlockBytes ? 1 : -1;
+            if (c < 0 || dst_bytes < w.stored_bytes) return RAD_E_INVAL;
+            const int N = c == 0 ? 4608 : 5120, K = c == 0 ? 5120 : 2304, UK = K / 32;
+            const uint8_t* codes = (const uint8_t*)pt[0].data;
+            const uint8_t* scales = (const uint8_t*)pt[1].data;
+            uint8_t* o = (uint8_t*)dst;
+            for (int n = 0; n < N; ++n)
+                for (int b = 0; b < UK; ++b) {
+                    uint8_t* blk = o + ((size_t)n * UK + b) * 17;
+                    blk[0] = scales[(size_t)n * UK + b];
+                    const uint8_t* row = codes + (size_t)n * (K / 2) + (size_t)b * 16;
+                    auto v = [&](int j) { return (uint8_t)((row[j / 2] >> (4 * (j & 1))) & 15); };
+                    for (int j = 0; j < 16; ++j) blk[1 + j] = (uint8_t)(v(j) | (v(j + 16) << 4));
+                }
+            return RAD_OK;
+        });
+        REQUIRE_EQ(m.init(prog, plan, mc), RAD_OK);
+        /* The planes as the drive gives them: random codes; scales 120 or 121 but in a few rounds. */
+        std::mt19937_64 rng(1234 + order);
+        std::vector<uint8_t> codes[2], scales[2], packed[2];
+        for (int c = 0; c < 2; ++c) {
+            const int N = shape[c][0], K = shape[c][1], UK = K / 32;
+            codes[c].resize((size_t)N * K / 2);
+            for (auto& x : codes[c]) x = (uint8_t)rng();
+            scales[c].resize((size_t)N * UK);
+            for (auto& x : scales[c]) x = (uint8_t)(120 + (rng() & 1));
+            for (int i = 0; i < 40; ++i) scales[c][(size_t)(rng() % scales[c].size())] = (uint8_t)(100 + rng() % 40);
+            scales[c][scales[c].size() - 1] = 90;   /* the last round: the down's is short */
+            ds41hx::PackInfo pi;
+            REQUIRE(ds41hx::pack_plan(scales[c].data(), N, K, &pi));
+            CHECK(pi.n_exc > 0);
+            REQUIRE(pi.n_exc <= cap[c]);
+            packed[c].assign(ds41hx::packed_bytes(N, K, cap[c]), 0xa5);
+            REQUIRE_EQ(ds41hx::pack_planes(codes[c].data(), scales[c].data(), N, K, cap[c], pi, packed[c].data(),
+                                           packed[c].size()),
+                       ds41hx::kPackOk);
+            ds41hx::Mx view;
+            REQUIRE(ds41hx::packed_view(packed[c].data(), packed[c].size(), N, K, &view));
+            REQUIRE(ds41hx::packed_scales_equal(view, scales[c].data()));
+            std::vector<uint8_t> back(scales[c].size(), 0);
+            REQUIRE(ds41hx::packed_scales(view, back.data()));
+            CHECK(back == scales[c]);
+            CHECK(view.codes != nullptr && std::memcmp(view.codes, codes[c].data(), codes[c].size()) == 0);
+        }
+        auto klass = [&](int k) { return prog.weights[plan.units[0].weights[(size_t)k]].stored_bytes == gu ? 0 : 1; };
+        /* The drive's reload: the planes read, relaid into the buffer. */
+        Mover::HostPlanes p;
+        p.unit = 0;
+        p.n = 2;
+        for (int k = 0; k < 2; ++k) {
+            const int c = klass(k);
+            p.w[k] = plan.units[0].weights[(size_t)k];
+            p.rows[k] = shape[c][0];
+            p.cols[k] = shape[c][1];
+            p.codes[k] = codes[c].data();
+            p.scales[k] = scales[c].data();
+        }
+        std::vector<uint8_t> drive((size_t)ds41p1::kSlotBytes, 0x11), ram((size_t)ds41p1::kSlotBytes, 0x77);
+        REQUIRE_EQ(m.relay_unit_block(p, drive.data(), ds41p1::kSlotBytes), RAD_OK);
+        /* The packed cache's lease, as borrow_host_unit hands it (its weights in the plan's order). */
+        Mover::HostUnit hu;
+        hu.unit = 0;
+        hu.n = 2;
+        hu.packed = true;
+        for (int k = 0; k < 2; ++k) {
+            const int c = klass(k);
+            hu.host[k] = packed[c].data();
+            hu.dev[k] = packed[c].data();
+            hu.bytes[k] = c == 0 ? gu : dn;
+            hu.slot[k] = (int64_t)packed[c].size();
+        }
+        std::vector<uint8_t> scratch;
+        REQUIRE_EQ(m.relay_packed_unit_block(hu, ram.data(), ds41p1::kSlotBytes, &scratch), RAD_OK);
+        CHECK(std::memcmp(drive.data(), ram.data(), drive.size()) == 0);
+        /* And both are the card's block form of these planes, weight by weight at the unit's offsets. */
+        CHECK_EQ(drive[(size_t)plan.units[0].offset[0]], scales[klass(0)][0]);
+        CHECK_EQ(drive[(size_t)plan.units[0].offset[1]], scales[klass(1)][0]);
+        /* Again into the same scratch (the reload thread keeps one a buffer): the same bytes. */
+        std::fill(ram.begin(), ram.end(), 0);
+        REQUIRE_EQ(m.relay_packed_unit_block(hu, ram.data(), ds41p1::kSlotBytes, &scratch), RAD_OK);
+        CHECK(std::memcmp(drive.data(), ram.data(), drive.size()) == 0);
+        /* Refused, never relaid: a lease that is not packed, a damaged header, a short buffer, a size that is
+         * not the plan's. */
+        std::fill(ram.begin(), ram.end(), 0x5c);
+        hu.packed = false;
+        CHECK(m.relay_packed_unit_block(hu, ram.data(), ds41p1::kSlotBytes, &scratch) < 0);
+        hu.packed = true;
+        packed[0][0] ^= 1;
+        CHECK(m.relay_packed_unit_block(hu, ram.data(), ds41p1::kSlotBytes, &scratch) < 0);
+        packed[0][0] ^= 1;
+        CHECK(m.relay_packed_unit_block(hu, ram.data(), ds41p1::kSlotBytes - 1, &scratch) < 0);
+        hu.bytes[0] += 1;
+        CHECK(m.relay_packed_unit_block(hu, ram.data(), ds41p1::kSlotBytes, &scratch) < 0);
+        hu.bytes[0] -= 1;
+        CHECK(m.relay_packed_unit_block(hu, ram.data(), ds41p1::kSlotBytes, nullptr) < 0);
+        hu.n = 0;   /* nothing for the HostUnit's leases to let go */
+    }
+}
+
 TEST(p1_admission_follows_the_sorted_order_past_the_admission_row) {
     const int64_t C = 256, T = C * 6;
     FileStager fs;

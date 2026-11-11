@@ -244,8 +244,9 @@ private:
  * first ring copy waits on the residents' last reader (an event behind the pass before it). Once
  * RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS have passed since the card path's last pass, the units are
  * reloaded in the background, so back-to-back prompts do not reload between them: from the RAM cache
- * where it holds the card's block form, else read from the drive and relaid into one of two pinned
- * buffers by a reload thread, then copied into their slots on the DMA lane, behind the card path's
+ * where it holds the card's block form; where the RAM cache is packed and holds the unit, its lease
+ * relaid from the packed form (the same planes, so the same bytes) into one of two pinned buffers by a
+ * reload thread; else read from the drive and relaid into such a buffer; then copied into their slots on the DMA lane, behind the card path's
  * last ring reader. Each is published again at a later pass's start, once the host has seen its copy
  * pass. Until then it is non-resident and the CPU path takes it; a reload that fails leaves it there
  * until the next return. A copy begun before the slots were taken back runs before the card path's
@@ -328,6 +329,13 @@ public:
     /* Lent slot k's unit read for its slot in the background: 1 begun, 0 not now (every reload
      * buffer busy), < 0 not possible (the unit stays on the CPU path). */
     virtual int  load(int k) = 0;
+    /* load(k) only where it reads no drive (the RAM cache holds the unit): 1 begun, 0 not now (not in the
+     * RAM cache, or every reload buffer busy), < 0 not possible. While the lender holds its drive reads
+     * back (RingLender::set_rest, after a pass that took the slots) it begins loads only so. */
+    virtual int  load_ram(int k) {
+        (void)k;
+        return 0;
+    }
     /* A begun load that landed since the last call: its slot (and *ok whether it read), or -1. */
     virtual int  landed(bool* ok) = 0;
     /* Slot k's landed bytes copied into its slot on the DMA lane, an event recorded after. */
@@ -715,6 +723,7 @@ public:
     int  lend_retarget(const int* ks, const LendUnit* units, int n, RadEvent behind);
     /* LendHost */
     int  load(int k) override;
+    int  load_ram(int k) override;
     int  landed(bool* ok) override;
     int  copy(int k) override;
     int  copied(int k) override;
@@ -743,9 +752,12 @@ public:
         uint64_t admitted = 0, leases_at_end = 0;
         uint64_t verified = 0, differ = 0, verify_skipped = 0;   /* FileStager::p1_verify's */
         uint64_t swiglu_spans = 0, swiglu_rows = 0, swiglu_full_rows = 0, swiglu_fallbacks = 0;
-        /* The lent ring's reloads: from the RAM cache, read from the drive (and the reload thread's
-         * time in them), failed reads. */
-        uint64_t lend_ram = 0, lend_drive = 0, lend_drive_ns = 0, lend_read_failed = 0;
+        /* The lent ring's reloads: from the RAM cache (its lease the copy's source where it holds the
+         * card's block form; relaid from the packed form into a reload buffer where it is packed, and the
+         * reload thread's time in those), read from the drive (and the reload thread's time in them),
+         * failed reads or relayouts. */
+        uint64_t lend_ram = 0, lend_ram_packed = 0, lend_ram_packed_ns = 0;
+        uint64_t lend_drive = 0, lend_drive_ns = 0, lend_read_failed = 0;
         uint64_t lend_audit_ns = 0;   /* the issuing thread's time in the read-back audit */
     };
     Counts& counts_mut() { return c_; }
@@ -818,9 +830,11 @@ private:
     static void landed(void* ctx, int i);
     int  drop_all();
     /* The lent ring and arena: by lent slot its unit, address, copy event (host) and source (a reload
-     * buffer, -1 its RAM-cache lease in lhu_, -2 none), and for the ring's (the first lring_.size()) the
-     * ring slot; the two pinned reload buffers, each with planes for the drive's read; the reload
-     * thread's queue (lent slot, buffer) and what it landed. lmu_ guards lbuf_free_, lq_ and ldone_. */
+     * buffer, -1 its RAM-cache lease in lhu_, -2 none), whether lhu_ holds a packed RAM-cache lease the
+     * reload thread relays from into the slot's buffer (lram_: set at load, let go at landed, both the
+     * issuing thread's), and for the ring's (the first lring_.size()) the ring slot; the two pinned reload
+     * buffers, each with planes for the drive's read and scratch for the packed form's scales; the reload
+     * thread's queue and what it landed. lmu_ guards lbuf_free_, lq_ and ldone_. */
     RingLender lend_;
     std::vector<LendUnit> lu_;
     std::vector<char*> lat_;
@@ -829,7 +843,11 @@ private:
     std::vector<uint8_t*> lbuf_;
     std::vector<std::unique_ptr<Mover::HostPlanes>> lplanes_;
     std::vector<int> lbuf_free_;
-    std::deque<std::pair<int, int>> lq_;
+    struct LendJob { int k = -1, b = -1; bool ram = false; };
+    std::deque<LendJob> lq_;
+    std::vector<uint8_t> lram_;
+    std::vector<std::vector<uint8_t>> lscales_;
+    int  load_from(int k, bool drive);
     std::deque<std::pair<int, bool>> ldone_;
     std::mutex lmu_;
     std::condition_variable lcv_;

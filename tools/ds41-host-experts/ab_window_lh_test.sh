@@ -106,7 +106,7 @@ eval "$(sed -n '/^lend_exit_gate() {/,/^}/p' "$W")"
 declare -F lend_exit_gate >/dev/null || { echo "FAIL no lend_exit_gate in $W"; exit 1; }
 # The engine's shutdown line (CardExpertPath::stats_line, FileStager::p1_stats_line): its lent parts.
 stat() {   # rank, the slab's part, the audit's, the heat's half-life part (each may be empty)
-  echo "I[$1] ds41 p1 stats, rank $1: 3 chunks, 120 card-path layers; units RAM 0 / drive 0 / host pool 0 (...); leases at pass end 0; verify rows 0, differ 0 (0 samples skipped); lent ring: 41 slots (41 in the activation arena), 41 residents now; 3 bursts took them back (123 residents withdrawn), 4 returns, 420 reloaded (RAM cache 0, drive 420 at 9.1 ms a unit), 0 failed, 0 overtaken, 2 passes held back by the grace$2$3; lent heat: 30 retargets (units published at a slot another unit gave up), 30 residents withdrawn for them, 900 passes declined (700 lent or in the grace, 200 a slot busy, 0 draft bank, 0 candidate, 0 no fence); touched experts 9000: VRAM residents 7000, slab 0, ring 2000; admission orders moved 0$4"
+  echo "I[$1] ds41 p1 stats, rank $1: 3 chunks, 120 card-path layers; units RAM 0 / drive 0 / host pool 0 (...); leases at pass end 0; verify rows 0, differ 0 (0 samples skipped); lent ring: 41 slots (41 in the activation arena), 41 residents now; 3 bursts took them back (123 residents withdrawn), 4 returns, 420 reloaded (RAM cache 0, drive 420 at 9.1 ms a unit), 0 failed, 0 overtaken, 2 passes held back by the grace${RL-; lent reloads: 420 from the RAM cache (380 relaid from the packed form at 6.2 ms a unit), 40 from the drive}$2$3; lent heat: 30 retargets (units published at a slot another unit gave up), 30 residents withdrawn for them, 900 passes declined (700 lent or in the grace, 200 a slot busy, 0 draft bank, 0 candidate, 0 no fence); touched experts 9000: VRAM residents 7000, slab 0, ring 2000; admission orders moved 0$4"
 }
 sl() { echo "; lent slab: $1 slots, $2 residents now ($3 at bring-up)"; }
 au() { echo "; lent audit: $1 slots read back ($2 differ, $3 not read) at 7.4 ms a slot, $4 slots lost, retargets ${5:-not stopped}"; }
@@ -147,6 +147,8 @@ gate 1 "Lhh2000, no rank counted 2000 decode rows"                              
 gate 1 "Lhh2000, a rank ran with a half-life of 100 rows"                               xhalf "" "" 2000 "half-life of 100"
 gate 1 "Lhh2000, no half-life part in the stats lines"                                  xnone "" "" 2000 "no 'heat half-life"
 gate 0 "Lhh2000, one rank counted its half-life"                                        xgood "" "" 2000
+RL=""; mk xoldrl "$(stat 0 "$(sl 128 128 128)" "" "")" "$(stat 1 "$(sl 128 128 128)" "" "")" "$(stat 2 "$(sl 128 128 128)" "" "")" "$(stat 3 "$(sl 128 128 128)" "" "")"; unset RL
+gate 1 "Ls128 on a radiance whose lender has no RAM-cache reload part"                  xoldrl 128 "" "" "no 'lent reloads"
 # The differing slot's own log line is quoted in the reason.
 why=$(lend_exit_gate "$OUT/xdiffer.server.log" "" 1 "")
 [[ "$why" == *"unit 2211"* ]] && ok "the reason quotes the audit's line (slot, unit, offset)" || bad "the reason does not quote the audit's line: $why"

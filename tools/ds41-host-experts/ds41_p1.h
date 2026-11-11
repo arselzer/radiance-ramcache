@@ -170,6 +170,13 @@ constexpr const char* kLendArenaEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA"
 constexpr const char* kLendHeatEnv       = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT";
 constexpr const char* kLendHeatHalfEnv   = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS";
 constexpr const char* kLendHeatMarginEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT";
+/* The heat's prior (kLendHeatPriorEnv=R, 0-kMaxLendHeatHalfRows; unset: the half-life): before any decode row
+ * is counted, each unit's heat is what R decode rows routed as the plan's profile shares give it (R x
+ * kExpertsPerRow x its share: the deployment's --expert-profile where one is given, else the container's
+ * profile; nothing without a profile), and it ages with every counted row as a count does. So a blended
+ * profile seeds the adaptive region, and live routing outweighs it after about a half-life. 0: no prior. */
+constexpr const char* kLendHeatPriorEnv  = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_PRIOR_ROWS";
+constexpr int kExpertsPerRow = 6;   /* a decode row's routed experts a layer (n_expert_used; a share is of these) */
 /* The lent slab (kLendSlabEnv=N; 0 off, the default; 1-kMaxLendSlab): N slots of VRAM of their own a rank,
  * which no pass ever takes back. The planner pays for them out of the same weights pool by giving up static
  * residents from the cold end of its order: N where a resident costs a slot, about N / 22 more where

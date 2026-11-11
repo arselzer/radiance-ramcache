@@ -47,6 +47,7 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         /* Behind the slab: unset, the half-life's default follows it. */
         { ds41p1::kLendHeatHalfEnv, 1, ds41p1::kMaxLendHeatHalfRows, &r.lend_heat_half },
         { ds41p1::kLendHeatMarginEnv, 100, 1000, &r.lend_heat_margin },
+        { ds41p1::kLendHeatPriorEnv, 0, ds41p1::kMaxLendHeatHalfRows, &r.lend_heat_prior },
         /* Behind the heat and the slab: unset, the rest is theirs (0 without both). */
         { ds41p1::kLendRestEnv, 0, ds41p1::kMaxLendRestMs, &r.lend_rest_ms },
     };
@@ -60,6 +61,7 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
             return false;
         }
     }
+    if (r.lend_heat_prior < 0) r.lend_heat_prior = r.lend_heat_half;   /* unset: one half-life */
     if (const char* a = get(ds41p1::kAlignEnv); a && *a) {
         if (!std::strcmp(a, "end")) r.align_end = true;
         else if (!std::strcmp(a, "start")) r.align_end = false;

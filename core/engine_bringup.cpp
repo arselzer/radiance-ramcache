@@ -2219,13 +2219,16 @@ int Engine::plan() {
         if (!decode_profile.rows.empty()) {
             in.profile = decode_profile.rows.data();
             in.n_profile = (int64_t)decode_profile.rows.size();
+            in.profile_from = "--expert-profile " + cfg_.expert_profile;
         } else if (file_ && file_->header().prof_count) {
             in.profile = file_->profile();
             in.n_profile = (int64_t)file_->header().prof_count;
+            in.profile_from = "the container's profile";
         }
         if (!expert_profile_.empty()) {
             in.profile = expert_profile_.data();
             in.n_profile = (int64_t)expert_profile_.size();
+            in.profile_from = "--expert-profile " + cfg_.expert_profile;
         }
         // DeepSeek EP movement groups are local; container/profile expert keys are global.
         // The tested adapter resolves every GU/DN contributor through WeightInfo.source.

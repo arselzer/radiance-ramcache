@@ -1580,6 +1580,7 @@ int Planner::plan(Plan* out) {
     *out = Plan{};
     out->rank = in_.rank;
     out->world_size = in_.world_size;
+    out->profile_from = in_.n_profile > 0 ? in_.profile_from : std::string();
     out->dynamic = !cfg.deterministic;
 
     const Budgets b = Budgets::from(cfg);

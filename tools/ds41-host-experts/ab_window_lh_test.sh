@@ -37,7 +37,7 @@ lc_line='I[0] large-chunk prefill: passes of up to 2048 tokens (RADIANCE_EXPERIM
 p1_line="I[0] ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of 320 to 2048 rows on the cards (RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS=320; ...)"
 arena_line="I[0] ds41 p1: lent arena: 42 slots (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64; 42 fit) in the activation arena's top, ..."
 # The engine's line (FileStager::p1_lend_init, ds41p1::kLogLendHeat).
-heat_line() { echo "I[0] ds41 p1: lent heat: on (${HEAT}=$1; half-life 100 decode rows, ${HEAT}_HALF_ROWS; margin 150%, ${HEAT}_MARGIN_PCT): each rank's lent slots (rank 0: 42) follow live decode routing, at most $1 handed to another unit a pass; ..."; }
+heat_line() { echo "I[0] ds41 p1: lent heat: on (${HEAT}=$1; half-life 100 decode rows, ${HEAT}_HALF_ROWS; margin 150%, ${HEAT}_MARGIN_PCT; prior ${2:-100} decode rows, ${HEAT}_PRIOR_ROWS, of --expert-profile /p.json's shares: 3840 units seeded, 900 of rank 0's lendable ones with 2000.0 rows of heat): each rank's lent slots (rank 0: 42) follow live decode routing, at most $1 handed to another unit a pass; ..."; }
 mk() { local n=$1; shift; printf '%s\n' "$@" > "$OUT/$n.server.log"; }
 # The rest's line (FileStager::p1_lend_init, ds41p1::kLogLendRest): 5000 ms by default beside the heat or the slab.
 REST=RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS
@@ -45,6 +45,8 @@ rest_line() { echo "I[0] ds41 p1: lent rest: $1 ms (${REST}=$1${2:-, the default
 mk arena "$lc_line" "$p1_line" "$arena_line"
 mk heat2 "$lc_line" "$p1_line" "$arena_line" "$(heat_line 2)" "$(rest_line 5000)"
 mk heat22 "$lc_line" "$p1_line" "$arena_line" "$(heat_line 22)" "$(rest_line 5000)"
+mk heat2noprior "$lc_line" "$p1_line" "$arena_line" "$(heat_line 2 | sed 's/; prior [^)]*)/)/')" "$(rest_line 5000)"
+mk heat2prior7 "$lc_line" "$p1_line" "$arena_line" "$(heat_line 2 7)" "$(rest_line 5000)"
 mk plain "$lc_line"
 expect() {   # want(0/1) what log P1 QE LH
   local want=$1 what=$2 rc
@@ -57,6 +59,8 @@ expect 1 "Lh4 on a server that took 2"                               heat2  1 64
 expect 1 "Lh2 on a server whose line says 22"                        heat22 1 64 2
 expect 1 "no Lh part on a server whose lent slots follow routing"    heat2  1 64 ""
 expect 0 "Qe64 without Lh, no lent-heat line"                        arena  1 64 ""
+expect 1 "Lh2 on a radiance whose lent-heat line states no prior"     heat2noprior 1 64 2
+expect 1 "Lh2 on a server whose prior is not one half-life"           heat2prior7  1 64 2
 expect 0 "the plain Lc arm"                                          plain  "" "" ""
 # An Lh arm's line goes to the window log.
 : > "$OUT/window.log"
@@ -70,7 +74,7 @@ AUDIT=RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT
 # The engine's lines (FileStager::p1_lend_init: ds41p1::kLogLendSlab, kLogLendAudit, kLogLendHeat).
 slab_line() { echo "I[0] ds41 p1: lent slab: $1 slots (${SLAB}=$1; 2.24 GiB of VRAM a card that no pass writes, for which the plan gave up 134 static residents, coldest first) hold rank 0's $1 hottest file-tier units of that plan (profile share 0.0412) as decode residents from bring-up on ($1 loaded in 3.1 s, ...); ..."; }
 audit_line="I[0] ds41 p1: lent audit: on (${AUDIT}=1): every lent slot is copied back from the card and compared, ..."
-heat_half() { echo "I[0] ds41 p1: lent heat: on (${HEAT}=$1; half-life $2 decode rows, ${HEAT}_HALF_ROWS; margin 150%, ${HEAT}_MARGIN_PCT): each rank's lent slots (rank 0: 170) follow live decode routing, at most $1 handed to another unit a pass; ..."; }
+heat_half() { echo "I[0] ds41 p1: lent heat: on (${HEAT}=$1; half-life $2 decode rows, ${HEAT}_HALF_ROWS; margin 150%, ${HEAT}_MARGIN_PCT; prior ${3:-$2} decode rows, ${HEAT}_PRIOR_ROWS, of --expert-profile /p.json's shares: 3840 units seeded, 900 of rank 0's lendable ones with 2000.0 rows of heat): each rank's lent slots (rank 0: 170) follow live decode routing, at most $1 handed to another unit a pass; ..."; }
 mk slab128 "$lc_line" "$p1_line" "$arena_line" "$(slab_line 128)" "$(rest_line 5000)"
 mk slab128h "$lc_line" "$p1_line" "$arena_line" "$(slab_line 128)" "$(heat_half 2 2000)" "$(rest_line 5000)"
 mk slab128h100 "$lc_line" "$p1_line" "$arena_line" "$(slab_line 128)" "$(heat_half 2 100)" "$(rest_line 5000)"
@@ -243,7 +247,7 @@ run_loop() {   # every model action stubbed
   export RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=4 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS=7
   export RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT=900
   export RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=7 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT=1
-  export RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS=7
+  export RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS=7 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_PRIOR_ROWS=9
   SUM=$(sha256sum "$H/kernels/libr4d.so" | cut -d' ' -f1); LIB=$H/kernels/libr4d.so
   TALL_OK=1 TALL_WHY=test TALL_SUM=$SUM TALL_LIB=$LIB DK_OK=1 DK_WHY=test DK_SUM=$SUM DK_LIB=$LIB
   RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=4096
@@ -274,6 +278,7 @@ launched() {   # what arm heat [lend_arena [lend]]
   has "$1" "$sec" ${HEAT} "$3"
   has "$1" "$sec" ${HEAT}_HALF_ROWS ""
   has "$1" "$sec" ${HEAT}_MARGIN_PCT ""
+  has "$1" "$sec" ${HEAT}_PRIOR_ROWS ""
   has "$1" "$sec" ${SLAB} 0      # an arm without Ls / La states both off, whatever the window's environment says
   has "$1" "$sec" ${AUDIT} 0
   has "$1" "$sec" ${REST} ""     # the engine's default, whatever the window's environment says
@@ -319,6 +324,7 @@ launched3() {   # what arm heat slab audit half lend_arena
   has "$1" "$sec" ${AUDIT} "$5"
   has "$1" "$sec" ${HEAT}_HALF_ROWS "$6"
   has "$1" "$sec" ${HEAT}_MARGIN_PCT ""
+  has "$1" "$sec" ${HEAT}_PRIOR_ROWS ""
   has "$1" "$sec" ${REST} "${8:-}"
   has "$1" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA "$7"
   has "$1" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1 1

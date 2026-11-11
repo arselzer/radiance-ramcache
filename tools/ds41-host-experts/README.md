@@ -1771,6 +1771,7 @@ with the traffic, and the audit checks every byte it moves.
 |---|---|
 | `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=N` (1-256 a card; needs `..._P1=1`, `--deterministic`, the file tier) | N slots of VRAM that no pass writes, paid for by the coldest static residents, holding the hottest units off the card from bring-up on |
 | `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=S` (1-8), `..._P1_LEND_HEAT_HALF_ROWS` (1-100000000; 100, or 2000 beside the slab), `..._P1_LEND_HEAT_MARGIN_PCT` (100-1000; 150) | every lent slot (ring, arena and slab) follows a decayed count of live decode rows, at most S slots a rank a pass |
+| `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS=MS` (0-600000; unset: 5000 beside the heat or the slab, else 0) | from a card-path prefill pass until MS ms after the last one, the heat moves nothing and no lent reload reads the drive |
 | `RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT=1` (needs a lent slot) | every lent slot read back from the card and compared before its unit is published and before its resident is withdrawn; not for a timed arm |
 
 **The slab's plan** (`Planner::assign_expert_tiered`, `Plan::lend_slab_vram`, `lend_slab_units`). The plan
@@ -1823,6 +1824,28 @@ is read from the drive as before. Bring-up, returns after the grace and retarget
 stats line's `lent reloads: R from the RAM cache (P relaid from the packed form at M ms a unit), D from the
 drive` part counts them (R includes block-form leases).
 
+**The rest after a long prefill** (`RingLender::set_rest`, `resting`, `LendHost::load_ram`, `hold_drive`;
+`..._P1_LEND_REST_MS`, 5000 ms by default beside the heat or the slab, 0 and nothing of it otherwise). The
+first window with the slab and the heat (half-life 300 rows) lost time to first token on the agent harness
+(61.5 -> 80.1 s summed) while its P1 chunks read 3,313-3,479 units a rank from the drive instead of about
+2,600: lender reloads read the drive beside the chunks' own reads, and retargets moved the slab between
+prompts. So from a pass that takes the lent slots back (an armed card-path pass, or a step at the lent
+arena's full plan) until MS ms after the last such pass ends:
+- the heat policy declines (its own reason, `Decline::Prefill`: "in a long prefill or its rest" on the
+  stats line), so the slab's residents stay published as they are through a prompt's chunks and the decode
+  right after them;
+- the lender begins no reload that reads the drive: a slot whose unit the RAM cache gives (block form, or
+  packed and relaid) reloads, the others wait as wanted; and a drive read already queued to the reload
+  thread (a kept slot's, which no pass cancels) does not start until the rest is over (`hold_drive`), a
+  RAM-cache job going ahead of it. Bring-up (`lend_prime`) is no rest.
+After the rest everything is as before. The grace still holds the ring's and the arena's slots back for
+`..._P1_GRACE_MS` after a pass; the rest is longer and only holds drive reads and the heat. Rank 0 logs
+`ds41 p1: lent rest: MS ms (..._P1_LEND_REST_MS=MS...)` at startup, and the stats line's `lent reloads:`
+part ends `H passes held back by the rest (L loads from the RAM cache in it)`. Host tests:
+`p1_lend_rest_*` (the tunable; drive reloads held through two chunks and the rest while a RAM-cache unit
+comes back, a kept slot's drive read begun before the chunks held until after the rest, nothing of it with
+the rest 0; the heat declining through a chunk and the rest, then moving, and as before without it).
+
 **The read-back audit** (`RingLender::set_audit`, `LendHost::audit`, `LendAudit`). Twice a residency the
 slot's two weights are copied back from the card to pinned host memory on the DMA lane, and the issuing
 thread waits for them:
@@ -1855,8 +1878,10 @@ the arena's slots alone), `lent audit: A slots read back (D differ, U not read) 
 lost, retargets stopped|not stopped`, and with the heat `heat half-life H decode rows, C counted`.
 
 Window parts (`ab_window.sh`): `LsN` (the slab, 1-256; needs `P1` and an `M` part of the chunk or more),
-`La` (the audit; needs `Ql`, `Qe` or `Ls`), `LhhR` (the half-life; needs `Lh`), and `LhS` now beside `Qe` or
-`Ls`. Every arm states `..._P1_LEND_SLAB` and `..._P1_LEND_AUDIT` (0 without the part) and the half-life
+`La` (the audit; needs `Ql`, `Qe` or `Ls`), `LhhR` (the half-life; needs `Lh`), `LrMS` (the rest, 0-600000;
+needs `Ql`, `Qe` or `Ls`; every arm states it, empty without the part, and an arm resting (the part's, or
+5000 beside `Lh` or `Ls`) is measured only with its `lent rest: MS ms` startup line, any other only without
+one), and `LhS` now beside `Qe` or `Ls`. Every arm states `..._P1_LEND_SLAB` and `..._P1_LEND_AUDIT` (0 without the part) and the half-life
 (empty without `Lhh`). At startup an `Ls` arm is measured only with its `lent slab: N slots
 (..._P1_LEND_SLAB=N;` line, an `La` arm only with `lent audit: on`, an `Lh` arm only if its line states the
 half-life it asks for (`Lhh`'s, 2000 beside `Ls`, else 100), and an arm without `Ls` or `La` only without

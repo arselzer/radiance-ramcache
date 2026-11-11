@@ -5149,6 +5149,16 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
         }
     }
     RAD_TRY(p1_->lend_init(units, slots, at, slab_at, t.grace_ms, t.lend_audit, why));
+    /* The rest after a long prefill (..._P1_LEND_REST_MS; by default with the heat or the slab only). */
+    p1_->lend_set_rest(t.lend_rest_ms);
+    if (plan_->rank == 0 && t.lend_rest_ms > 0)
+        RAD_INFO("%s: %d ms (%s=%d%s): from a pass that takes the lent slots back (a card-path prefill pass, or a "
+                 "step at the lent arena's full plan) until %d ms after the last such pass ends, the heat policy "
+                 "moves no slot (declined: a long prefill or its rest) and no lent reload reads the drive (one the "
+                 "RAM cache gives begins; one already queued waits); the slab's residents stay published",
+                 ds41p1::kLogLendRest, t.lend_rest_ms, ds41p1::kLendRestEnv, t.lend_rest_ms,
+                 std::getenv(ds41p1::kLendRestEnv) && *std::getenv(ds41p1::kLendRestEnv) ? "" : ", the default beside the heat or the slab",
+                 t.lend_rest_ms);
     if (plan_->rank == 0 && t.lend_audit)
         RAD_INFO("%s: on (%s=1): every lent slot is copied back from the card and compared, once its copy has "
                  "passed and before its unit is published (byte for byte with the bytes copied) and again before "

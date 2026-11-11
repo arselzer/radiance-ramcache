@@ -189,6 +189,16 @@ constexpr const char* kLendSlabEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB";
  * (card_expert_stager.h, the read-back audit). Needs lent slots. Not for a timed arm: each read-back is a
  * copy of the slot off the card that the issuing thread waits for. */
 constexpr const char* kLendAuditEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT";
+/* The lent slots' rest after a long prefill (kLendRestEnv=MS, 0-kMaxLendRestMs; unset: kDefLendRestMs with
+ * kLendHeatEnv or kLendSlabEnv, else 0): from a pass that takes the slots back (an armed card-path pass, or
+ * a step at the lent arena's full plan) until MS ms after the last such pass ends, the heat policy moves no
+ * slot (declined, its own reason) and the lender begins no reload that reads the drive: one the RAM cache
+ * can give begins, the rest wait, and a drive read already queued to the reload thread waits too. So the
+ * card path's prefill chunks have the drive to themselves, and the lent slots stay as they were through a
+ * prompt's chunks and the decode right after them. 0: none of it (the lender as before). Residency waits,
+ * bytes do not change (card_expert_stager.h, the rest). */
+constexpr const char* kLendRestEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS";
+constexpr int kDefLendRestMs = 5000, kMaxLendRestMs = 600000;
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
 /* kMaxLend bounds each of kLendEnv and kLendArenaEnv, kMaxLendSlab kLendSlabEnv; the lender holds all three
  * (kMaxLendSlots). */
@@ -229,6 +239,7 @@ constexpr const char* kLogLendArena = "ds41 p1: lent arena";    /* rank 0, at st
 constexpr const char* kLogLendHeat = "ds41 p1: lent heat";      /* rank 0, at startup, with kLendHeatEnv */
 constexpr const char* kLogLendSlab = "ds41 p1: lent slab";      /* rank 0, at startup, with kLendSlabEnv */
 constexpr const char* kLogLendAudit = "ds41 p1: lent audit";    /* rank 0, at startup, with kLendAuditEnv; and every difference */
+constexpr const char* kLogLendRest = "ds41 p1: lent rest";      /* rank 0, at startup, with a rest (kLendRestEnv) */
 
 /* Whether the lent arena is asked for (kEnv `p1` on, kLendArenaEnv `lend` a count from 1 to kMaxLend):
  * the deepseek41 plugin then declares at a smaller step too. A value the core refuses counts as not

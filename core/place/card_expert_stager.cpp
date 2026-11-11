@@ -1317,11 +1317,13 @@ int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vec
         lev_[(size_t)k] = event_create(true);
         if (lev_[(size_t)k] < 0) return no("could not create the lent ring's events");
     }
+    lram_.assign((size_t)n, 0);
     for (int b = 0; b < 2; ++b) {
         uint8_t* buf = (uint8_t*)rad_dev_alloc(ds41p1::kSlotBytes, RAD_MEM_HOST_PINNED);
         if (!buf) return no("no pinned memory for the lent ring's two reload buffers");
         lbuf_.push_back(buf);
         lplanes_.emplace_back(new Mover::HostPlanes());
+        lscales_.emplace_back();
         lbuf_free_.push_back(b);
     }
     if (lend_.init(this, n, grace_ms, ns) < 0) return no("the lent ring's state");
@@ -1355,10 +1357,12 @@ int CardExpertPath::lend_prime(int64_t most_ms) {
 }
 
 /* The reload thread: a unit's two extents read whole from the container (Mover::read_piece, beside the
- * kept readers), relaid into the reload buffer in the unit's layout (Mover::relay_unit_block). */
+ * kept readers), relaid into the reload buffer in the unit's layout (Mover::relay_unit_block); or, for a
+ * unit the packed RAM cache holds, its lease's two weights relaid from the packed form into the buffer
+ * (Mover::relay_packed_unit_block: the same planes, so the same bytes), no drive read. */
 void CardExpertPath::lend_loop() {
     for (;;) {
-        std::pair<int, int> job;
+        LendJob job;
         {
             std::unique_lock<std::mutex> lk(lmu_);
             lcv_.wait(lk, [&] { return lstop_ || !lq_.empty(); });
@@ -1366,20 +1370,31 @@ void CardExpertPath::lend_loop() {
             job = lq_.front();
             lq_.pop_front();
         }
-        const int k = job.first, b = job.second;
-        Mover::HostPlanes& p = *lplanes_[(size_t)b];
-        p.unit = lu_[(size_t)k].unit;
+        const int k = job.k, b = job.b;
         const auto t0 = std::chrono::steady_clock::now();
-        PlaneExtent ext[2];
-        bool ok = mover_->lay_out_unit_planes(&p, ext) && mover_->source_epochs_current();
-        for (int i = 0; ok && i < 2; ++i) ok = mover_->read_piece(ext[i].file, ext[i].off, ext[i].len, ext[i].dst, ext[i].cap) >= 0;
-        ok = ok && mover_->relay_unit_block(p, lbuf_[(size_t)b], ds41p1::kSlotBytes) >= 0;
+        bool ok;
+        if (job.ram) {
+            ok = mover_->relay_packed_unit_block(*lhu_[(size_t)k], lbuf_[(size_t)b], ds41p1::kSlotBytes,
+                                                 &lscales_[(size_t)b]) >= 0;
+        } else {
+            Mover::HostPlanes& p = *lplanes_[(size_t)b];
+            p.unit = lu_[(size_t)k].unit;
+            PlaneExtent ext[2];
+            ok = mover_->lay_out_unit_planes(&p, ext) && mover_->source_epochs_current();
+            for (int i = 0; ok && i < 2; ++i) ok = mover_->read_piece(ext[i].file, ext[i].off, ext[i].len, ext[i].dst, ext[i].cap) >= 0;
+            ok = ok && mover_->relay_unit_block(p, lbuf_[(size_t)b], ds41p1::kSlotBytes) >= 0;
+        }
         const uint64_t took = ns_since(t0);
         {
             std::lock_guard<std::mutex> lk(lmu_);
             ldone_.push_back({ k, ok });
-            ++c_.lend_drive;
-            c_.lend_drive_ns += took;
+            if (job.ram) {
+                ++c_.lend_ram_packed;
+                c_.lend_ram_packed_ns += took;
+            } else {
+                ++c_.lend_drive;
+                c_.lend_drive_ns += took;
+            }
             c_.lend_read_failed += !ok;
         }
     }
@@ -1392,6 +1407,12 @@ void CardExpertPath::lend_stop() {
     }
     lcv_.notify_all();
     if (lth_.joinable()) lth_.join();
+    /* A packed lease a job still held (queued, or landed and not yet seen): the thread has stopped. */
+    for (size_t k = 0; k < lram_.size(); ++k)
+        if (lram_[k] && mover_) {
+            mover_->release_host_unit(lhu_[k].get());
+            lram_[k] = 0;
+        }
     /* A copy still in flight reads its source until its event passes. */
     for (size_t k = 0; k < lsrc_.size(); ++k) {
         if (lsrc_[k] == -2) continue;
@@ -1406,8 +1427,34 @@ void CardExpertPath::lend_stop() {
     laud_buf_ = nullptr;
 }
 
-int CardExpertPath::load(int k) {
-    if (k < 0 || k >= (int)lu_.size() || lsrc_[(size_t)k] != -2) return -1;
+int CardExpertPath::load(int k) { return load_from(k, true); }
+
+int CardExpertPath::load_ram(int k) { return load_from(k, false); }
+
+int CardExpertPath::load_from(int k, bool drive) {
+    if (k < 0 || k >= (int)lu_.size() || lsrc_[(size_t)k] != -2 || lram_[(size_t)k]) return -1;
+    /* The packed RAM cache: its lease, held until the reload thread has relaid it into a reload buffer
+     * (landed), is the source; the slot's copy reads the buffer, as a drive reload's. */
+    if (mover_->packed_cache()) {
+        Mover::HostUnit& hu = *lhu_[(size_t)k];
+        if (mover_->borrow_host_unit(lu_[(size_t)k].unit, &hu, false)) {
+            bool fit = hu.n == 2 && hu.packed;
+            for (int i = 0; fit && i < 2; ++i) fit = hu.host[i] && hu.bytes[i] == lu_[(size_t)k].bytes[i];
+            std::lock_guard<std::mutex> lk(lmu_);
+            if (fit && !lbuf_free_.empty()) {
+                const int b = lbuf_free_.back();
+                lbuf_free_.pop_back();
+                lsrc_[(size_t)k] = b;
+                lram_[(size_t)k] = 1;
+                lq_.push_back({ k, b, true });
+                lcv_.notify_all();
+                return 1;
+            }
+            mover_->release_host_unit(&hu);
+            if (fit) return 0;   /* every buffer busy */
+        }
+        if (!drive) return 0;
+    }
     /* The RAM cache in the card's block form: its lease is the source, landed at once. */
     if (!mover_->packed_cache()) {
         Mover::HostUnit& hu = *lhu_[(size_t)k];
@@ -1423,22 +1470,32 @@ int CardExpertPath::load(int k) {
             }
             mover_->release_host_unit(&hu);
         }
+        if (!drive) return 0;
     }
     std::lock_guard<std::mutex> lk(lmu_);
     if (lbuf_free_.empty()) return 0;
     const int b = lbuf_free_.back();
     lbuf_free_.pop_back();
     lsrc_[(size_t)k] = b;
-    lq_.push_back({ k, b });
+    lq_.push_back({ k, b, false });
     lcv_.notify_all();
     return 1;
 }
 
 int CardExpertPath::landed(bool* ok) {
-    std::lock_guard<std::mutex> lk(lmu_);
-    if (ldone_.empty()) return -1;
-    const std::pair<int, bool> d = ldone_.front();
-    ldone_.pop_front();
+    std::pair<int, bool> d;
+    {
+        std::lock_guard<std::mutex> lk(lmu_);
+        if (ldone_.empty()) return -1;
+        d = ldone_.front();
+        ldone_.pop_front();
+    }
+    /* A packed lease's bytes are in the reload buffer now: the lease goes (the issuing thread's). */
+    const int k = d.first;
+    if (k >= 0 && (size_t)k < lram_.size() && lram_[(size_t)k]) {
+        mover_->release_host_unit(lhu_[(size_t)k].get());
+        lram_[(size_t)k] = 0;
+    }
     *ok = d.second;
     return d.first;
 }
@@ -1890,11 +1947,15 @@ std::string CardExpertPath::stats_line(int rank) const {
         std::snprintf(buf, sizeof buf,
                       "; lent ring: %d slots (%d in the activation arena), %d residents now; %" PRIu64 " bursts took them back (%" PRIu64
                       " residents withdrawn), %" PRIu64 " returns, %" PRIu64 " reloaded (RAM cache %" PRIu64 ", drive %" PRIu64
-                      " at %.1f ms a unit), %" PRIu64 " failed, %" PRIu64 " overtaken, %" PRIu64 " passes held back by the grace",
+                      " at %.1f ms a unit), %" PRIu64 " failed, %" PRIu64 " overtaken, %" PRIu64 " passes held back by the grace"
+                      "; lent reloads: %" PRIu64 " from the RAM cache (%" PRIu64 " relaid from the packed form at %.1f ms a unit), %" PRIu64
+                      " from the drive",
                       lend_.n() - lend_.kept(), lend_arena_slots(), lend_.residents() - slab_in, l.lends, l.withdrawn, l.returns,
-                      l.reloaded, c_.lend_ram, c_.lend_drive,
+                      l.reloaded, c_.lend_ram + c_.lend_ram_packed, c_.lend_drive,
                       c_.lend_drive ? (double)c_.lend_drive_ns * 1e-6 / (double)c_.lend_drive : 0.0, l.failed, l.cancelled,
-                      l.held_back);
+                      l.held_back, c_.lend_ram + c_.lend_ram_packed, c_.lend_ram_packed,
+                      c_.lend_ram_packed ? (double)c_.lend_ram_packed_ns * 1e-6 / (double)c_.lend_ram_packed : 0.0,
+                      c_.lend_drive);
         line += buf;
         if (lend_.kept() > 0) {
             std::snprintf(buf, sizeof buf, "; lent slab: %d slots, %d residents now (%d at bring-up)", lend_.kept(),

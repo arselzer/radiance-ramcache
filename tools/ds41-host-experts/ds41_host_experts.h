@@ -106,6 +106,12 @@ bool packed_view(const uint8_t* p, size_t bytes, int N, int K, Mx* out);
 /* The round trip: true when every block's e8m0, as the AVX2 kernels widen it from the packed form
  * (raw rounds included, each used once and in order), equals `scales` [N, K / 32] byte for byte. */
 bool packed_scales_equal(const Mx& pk, const uint8_t* scales);
+/* The inverse of the packing's scales: every block's e8m0, as the kernels widen it from the packed form
+ * (raw rounds included), written to scales [N, K / 32]. With the codes plane, which the packed form keeps
+ * as it is (w.codes), these are the release's planes bit for bit: a packed weight can be relaid into
+ * block_mxfp4 exactly as the drive's planes are. False for an unusable view or raw rounds that are not
+ * each used once and in order (scales then unspecified). */
+bool packed_scales(const Mx& pk, uint8_t* scales);
 
 uint16_t bf16_rne_nan(float f);   /* libr4d bf16_hi_rne_nan(f) >> 16 */
 uint16_t f32_to_bf16(float f);    /* libr4d f32_to_bf16 */

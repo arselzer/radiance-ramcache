@@ -72,7 +72,7 @@ RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=64                   # bounded insertion 
 RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1                    # routed gemv: work split by row passes, all-dropped passes skipped (exact)
 RADIANCE_EXPERIMENTAL_DS41_P1=1                             # prefill Phase 1: layer passes of >= 320 rows (..._P1_MIN_ROWS) compute every routed expert on the cards (needs the libr4d whose P1 card check passed)
 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64                 # the activation arena's idle top holds ~42 decode residents a card between long prefills (needs the deepseek41 plugin from this tree and ..._EARLY_ISSUE=1)
-RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=256                 # adaptive residency: 256 dedicated VRAM slots a card that follow live routing (gives up ~268 static residents; reloads from the RAM cache)
+RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=256                 # adaptive residency, four cards only (leave these three out with the fifth card's online set, which does the same job): 256 dedicated VRAM slots a card that follow live routing (gives up ~268 static residents; reloads from the RAM cache)
 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=4                   # up to 4 slots a card retargeted a pass to hotter units (decayed decode counts, 150% margin, rests 5 s after a long prefill)
 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS=300       # the counts' half-life in decode rows (the measured setting; seeded from --expert-profile)
 RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1                    # static VRAM experts in the packed-scale form, x1.044 as many a card (gemv_vp and the P1 row read it; needs --deterministic and the libr4d whose vpack card check passed)
@@ -738,7 +738,12 @@ reply identical to the base engine's, a read-back audit of 1,824 slot swaps with
 
 The harness's prefill pays for the ~268 static residents a card the slots displace (its card-path chunks read
 3,319 units a rank from the drive instead of 2,537); a profile recorded on the deployment's traffic (next section)
-more than makes up for it. Without the three lines the engine places experts statically as before. Opt-in diagnostics:
+more than makes up for it. Without the three lines the engine places experts statically as before. **With the fifth
+card's online unit set (`..._AUX_ONLINE`) leave the three lines out**: both chase the hottest off-card experts, the
+fifth card absorbs the same rows either way (313,924 vs 315,365), and the slab then only costs static residents.
+Measured with the fifth card (ab-20261111T124053Z, every reply identical): code at 8 streams 65.55 tok/s without the
+slab, 62.96 with it (-4%), chat 42.68 vs 40.96, harness time to first token 61.1 vs 66.9 s. A blended profile still
+adds on top of the fifth card: code 71.14 (+8.5%), harness 59.1 s. Opt-in diagnostics:
 `..._P1_LEND_AUDIT=1` reads every slot back at publish and withdrawal (costs a few percent).
 
 ## The placement profile (`--expert-profile`, `profile_blend.py`)

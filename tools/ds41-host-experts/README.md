@@ -72,6 +72,9 @@ RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=64                   # bounded insertion 
 RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1                    # routed gemv: work split by row passes, all-dropped passes skipped (exact)
 RADIANCE_EXPERIMENTAL_DS41_P1=1                             # prefill Phase 1: layer passes of >= 320 rows (..._P1_MIN_ROWS) compute every routed expert on the cards (needs the libr4d whose P1 card check passed)
 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64                 # the activation arena's idle top holds ~42 decode residents a card between long prefills (needs the deepseek41 plugin from this tree and ..._EARLY_ISSUE=1)
+RADIANCE_EXPERIMENTAL_DS41_P1_LEND_SLAB=256                 # adaptive residency: 256 dedicated VRAM slots a card that follow live routing (gives up ~268 static residents; reloads from the RAM cache)
+RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=4                   # up to 4 slots a card retargeted a pass to hotter units (decayed decode counts, 150% margin, rests 5 s after a long prefill)
+RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS=300       # the counts' half-life in decode rows (the measured setting; seeded from --expert-profile)
 RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1                    # static VRAM experts in the packed-scale form, x1.044 as many a card (gemv_vp and the P1 row read it; needs --deterministic and the libr4d whose vpack card check passed)
 RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1                    # the 40 routers and 3 compressor kv|gate projections read as bf16, 180 MiB a card back to the experts (the load refuses one with a nonzero f32 low half; the deepseek41 plugin and libr4d from one build, whose gemm_nt_f32bf16 card check passed)
 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1                # no pass after a reply's end-of-generation token
@@ -717,6 +720,26 @@ whole design). The Lc2048/P1/lent-arena block holds 627 / 635 block or 665 / 674
 - **Shutdown report.** The mover's report has a `VRAM packed experts` line: residents and weights
   packed, their bytes against block_mxfp4's, weights packed and checked at load, weights over budget
   kept block, the scan.
+
+## Adaptive residency: the recommended default (`..._P1_LEND_SLAB=256`, `..._P1_LEND_HEAT=4`)
+
+Since 2026-11-11 the recommended configuration above includes 256 adaptive VRAM slots a card whose experts follow
+live decode routing, seeded from the `--expert-profile` in use. Measured on four RX 9070 XT, 192 GiB cache, every
+reply identical to the base engine's, a read-back audit of 1,824 slot swaps with no byte different
+(ab-20261111T072712Z, ab-20261111T095515Z; prompts in no profile unless said):
+
+| workload | without | adaptive | adaptive + a blended profile |
+|---|---|---|---|
+| code, 8 streams (total tok/s) | 36.96 | 46.98 (+27%) | 53.87 (+46%) |
+| whole-file edits, 8 streams | 23.65 | 28.29 (+20%) | 36.13 (+53%) |
+| chat, 8 streams | 31.22 | 32.25 (+3%) | - |
+| agent harness, one stream: decode tok/s | 26.30 | 26.0 | 28.63 (+9%; its capture is in the profile) |
+| agent harness: time to first token, summed | 60.8 s | 64.8 s (+6.5%) | 56.3 s (-7%) |
+
+The harness's prefill pays for the ~268 static residents a card the slots displace (its card-path chunks read
+3,319 units a rank from the drive instead of 2,537); a profile recorded on the deployment's traffic (next section)
+more than makes up for it. Without the three lines the engine places experts statically as before. Opt-in diagnostics:
+`..._P1_LEND_AUDIT=1` reads every slot back at publish and withdrawal (costs a few percent).
 
 ## The placement profile (`--expert-profile`, `profile_blend.py`)
 

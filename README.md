@@ -66,7 +66,8 @@ tokenization and admission wait. All prefill rows use admit-all with the tested 
 paused after long prefills). Measured on `ds41-stable`, every reply identical to the base engine's and 1,824 slot
 swaps read back with no byte different: code at 8 streams 37.0 to 47.0 tok/s (+27%), 53.9 with a blended profile
 (+46%); whole-file edits +20% (+53% with the profile); chat +3%; agent-harness turns 6.5% slower to first token
-alone and 7% faster with the profile, decode +9%.
+alone and 7% faster with the profile, decode +9%. On four cards only: beside the optional fifth card's online set, which
+already tracks hot experts, the slots cost 4% (leave the three switches out there); a blended profile still adds +8.5%.
 
 ## Placement profiles, prompt-lookup drafting and the worker's online set (10 November)
 

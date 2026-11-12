@@ -209,7 +209,7 @@ TEST(the_guard_holds_below_the_floor_and_releases_at_the_reserve) {
     CHECK(g.observe(4 * GiB) == RamGuardState::Event::Hold);
     CHECK_EQ(g.holds(), (uint64_t)2);
     CHECK_EQ(g.lowest(), 3 * GiB);
-    CHECK_EQ(g.samples(), (uint64_t)10);
+    CHECK_EQ(g.samples(), (uint64_t)8);   /* nine samples, one unreadable */
 }
 
 /* A release below the floor is raised to the floor: no oscillation on one sample. */

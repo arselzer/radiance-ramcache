@@ -2200,12 +2200,27 @@ aux_exit_gate() {   # server log, cap ("" none, 0 Ax0), verify (1 or ""), forced
   (( fails == 4 )) || { echo "$((4 - fails)) rank(s) had launch failures"; return 1; }
   if [[ -n $verify ]] && (( cmp != 4 )); then echo "AUX VERIFY FAIL: $cmp of 4 ranks compared rows with 0 differing"; return 1; fi
   if [[ -n $forced ]] && (( forced_n == 0 )); then echo "forced lateness every $forced, but no rank forced a deadline miss"; return 1; fi
+  # AxrN: the rank lines' heights (the "; by height:" part) and at least one job taller than 16 rows over the ranks;
+  # without the part no rank line may have that part (the switch set for the window?).
+  local tall=0 by=0 j
+  while IFS= read -r l; do
+    [[ $l == *"; by height: "* ]] && by=$((by + 1))
+    for j in $(grep -oE '(17-[0-9]+|33-[0-9]+|65-[0-9]+|129-[0-9]+|257-[0-9]+): [0-9]+ jobs' <<< "$l" | grep -oE '[0-9]+ jobs' | cut -d' ' -f1); do
+      tall=$((tall + j))
+    done
+  done < <(grep -E 'aux experts: rank [0-3]: ' "$f")
+  if [[ -n "${ARM_AXR:-}" ]]; then
+    (( by == 4 )) || { echo "Axr${ARM_AXR}, but $by of 4 ranks' lines count jobs by height"; return 1; }
+    (( tall > 0 )) || { echo "Axr${ARM_AXR}, but no rank ran a job taller than 16 rows (the part did not act)"; return 1; }
+  elif (( by > 0 )); then
+    echo "no Axr part, but $by rank line(s) count jobs by height (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS set for the window?)"; return 1
+  fi
   return 0
 }
 # The "aux experts: on:" line's six values an Ax / Axv arm must state (ARM_AX, ARM_AXV, ARM_AXF, ARM_AXDL, ARM_AXBO,
 # ARM_AXHR); the trailing space keeps "forced lateness 4" from matching 40.
 aux_want() {
-  echo "policy $([[ -n "${ARM_AXV:-}" ]] && echo verify || echo serve), deadline ${ARM_AXDL:-2000} us, backoff ${ARM_AXBO:-64}, headroom ${ARM_AXHR:-1024} MiB, cap ${ARM_AX} MiB, forced lateness ${ARM_AXF:-0} "
+  echo "passes of up to ${ARM_AXR:-16} rows, policy $([[ -n "${ARM_AXV:-}" ]] && echo verify || echo serve), deadline ${ARM_AXDL:-2000} us, backoff ${ARM_AXBO:-64}, headroom ${ARM_AXHR:-1024} MiB, cap ${ARM_AX} MiB, forced lateness ${ARM_AXF:-0} "
 }
 # After an arm with the extra card visible (its server stopped): its clients again (aux_clients_after) and its
 # minimum free VRAM over the arm (AUX MARGIN LOW under AUX_MARGIN_MIB, 1024), both logged; for an Ax / Axv arm the
@@ -2249,6 +2264,10 @@ aux_arm_exit() {   # arm name, the stopped server's pid: aux_arm_check, the resu
     if [[ -n "${ARM_AXO:-}" ]]; then
       AXV_OK_O=1 AXV_SUM_O=${ARM_AXSUM:-}
       log "arm $name: Axv with AxO: swaps and rows compared, none differ; AxO arms on this library may run"
+    fi
+    if [[ -n "${ARM_AXR:-}" ]]; then
+      AXV_OK_R=1 AXV_SUM_R=${ARM_AXSUM:-} AXV_ROWS_R=$(( ARM_AXR > ${AXV_ROWS_R:-0} ? ARM_AXR : ${AXV_ROWS_R:-0} ))
+      log "arm $name: Axv with Axr${ARM_AXR}: rows compared up to ${ARM_AXR}-row passes, none differ; Axr arms of up to ${AXV_ROWS_R} rows on this library may run"
     fi
     if [[ -n "${ARM_AXS:-}" ]]; then
       AXV_OK_T=1 AXV_SUM_T=${ARM_AXSUM:-}
@@ -2324,6 +2343,15 @@ AUX_CHECK_WHY="no aux device check in this window (DEVICE_CHECKS=aux with AUX_CH
 aux_any=""
 for aux_a in $ARMS; do [[ "-$aux_a-" =~ -Ax(v|0)?[0-9]*- ]] && aux_any=1; done
 AUX_SWAP_OK="" AUX_SWAP_SUM="" AUX_SWAP_WHY="" AXV_OK_O="" AXV_SUM_O="" AXV_OK_T="" AXV_SUM_T=""
+# AxrN: the auxtall check's verdict (AUX_TALL_OK on AUX_TALL_SUM, up to AUX_TALL_ROWS rows) and the Axv gate for it.
+AUX_TALL_OK="" AUX_TALL_SUM="" AUX_TALL_ROWS=0 AUX_TALL_WHY="" AXV_OK_R="" AXV_SUM_R="" AXV_ROWS_R=0
+aux_tall_rows=0
+for aux_a in $ARMS; do
+  if [[ "-$aux_a-" =~ -Axr([0-9]*)- ]]; then
+    aux_tn=${BASH_REMATCH[1]:-128}
+    [[ $aux_tn =~ ^[0-9]+$ ]] && (( 10#$aux_tn >= 17 && 10#$aux_tn <= 512 && 10#$aux_tn > aux_tall_rows )) && aux_tall_rows=$((10#$aux_tn))
+  fi
+done
 aux_dyn_any=""
 for aux_a in $ARMS; do [[ "-$aux_a-" =~ -Ax(S|Sa|Sx|O[0-9]*|Od|T[0-9]*|F[0-9]*)- ]] && aux_dyn_any=1; done
 if [[ " ${DEVICE_CHECKS:-1} " == *" aux "* || -n "$aux_any" ]]; then
@@ -2401,6 +2429,33 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" aux "* ]]; then
       else
         AUX_SWAP_WHY="the auxswap device check did not pass on $AL ($(tail -1 "$OUT/devcheck-auxswap.log"))"
         log "$AUX_SWAP_WHY; no AxS / AxO arm runs"
+      fi
+    fi
+    # AxrN (ds41_aux.h "taller passes"): `auxtall` at 17..N rows (N the window's tallest Axr part) on card 0 and on the
+    # extra card -- the P1 twin's compacted chains against its full launch and the 16-token gemv_vp / gemv chains --
+    # with byte-identical outputs gates those arms (AUX_TALL_OK, on the same library, up to AUX_TALL_ROWS rows).
+    if [[ -n "$AUX_OK" ]] && (( aux_tall_rows > 0 )); then
+      ( export HIP_VISIBLE_DEVICES=0 RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=$aux_tail
+        timeout 2400 "$AC" "$AL" auxtall "$OUT/auxtall-xt.bin" "$aux_tall_rows" >"$OUT/devcheck-auxtall-xt.log" 2>&1
+        echo "auxtall exit $?" >>"$OUT/devcheck-auxtall-xt.log" )
+      ( export ROCR_VISIBLE_DEVICES=$AUX_UUID HIP_VISIBLE_DEVICES=0 RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=$aux_tail
+        timeout 2400 "$AC" "$AL" auxtall "$OUT/auxtall-ext.bin" "$aux_tall_rows" >"$OUT/devcheck-auxtall-ext.log" 2>&1
+        echo "auxtall exit $?" >>"$OUT/devcheck-auxtall-ext.log" )
+      grep -E '^(PASS|FAIL)|exit' "$OUT"/devcheck-auxtall-*.log | tail -6 | tee -a "$OUT/window.log"
+      aux_tbad=""
+      for f in auxtall-xt auxtall-ext; do
+        grep -qx "auxtall exit 0" "$OUT/devcheck-$f.log" || aux_tbad+=" $f exited non-zero;"
+        grep -q '^PASS: auxtall: ' "$OUT/devcheck-$f.log" || aux_tbad+=" $f has no PASS line;"
+        grep -q '^FAIL' "$OUT/devcheck-$f.log" && aux_tbad+=" $f printed FAIL;"
+      done
+      cmp -s "$OUT/auxtall-xt.bin" "$OUT/auxtall-ext.bin" || aux_tbad+=" the extra card's auxtall outputs differ from card 0's;"
+      [[ "$(sha256sum "$AL" | cut -d' ' -f1)" == "$aux_sum0" ]] || aux_tbad+=" the library changed during the checks;"
+      if [[ -z "$aux_tbad" ]]; then
+        AUX_TALL_OK=1 AUX_TALL_SUM=$aux_sum0 AUX_TALL_ROWS=$aux_tall_rows
+        log "aux device check auxtall passed on $AL up to $aux_tall_rows rows: Axr arms of up to $aux_tall_rows rows on it may run"
+      else
+        AUX_TALL_WHY="the auxtall device check did not pass on $AL:$aux_tbad"
+        log "$AUX_TALL_WHY no Axr arm runs"
       fi
     fi
   fi
@@ -2793,6 +2848,12 @@ for a in $ARMS; do
 # AUX_MARGIN_MIB, 1024). Ax0 needs five devices and no aux line. An Ax / Axv arm with Kld needs passes of at most 16
 # rows (no Lc part, no BT above 16: KL mode is prefill only, so a taller step leaves the worker no row), its run is
 # gated as a serving arm's (kld_finish, aux_kld_check), and it is never the window's Kld reference.
+# AxrN (with an Ax / Axv part, P1 and an Lc part; N 17-512, Axr 128): RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=N, the
+# worker also takes routed layer passes of 17..N rows through the P1 twin (ds41_aux.h "taller passes"; not yet
+# measured on the cards). Gated by DEVICE_CHECKS=aux's `auxtall` at the window's tallest N on card 0 and the extra card
+# (AUX_TALL_OK, outputs byte-identical), a serve arm by an Axv arm with an Axr part of at least N rows (AXV_OK_R); the
+# "aux experts: on:" line must say "passes of up to N rows", and at exit every rank line must count jobs by height with
+# at least one job taller than 16 rows over the ranks (the acted check). Not beside Kld.
 # the RAM cache's profile-hot units get N second chances before eviction; Ov / Ov2 a launch whose
 # first dispatch depends on nothing in flight on its queue goes without the barrier bit, in decode
 # passes / in every pass issued live (RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1 / 2; exact, only
@@ -2914,6 +2975,7 @@ for a in $ARMS; do
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
+  axr=""   # AxrN: the worker's passes up to N rows (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= ARM_PROFILE= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
   f5="" ARM_BEFORE_PROMPTS= ARM_BEFORE_N= ARM_BEFORE_CONC= ARM_OBS_CONC=
@@ -3208,6 +3270,13 @@ for a in $ARMS; do
                  log "arm $a: $p: forced lateness takes 1-1000000; the arm is skipped"; skip=1; axf=1
                fi
                axf=$((10#$axf)) ;;
+      Axr|Axr[0-9]*)                                                   # the worker's passes up to N rows (128)
+               [[ -n "$axr" ]] && { log "arm $a: two Axr parts; the arm is skipped"; skip=1; }
+               axr=${p#Axr}; axr=${axr:-128}
+               if ! [[ $axr =~ ^[0-9]+$ ]] || (( 10#$axr < 17 || 10#$axr > 512 )); then
+                 log "arm $a: $p: the worker's tallest pass is 17-512 rows; the arm is skipped"; skip=1; axr=128
+               fi
+               axr=$((10#$axr)) ;;
       AxS|AxSa|AxSx)                                                   # card sharing: allow (whisper) / exclusive
                [[ -n "$axs" ]] && { log "arm $a: two AxS parts; the arm is skipped"; skip=1; }
                axs=allow; [[ $p == AxSx ]] && axs=exclusive ;;
@@ -3854,6 +3923,27 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
         RADIANCE_EXPERIMENTAL_DS41_AUX_BACKOFF=$ARM_AXBO RADIANCE_EXPERIMENTAL_DS41_AUX_FORCE_LATE=${axf:-0})
   [[ -n "$ARM_AXVIS" ]] && env+=("ROCR_VISIBLE_DEVICES=$ARM_AXVIS")
   ARM_AXSUM=${axsum:-}
+  # AxrN (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=N, ds41_aux.h "taller passes"): the worker also takes routed layer passes
+  # of 17..N rows, through the P1 twin the rank cards run at those heights, so it needs an Ax / Axv part, P1 and an Lc
+  # part (VRAM_PACKED admits passes above 16 only beside them); it runs only on the libr4d.so the window's auxtall
+  # device check passed on at N rows or more (AUX_TALL_OK, AUX_TALL_ROWS), and a serve arm only after an Axv arm with
+  # an Axr part of this window measured on it (AXV_OK_R). Every arm states the switch (empty without the part: 16).
+  if [[ -n "$axr" ]]; then
+    if [[ -z "$ax" || "$ax" == 0 ]]; then log "arm $a: Axr$axr needs an Ax or Axv part; the arm is skipped"; skip=1; fi
+    [[ -n "$p1" && -n "$lc" ]] || { log "arm $a: Axr$axr needs P1 and an Lc part (the P1 twin above 16 rows: the worker's row there); the arm is skipped"; skip=1; }
+    [[ -n "$kld" ]] && { log "arm $a: Axr with Kld (not covered: KL mode's passes are the prefill's chunks); the arm is skipped"; skip=1; }
+    if [[ -n "$ax" && "$ax" != 0 && -z "$skip" ]]; then
+      if [[ -z "${AUX_TALL_OK:-}" || "$axsum" != "${AUX_TALL_SUM:-}" ]]; then
+        log "arm $a: Axr refused: ${AUX_TALL_WHY:-no auxtall device check passed on this library (DEVICE_CHECKS=aux with an Axr arm)}"; skip=1
+      elif (( axr > ${AUX_TALL_ROWS:-0} )); then
+        log "arm $a: Axr$axr refused: the auxtall device check passed up to ${AUX_TALL_ROWS:-0} rows only"; skip=1
+      elif [[ -z "$axv" && ( -z "${AXV_OK_R:-}" || "$axsum" != "${AXV_SUM_R:-}" || $axr -gt ${AXV_ROWS_R:-0} ) ]]; then
+        log "arm $a: Axr refused: no Axv arm of this window with an Axr part of at least $axr rows compared the worker's rows on this library (run one first)"; skip=1
+      fi
+    fi
+  fi
+  ARM_AXR=$axr
+  env+=(RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=$axr)
   # AxS / AxSx / AxO / AxOd / AxT / AxF (work/aux-dyn/SPEC.md §8): card sharing with a control file
   # ($OUT/<arm>.aux-ctl, its holders and state beside it) and the online unit set. AxT (the control file toggled) and
   # AxF (a simulated tenant) imply AxS. Every arm states every new switch, empty without its part, so a window's

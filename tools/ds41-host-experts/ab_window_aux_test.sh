@@ -25,7 +25,9 @@
 #      the reference; Ax0 and plain arms as before;
 #   9. the loop skips an Ax / Axv part beside Kld when the arm's step is over 16 rows (Lc, BT32), and launches it on
 #      the 16-token base;
-#  10. arm(): the aux startup lines logged before the switch table can return, the server's pid kept for the exit.
+#  10. arm(): the aux startup lines logged before the switch table can return, the server's pid kept for the exit;
+#  12. AxrN (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS): the loop's switch and skips, aux_want's rows, the exit gate's acted
+#      check, the DEVICE_CHECKS=aux section's auxtall step.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -581,6 +583,12 @@ case $2 in
     [[ -n ${FAKE_AUX_FAIL:-} ]] && { echo "FAIL: aux: a row differs"; exit 1; }
     echo "PASS: aux: compacted gemv_vp and gemv rows equal the full launch's at M1/M4/M8/M16 (48 cases)" ;;
   swiglu) cp "$FAKE_SILU" "$3"; echo "PASS: host swiglu with the captured table equals libr4d's" ;;
+  auxtall)   # auxtall OUT MMAX (AxrN)
+    o=same; [[ ${ROCR_VISIBLE_DEVICES:-} == "$FAKE_XUUID" && -n ${FAKE_TALL_DIFFER:-} ]] && o=differs
+    echo "$o" > "$3"
+    echo "auxtall rows $4" >> "$FAKE_RUNS"
+    [[ -n ${FAKE_TALL_FAIL:-} ]] && { echo "FAIL: auxtall: a row differs"; exit 1; }
+    echo "PASS: auxtall: the P1 twin's compacted rows equal its full launch's and the gemv_vp and gemv chains' in passes of 16 at M17..$4 (60 cases)" ;;
   auxrt) echo "auxrt M1 units 1: median 301.0 us, p90 340.0 us, max 900.0 us"
          [[ -n ${FAKE_TOUCH_LIB:-} ]] && echo changed >> "$1" ;;
   *) exit 2 ;;
@@ -609,6 +617,7 @@ EOF
       done
       eval "$SECTION"
       echo "AUX=$AUX_OK|$AUX_SUM|$AUX_LIB"
+      echo "TALL=${AUX_TALL_OK:-}|${AUX_TALL_SUM:-}|${AUX_TALL_ROWS:-}|${AUX_TALL_WHY:-}"
       echo "WHY=$AUX_CHECK_WHY"
       cat "$OUT/runs" 2>/dev/null ) 2>&1
   }
@@ -731,7 +740,7 @@ kcase "Ax, no rank ran a layer job: not compared" 1 "arm k2: 0 of 4 ranks ran la
 kcase "Ax, the worker off: not compared, the reason said" 1 \
   "arm k3: Ax, but the worker did not start (I aux experts: off: no usable device beyond the ranks: too little free VRAM); Kld not measured" "" \
   k3 26000 "" "" "$KL/off.log" "$T/ref"
-kcase "Ax, the 'on:' line with another cap: not compared" 1 "does not state 'policy serve, deadline 2000 us, backoff 64, headroom 1024 MiB, cap 26000 MiB, forced lateness 0 '" "" \
+kcase "Ax, the 'on:' line with another cap: not compared" 1 "does not state 'passes of up to 16 rows, policy serve, deadline 2000 us, backoff 64, headroom 1024 MiB, cap 26000 MiB, forced lateness 0 '" "" \
   k4 26000 "" "" "$KL/cap.log" "$T/ref"
 kcase "Axv, a row differs: not compared" 1 "AUX VERIFY FAIL: 3 of 4 ranks compared rows with 0 differing; Kld not measured" "" \
   k5 26000 1 "" "$KL/differ.log" "$T/ref"
@@ -788,7 +797,7 @@ RLFMT=$(cfmt "$SRC/core/engine_aux.cpp" 'nothing loaded on device' RAD_INFO)
 [[ "$OLFMT" == "%s%.2f swaps a token, at most"* ]] && ok "fmt: the online-set startup line" || bad "fmt: no online-set format ('$OLFMT')"
 [[ "$OSFMT" == *"read back (%llu differ)"* && "$OSFMT" == *"%s%s" ]] && ok "fmt: the online shutdown line" || bad "fmt: the online shutdown format ('$OSFMT')"
 [[ "$SSFMT" == "%s%llu releases ("* ]] && ok "fmt: the sharing shutdown line" || bad "fmt: the sharing shutdown format ('$SSFMT')"
-[[ "$RLFMT" == *"forced lateness %lld (0 off)" ]] && ok "fmt: the released-at-start line states the six values" || bad "fmt: '$RLFMT'"
+[[ "$RLFMT" == *"forced lateness %lld (0 off)%s" ]] && ok "fmt: the released-at-start line states the six values" || bad "fmt: '$RLFMT'"
 SHL=$(printf "I $SHFMT\n" "aux experts: sharing: " "allow (^whisper, foreign at most 6144 MiB)" 1 1024 100 2 60 3000 \
       "/x/a.aux-ctl (holders /x/a.aux-ctl.d, state /x/a.aux-ctl.state)" 50005)
 OLL=$(printf "I $OLFMT\n" "aux experts: online set: " 2.00 16 1 512 256 100 16 1497 1513 3000 "every 16th swap" "")
@@ -976,6 +985,109 @@ out=$("$AY" "$YD/c2" 5 -- sh -c 'ls "$0"/c2.d | grep -c "^job-"' "$YD" 2>&1); rc
   bad "aux_yield: released: rc $rc '$out'"
 [[ -z "$(ls "$YD/c2.d")" ]] && ok "aux_yield: the holder removed after the command" || bad "aux_yield: holder left: $(ls "$YD/c2.d")"
 wait "$lp" 2>/dev/null
+
+# ---- 12. AxrN: the worker's taller passes (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS, ds41_aux.h "taller passes")
+#   the loop: Axr / AxrN with Ax or Axv states the switch (every other arm states it empty), its skips (no Ax part,
+#   Ax0, no P1, no Lc, Kld, N outside 17-512, two parts, no auxtall pass or on another library, N above the check's,
+#   a serve arm without an Axv arm with Axr of N rows or more); aux_want's rows; the exit gate's acted check; the
+#   DEVICE_CHECKS=aux section's auxtall step (both cards at the window's tallest N, outputs compared).
+L20=$T/loop20.txt
+NOP1=${C2/-P1-/-}
+ARMS="$C2 $C2-Ax $C2-Axv-Axr $C2-Axv-Axr256 $C2-Ax-Axr $C2-Ax-Axr64 $C2-Axr $C2-Ax0-Axr $NOP1-Ax-Axr $C2-Ax-Axr16"
+ARMS+=" $C2-Ax-Axr600 $C2-Ax-Axr-Axr64 $C2-Ax-Axr384"
+( set +u; window "$T/out20"; AUX_TALL_OK=1 AUX_TALL_SUM=$SUM AUX_TALL_ROWS=256 AXV_OK_R=1 AXV_SUM_R=$SUM AXV_ROWS_R=128; loop ) > "$L20" 2>&1
+for spec in "$C2|" "$C2-Ax|" "$C2-Axv-Axr|128" "$C2-Axv-Axr256|256" "$C2-Ax-Axr|128" "$C2-Ax-Axr64|64"; do
+  IFS='|' read -r a want <<< "$spec"
+  sec=$(section "$L20" "$a")
+  if [[ -z "$sec" ]]; then bad "Axr: ${a#$C2} not launched: $(grep "arm $a: " "$L20" | head -2 | tr '\n' ' ')"; continue; fi
+  if grep -qx "    RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=$want" <<< "$sec"; then ok "Axr: ${a#$C2} states RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS='$want'"
+  else bad "Axr: ${a#$C2}: RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS is '$(val "$sec" RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)', want '$want'"; fi
+done
+skipped "$L20" "$C2-Axr" "Axr128 needs an Ax or Axv part" "Axr alone"
+skipped "$L20" "$C2-Ax0-Axr" "Axr128 needs an Ax or Axv part" "Axr beside Ax0"
+skipped "$L20" "$NOP1-Ax-Axr" "Axr128 needs P1 and an Lc part" "Axr without P1"
+skipped "$L20" "$C2-Ax-Axr16" "the worker's tallest pass is 17-512 rows" "Axr16"
+skipped "$L20" "$C2-Ax-Axr600" "the worker's tallest pass is 17-512 rows" "Axr600"
+skipped "$L20" "$C2-Ax-Axr-Axr64" "two Axr parts" "Axr twice"
+skipped "$L20" "$C2-Ax-Axr384" "the auxtall device check passed up to 256 rows only" "Axr384 above the check's 256"
+L21=$T/loop21.txt
+ARMS="$C2-Ax-Axr256 $C2-Axv-Axr $C2-Ax-Axr"
+( set +u; window "$T/out21"; AUX_TALL_OK=1 AUX_TALL_SUM=$SUM AUX_TALL_ROWS=256 AXV_OK_R=1 AXV_SUM_R=$SUM AXV_ROWS_R=128; loop ) > "$L21" 2>&1
+skipped "$L21" "$C2-Ax-Axr256" "no Axv arm of this window with an Axr part of at least 256 rows" "Axr256 after an Axv arm of 128 rows"
+L22=$T/loop22.txt
+( set +u; window "$T/out22"; AXV_OK_R="" AUX_TALL_OK=1 AUX_TALL_SUM=$SUM AUX_TALL_ROWS=256; loop ) > "$L22" 2>&1
+skipped "$L22" "$C2-Ax-Axr" "no Axv arm of this window with an Axr part" "Axr serve before an Axv arm with Axr"
+[[ -n "$(section "$L22" "$C2-Axv-Axr")" ]] && ok "Axr: an Axv arm with Axr runs before any" || bad "Axr: Axv-Axr not launched in loop22"
+L23=$T/loop23.txt
+( set +u; window "$T/out23"; AUX_TALL_OK="" AUX_TALL_WHY="the auxtall device check did not pass on x: y;"; loop ) > "$L23" 2>&1
+skipped "$L23" "$C2-Axv-Axr" "Axr refused: the auxtall device check did not pass" "Axv-Axr without the auxtall pass"
+L24=$T/loop24.txt
+( set +u; window "$T/out24"; AUX_TALL_OK=1 AUX_TALL_SUM=$OTHER AUX_TALL_ROWS=256; loop ) > "$L24" 2>&1
+skipped "$L24" "$C2-Axv-Axr" "Axr refused: no auxtall device check passed on this library" "Axv-Axr on another library"
+# aux_want: the rows lead the "on:" values; the engine's line with N rows (its format, the rows its 16th argument).
+on_rows() {   # rows, policy
+  printf "I $ONFMT\n" "aux experts: on: " 1513 "25.4 GiB" 4 "rank 0 380, rank 1 378, rank 2 377, rank 3 378" 0.4123 \
+    0.9 15360 61.2 1500 13 0 "$1" "$2" 2000 64 1024 26000 0 \
+    "; RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=$1: passes of 17-$1 rows by moe_gemm_ggml_mxfp4_gemv_tall_p1, the deadline D * ceil(rows / 16), lanes of 40.1 MiB each"
+}
+wantr() {   # ARM_AXR, ARM_AXV, line, want, what
+  local ARM_AX=26000 ARM_AXR=$1 ARM_AXV=$2 ARM_AXF="" ARM_AXDL=2000 ARM_AXBO=64 ARM_AXHR=1024 w n
+  w=$( eval "$FUNCS"; aux_want )
+  n=$(grep -cF -- "$w" <<< "$3")
+  if [[ "$n" == "$4" ]]; then ok "on: $5"; else bad "on: $5 ('$w', $n matches)"; fi
+}
+wantr 128 "" "$(on_rows 128 serve)" 1 "Axr128's line (passes of up to 128 rows)"
+wantr 128 1 "$(on_rows 128 verify)" 1 "Axv-Axr128's line"
+wantr 128 "" "$(on_rows 256 serve)" 0 "Axr128 does not take a line of 256 rows"
+wantr "" "" "$(on_rows 128 serve)" 0 "an Ax arm without Axr does not take a line of 128 rows"
+wantr "" "" "$(on_line serve 2000 64 1024 26000 0)" 1 "an Ax arm without Axr takes today's line (16 rows)"
+# The exit gate's acted check: the height part on every rank line, a job above 16 rows on some rank.
+tall_lines() {   # file, then per rank the jobs above 16 rows ("-" no height part)
+  local f=$1 r=0 n l; shift
+  : > "$f"
+  for n in "$@"; do
+    l=$(rank_line "$r" 120 0 0 0 0)
+    [[ $n != - ]] && l+="; by height: 1-16: 100 jobs, 300 of 900 rows; 17-32: 0 jobs, 0 of 0 rows; 33-64: 0 jobs, 0 of 0 rows; 65-128: $n jobs, $((n * 40)) of $((n * 90)) rows"
+    echo "$l" >> "$f"; r=$((r + 1))
+  done
+}
+egate_r() {   # what, file, ARM_AXR, want rc, words
+  local got rc
+  got=$( set +u; ARM_AXR=$3; eval "$FUNCS"; aux_exit_gate "$2" 26000 "" ""; echo "rc=$?" )
+  rc=${got##*rc=}
+  if [[ "$rc" != "$4" ]]; then bad "aux_exit_gate (Axr): $1: rc $rc ('$got')"; return; fi
+  if [[ -n "$5" && "$got" != *"$5"* ]]; then bad "aux_exit_gate (Axr): $1: no '$5' in '$got'"; return; fi
+  ok "aux_exit_gate (Axr): $1"
+}
+tall_lines "$EX/tall.log" 40 38 0 41
+egate_r "Axr128: tall jobs on three ranks" "$EX/tall.log" 128 0 ""
+tall_lines "$EX/tall0.log" 0 0 0 0
+egate_r "Axr128: no tall job on any rank" "$EX/tall0.log" 128 1 "no rank ran a job taller than 16 rows (the part did not act)"
+tall_lines "$EX/tallby.log" 40 38 - 41
+egate_r "Axr128: a rank line without heights" "$EX/tallby.log" 128 1 "3 of 4 ranks' lines count jobs by height"
+egate_r "no Axr part, heights in the lines" "$EX/tall.log" "" 1 "no Axr part, but 4 rank line(s) count jobs by height"
+lines "$EX/serve16.log" 120:0:0:0:0 118:0:0:0:0 119:0:0:0:0 121:0:0:0:0
+egate_r "no Axr part, today's lines" "$EX/serve16.log" "" 0 ""
+egate_r "Axr128 on today's lines" "$EX/serve16.log" 128 1 "0 of 4 ranks' lines count jobs by height"
+# The DEVICE_CHECKS=aux section's auxtall step.
+if declare -f dcheck >/dev/null; then
+  got=$(dcheck tall aux_tall_rows=256)
+  if [[ "$got" == *"TALL=1|$LSUM|256|"* && "$got" == *"auxtall card $MASK/0 live tail 0"* && "$got" == *"auxtall card $XUUID/0 live tail 0"* &&
+        "$got" == *"auxtall rows 256"* ]]; then ok "auxtall check: both cards at the window's tallest N, passed"
+  else bad "auxtall check (pass): '$got'"; fi
+  got=$(dcheck tall0)
+  if [[ "$got" == *"TALL=|||"* && "$got" != *"auxtall card"* ]]; then ok "auxtall check: no Axr arm, not run"
+  else bad "auxtall check (no Axr arm): '$got'"; fi
+  got=$(dcheck talldiffer aux_tall_rows=128 FAKE_TALL_DIFFER=1)
+  if [[ "$got" == *"TALL=|||"*"the extra card's auxtall outputs differ from card 0's"* ]]; then ok "auxtall check: outputs differing between the cards refuse"
+  else bad "auxtall check (outputs differ): '$got'"; fi
+  got=$(dcheck tallfail aux_tall_rows=128 FAKE_TALL_FAIL=1)
+  if [[ "$got" == *"TALL=|||"*"auxtall-xt exited non-zero"* ]]; then ok "auxtall check: a FAIL refuses"
+  else bad "auxtall check (FAIL): '$got'"; fi
+  got=$(dcheck tallaux aux_tall_rows=128 FAKE_AUX_FAIL=1)
+  if [[ "$got" == *"AUX=||"* && "$got" == *"TALL=|||"* && "$got" != *"auxtall card"* ]]; then ok "auxtall check: not run when aux did not pass"
+  else bad "auxtall check (aux failed): '$got'"; fi
+else bad "no dcheck (section 6) for the auxtall step"; fi
 
 (( fail == 0 )) && echo "PASS ab_window_aux_test" || echo "FAIL ab_window_aux_test (loop outputs: $T)"
 (( fail == 0 )) || trap - EXIT

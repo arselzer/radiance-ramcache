@@ -89,6 +89,7 @@
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
 #include "card_expert_stager.h"
+#include "p1_hybrid.h"
 #include "hx_fetch_list.h"
 #include "hx_side_store.h"
 #include "readahead.h"
@@ -645,6 +646,7 @@ public:
 private:
     friend struct EpCountsHostProbe;
     friend struct AuxStagerProbe;
+    friend struct P1HybridProbe;
     using Layer = StagedLayer;
     std::vector<Layer>   layers_;      /* the routed layers with file-tier units, in first-op order */
     std::vector<int32_t> first_of_;    /* by op: the layer whose first op it is, or -1 */
@@ -855,7 +857,9 @@ private:
      * ..._MISSES of at least p1_cpu_rows). */
     int64_t hx_miss_need(int32_t li) const { return p1_armed_ ? layer_rows(li) : pass_tok_; }
     uint64_t p1_cpu_layers_ = 0;         /* this armed pass's routed layers on the CPU path (below the threshold) */
-    int  p1_layer(int32_t li, RadStream s);
+    /* `hyb`: this layer may give RAM-cache units to the CPU pool (hybrid decode, p1_hybrid.h; its rows
+     * and sorted order were fetched with the counts). */
+    int  p1_layer(int32_t li, RadStream s, bool hyb = false);
     /* ..._P1_DECODE_ROWS (p1_decode_pass_arms): the threshold as p1_init read it (0 off); this pass armed as a
      * decode pass; and the shutdown counts (p1_stats_line): decode passes armed, their rows, the tallest, their
      * issue time from begin_pass to end_pass; and the pure decode passes of 17 rows or more below the
@@ -863,6 +867,28 @@ private:
     int64_t  p1_decode_rows_ = 0;
     bool     p1_decode_pass_ = false;
     uint64_t p1_dec_passes_ = 0, p1_dec_rows_ = 0, p1_dec_max_ = 0, p1_dec_ns_ = 0, p1_dec_below_ = 0;
+    /* ..._P1_HYBRID (p1_hybrid.h; 0 off: none of this acts): this pass is an armed decode pass that may split;
+     * the layer whose CPU units are with the pool (-1 none); the event behind its waves (after_op) and whether
+     * it was recorded; the submit time; the share. p1_hyb_pick chooses (fills p1_hyb_to_, by want_ index),
+     * p1_hyb_take borrows and submits, p1_hyb_done counts a layer at its gather (hx_finish). */
+    bool     p1_hyb_pass_ = false, p1_hyb_split_ = false, p1_hyb_rec_ = false;
+    int32_t  p1_hyb_li_ = -1;
+    RadEvent p1_hyb_ev_ = nullptr;
+    std::chrono::steady_clock::time_point p1_hyb_t_sub_{};
+    p1hyb::Share p1_hyb_share_;
+    std::vector<p1hyb::Cand> p1_hyb_cand_;
+    std::vector<uint8_t> p1_hyb_to_;
+    std::vector<int> p1_hyb_order_;
+    std::vector<int32_t> p1_hyb_cpu_;   /* this layer's units with the pool, aliased skipped */
+    struct HybStats {
+        uint64_t armed = 0, passes = 0, layers = 0, cpu_units = 0, card_units = 0, fell_back = 0, no_rows = 0;
+        uint64_t cpu_rows = 0, cpu_ns = 0, wait_ns = 0, late = 0, late_wait_ns = 0, early = 0;
+        double   pred_cpu_ns = 0, pred_card_ns = 0;
+    } p1_hyb_st_;
+    int  p1_hyb_pick(int32_t li);
+    bool p1_hyb_borrow(int32_t u, int rows, bool admit);
+    int  p1_hyb_submit(int32_t li);
+    void p1_hyb_done(bool early, uint64_t waited_ns);
     bool p1_admits(int32_t li, int32_t e) const;
     /* ..._P1_VERIFY=N: after a layer's waves, N of its RAM-cache units' expert-rows recomputed by the
      * CPU pool from the cache's bytes (borrowed again, read-only) and compared with the card's down

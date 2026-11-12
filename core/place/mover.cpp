@@ -1766,6 +1766,7 @@ bool Mover::read_weight_file(const WeightInfo& w, void* dst) {
 }
 
 bool Mover::unit_cached(int32_t u) {
+    if (borrow_hook_.cached) return borrow_hook_.cached(borrow_hook_.context, u);   /* a host test's */
     if (!plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 || (size_t)u >= unit_.size()) return false;
     for (rad_weight h : plan_->units[(size_t)u].weights)
         if (!mapped_file_cache_.present((size_t)h)) return false;

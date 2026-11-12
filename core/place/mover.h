@@ -481,6 +481,7 @@ struct AuxStagerProbe;
 class Mover {
     friend struct NativeMappedMoverHostTest; //private HOST-only fixture seam
     friend struct AuxStagerProbe; //tests/aux_stager_test.cpp: borrow_hook_ only
+    friend struct P1HybridProbe; //tests/p1_hybrid_test.cpp: borrow_hook_ only
     friend class Engine; //drain mapped source consumers before Engine tears down arenas/events
 public:
     ~Mover();
@@ -1195,6 +1196,7 @@ private:
     struct BorrowHook {
         void* context = nullptr;
         bool (*borrow)(void*, int32_t, HostUnit*, bool) = nullptr;
+        bool (*cached)(void*, int32_t) = nullptr;   /* unit_cached's answer (tests/p1_hybrid_test.cpp) */
     } borrow_hook_;
     static bool mapped_file_eligible(const WeightInfo& w);
     int mapped_file_drain();

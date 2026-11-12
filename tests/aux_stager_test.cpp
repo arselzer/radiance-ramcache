@@ -116,7 +116,12 @@ struct FakeLane final : rad::aux::Lane {
     int64_t last_deadline = 0, last_wait_at = 0;
     rad::aux::Job job;
     std::vector<int32_t> sorted, off;
+    std::vector<uint16_t> x;   /* the job's token rows, copied (its pointer may not outlive the call) */
     std::vector<uint16_t> out = std::vector<uint16_t>((size_t)ds41aux::kMaxSlots * ds41aux::kEmbd, 0x7777);
+    /* A taller job (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS) gets room for its rows, 0x7777 too. */
+    void room(int T) {
+        if (out.size() < (size_t)T * ds41aux::kEmbd) out.resize((size_t)T * ds41aux::kEmbd, 0x7777);
+    }
     State state() override {
         ++states;
         return st;
@@ -124,9 +129,11 @@ struct FakeLane final : rad::aux::Lane {
     void declined() override { ++declines; }
     int submit(const rad::aux::Job& j) override {
         ++submits;
+        room(j.T);
         job = j;
         sorted.assign(j.sorted, j.sorted + j.T);
         off.assign(j.off, j.off + ds41aux::kExperts + 1);
+        x.assign(j.x, j.x + (size_t)j.AR * ds41aux::kEmbd);
         return submit_rc;
     }
     int wait(int64_t deadline_ns) override {
@@ -159,7 +166,8 @@ struct AuxStagerProbe {
     std::vector<Packed> experts;
     std::vector<uint16_t> ref;   /* the CPU path's rows for the worker's slots, by compacted slot */
 
-    AuxStagerProbe() {
+    const int R;   /* the CPU path's rows (ep_rows_): 16, or a taller probe's (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS) */
+    explicit AuxStagerProbe(int rows = 16) : R(rows) {
         plan.rank = 0;
         plan.world_size = 4;
         plan.units.resize(96);
@@ -182,22 +190,22 @@ struct AuxStagerProbe {
         o.n_expert = 96;
         o.top_k = 6;
         fs.hx_ops_ = { o };
-        fs.ep_rows_ = 16;
-        fs.hx_alloc_rows_ = 16;
-        fs.hx_x_ = (uint16_t*)rad_dev_alloc(16 * 5120 * 2, RAD_MEM_HOST_PINNED);
-        fs.hx_idx_ = (int32_t*)rad_dev_alloc((96 + 128) * 4, RAD_MEM_HOST_PINNED);
-        fs.hx_out_ = (uint16_t*)rad_dev_alloc(96 * 5120 * 2, RAD_MEM_HOST_PINNED);
+        fs.ep_rows_ = R;
+        fs.hx_alloc_rows_ = R;
+        fs.hx_x_ = (uint16_t*)rad_dev_alloc((int64_t)R * 5120 * 2, RAD_MEM_HOST_PINNED);
+        fs.hx_idx_ = (int32_t*)rad_dev_alloc(((int64_t)R * 6 + 128) * 4, RAD_MEM_HOST_PINNED);
+        fs.hx_out_ = (uint16_t*)rad_dev_alloc((int64_t)R * 6 * 5120 * 2, RAD_MEM_HOST_PINNED);
         fs.counts_host_ = counts.data();
         fs.counts_cap_ = 96;
         fs.hx_pool_ = pool();
         fs.hx_policy_ = FileStager::kHxAll;
         fs.hx_units_.reset(new Mover::HostUnit[FileStager::kHxUnits]);
-        FileStager::AuxRows R;
-        R.gu.assign(17, nullptr);
-        R.sw.assign(97, nullptr);
-        R.dn.assign(17, nullptr);
-        R.ok = true;
-        fs.aux_rows_ = { R };
+        FileStager::AuxRows AR;
+        AR.gu.assign((size_t)R + 1, nullptr);
+        AR.sw.assign((size_t)R * 6 + 1, nullptr);
+        AR.dn.assign((size_t)R + 1, nullptr);
+        AR.ok = true;
+        fs.aux_rows_ = { AR };
         fs.aux_op_.assign(4, -1);
         view.resident.assign(96, 0);
         view.slot.assign(96, -1);
@@ -243,7 +251,7 @@ struct AuxStagerProbe {
         while (at < AR * 6) sorted[at++] = -1;
         std::mt19937 rng((uint32_t)(AR * 131 + base));
         for (int i = 0; i < AR * 5120; ++i) fs.hx_x_[i] = ds41hx::f32_to_bf16((float)((int)(rng() % 2001) - 1000) / 400.0f);
-        std::memset(fs.hx_out_, 0xEE, 96 * 5120 * 2);
+        std::memset(fs.hx_out_, 0xEE, (size_t)R * 6 * 5120 * 2);
     }
     /* A lease as the packed RAM cache lends it, on experts_[k]'s bytes. */
     void lease(Mover::HostUnit* hu, int32_t u, const Packed& p) {
@@ -485,6 +493,136 @@ struct AuxStagerProbe {
         CHECK(placed_rows_are_ref());
         CHECK_EQ(fs.aux_stats_.late, (uint64_t)0);
         CHECK_EQ(fs.aux_stats_.placed, (uint64_t)fs.aux_cmp_.T);
+    }
+
+    /* RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS (a probe of R rows, the switch at R): a pass of 17..R rows is compacted
+     * and queued as a 16-row one is, the lane's rows placed at their sorted rows, and counted by height. */
+    void tall_serve_places_the_lanes_rows(int AR) {
+        FakeLane lane;
+        pass(AR, 3, 5);
+        aux::Config cfg;
+        cfg.rows = R;
+        const std::vector<int> w = { 3, 10, 17, 24, 50 };
+        take(&lane, w, cfg);
+        REQUIRE_OK(fs.hx_submit());
+        const ds41aux::Compact& c = fs.aux_cmp_;
+        CHECK_EQ(lane.submits, 1);
+        CHECK_EQ(lane.job.AR, AR);
+        CHECK_EQ(lane.job.T, c.T);
+        int want = 0;
+        for (int e : w) want += counts[(size_t)e];
+        CHECK_EQ(c.T, want);
+        REQUIRE(c.T > 0);
+        REQUIRE_EQ(fs.hx_rows_.size(), (size_t)c.T);
+        CHECK(lane.sorted == std::vector<int32_t>(c.sorted, c.sorted + c.T));
+        REQUIRE(reference());
+        std::memcpy(lane.out.data(), ref.data(), ref.size() * 2);
+        lane.wait_rc = 1;
+        REQUIRE_OK(finish());
+        CHECK(placed_rows_are_ref());
+        CHECK_EQ(fs.aux_stats_.placed, (uint64_t)c.T);
+        CHECK_EQ(fs.aux_stats_.late, (uint64_t)0);
+        const int b = ds41aux::height_bucket(AR);
+        for (int k = 0; k < ds41aux::kHeightBuckets; ++k) {
+            CHECK_EQ(fs.aux_stats_.jobs_h[k], (uint64_t)(k == b ? 1 : 0));
+            CHECK_EQ(fs.aux_stats_.rows_h[k], (uint64_t)(k == b ? c.T : 0));
+        }
+    }
+    /* A tall job still pending is asked with its submit + D * ceil(AR / 16) at the earliest, then its units go to
+     * the CPU from the kept leases (the rows the CPU path's). */
+    void tall_late_job_has_a_scaled_deadline_and_falls_back(int AR) {
+        FakeLane lane;
+        pass(AR, 7, 4);
+        aux::Config cfg;
+        cfg.rows = R;
+        cfg.deadline_us = 1000;
+        take(&lane, { 7, 14, 21 }, cfg);
+        REQUIRE_OK(fs.hx_submit());
+        REQUIRE(reference());
+        lane.wait_rc = 0;
+        const int64_t t0 = fs.aux_t0_ns_;
+        REQUIRE_OK(finish());
+        CHECK(lane.last_deadline >= t0 + ds41aux::deadline_us_for(1000, AR) * 1000);
+        CHECK(ds41aux::deadline_us_for(1000, AR) > 1000);
+        CHECK(placed_rows_are_ref());
+        CHECK_EQ(fs.aux_stats_.late, (uint64_t)1);
+        CHECK_EQ(lane.abandons_backoff, 1);
+        CHECK_EQ(fs.aux_stats_.fallback_rows, (uint64_t)fs.aux_cmp_.T);
+    }
+    /* The bound: a pass of R rows is the worker's to take, R + 1 is declined as taller; with the switch at 16 (the
+     * default) the same R-row pass is declined. */
+    void tall_bound(int AR) {
+        const std::vector<int32_t> want = { 3, 17, 40 };
+        for (int e = 0; e < 96; ++e) counts[(size_t)e] = 0;
+        for (int32_t u : want) counts[(size_t)u] = 1;
+        view.resident[17] = 1;
+        FakeLane lane;
+        aux::Config cfg;
+        cfg.rows = R;
+        fs.aux_bind(&lane, &view, cfg);
+        fs.aux_pass_ = true;
+        (void)choose(AR, want);
+        CHECK_EQ(fs.aux_stats_.declined_tall, (uint64_t)0);
+        CHECK_EQ(fs.aux_stats_.uncached, (uint64_t)1);   /* taken, its unit not cached: the CPU's miss path */
+        CHECK(lane.states >= 1);
+        (void)choose(R + 1, want);   /* taller than the bound */
+        CHECK_EQ(fs.aux_stats_.declined_tall, (uint64_t)1);
+        fs.aux_unbind();
+        fs.aux_bind(&lane, &view, aux::Config{});
+        fs.aux_pass_ = true;
+        (void)choose(AR, want);
+        CHECK_EQ(fs.aux_stats_.declined_tall, (uint64_t)1);   /* a fresh bind: the default 16 declines it */
+        fs.aux_unbind();
+        view.resident[17] = 0;
+    }
+
+    /* The warm-up's tall job (ds41aux::kRowsEnv above 16): R token rows with one slot each on the unit's expert,
+     * through the rows at R; refused when a row differs from the CPU pool's for the same lease, taken when they are
+     * the pool's. */
+    void tall_warm_checks_the_lanes_rows() {
+        if (experts.empty()) experts.resize(1);
+        if (experts[0].gu.empty()) REQUIRE_OK(experts[0].make(3000) ? 0 : -1);
+        FakeLane lane;
+        Mover::HostUnit hu;
+        lease(&hu, 5, experts[0]);
+        fs.aux_rows_max_ = R;
+        std::string why;
+        CHECK_EQ(fs.aux_warm_tall(&lane, 5, 0, &hu, (const void*)0x1000, (const void*)0x2000, 0, &why), RAD_E_STATE);
+        CHECK(has(why, fmt("tall warm-up job (%d rows, unit 5, layer 3 expert 5)", R)));
+        CHECK(has(why, "unlike the CPU pool's"));
+        REQUIRE_EQ(lane.submits, 1);
+        CHECK_EQ(lane.job.AR, R);
+        CHECK_EQ(lane.job.T, R);
+        CHECK(lane.job.gu_w.data == (void*)0x1000 && lane.job.dn_w.data == (void*)0x2000);
+        bool order = (int)lane.sorted.size() == R;
+        for (int i = 0; order && i < R; ++i) order = lane.sorted[(size_t)i] == i * 6;
+        CHECK(order);
+        CHECK(lane.off[5] == 0 && lane.off[6] == R && lane.off[96] == R);
+        /* The pool's rows for the job's own token rows: taken. */
+        std::vector<HostExpertPool::Job> jobs((size_t)R);
+        int64_t cost = 0;
+        for (int i = 0; i < R; ++i) {
+            HostExpertPool::Job& jb = jobs[(size_t)i];
+            jb.gu = experts[0].gu.data();
+            jb.dn = experts[0].dn.data();
+            jb.packed = true;
+            jb.gu_bytes = (int64_t)experts[0].gu.size();
+            jb.dn_bytes = (int64_t)experts[0].dn.size();
+            jb.x = lane.x.data() + (int64_t)i * 5120;
+            jb.y = lane.out.data() + (int64_t)i * 5120;
+            jb.cost = HostExpertPool::job_cost(1);
+            cost += jb.cost;
+        }
+        HostExpertPool::Ticket t;
+        fs.hx_pool_->reserve(cost);
+        REQUIRE_OK(fs.hx_pool_->submit(jobs.data(), R, &t));
+        fs.hx_pool_->wait(&t);
+        why.clear();
+        CHECK_EQ(fs.aux_warm_tall(&lane, 5, 0, &hu, (const void*)0x1000, (const void*)0x2000, 0, &why), RAD_OK);
+        CHECK(why.empty());
+        lane.out[(size_t)(R - 1) * 5120 + 7] ^= 1;   /* the last row, one bit */
+        CHECK_EQ(fs.aux_warm_tall(&lane, 5, 0, &hu, (const void*)0x1000, (const void*)0x2000, 0, &why), RAD_E_STATE);
+        CHECK(has(why, fmt("row %d has 1 of 5120 values", R - 1)));
     }
 
     void verify_compares_and_counts() {
@@ -1242,6 +1380,107 @@ std::vector<char>& leaked_workspace(size_t bytes) {
     return kept.back();
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS: a lane for 64 rows takes a job of 40 rows and 200 slots into ws(64)'s
+ * layout, and refuses one of 65 rows or 385 slots (a job's shape); a lane of the default 16 refuses 17 rows. */
+TEST(device_lane_for_taller_jobs) {
+    const ds41aux::Ws w = ds41aux::ws(64);
+    std::vector<char>& ws = leaked_workspace((size_t)w.bytes);
+    rad::aux::DeviceLane lane(4, 1, ws.data(), 3, 64);
+    std::string why;
+    REQUIRE_OK(lane.init(&why));
+    std::vector<uint16_t> x((size_t)40 * 5120);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = (uint16_t)(i * 5 + 3);
+    std::vector<int32_t> sorted(200), off(97);
+    for (int i = 0; i < 200; ++i) sorted[(size_t)i] = (i % 40) * 6 + i / 40;
+    for (int e = 0; e <= 96; ++e) off[(size_t)e] = e <= 2 ? 0 : 200;
+    const RadParam params[1] = {};
+    rad::aux::Job j;
+    j.AR = 40;
+    j.T = 200;
+    j.x = x.data();
+    j.sorted = sorted.data();
+    j.off = off.data();
+    j.gu = { fake_gu, params, 1, nullptr };
+    j.sw = { fake_sw, params, 1, nullptr };
+    j.dn = { fake_dn, params, 1, nullptr };
+    j.gu_w.data = (void*)0x1000;
+    j.gu_w.rank = 3;
+    j.dn_w.data = (void*)0x2000;
+    j.dn_w.rank = 3;
+    j.rank = 1;
+    j.world = 4;
+    g_log = LaunchLog{};
+    REQUIRE_OK(lane.submit(j));
+    REQUIRE_EQ(lane.wait(now_ns() + 2'000'000'000LL), 1);
+    CHECK(std::memcmp(ws.data() + w.sorted, sorted.data(), 200 * 4) == 0);
+    CHECK(std::memcmp(ws.data() + w.off, off.data(), 97 * 4) == 0);
+    CHECK(std::memcmp(ws.data() + w.x, x.data(), x.size() * 2) == 0);
+    CHECK(g_log.t[0][0].data == ws.data() + w.x && g_log.t[0][0].shape[0] == 40);
+    CHECK(g_log.t[0][4].data == ws.data() + w.gu_out && g_log.t[0][4].shape[0] == 200);
+    CHECK(g_log.t[1][1].data == ws.data() + w.act && g_log.t[1][1].shape[0] == 200);
+    CHECK(g_log.t[2][4].data == ws.data() + w.dn_out && g_log.t[2][4].shape[0] == 200);
+    bool rows_ok = true;
+    for (int64_t i = 0; i < 200 * 5120; ++i) rows_ok = rows_ok && lane.rows()[i] == (uint16_t)(0x3c00 + i % 977);
+    CHECK(rows_ok);
+    CHECK(lane.drain(1'000'000'000LL));
+    /* Past the lane's height or slots: refused before anything is queued, the lane retired. */
+    for (int bad = 0; bad < 2; ++bad) {
+        std::vector<char>& ws2 = leaked_workspace((size_t)w.bytes);
+        rad::aux::DeviceLane l2(4, 1, ws2.data(), 3, 64);
+        REQUIRE_OK(l2.init(&why));
+        rad::aux::Job k = j;
+        std::vector<int32_t> s2(385, 0);
+        std::vector<uint16_t> x2((size_t)65 * 5120, 0);
+        if (bad == 0) { k.AR = 65; k.x = x2.data(); }
+        else { k.T = 385; k.sorted = s2.data(); }
+        CHECK(l2.submit(k) < 0);
+        CHECK(l2.dead());
+        CHECK(has(l2.why_dead(), "a job's shape"));
+        l2.leak();
+    }
+    const ds41aux::Ws w16 = ds41aux::ws();
+    std::vector<char>& ws3 = leaked_workspace((size_t)w16.bytes);
+    rad::aux::DeviceLane l3(4, 1, ws3.data(), 3);
+    REQUIRE_OK(l3.init(&why));
+    rad::aux::Job k = j;
+    k.AR = 17;
+    k.T = 17;
+    CHECK(l3.submit(k) < 0);
+    CHECK(has(l3.why_dead(), "a job's shape"));
+    l3.leak();
+}
+
+/* The shutdown line: unchanged at the default 16 (no height part); at 256 rows it says so and counts every bucket up
+ * to 256. */
+TEST(the_shutdown_line_by_height) {
+    rad::aux::Stats s;
+    s.jobs = 5;
+    s.jobs_h[0] = 3;
+    s.rows_h[0] = 20;
+    s.eligible_h[0] = 60;
+    s.jobs_h[4] = 2;
+    s.rows_h[4] = 300;
+    s.eligible_h[4] = 900;
+    const std::string a = rad::aux::stats_line(0, s), b = rad::aux::stats_line(0, s, false, 16);
+    CHECK(a == b);
+    CHECK(has(a, "passes of up to 16 rows"));
+    CHECK(!has(a, "by height"));
+    const std::string t = rad::aux::stats_line(2, s, false, 256);
+    CHECK(has(t, "aux experts: rank 2: "));
+    CHECK(has(t, "passes of up to 256 rows"));
+    CHECK(has(t, "; by height: 1-16: 3 jobs, 20 of 60 rows; 17-32: 0 jobs, 0 of 0 rows;"));
+    CHECK(has(t, "; 129-256: 2 jobs, 300 of 900 rows"));
+    CHECK(!has(t, "257-"));
+    CHECK(has(rad::aux::stats_line(2, s, false, 200), "; 129-200: 2 jobs, 300 of 900 rows"));
+    /* The rest of the line is the default's, word for word, before the height part. */
+    const std::string head = t.substr(0, t.find("; by height:"));
+    std::string a2 = a;
+    const size_t at = a2.find("passes of up to 16 rows");
+    a2.replace(at, std::strlen("passes of up to 16 rows"), "passes of up to 256 rows");
+    a2.replace(0, std::strlen("aux experts: rank 0: "), "aux experts: rank 2: ");
+    CHECK(head == a2);
+}
+
 TEST(device_lane_a_failed_step_fails_the_job_and_retires_the_lane) {
     for (int at = 0; at < 3; ++at) {
         const ds41aux::Ws w = ds41aux::ws();
@@ -1401,6 +1640,34 @@ TEST(a_count_mismatch_refuses_before_any_job_runs) {
     if (!pool()) SKIP("no AVX2 or no CPU pool");
     AuxStagerProbe p;
     p.a_count_mismatch_refuses_before_the_pool_submit();
+}
+
+TEST(tall_passes_are_compacted_queued_and_placed) {
+    if (!pool()) SKIP("no AVX2 or no CPU pool");
+    for (int AR : { 17, 40, 64 }) {
+        AuxStagerProbe p(64);
+        p.tall_serve_places_the_lanes_rows(AR);
+    }
+    AuxStagerProbe p(128);
+    p.tall_serve_places_the_lanes_rows(128);
+}
+
+TEST(a_late_tall_job_has_a_scaled_deadline_and_falls_back) {
+    if (!pool()) SKIP("no AVX2 or no CPU pool");
+    AuxStagerProbe p(64);
+    p.tall_late_job_has_a_scaled_deadline_and_falls_back(48);
+}
+
+TEST(the_tall_warm_up_job_checks_every_row_against_the_cpu_pool) {
+    if (!pool()) SKIP("no AVX2 or no CPU pool");
+    AuxStagerProbe p(48);
+    p.tall_warm_checks_the_lanes_rows();
+}
+
+TEST(tall_passes_up_to_the_bound_only) {
+    if (!pool()) SKIP("no AVX2 or no CPU pool");
+    AuxStagerProbe p(64);
+    p.tall_bound(64);
 }
 
 TEST(hx_drain_abandons_a_job_in_flight) {

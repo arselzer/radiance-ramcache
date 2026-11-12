@@ -1471,7 +1471,7 @@ cached; a refused one is read from the container through the mover's windows as 
 `ram_budget_test`). `..._PREGROW` and `..._CACHE_WARM` run at `serve()` inside the budget. The
 largest other item is the prefix cache's pinned snapshot store (641 slots of 22.59 MiB, 14.14 GiB, at
 N128 with the window's `--max-model-len 147456`); in this mode `--checkpoint-slots auto` sizes it for
-sessions of `..._RAM_BUDGET_SESSION_TOKENS` (default min(--max-model-len, 4096)) instead, plus one
+sessions of `..._RAM_BUDGET_SESSION_TOKENS` (default min(--max-model-len, max(--max-model-len / --max-num-seqs, 4096)): a lone agent session keeps its full context, a batch of short prompts few) instead, plus one
 slot a sequence under `RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD` (startup line `ram budget: the
 snapshot store is sized for N-token sessions`); fewer slots mean fewer resume points, never other
 bytes. Arm part

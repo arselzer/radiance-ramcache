@@ -194,6 +194,34 @@ arm; the cost is one extra prefill step for each prompt that writes a head snaps
 skipped by every prompt after it. Tests `sched_test` `shared_heads_*`, `mem_test`
 `a_hit_reports_the_shared_head_from_every_entry_of_its_chain`, `shared_head_pick_prefers_the_most_ways_then_the_deepest`,
 `ab_window_ba_test.sh` (part 4).
+
+**Batched keep points and running chunks** (`RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1`, part `Bs`, beside `Ba` and
+`Pc` / `Pc0`; `claude/ds41-batch4096`; not yet measured on the cards). Window ab-20261112T142114Z (NL-to-SQL,
+`...-Pc-Pch64-L<pool>-Pf-N<n>-C<n>-Ba2048`) took 124 prefill steps for 256 prompts against 38 for 128. Cause
+(`core/sched/scheduler.cpp`, `admit_one`'s join check and `step()`'s batch opener): beside the prefix cache a prompt
+joined a batch only with a chunk finishing its prompt, so a prompt splitting at a shared head's keep point ran
+`[hit, head)` alone and then its suffix alone (a running prompt's chunk opened no batch), two steps of their own
+for each keep, and each refused join ended its batch. With the switch a chunk that ends at the snapshot the prompt
+writes alone before its end joins or opens a batch, and so does a running prompt's next chunk, each only where it is
+the chunk the prompt takes alone from where it stands (`batch_alone_plan`) with the snapshot it writes alone; a
+join whose keep point another entry of the step already snapshots waits a step and resumes there instead. Every
+prompt's chunk boundaries and snapshot positions stay the unbatched run's (a shared step runs every layer on every
+row, uncut). Host model of the batch (`sched_test` `batch_split_shares_steps_and_keeps_every_prompt_s_chunks`):
+128 / 256 prompts sent at once at N128 / N256, 24 -> 10 and 30 -> 15 prefill steps against `Ba2048` alone (136 / 264
+without batching), the same keep points (8) each ending in its snapshot, the resumed tokens within 0.4%, and every
+prompt's chunks the ones `plan_chunk` gives it alone (each step's close cause: before, 16 steps closed at a first
+entry no batch held; with the switch none). The shared-heads counters were also wrong: `shared_heads.keeps` counted every lookup, and a refused join
+set its keep back and counted it again at the next attempt (43 refused joins at N256, against 69 keeps / 39
+snapshots); keeps are now counted once per admission. Shutdown lines `shared heads: R keep points set back by a
+refused batch join ..., M passed with no snapshot ..., S snapshots left to another entry of the step ...`,
+`batch admission: prefill-only steps closed by: nothing more waiting W, the rows left R, a chunk not the one it
+takes alone A, a first entry no batch holds O, --max-num-seqs Q` (every Ba arm beside Pc) and `batch split: J joins
+..., K batches opened by a running prompt's next chunk, H joins left for a step ...`; startup line `batch split:
+on (RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1)`, checked both ways. Gates for a window: replies and `Kh` hashes
+against the same arm without `Bs`. The pool's evictions at `L36864` (4,644 entries, prefix_hit_rate 0.660 against
+0.668 at `L147456` without any) cost about 1% of the hit rate: the evicted entries are questions' tails, while the
+shared heads' entries stay held by the running sequences that adopted them (`evict_lru` skips them); no policy
+change. Tests also `ab_window_ba_test.sh` (Bs).
 In the paragraphs from here to the two-batch overlap one, every 4- and 8-stream arm also ran
 `..._PREFETCH_MULTIROW=N` (parts `Pmr4` / `Pmr8`) with `--max-model-len 1024` (`L1024`), sending the 8 held-out
 requests N at a time. A total at N streams is N times the mean of the requests' `predicted_per_second`

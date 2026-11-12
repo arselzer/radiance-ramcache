@@ -64,6 +64,16 @@
  * trace is the dump-only arm: `would` shows which dispatches the check frees, and no packet
  * changes (the host pays the bookkeeping and the stamps, so it is not a timing arm).
  *
+ * RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL=N (off by default; with or without the decode
+ * trace) traces every Nth armed card-path prefill pass on rank 0 the same way: a trunk pass that is
+ * not a decode pass and for which the stager armed prefill Phase 1's card path
+ * (OpStager::card_pass). Its kernels' times are the step's split -- the routed experts' twin, the
+ * dense projections, attention and the indexer, the issue path's own copies and the gaps the ring
+ * waits leave. Both files gain the pass's kind and rows (ops.csv columns `kind`, `rows`: decode
+ * or prefill); chain_report.py --split prints a pass's card time by kernel class. Exact as the
+ * decode trace is: the stamps only read the card's timestamps and no packet's order changes; the
+ * choice of pass reads the stager's state and changes nothing it does.
+ *
  * Either switch prints a summary line per rank at shutdown (Engine's report, Ctx::live_report).
  */
 #pragma once
@@ -188,7 +198,7 @@ private:
 
 /* Counters for the shutdown line. One rank's thread writes them; read after it stops. */
 struct LiveStats {
-    uint64_t passes = 0, decode_passes = 0, overlap_passes = 0, traced = 0;
+    uint64_t passes = 0, decode_passes = 0, overlap_passes = 0, traced = 0, traced_prefill = 0;
     uint64_t launches = 0;        /* device launches checked */
     uint64_t free = 0;            /* of them, nothing in flight to wait for */
     uint64_t unordered = 0;       /* first dispatches the backend wrote without the bit */
@@ -197,6 +207,29 @@ struct LiveStats {
     uint64_t multi = 0;           /* launches of more than one packet on their queue */
     uint64_t silent = 0;          /* launches that wrote nothing on their queue */
     uint64_t decode_launches = 0, decode_free = 0, decode_unordered = 0;
+};
+
+/* Which passes the trace takes (CHAIN_TRACE / CHAIN_TRACE_PREFILL): pure bookkeeping over the
+ * batch, the rank and whether the stager armed the card path, so the tests drive it without a
+ * live backend. */
+enum : int { kLiveTraceNone = 0, kLiveTraceDecode = 1, kLiveTracePrefill = 2 };
+const char* live_trace_kind_name(int kind);
+
+class LiveTracePick {
+public:
+    LiveTracePick(int decode_every = 0, int prefill_every = 0)
+        : every_(decode_every > 0 ? decode_every : 0), pf_every_(prefill_every > 0 ? prefill_every : 0) {}
+    bool on() const { return every_ > 0 || pf_every_ > 0; }
+    /* What a pass could be traced as: a trunk decode pass, an armed card-path prefill pass (not a
+     * decode pass), or neither; rank 0 only. */
+    static int candidate(const RadBatch* b, int rank, bool card_pass);
+    /* The pass's kind when this pass is traced (every Nth candidate of its kind), else none. */
+    int next(const RadBatch* b, int rank, bool card_pass);
+    uint64_t seen(int kind) const { return kind == kLiveTracePrefill ? pf_seen_ : decode_seen_; }
+
+private:
+    int      every_ = 0, pf_every_ = 0;
+    uint64_t decode_seen_ = 0, pf_seen_ = 0;
 };
 
 /* One operand of a traced launch, for naming. */
@@ -249,10 +282,10 @@ public:
     LiveChain& operator=(const LiveChain&) = delete;
     /* Reads the switches. Inert (on() false) when both are off or the backend has no live path. */
     void init(int rank, const Program* prog);
-    bool on() const { return mode_ > 0 || every_ > 0; }
+    bool on() const { return mode_ > 0 || pick_.on(); }
 
-    /* Around one pass issued live. */
-    void pass_begin(const RadBatch* b);
+    /* Around one pass issued live; `card_pass`: the stager armed the card path for it. */
+    void pass_begin(const RadBatch* b, bool card_pass = false);
     void pass_end();
     /* Whether this pass's launches go through the check at all, and may be unordered. */
     bool checking() const { return in_pass_; }
@@ -275,11 +308,15 @@ private:
 
     int            mode_ = 0;          /* CHAIN_OVERLAP: 0 off, 1 decode, 2 every live pass */
     int            every_ = 0;         /* CHAIN_TRACE: every Nth trunk decode pass on rank 0 */
+    int            pf_every_ = 0;      /* CHAIN_TRACE_PREFILL: every Nth armed card-path prefill pass */
+    LiveTracePick  pick_;
+    int            pass_kind_ = kLiveTraceNone;
+    int64_t        pass_rows_ = 0;
     std::string    prefix_;
     int            rank_ = 0;
     const Program* prog_ = nullptr;
     bool           in_pass_ = false, overlap_pass_ = false, traced_ = false;
-    uint64_t       decode_seen_ = 0, trace_id_ = 0;
+    uint64_t       trace_id_ = 0;
     uint64_t       tag_base_ = 0, tag_n_ = 0, pass_tag0_ = 0;
     LiveQueues     q_;
     LiveStats      st_;

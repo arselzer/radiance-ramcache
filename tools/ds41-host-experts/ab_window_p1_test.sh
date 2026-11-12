@@ -26,6 +26,10 @@
 #      alone and through lcp_check; in the arm loop the fast arm with Qd200 is launched with the switch at 200
 #      and every arm without the part states it 0, while Qd above the chunk, Qd16, Qd beside Tb and Qd without
 #      P1 are skipped with the reason.
+#   6. Ctp / CtpN (the prefill chain trace, ..._CHAIN_TRACE_PREFILL): the fast arm with Ctp traces one armed
+#      prefill pass in 4 into chain-<arm>, with Qd64 Ct16 Ctp2 both traces at their N into the same files;
+#      Ctp without P1 and Ctp0 are skipped with the reason; arms without the part do not set it; and
+#      chain_report.py's selftest (the --split classes on a synthetic prefill pass, old files as decode).
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -261,9 +265,14 @@ QD4096=$FAST-Qd4096
 QD16=$FAST-Qd16
 QDTB=$FAST-Qd200-Tb
 QDNOP=$REF-Qd200
+CTP=$FAST-Ctp
+CTP2=$FAST-Qd64-Ct16-Ctp2
+CTPNOP=$REF-Ctp
+CTP0=$FAST-Ctp0
 ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP $COLD4K $PC4K $NOINT4K $LOWINT4K $NOPC4K $OVER4K"
 ARMS="$ARMS $FAST $SG8 $SGA8 $SG15 $SG16 $N2SG7 $N2SG8 $N8SG2 $SG0"
 ARMS="$ARMS $QD200 $QD4096 $QD16 $QDTB $QDNOP"
+ARMS="$ARMS $CTP $CTP2 $CTPNOP $CTP0"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
@@ -425,6 +434,29 @@ qdskip "$QD4096" "Qd4096 is above the chunk Lc2048.*skipped"
 qdskip "$QD16" "Qd16: Qd takes 17-4096.*skipped"
 qdskip "$QDTB" "Qd200 with Tb.*skipped"
 qdskip "$QDNOP" "the Q parts (RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=200) need P1.*skipped"
+
+# ---- 6. Ctp: the prefill chain trace's switch and output prefix; skipped without P1 or at 0.
+for x in "$CTP 4" "$CTP2 2"; do
+  read -r a n <<< "$x"
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "the Ctp arm $a was not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  has "Ctp ($n)" "$sec" RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL "$n"
+  [[ "$(val "$sec" RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT)" == */chain-$a ]] && ok "Ctp ($n): traced into chain-<arm>" ||
+    bad "Ctp ($n): CHAIN_TRACE_OUT is '$(val "$sec" RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT)'"
+  has "Ctp ($n) keeps P1" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1 1
+done
+sec=$(section "$CTP2")
+has "Ct16 beside Ctp2" "$sec" RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE 16
+has "Qd64 beside Ctp2" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS 64
+has "Ctp alone sets no decode trace" "$(section "$CTP")" RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE ""
+for a in "$FAST" "$QD200" "$REF"; do
+  has "no Ctp part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL ""
+done
+qdskip "$CTPNOP" "Ctp4 traces armed card-path prefill passes, which need P1.*skipped"
+qdskip "$CTP0" "Ctp0: CtpN takes a positive N.*skipped"
+if pyout=$(python3 -I "$(dirname "$W")/chain_report.py" --selftest 2>&1) && grep -q "^selftest ran" <<< "$pyout"; then
+  ok "chain_report.py --selftest (the --split classes of a prefill pass)"
+else bad "chain_report.py --selftest: $(tail -5 <<< "$pyout")"; fi
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do

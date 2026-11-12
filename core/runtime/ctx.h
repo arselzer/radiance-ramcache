@@ -620,7 +620,7 @@ private:
     void live_after(LiveCall* c);
     /* An architecture step issued live, between the trace's and the counters' pass marks. */
     void live_step(const RadBatch* b) {
-        live_.pass_begin(b);
+        live_.pass_begin(b, staging_ && stager_ && stager_->card_pass());
         arch_step_(this, b);
         live_.pass_end();
     }

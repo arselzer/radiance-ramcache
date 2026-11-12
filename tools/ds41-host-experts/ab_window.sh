@@ -2913,7 +2913,11 @@ for a in $ARMS; do
 # pass in N (16) on rank 0: every launch with its dependences into chain-<arm>.ops.csv and every
 # kernel's card times into chain-<arm>.stamps.csv (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE; read them
 # with chain_report.py; without Ov it is the dump-only arm: what the check would free, nothing
-# changed); rN a repeat (ignored).
+# changed); Ctp / CtpN trace one armed card-path prefill pass in N (4) on rank 0 into the same files
+# (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL; needs P1; beside Ct or alone; ops rows carry the
+# pass's kind and rows; chain_report.py PREFIX --split gives the step's card time by kernel class:
+# routed experts, dense GEMMs, attention, indexer, collectives, the rest, copies, idle; exact, it only
+# reads timestamps, but not a timing arm); rN a repeat (ignored).
 # Ss a step of one sequence that its own token can end has its tokens read back before the next
 # step is planned, and nothing runs behind one that ended its request: no forward pass after a
 # reply's end-of-generation token, which the reply (and the next request) otherwise waits out,
@@ -3025,6 +3029,7 @@ for a in $ARMS; do
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
   p1="" q1=() qm="" ql="" qg="" qe="" qd="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
+  ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   axr=""   # AxrN: the worker's passes up to N rows (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)
@@ -3199,6 +3204,14 @@ for a in $ARMS; do
       Xwp)     ARGS+=(--weight-prefetch off) ;;                        # no weight reads beside the collectives (core/config.cpp; exact)
       Xq?*)    ARM_PROFILE=${EXTRA_PROFILES:-/home/as/ds41-claude-build/work/extra-profiles}/${p#Xq}.json   # this arm's --expert-profile
                [[ -f "$ARM_PROFILE" ]] || { log "arm $a: $p: no profile $ARM_PROFILE; the arm is skipped"; skip=1; } ;;
+      Ctp|Ctp[0-9]*)                                                   # one armed card-path prefill pass in N traced
+               ctp=${p#Ctp}; ctp=${ctp:-4}
+               if [[ ! $ctp =~ ^[0-9]+$ ]] || (( 10#$ctp < 1 )); then
+                 log "arm $a: $p: CtpN takes a positive N; the arm is skipped"; skip=1
+               else
+                 env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL=$((10#$ctp))
+                       RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT=$(cd "$OUT" && pwd)/chain-$a)
+               fi ;;
       Ct|Ct[0-9]*)
                ct=${p#Ct}
                env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE=${ct:-16}
@@ -3768,6 +3781,7 @@ for a in $ARMS; do
     [[ -n "$qd" && -n "$tb" ]] && { log "arm $a: Qd$qd with Tb (a split decode step: the engine refuses it); the arm is skipped"; skip=1; }
   else
     (( ${#q1[@]} )) && { log "arm $a: the Q parts (${q1[*]}) need P1; the arm is skipped"; skip=1; }
+    [[ -n "$ctp" ]] && { log "arm $a: Ctp$ctp traces armed card-path prefill passes, which need P1; the arm is skipped"; skip=1; }
     env+=(RADIANCE_EXPERIMENTAL_DS41_P1=0 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0

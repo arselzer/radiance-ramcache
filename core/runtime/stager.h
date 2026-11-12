@@ -47,6 +47,11 @@ public:
      * may publish weights for a later pass it expects to arm for, which that pass's begin_pass
      * keeps or gives back. */
     virtual int end_pass(RadStream s) = 0;
+
+    /* Between begin_pass and end_pass: whether this pass runs routed expert rows on the cards'
+     * own path (prefill Phase 1's card path, place/card_expert_stager.h). Read only by the chain
+     * trace's choice of pass (runtime/live_chain.h); it changes nothing the pass issues. */
+    virtual bool card_pass() const { return false; }
 };
 
 /* Two stagers on one pass, each called only on the passes it armed for, so a stager whose
@@ -100,6 +105,12 @@ public:
             on_[i] = false;
         }
         return rc;
+    }
+
+    bool card_pass() const override {
+        for (int i = 0; i < 2; ++i)
+            if (on_[i] && s_[i]->card_pass()) return true;
+        return false;
     }
 
 private:

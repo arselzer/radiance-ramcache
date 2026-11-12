@@ -41,6 +41,17 @@ struct SchedMetrics {
     int64_t batch_admit_steps = 0;
     int64_t batch_admit_prompts = 0;
     int64_t batch_admit_rows = 0;
+    /* Of those prompts, the ones whose prefix hit restored a snapshot in the shared step and the ones
+     * that wrote a snapshot there (beside the prefix cache); the shared steps of Phase 1's threshold's
+     * rows or more (the card path's); and the entries of a shared step outside the covered case (a
+     * chunk not the one the prompt takes alone, or not whole), which the admission never lets in: 0. */
+    int64_t batch_admit_hits = 0;
+    int64_t batch_admit_snapshots = 0;
+    int64_t batch_admit_p1_steps = 0;
+    int64_t batch_admit_outside = 0;
+    /* Prompts whose join admit_one refused beside the prefix cache (their hit left another chunk than
+     * the batch takes); each ended its batch and was admitted later as before. */
+    int64_t batch_admit_join_refused = 0;
     /* --prefill-interleave: decode-only steps the hold inserted, issued ahead or not; each kept a
      * ready chunk out. */
     int64_t steps_held = 0;

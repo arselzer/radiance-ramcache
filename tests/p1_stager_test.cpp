@@ -1238,6 +1238,40 @@ TEST(p1_threshold_arms_long_layer_passes_and_leaves_the_rest_to_the_cpu_path) {
     EpCountsHostProbe::disarm(fs);
 }
 
+/* A pass of several whole prompts (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT above 256 rows beside Phase 1):
+ * the arming reads the pass's rows and kind, never its sequences, so a prefill-only pass of three prompts
+ * (1,818 rows, cu_seqlens 0 / 288 / 1,000 / 1,818) arms exactly as a lone prompt's chunk of the same rows,
+ * and, uncut (a shared step runs every layer on every row), every routed layer of it is the card path's;
+ * a batch below the threshold is the CPU path's on every layer, as a lone chunk of its rows is. */
+TEST(p1_arms_a_pass_of_several_prompts_as_a_lone_chunk_of_its_rows) {
+    const int32_t cu3[4] = { 0, 288, 1000, 1818 };
+    for (int64_t thr : { 17, 320, 1024 })
+        for (int64_t n : { 64, 319, 320, 769, 1818, 2048, 2049 }) {
+            RadBatch lone{};
+            lone.phase = RAD_PHASE_PREFILL;
+            lone.n_tok = n;
+            lone.n_seq = 1;
+            RadBatch many = lone;
+            many.n_seq = 3;
+            many.cu_seqlens = cu3;
+            CHECK_EQ(FileStager::p1_pass_arms(many, thr, 2048), FileStager::p1_pass_arms(lone, thr, 2048));
+            CHECK_EQ(FileStager::p1_pass_arms(many, thr, 2048), n >= thr && n <= 2048);
+            RadBatch beside = many;   /* a decode row beside them: never armed (batches carry none) */
+            beside.n_tok_decode = 1;
+            CHECK(!FileStager::p1_pass_arms(beside, thr, 2048));
+            FileStager fs;
+            const int32_t nl = 43;
+            const std::vector<int32_t> uncut((size_t)nl, 0);
+            const bool armed = FileStager::p1_pass_arms(many, thr, 2048);
+            EpCountsHostProbe::cut(fs, armed, n, uncut, nl, thr, 2048);
+            for (int32_t li = 0; li < nl; ++li) {
+                CHECK_EQ(EpCountsHostProbe::rows(fs, li), n);
+                CHECK_EQ(EpCountsHostProbe::card(fs, li), armed);
+            }
+            EpCountsHostProbe::disarm(fs);
+        }
+}
+
 /* ---- the lent ring ------------------------------------------------------------------------------------------
  *
  * RingLender against a simulated host: loads land and copies pass at random host calls, the host's two reload

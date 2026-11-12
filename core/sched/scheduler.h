@@ -591,7 +591,13 @@ public:
      * together may hold once init took the switch, else 0; and its shutdown line (nothing while off). */
     static constexpr const char* kBatchAdmitEnv = "RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT";
     static constexpr int64_t kBatchAdmitMin = 32, kBatchAdmitMax = 256;
+    /* Above kBatchAdmitMax, up to the chunk C and at most kBatchAdmitMaxP1, only beside prefill Phase 1
+     * (RADIANCE_EXPERIMENTAL_DS41_P1=1): a batch of its threshold's rows or more is then the card path's,
+     * as a lone prompt's chunk of that height is (batch_admit_init). */
+    static constexpr int64_t kBatchAdmitMaxP1 = 2048;
     int64_t batch_admit_rows() const { return batch_rows_; }
+    /* Whether init took it beside the prefix cache (--prefix-resume exact; batch_pc_). */
+    bool    batch_admit_prefix() const { return batch_pc_; }
     void    batch_admit_report() const;
     /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
      * at the whole step budget, or -1; with `all`, every one of them, ascending. */
@@ -988,7 +994,24 @@ private:
      * launch (LCP's admission and its tall checks; the attention, compressor, indexer and Engram ops
      * read each sequence's own rows and state through cu_seqlens and its tables). */
     int64_t batch_rows_ = 0;
+    /* Beside the prefix cache (batch_admit_init; only under --prefix-resume exact): a prompt joins a
+     * batch only where its chunk is the one it takes alone in its step (batch_alone_plan): its whole
+     * remaining prompt from its hit (a snapshot restored, or none), with the snapshot it writes alone,
+     * if any. batch_join_: set around admit_one for a prompt joining a batch (the rows left), which
+     * then refuses, before it takes any block, a chunk that is not that one (the batch ends there and
+     * the prompt is admitted in a later step as before). batch_p1_rows_: Phase 1's threshold when a
+     * batch may reach it (0 otherwise), for the shutdown count of batches the card path computes. */
+    bool    batch_pc_ = false;
+    int64_t batch_join_ = 0;
+    int64_t batch_p1_rows_ = 0;
     int     batch_admit_init(const Config& cfg);
+    /* The chunk request `r`, at its computed tokens, takes alone in its step (plan_chunk at the whole
+     * step's budget, as idle_prefill_checkpoint plans it) and the snapshot it writes there (-1 none). */
+    int64_t batch_alone_plan(const Request& r, int64_t target, int64_t* ckpt) const;
+    /* Whether admitted entry `e` of request `s` is what the prefix-cache case covers: fresh, of a kind
+     * a batch holds, its chunk the alone one and completing its prompt, its planned snapshot the alone
+     * one, at most the batch's rows. */
+    bool    batch_pc_covered(const SchedReq& s, const StepEntry& e, bool fresh) const;
     /* Whether waiting request `s` may join this step's batch of whole prompts, `used` of its rows
      * taken (-1: the step is no such batch), `budget` tokens left: a fresh request that runs whole in
      * the rows left, the chunk admit_one would plan for it the whole prompt with no snapshot. */

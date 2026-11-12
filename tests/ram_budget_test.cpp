@@ -233,3 +233,5 @@ TEST(meminfo_fields_parse_in_bytes) {
     CHECK_EQ(meminfo_field(t, "Cached"), -1);
     CHECK_EQ(meminfo_field("VmRSS:\t  12345 kB\n", "VmRSS"), (int64_t)12345 * 1024);
 }
+
+RAD_TEST_MAIN()

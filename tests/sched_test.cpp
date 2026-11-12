@@ -10186,8 +10186,9 @@ PcRun pc_run(Fixture& f, const std::vector<uint64_t>& ids, int64_t p1_thr = 0) {
 
 /* lcp_fixture at C 2,048 with the prefix cache on (--prefix-resume exact, the A/B's Pc), --max-num-seqs 8;
  * `admit` the switch, `eors` end-of-request snapshots on a 16-token grid (the A/B's Pce-Pcg16). */
-int pc_start(Fixture& f, const char* admit, bool eors, std::string* log = nullptr) {
-    lcp_fixture(f, 2048, 2048);
+int pc_start(Fixture& f, const char* admit, bool eors, std::string* log = nullptr, int64_t C = 2048,
+             int64_t seqs = 8) {
+    lcp_fixture(f, C, std::max<int64_t>(2048, C));
     f.cfg.prefix_cache = true;
     f.cfg.prefix_exact = true;
     if (eors) {
@@ -10195,7 +10196,7 @@ int pc_start(Fixture& f, const char* admit, bool eors, std::string* log = nullpt
         setenv("RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID", "16", 1);
     }
     int rc = 0;
-    const std::string l = info_of([&] { rc = batch_start(f, admit, 8); });
+    const std::string l = info_of([&] { rc = batch_start(f, admit, seqs); });
     unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS");
     unsetenv("RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID");
     if (log) *log = l;
@@ -10341,9 +10342,9 @@ TEST(batch_admission_beside_the_prefix_cache_refuses_a_join_whose_chunk_is_not_i
     CHECK(c[1] == std::make_tuple(896, 304, -1, (int64_t)-1));
 }
 
-/* Refusals and bounds: above 256 rows without Phase 1 (refused, one a step), above 2,048 (refuses to start),
+/* Refusals and bounds: above 256 rows without Phase 1 (refused, one a step), above 4,096 (refuses to start),
  * the prefix cache under --prefix-resume nearest (refused); under Phase 1 at Ba1024 the rows are 1,024
- * (not held below the threshold), at Ba256 still held below it. */
+ * (not held below the threshold), at Ba256 still held below it; Ba4096 at C 2,048 is held to the chunk. */
 TEST(batch_admission_to_the_chunk_is_refused_where_it_is_not_covered) {
     {
         LcpOn lc(2048, 1);
@@ -10357,7 +10358,7 @@ TEST(batch_admission_to_the_chunk_is_refused_where_it_is_not_covered) {
         CHECK(has(err, "taken only beside prefill Phase 1"));
         CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)0);
     }
-    for (const char* bad : { "2049", "4096", "16" }) {
+    for (const char* bad : { "4097", "8192", "16" }) {
         P1Env p1;
         LcpOn lc(2048, 1);
         Fixture f;
@@ -10365,7 +10366,15 @@ TEST(batch_admission_to_the_chunk_is_refused_where_it_is_not_covered) {
         int rc = 0;
         const std::string err = info_of([&] { rc = batch_start(f, bad, 8); });
         CHECK_EQ(rc, (int)RAD_E_INVAL);
-        CHECK(has(err, "or up to 2048 beside prefill Phase 1"));
+        CHECK(has(err, "or up to 4096 beside prefill Phase 1"));
+    }
+    for (const char* held : { "2049", "4096" }) {   /* above C 2,048: held to the chunk, as below it */
+        P1Env p1;
+        LcpOn lc(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        REQUIRE_EQ(batch_start(f, held, 8), RAD_OK);
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)2048);
     }
     {
         P1Env p1;
@@ -10403,6 +10412,123 @@ TEST(batch_admission_to_the_chunk_is_refused_where_it_is_not_covered) {
         const std::string rep = info_of([&] { f.sch.batch_admit_report(); });
         CHECK(has(rep, "outside the covered case: 0"));
         CHECK_EQ(has(rep, "(Phase 1's card path)"), big);
+    }
+}
+
+/* At C 4,096 (RADIANCE_EXPERIMENTAL_DS41_LCP=4096, --checkpoint-interval 4096, Phase 1 on), Ba4096: eight
+ * 512-token prompts fill one 4,096-row step exactly (Phase 1's card path computes it, as a lone 4,096-row
+ * chunk), the ninth (5,000 tokens, above C) ends the batch and runs alone in the chunks it takes off, and the
+ * last two share a step of 200 rows (below the threshold: the CPU path's). Every prompt's chunks and its end
+ * are the same as with the switch off; no step holds more than C rows or anything but whole prompts' rows.
+ * Without Phase 1, Ba4096 at C 4,096 is refused (one a step, as before). */
+TEST(batch_admission_fills_a_4096_row_step_at_c_4096) {
+    const std::vector<int> lens = { 512, 512, 512, 512, 512, 512, 512, 512, 5000, 100, 100 };
+    BaRun off, on;
+    for (const char* admit : { "0", "4096" }) {
+        P1Env p1;
+        LcpOn lc(4096, 1);
+        Fixture f;
+        lcp_fixture(f, 4096, 4096);
+        std::string log;
+        int rc = 0;
+        log = info_of([&] { rc = batch_start(f, admit, 16); });
+        REQUIRE_EQ(rc, RAD_OK);
+        REQUIRE_EQ(f.sch.lcp_rows(), (int64_t)4096);
+        const bool batching = std::strcmp(admit, "0") != 0;
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)(batching ? 4096 : 0));
+        CHECK_EQ(has(log, "batch admission: on (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=4096)"), batching);
+        CHECK_EQ(has(log, "Phase 1's card path computes a batch of 320 rows or more"), batching);
+        CHECK(!has(log, "batch admission: refused"));
+        const std::vector<uint64_t> ids = submit_all(f, lens, 3);
+        (batching ? on : off) = batch_run(f, ids);
+        const BaRun& r = batching ? on : off;
+        for (const BaStep& s : r.steps) {
+            CHECK(s.n_tok <= 4096);
+            if (s.pf > 0) CHECK_EQ(s.dec, 0);
+            if (s.pf > 1) CHECK(!s.cut);
+        }
+        for (uint64_t id : ids) CHECK_EQ(out_of(r, id), (size_t)3);
+        const SchedMetrics m = f.sch.metrics();
+        if (batching) {
+            CHECK_EQ(m.batch_admit_steps, (int64_t)2);
+            CHECK_EQ(m.batch_admit_prompts, (int64_t)10);
+            CHECK_EQ(m.batch_admit_rows, (int64_t)(8 * 512 + 200));
+            CHECK_EQ(m.batch_admit_p1_steps, (int64_t)1);
+            CHECK_EQ(m.batch_admit_outside, (int64_t)0);
+            REQUIRE(!r.steps.empty());
+            const BaStep& a = r.steps[0];
+            CHECK_EQ(a.pf, 8);
+            CHECK_EQ(a.n_tok, (int64_t)4096);
+            CHECK_EQ(a.n_seq, (int64_t)8);
+            CHECK_EQ(a.n_out, (int64_t)8);
+            CHECK_EQ(a.phase, (int)RAD_PHASE_PREFILL);
+            for (size_t i = 0; i < 8 && i < a.e.size(); ++i) CHECK(a.e[i] == BaEntry(ids[i], 0, 512, true));
+            const std::string rep = info_of([&] { f.sch.batch_admit_report(); });
+            CHECK(has(rep, "outside the covered case: 0"));
+            CHECK(has(rep, "(Phase 1's card path)"));
+        } else {
+            CHECK_EQ(m.batch_admit_steps, (int64_t)0);
+        }
+    }
+    CHECK(on.chunks == off.chunks);
+    CHECK(on.out == off.out);
+    /* off: 8 + 2 (the 5,000-token prompt's two chunks) + 2 prefill steps; on: 1 + 2 + 1 */
+    CHECK_EQ(ba_prefill_steps(off), 12);
+    CHECK_EQ(ba_prefill_steps(on), 4);
+    {   /* without Phase 1: refused at C 4,096, one prompt a step as before */
+        LcpOn lc(4096, 1);
+        Fixture f;
+        lcp_fixture(f, 4096, 4096);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = batch_start(f, "4096", 16); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(err, "batch admission: refused"));
+        CHECK(has(err, "taken only beside prefill Phase 1"));
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)0);
+    }
+}
+
+/* Beside the prefix cache at C 4,096 (Ba4096, Phase 1, --max-num-seqs 16): the ten prompts behind the
+ * 512-token head share one step of 3,673 rows (more than 2,048), each its suffix from the snapshot at 512 and
+ * the snapshot it writes alone (EORS on the 16-token grid); the hits, the snapshots and every plan equal the
+ * unbatched run's. */
+TEST(batch_admission_beside_the_prefix_cache_at_c_4096_plans_each_prompt_as_alone) {
+    for (const bool eors : { false, true }) {
+        PcRun off, on;
+        for (const char* admit : { "0", "4096" }) {
+            P1Env p1;
+            LcpOn lc(4096, 1);
+            Fixture f;
+            std::string log;
+            REQUIRE_EQ(pc_start(f, admit, eors, &log, 4096, 16), RAD_OK);
+            const bool batching = std::strcmp(admit, "0") != 0;
+            CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)(batching ? 4096 : 0));
+            CHECK_EQ(f.sch.batch_admit_prefix(), batching);
+            CHECK(!has(log, "batch admission: refused"));
+            f.pc.seed(512);
+            f.pc.lin = 512;
+            f.pc.src = 3;
+            const std::vector<uint64_t> ids = submit_all(f, kPcPrompts, 20);
+            (batching ? on : off) = pc_run(f, ids);
+            const SchedMetrics m = f.sch.metrics();
+            if (batching) {
+                CHECK_EQ(m.batch_admit_steps, (int64_t)1);
+                CHECK_EQ(m.batch_admit_prompts, (int64_t)kPcPrompts.size());
+                CHECK_EQ(m.batch_admit_hits, (int64_t)kPcPrompts.size());
+                CHECK_EQ(m.batch_admit_snapshots, (int64_t)(eors ? 4 : 0));
+                CHECK_EQ(m.batch_admit_p1_steps, (int64_t)1);
+                CHECK_EQ(m.batch_admit_outside, (int64_t)0);
+                CHECK_EQ(m.batch_admit_join_refused, (int64_t)0);
+            }
+        }
+        CHECK_EQ(off.bad, 0);
+        CHECK_EQ(on.bad, 0);
+        CHECK_EQ(off.pf_rows.size(), kPcPrompts.size());
+        CHECK(on.pf_rows == std::vector<int64_t>({ 3673 }));
+        CHECK(on.pf_seqs == std::vector<int>({ 10 }));
+        CHECK(on.chunks == off.chunks);
+        CHECK(on.decode_snaps == off.decode_snaps);
+        CHECK(on.end == off.end);
     }
 }
 

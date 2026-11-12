@@ -195,8 +195,8 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
 }
 
 /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=<R> (batch_rows_, scheduler.h): R in [kBatchAdmitMin,
- * kBatchAdmitMax], or up to kBatchAdmitMaxP1 beside prefill Phase 1, 0 or unset off; any other value
- * refuses to start. Taken only where prefill alone already gives each prompt a step of its own and
+ * kBatchAdmitMax], or up to kBatchAdmitMaxP1 (4096) beside prefill Phase 1, 0 or unset off; any other
+ * value refuses to start; the rows are then held to the chunk C. Taken only where prefill alone already gives each prompt a step of its own and
  * large-chunk prefill's admission holds every op to one form at every pass height up to the chunk (each
  * row's bytes launched alone, 16 at a time and whole: ds41_mxfp4_device_check `lcp`), the
  * row-independence a step of several prompts stands on; refused, with the reason, where the scheduler
@@ -224,6 +224,13 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
  * the ones it leaves alone, at the same positions with the same bytes; which hit a prompt finds still
  * depends on what the cache holds when it is admitted, as it does without the switch whenever requests
  * overlap (the exact resume's grid argument, --prefix-resume exact, covers each). */
+/* Above 2,048 rows (C 4096) a batch stands on the argument it stands on at 2,048: LCP's admission holds
+ * every op to one form at every height up to C (ds41_mxfp4_device_check `lcp 4096`, LCP_CHECK_C), T1 holds
+ * the twin row's bytes to the decode band's at every M up to kTwinMaxRows (`p1 4096`, P1_CHECK_M), and the
+ * stager arms a pass by its rows up to the chunk alone (p1_pass_arms). The bound is their common one. */
+static_assert(Scheduler::kBatchAdmitMaxP1 == kEpRouteLcpMax && Scheduler::kBatchAdmitMaxP1 == ds41p1::kTwinMaxRows,
+              "batch admission's bound beside Phase 1 is LCP's largest chunk and the P1 twin's checked height");
+
 int Scheduler::batch_admit_init(const Config& cfg) {
     batch_rows_ = 0;
     batch_pc_ = false;

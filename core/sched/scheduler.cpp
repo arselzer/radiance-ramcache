@@ -195,8 +195,8 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
 }
 
 /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=<R> (batch_rows_, scheduler.h): R in [kBatchAdmitMin,
- * kBatchAdmitMax], or up to kBatchAdmitMaxP1 beside prefill Phase 1, 0 or unset off; any other value
- * refuses to start. Taken only where prefill alone already gives each prompt a step of its own and
+ * kBatchAdmitMax], or up to kBatchAdmitMaxP1 (4096) beside prefill Phase 1, 0 or unset off; any other
+ * value refuses to start; the rows are then held to the chunk C. Taken only where prefill alone already gives each prompt a step of its own and
  * large-chunk prefill's admission holds every op to one form at every pass height up to the chunk (each
  * row's bytes launched alone, 16 at a time and whole: ds41_mxfp4_device_check `lcp`), the
  * row-independence a step of several prompts stands on; refused, with the reason, where the scheduler
@@ -224,13 +224,33 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
  * the ones it leaves alone, at the same positions with the same bytes; which hit a prompt finds still
  * depends on what the cache holds when it is admitted, as it does without the switch whenever requests
  * overlap (the exact resume's grid argument, --prefix-resume exact, covers each). */
+/* Above 2,048 rows (C 4096) a batch stands on the argument it stands on at 2,048: LCP's admission holds
+ * every op to one form at every height up to C (ds41_mxfp4_device_check `lcp 4096`, LCP_CHECK_C), T1 holds
+ * the twin row's bytes to the decode band's at every M up to kTwinMaxRows (`p1 4096`, P1_CHECK_M), and the
+ * stager arms a pass by its rows up to the chunk alone (p1_pass_arms). The bound is their common one. */
+static_assert(Scheduler::kBatchAdmitMaxP1 == kEpRouteLcpMax && Scheduler::kBatchAdmitMaxP1 == ds41p1::kTwinMaxRows,
+              "batch admission's bound beside Phase 1 is LCP's largest chunk and the P1 twin's checked height");
+
 int Scheduler::batch_admit_init(const Config& cfg) {
     batch_rows_ = 0;
     batch_pc_ = false;
+    batch_split_ = false;
     batch_join_ = 0;
     batch_p1_rows_ = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT (batch_split_, scheduler.h): 1 on, 0 / unset / empty off. */
+    const char* sv = std::getenv(kBatchSplitEnv);
+    const bool split = sv && *sv && std::strcmp(sv, "0");
+    if (split && std::strcmp(sv, "1")) {
+        RAD_ERR("%s=%s: 1 is on, 0 / unset / empty off", kBatchSplitEnv, sv);
+        return RAD_E_INVAL;
+    }
     const char* v = std::getenv(kBatchAdmitEnv);
-    if (!v || !*v || !std::strcmp(v, "0")) return RAD_OK;
+    if (!v || !*v || !std::strcmp(v, "0")) {
+        if (split)
+            RAD_WARN("batch split: refused (%s=1) -- it needs batch admission (%s) beside the prefix cache; "
+                     "nothing changes", kBatchSplitEnv, kBatchAdmitEnv);
+        return RAD_OK;
+    }
     char* end = nullptr;
     const long long n = std::strtoll(v, &end, 10);
     if (end == v || *end || n < kBatchAdmitMin || n > kBatchAdmitMaxP1) {
@@ -289,6 +309,8 @@ int Scheduler::batch_admit_init(const Config& cfg) {
     if (!why.empty()) {
         RAD_WARN("batch admission: refused (%s=%s) -- %s; prompts are admitted one a step as before",
                  kBatchAdmitEnv, v, why.c_str());
+        if (split)
+            RAD_WARN("batch split: refused (%s=1) -- batch admission is off; nothing changes", kBatchSplitEnv);
         batch_p1_rows_ = 0;
         return RAD_OK;
     }
@@ -309,6 +331,18 @@ int Scheduler::batch_admit_init(const Config& cfg) {
                  "alone, if any, at the same position; a prompt whose hit leaves another chunk (a shared head "
                  "to snapshot on its way, more than the rows left) ends the batch, before it takes a block, "
                  "and is admitted as before; the shutdown line counts what fell outside (0)");
+    if (split && !batch_pc_)
+        RAD_WARN("batch split: refused (%s=1) -- it acts beside the prefix cache only (--prefix-resume exact), "
+                 "where a prompt's chunk may end at a snapshot before its end; nothing changes", kBatchSplitEnv);
+    else if (split) {
+        batch_split_ = true;
+        RAD_INFO("batch split: on (%s=1) -- a prompt's chunk that ends before its prompt does, at the snapshot "
+                 "it writes alone there (a shared head's keep point), joins or opens a batch, and so does a "
+                 "running prompt's next chunk, each only where it is the chunk the prompt takes alone in its "
+                 "step with the snapshot it writes alone: every prompt's chunk boundaries and snapshot "
+                 "positions are the unbatched run's; two entries of a step writing one snapshot write it once",
+                 kBatchSplitEnv);
+    }
     return RAD_OK;
 }
 
@@ -368,6 +402,10 @@ void Scheduler::shared_head_report() const {
              (long long)m.shared_head_keeps, (long long)m.shared_head_snapshots,
              (long long)m.prefill_end_published, (long long)(sh_floor_ > 0 ? sh_floor_ : kSharedHeadMin),
              sh_floor_ > 0 ? ", RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD" : "");
+    RAD_INFO("shared heads: %lld keep points set back by a refused batch join (looked up again), %lld passed "
+             "with no snapshot (refused or dropped), %lld snapshots left to another entry of the step writing "
+             "the same one", (long long)m.shared_head_keeps_redone, (long long)m.shared_head_keep_missed,
+             (long long)m.shared_head_snapshot_shared);
 }
 
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
@@ -1294,6 +1332,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.ckpt_src = -1;
     s.hit_attn = 0;
     s.hit_owed = false;
+    s.keep_owed = false;
     s.hit_eors = false;
     /* Slots are reused: a request that inherited `restore_waited` would never wait for a deferred
      * release and its restore would be cut. */
@@ -1671,10 +1710,13 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
      * StepEntry::consumer_ckpt, at the chunk's end); the one at the target is whole
      * (consumer_skip.h). Counted only with the prefix cache on: without it the store refuses every
      * snapshot anyway (a model with linear state still proposes them). */
+    const int64_t q = std::max<int64_t>(geo_.quantum, 1);
+    const bool at_keep = r.checkpoint_at > 0 && pos == r.checkpoint_at / q * q;
     const bool below = e.consumer_end > 0 && !consumer_checkpoint_complete(pos, e.consumer_end);
     if (below && !(e.consumer_ckpt > 0 && pos == e.consumer_ckpt &&
                    pos == (int64_t)e.ctx_len + tok + 1)) {
         if (cfg_.prefix_cache) ++m_.consumer_ckpt_dropped;
+        if (cfg_.prefix_cache && at_keep) ++m_.shared_head_keep_missed;
         return;
     }
     int32_t cs = -1;
@@ -1688,7 +1730,19 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
     const bool eors = eors_ && pos >= (int64_t)r.prompt.size();
     const int rc = eors ? pc_->reserve_eors_checkpoint(r, pos, &cs)
                         : pc_->reserve_checkpoint(r, pos, &cs);
-    if (rc < 0 || cs < 0) return;
+    if (rc < 0 || cs < 0) {
+        if (!eors && at_keep) ++m_.shared_head_keep_missed;
+        return;
+    }
+    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT: two prompts of one step computing the same head reserve
+     * the same snapshot (the cache keys it by the tokens before it, so its bytes are the same either
+     * way); the entry already in the step writes it, this one leaves it. */
+    if (batch_split_)
+        for (const StepEntry& o : plan_.e)
+            if (o.ckpt_slot == cs) {
+                if (!eors && at_keep) ++m_.shared_head_snapshot_shared;
+                return;
+            }
     e.ckpt_tok = tok;
     e.ckpt_slot = cs;
     e.ckpt_eors = eors;
@@ -1697,8 +1751,7 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
     if (below) ++m_.consumer_ckpt_whole;
     if (eors) ++m_.eors_reserved;
     /* One at the request's keep point (Request::checkpoint_at on the quantum): a shared head's. */
-    const int64_t q = std::max<int64_t>(geo_.quantum, 1);
-    if (!eors && r.checkpoint_at > 0 && pos == r.checkpoint_at / q * q) ++m_.shared_head_snapshots;
+    if (!eors && at_keep) ++m_.shared_head_snapshots;
 }
 
 int Scheduler::fail_prefilling(const char* why) {
@@ -2355,6 +2408,20 @@ bool Scheduler::batch_pc_covered(const SchedReq& s, const StepEntry& e, bool fre
     return alone == e.n_tokens && ck == (s.pending_ckpt > 0 ? s.pending_ckpt : -1);
 }
 
+bool Scheduler::batch_split_covered(const SchedReq& s, const StepEntry& e, int64_t ckpt) const {
+    if (!batch_split_ || !s.req || !e.is_prefill || e.n_spec != 0) return false;
+    const Request& r = *s.req;
+    if (r.state == ReqState::Preempted || r.media || r.score || r.embed || r.token_scores || r.lora_slot >= 0 ||
+        !r.plugin_words.empty())
+        return false;
+    if ((int64_t)e.ctx_len != (int64_t)r.n_computed || e.n_tokens <= 0 || e.n_tokens > batch_rows_) return false;
+    /* Within its prompt (a chunk past it is a preempted request's recompute of its output). */
+    if ((int64_t)e.ctx_len + e.n_tokens > (int64_t)r.prompt.size()) return false;
+    int64_t ck = -1;
+    const int64_t alone = batch_alone_plan(r, s.seq_len(), &ck);
+    return alone == e.n_tokens && ck == (ckpt > 0 ? ckpt : -1);
+}
+
 bool Scheduler::batch_whole(const SchedReq& s, bool fresh) {
     if (!fresh || !s.req) return false;
     const Request& r = *s.req;
@@ -2380,6 +2447,16 @@ void Scheduler::batch_admit_report() const {
                  (long long)m.batch_admit_join_refused, (long long)m.batch_admit_outside);
     else
         RAD_INFO("batch admission: outside the covered case: %lld", (long long)m.batch_admit_outside);
+    if (batch_pc_)
+        RAD_INFO("batch admission: prefill-only steps closed by: nothing more waiting %lld, the rows left %lld, "
+                 "a chunk not the one it takes alone %lld, a first entry no batch holds %lld, --max-num-seqs %lld",
+                 (long long)m.batch_close_waiting, (long long)m.batch_close_rows, (long long)m.batch_close_alone,
+                 (long long)m.batch_close_opener, (long long)m.batch_close_seqs);
+    if (batch_split_)
+        RAD_INFO("batch split: %lld joins with a chunk ending before their prompt's end, %lld batches opened by a "
+                 "running prompt's next chunk, %lld joins left for a step because another entry snapshots their "
+                 "head (%s=1)", (long long)m.batch_split_joins, (long long)m.batch_split_opens,
+                 (long long)m.batch_split_head_waits, kBatchSplitEnv);
 }
 
 /* ------------------------------------------------------------------ admission */
@@ -2588,7 +2665,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         const int64_t head_min = sh_floor_ > 0 ? sh_floor_ : kSharedHeadMin;
         if (geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= head_min) {
             r.checkpoint_at = h.branch_at;
-            ++m_.shared_head_keeps;
+            s.keep_owed = true;   /* counted once, when admitted (SchedMetrics::shared_head_keeps) */
             RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; a snapshot there",
                       (unsigned long long)r.id, (long long)h.branch_at);
         }
@@ -2634,8 +2711,22 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     if (batch_join_ > 0 && !r.embed && want > 0) {
         int64_t ck_alone = -1;
         const int64_t alone = batch_alone_plan(r, target, &ck_alone);
-        join_refused = want != alone || ckpt != ck_alone || r.n_computed + want != target ||
-                       want > batch_join_;
+        /* Under RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT the chunk may end before the prompt does: at the
+         * snapshot it writes alone there. */
+        join_refused = want != alone || ckpt != ck_alone ||
+                       (!batch_split_ && r.n_computed + want != target) || want > batch_join_;
+        batch_join_rows_ = join_refused && alone > batch_join_;
+        /* Nor a keep point another entry of this step already snapshots (the same tokens before it): the
+         * prompt would compute that head again beside it, where a step later it resumes from it. */
+        if (!join_refused && batch_split_ && ckpt > 0 && ckpt < target)
+            for (const StepEntry& o : plan_.e)
+                if (o.req && o.ckpt_slot >= 0 && o.ckpt_tok >= 0 &&
+                    (int64_t)o.ctx_len + o.ckpt_tok + 1 == ckpt && (int64_t)o.req->prompt.size() >= ckpt &&
+                    std::equal(r.prompt.begin(), r.prompt.begin() + ckpt, o.req->prompt.begin())) {
+                    join_refused = true;
+                    ++m_.batch_split_head_waits;
+                    break;
+                }
     }
     if (join_refused)                                       rc = RAD_E_FULL;
     else if (want <= 0)                                     rc = RAD_E_FULL;
@@ -2654,6 +2745,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     if (rc < 0) {
         if (join_refused) {
             ++m_.batch_admit_join_refused;
+            if (s.keep_owed && r.checkpoint_at != keep_before) {
+                ++m_.shared_head_keeps_redone;
+                s.keep_owed = false;
+            }
             r.checkpoint_at = keep_before;
             /* Every hit goes back, an attention-only one too: the next attempt looks up afresh, as
              * the prompt's first attempt without the switch would. */
@@ -2692,6 +2787,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
             }
         }
         s.hit_owed = false;
+    }
+    if (s.keep_owed) {
+        ++m_.shared_head_keeps;
+        s.keep_owed = false;
     }
 
     if (s.card < 0) { s.card = free_cards_.back(); free_cards_.pop_back(); }
@@ -3100,6 +3199,7 @@ replan:
     /* ---------------------------------------------------------- running requests first */
     /* Continuous batching: requests already holding blocks are served before new ones are
      * admitted, so new work never preempts work half done. */
+    int64_t run_pf_ckpt = -1;   /* the snapshot the step's first entry, a running prefill chunk, plans */
     for (size_t i = 0; i < running_.size(); ) {
         if ((int64_t)plan_.e.size() >= cfg_.max_seqs || budget <= 0) break;
 
@@ -3278,6 +3378,7 @@ replan:
         /* The checkpoint is the state after the chunk's token at `ckpt`: its last, where the split
          * put the interval boundary there, or inside it for a window snapshot (plan_chunk). */
         if (ckpt > 0) reserve_ckpt(e, r, ckpt, (int32_t)(ckpt - r.n_computed - 1));
+        if (prefill && plan_.e.empty()) run_pf_ckpt = ckpt;   /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT */
         /* End-of-request snapshots: a decode row that completes a grid position past the prompt
          * snapshots the state after it (eors_position). Speculation is refused with the switch,
          * so the row is the entry's only one and its position the host's. */
@@ -3309,6 +3410,23 @@ replan:
         int64_t batch_used = -1;
         int32_t batch_n = 0;
         int64_t batch_hits = 0, batch_snaps = 0;   /* the batch's restores and snapshots (prefix cache) */
+        /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT: a running prompt's next chunk, the step's only entry,
+         * opens a batch where it is the chunk the prompt takes alone with the snapshot it writes alone
+         * (batch_split_covered). */
+        bool batch_opened_running = false;
+        if (batch_split_ && plan_.e.size() == 1 && plan_.e[0].is_prefill) {
+            const StepEntry& e0 = plan_.e[0];
+            const SchedReq& s0 = *reqs_[(size_t)e0.slot];
+            if (batch_split_covered(s0, e0, run_pf_ckpt)) {
+                batch_used = e0.n_tokens;
+                batch_hits = e0.ckpt_restore >= 0;
+                batch_snaps = e0.ckpt_slot >= 0;
+                batch_opened_running = true;
+            }
+        }
+        /* Why a prefill-only step beside the prefix cache stopped taking prompts (the shutdown line). */
+        enum class Close { Waiting, Rows, Alone, Opener, Seqs } close = Close::Waiting;
+        const size_t pf_before = plan_.e.size();
         while (at < waiting_.size() &&
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
             /* A step planned for one prefill holds that one (span_now_ above). */
@@ -3319,7 +3437,12 @@ replan:
              * for whole prompts admitted together into a step of nothing else (batch_fits; never
              * with the switch off). */
             const bool batched = prefill_alone_ && !plan_.e.empty();
-            if (batched && !batch_fits(s, batch_used, budget)) break;
+            if (batched && !batch_fits(s, batch_used, budget)) {
+                close = batch_used < 0 ? Close::Opener
+                        : std::min<int64_t>(batch_rows_ - batch_used, budget) < std::max<int64_t>(geo_.quantum, 1)
+                            ? Close::Rows : Close::Alone;
+                break;
+            }
             const bool fresh = s.req->state != ReqState::Preempted && s.req->n_computed == 0;
             /* Generation reserves one position after the prompt. An embedding consumes just
              * the prompt, so its exact context boundary fits without a generation slot.
@@ -3351,6 +3474,8 @@ replan:
                                      areserve);
             batch_join_ = 0;
             if (as == kAdmitWait) { ++at; continue; }
+            if (as < 0 && batched) close = batch_join_rows_ ? Close::Rows : Close::Alone;
+            batch_join_rows_ = false;
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
              * Fail it (spec §17) and ask the next request, instead of parking the step loop. */
@@ -3412,8 +3537,12 @@ replan:
                 /* Beside the prefix cache: the chunk it takes alone, finishing its prompt from its hit
                  * (batch_pc_covered); without it, the whole prompt from 0 with no snapshot, as before. */
                 const StepEntry& pe = plan_.e.back();
+                /* Under RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT also a fresh prompt's chunk that ends at
+                 * the snapshot it writes alone before its prompt's end (batch_split_covered). */
+                const bool split_chunk = batch_pc_ && batch_split_ && fresh && !batch_pc_covered(s, pe, fresh) &&
+                                         batch_split_covered(s, pe, s.pending_ckpt);
                 const bool whole = batch_pc_
-                    ? batch_pc_covered(s, pe, fresh)
+                    ? batch_pc_covered(s, pe, fresh) || split_chunk
                     : batch_whole(s, fresh) && pe.ckpt_restore < 0 && pe.ckpt_slot < 0 &&
                           s.sched_tokens <= batch_rows_;
                 if (!batched) {
@@ -3423,6 +3552,7 @@ replan:
                 } else if (whole && batch_used + s.sched_tokens <= batch_rows_) {
                     batch_used += s.sched_tokens;
                     ++batch_n;
+                    if (split_chunk) ++m_.batch_split_joins;
                     batch_hits += pe.ckpt_restore >= 0;
                     batch_snaps += pe.ckpt_slot >= 0;
                 } else {
@@ -3435,6 +3565,25 @@ replan:
                 }
             }
         }
+        if (batch_pc_ && batch_rows_ > 0 && !plan_.e.empty()) {
+            bool pf_only = true;
+            for (const StepEntry& e : plan_.e) pf_only = pf_only && e.is_prefill;
+            if (pf_only) {
+                if ((int64_t)plan_.e.size() >= cfg_.max_seqs && close == Close::Waiting) close = Close::Seqs;
+                else if (budget <= 0 && close == Close::Waiting) close = Close::Rows;
+                /* A step whose only entry no batch holds closes at it, whatever is waiting. */
+                if (plan_.e.size() == 1 && pf_before == 1 && !batch_opened_running && at < waiting_.size())
+                    close = Close::Opener;
+                switch (close) {
+                    case Close::Waiting: ++m_.batch_close_waiting; break;
+                    case Close::Rows:    ++m_.batch_close_rows;    break;
+                    case Close::Alone:   ++m_.batch_close_alone;   break;
+                    case Close::Opener:  ++m_.batch_close_opener;  break;
+                    case Close::Seqs:    ++m_.batch_close_seqs;    break;
+                }
+            }
+        }
+        if (batch_n > 0 && batch_opened_running) ++m_.batch_split_opens;
         if (batch_n > 0) {
             /* A step of batch_n + 1 whole prompts (the counters' and the debug line's view). */
             ++m_.batch_admit_steps;

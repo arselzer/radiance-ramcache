@@ -144,8 +144,8 @@ tokens are admitted as before and gain nothing.
 
 **Batch prefill up to the chunk, beside the prefix cache** (`claude/ds41-batch-prefill`; not yet measured on the
 cards). For offline batch jobs of many 600-900-token prompts behind a few shared system prompts, where each prompt
-alone in its prefill step spends most of the wall time there, `..._BATCH_ADMIT=N` takes N up to the chunk C (2048)
-beside prefill Phase 1 (`..._DS41_P1=1`): a shared step of Phase 1's threshold (320) or more rows is then the card
+alone in its prefill step spends most of the wall time there, `..._BATCH_ADMIT=N` takes N up to the chunk C (2048,
+or 4096 at `..._LCP=4096`) beside prefill Phase 1 (`..._DS41_P1=1`): a shared step of Phase 1's threshold (320) or more rows is then the card
 path's, as a lone chunk of that height is (`FileStager::p1_pass_arms` reads the pass's rows and kind, not its
 sequences; T1 holds the twin row's bytes to the decode band's at every height, and the CPU path's too). N of 256 or
 less is as before (held below the threshold), and N above 256 without P1 is refused. With the prefix cache on
@@ -160,9 +160,15 @@ batch of 320 rows or more` and `batch admission: beside the prefix cache (--pref
 `batch admission: K of those steps of 320 rows or more (Phase 1's card path)`, `... H batched prompts restored a
 snapshot and S wrote one; J joins refused ...; outside the covered case: 0` (an arm counting more is set aside).
 Arm parts e.g. `...-Lc2048-P1-...-Pf-N32-C32-Ba2048-Pc-Pce-Pcg16-...` (`BaN` up to 2048 with `P1`, at most the
-`Lc` chunk; beside `Pc` / `Pc0`, not `Pcn`). Gates for a window: replies and `Kh` hashes against the same arm
-without `Ba`. Tests `sched_test` `batch_admission_beside_the_prefix_cache_*`,
-`batch_admission_to_the_chunk_is_refused_where_it_is_not_covered`, `p1_stager_test`
+`Lc` chunk; beside `Pc` / `Pc0`, not `Pcn`). At C 4096 (`claude/ds41-batch4096`; not yet measured on the cards) a
+step holds up to 4,096 rows, twice the prompts per ~1.7 s card-path step: `...-M4096-...-Lc4096-P1-...-Pf-N32-C32-
+Ba4096-Pc-Pce-Pcg16-Pci4096-...` with the 4,096-token chunks' companions (`M4096`, `Pci4096`, card checks with
+`LCP_CHECK_C=4096`, `P1_CHECK_M` 4096, `bal` through M4096 for `Mb`); `BaN` above `Lc` is skipped, and the scheduler
+holds N to the chunk C and refuses N above 4096 at startup. The argument is the one at 2,048: LCP's `lcp 4096` check,
+T1 at every M up to 4096 (`p1 4096`), arming by rows alone. Gates for a window: replies and `Kh` hashes against the
+same arm without `Ba`. Tests `sched_test` `batch_admission_beside_the_prefix_cache_*`,
+`batch_admission_to_the_chunk_is_refused_where_it_is_not_covered`, `batch_admission_fills_a_4096_row_step_at_c_4096`,
+`batch_admission_beside_the_prefix_cache_at_c_4096_plans_each_prompt_as_alone`, `p1_stager_test`
 `p1_arms_a_pass_of_several_prompts_as_a_lone_chunk_of_its_rows`, `ab_window_ba_test.sh`.
 
 **Shared-head snapshots** (`RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=N`, part `Pch` / `PchN`, beside `Pc` / `Pc0`;
@@ -188,6 +194,34 @@ arm; the cost is one extra prefill step for each prompt that writes a head snaps
 skipped by every prompt after it. Tests `sched_test` `shared_heads_*`, `mem_test`
 `a_hit_reports_the_shared_head_from_every_entry_of_its_chain`, `shared_head_pick_prefers_the_most_ways_then_the_deepest`,
 `ab_window_ba_test.sh` (part 4).
+
+**Batched keep points and running chunks** (`RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1`, part `Bs`, beside `Ba` and
+`Pc` / `Pc0`; `claude/ds41-batch4096`; not yet measured on the cards). Window ab-20261112T142114Z (NL-to-SQL,
+`...-Pc-Pch64-L<pool>-Pf-N<n>-C<n>-Ba2048`) took 124 prefill steps for 256 prompts against 38 for 128. Cause
+(`core/sched/scheduler.cpp`, `admit_one`'s join check and `step()`'s batch opener): beside the prefix cache a prompt
+joined a batch only with a chunk finishing its prompt, so a prompt splitting at a shared head's keep point ran
+`[hit, head)` alone and then its suffix alone (a running prompt's chunk opened no batch), two steps of their own
+for each keep, and each refused join ended its batch. With the switch a chunk that ends at the snapshot the prompt
+writes alone before its end joins or opens a batch, and so does a running prompt's next chunk, each only where it is
+the chunk the prompt takes alone from where it stands (`batch_alone_plan`) with the snapshot it writes alone; a
+join whose keep point another entry of the step already snapshots waits a step and resumes there instead. Every
+prompt's chunk boundaries and snapshot positions stay the unbatched run's (a shared step runs every layer on every
+row, uncut). Host model of the batch (`sched_test` `batch_split_shares_steps_and_keeps_every_prompt_s_chunks`):
+128 / 256 prompts sent at once at N128 / N256, 24 -> 10 and 30 -> 15 prefill steps against `Ba2048` alone (136 / 264
+without batching), the same keep points (8) each ending in its snapshot, the resumed tokens within 0.4%, and every
+prompt's chunks the ones `plan_chunk` gives it alone (each step's close cause: before, 16 steps closed at a first
+entry no batch held; with the switch none). The shared-heads counters were also wrong: `shared_heads.keeps` counted every lookup, and a refused join
+set its keep back and counted it again at the next attempt (43 refused joins at N256, against 69 keeps / 39
+snapshots); keeps are now counted once per admission. Shutdown lines `shared heads: R keep points set back by a
+refused batch join ..., M passed with no snapshot ..., S snapshots left to another entry of the step ...`,
+`batch admission: prefill-only steps closed by: nothing more waiting W, the rows left R, a chunk not the one it
+takes alone A, a first entry no batch holds O, --max-num-seqs Q` (every Ba arm beside Pc) and `batch split: J joins
+..., K batches opened by a running prompt's next chunk, H joins left for a step ...`; startup line `batch split:
+on (RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1)`, checked both ways. Gates for a window: replies and `Kh` hashes
+against the same arm without `Bs`. The pool's evictions at `L36864` (4,644 entries, prefix_hit_rate 0.660 against
+0.668 at `L147456` without any) cost about 1% of the hit rate: the evicted entries are questions' tails, while the
+shared heads' entries stay held by the running sequences that adopted them (`evict_lru` skips them); no policy
+change. Tests also `ab_window_ba_test.sh` (Bs).
 In the paragraphs from here to the two-batch overlap one, every 4- and 8-stream arm also ran
 `..._PREFETCH_MULTIROW=N` (parts `Pmr4` / `Pmr8`) with `--max-model-len 1024` (`L1024`), sending the 8 held-out
 requests N at a time. A total at N streams is N times the mean of the requests' `predicted_per_second`

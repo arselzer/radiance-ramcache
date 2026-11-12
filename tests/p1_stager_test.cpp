@@ -1285,6 +1285,32 @@ TEST(p1_arms_a_pass_of_several_prompts_as_a_lone_chunk_of_its_rows) {
             }
             EpCountsHostProbe::disarm(fs);
         }
+    /* At C 4,096 (Ba4096 beside Lc4096): a batch of more than 2,048 rows arms exactly as a lone chunk of
+     * its rows, up to the chunk, and runs uncut; at C 2,048 nothing above 2,048 rows arms. */
+    const int32_t cu4[5] = { 0, 1024, 2048, 3072, 4096 };
+    for (int64_t thr : { 17, 320 })
+        for (int64_t n : { 2048, 2049, 3673, 4096, 4097 }) {
+            RadBatch lone{};
+            lone.phase = RAD_PHASE_PREFILL;
+            lone.n_tok = n;
+            lone.n_seq = 1;
+            RadBatch many = lone;
+            many.n_seq = 4;
+            many.cu_seqlens = cu4;
+            CHECK_EQ(FileStager::p1_pass_arms(many, thr, 4096), FileStager::p1_pass_arms(lone, thr, 4096));
+            CHECK_EQ(FileStager::p1_pass_arms(many, thr, 4096), n >= thr && n <= 4096);
+            CHECK_EQ(FileStager::p1_pass_arms(many, thr, 2048), n <= 2048);
+            FileStager fs;
+            const int32_t nl = 43;
+            const std::vector<int32_t> uncut((size_t)nl, 0);
+            const bool armed = FileStager::p1_pass_arms(many, thr, 4096);
+            EpCountsHostProbe::cut(fs, armed, n, uncut, nl, thr, 4096);
+            for (int32_t li = 0; li < nl; ++li) {
+                CHECK_EQ(EpCountsHostProbe::rows(fs, li), n);
+                CHECK_EQ(EpCountsHostProbe::card(fs, li), armed);
+            }
+            EpCountsHostProbe::disarm(fs);
+        }
 }
 
 /* ---- decode passes on the cards (..._P1_DECODE_ROWS) ------------------------------------------------------

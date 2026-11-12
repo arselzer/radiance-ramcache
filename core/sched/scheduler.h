@@ -157,6 +157,9 @@ struct SchedReq {
      * fit would inflate the prompt and hit totals. */
     int32_t  hit_attn = 0;
     bool     hit_owed = false;
+    /* A keep point (Request::checkpoint_at) a lookup set and admission has not counted yet
+     * (SchedMetrics::shared_head_keeps: once per admitted keep, not per attempt). */
+    bool     keep_owed = false;
     /* That hit resumes from an end-of-request snapshot (CacheHit::ckpt_eors), for the counters
      * (SchedMetrics::eors_hits). */
     bool     hit_eors = false;
@@ -593,12 +596,24 @@ public:
     static constexpr int64_t kBatchAdmitMin = 32, kBatchAdmitMax = 256;
     /* Above kBatchAdmitMax, up to the chunk C and at most kBatchAdmitMaxP1, only beside prefill Phase 1
      * (RADIANCE_EXPERIMENTAL_DS41_P1=1): a batch of its threshold's rows or more is then the card path's,
-     * as a lone prompt's chunk of that height is (batch_admit_init). */
-    static constexpr int64_t kBatchAdmitMaxP1 = 2048;
+     * as a lone prompt's chunk of that height is (batch_admit_init). 4096: large-chunk prefill's admitted
+     * maximum C (kEpRouteLcpMax), which is also the P1 twin row's bound (ds41p1::kTwinMaxRows) and the
+     * height its card check sweeps to (P1_CHECK_M); scheduler.cpp asserts they agree. The rows are still
+     * held to the chunk C init admitted, so at C 2,048 a batch never holds more than 2,048 rows. */
+    static constexpr int64_t kBatchAdmitMaxP1 = 4096;
     int64_t batch_admit_rows() const { return batch_rows_; }
     /* Whether init took it beside the prefix cache (--prefix-resume exact; batch_pc_). */
     bool    batch_admit_prefix() const { return batch_pc_; }
     void    batch_admit_report() const;
+    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1 (batch_split_; off unset or 0), beside batch admission
+     * and the prefix cache (batch_pc_): a prompt's chunk that ends before its prompt does, at the
+     * snapshot it writes alone there (a shared head's keep point), joins or opens a batch as a whole
+     * prompt's does, and so does a running prompt's next chunk, each only where it is the chunk the
+     * prompt takes alone in its step (batch_alone_plan) with the snapshot it writes alone. So every
+     * prompt's chunk boundaries and snapshot positions are the unbatched run's; only which prompts
+     * share a step changes (batch_split_init). */
+    static constexpr const char* kBatchSplitEnv = "RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT";
+    bool    batch_admit_split() const { return batch_split_; }
     /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
      * at the whole step budget, or -1; with `all`, every one of them, ascending. */
     int64_t idle_prefill_checkpoint(const Request& r, int64_t end,
@@ -1012,7 +1027,9 @@ private:
      * the prompt is admitted in a later step as before). batch_p1_rows_: Phase 1's threshold when a
      * batch may reach it (0 otherwise), for the shutdown count of batches the card path computes. */
     bool    batch_pc_ = false;
+    bool    batch_split_ = false;
     int64_t batch_join_ = 0;
+    bool    batch_join_rows_ = false;   /* the last refused join's chunk was past the rows left */
     int64_t batch_p1_rows_ = 0;
     int     batch_admit_init(const Config& cfg);
     /* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (kSharedHeadEnv): the floor once init took it, else 0. */
@@ -1026,6 +1043,10 @@ private:
      * a batch holds, its chunk the alone one and completing its prompt, its planned snapshot the alone
      * one, at most the batch's rows. */
     bool    batch_pc_covered(const SchedReq& s, const StepEntry& e, bool fresh) const;
+    /* Under batch_split_: whether entry `e` of request `s` is the chunk `s` takes alone from its
+     * computed tokens (batch_alone_plan), its planned snapshot `ckpt` the alone one, at most the
+     * batch's rows; it need not finish the prompt (a fresh admission's or a running prompt's). */
+    bool    batch_split_covered(const SchedReq& s, const StepEntry& e, int64_t ckpt) const;
     /* Whether waiting request `s` may join this step's batch of whole prompts, `used` of its rows
      * taken (-1: the step is no such batch), `budget` tokens left: a fresh request that runs whole in
      * the rows left, the chunk admit_one would plan for it the whole prompt with no snapshot. */

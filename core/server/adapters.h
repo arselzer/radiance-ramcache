@@ -133,6 +133,16 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.shared_head_keeps = m.shared_head_keeps;
     o.shared_head_snapshots = m.shared_head_snapshots;
     o.prefill_end_published = m.prefill_end_published;
+    o.shared_head_keeps_redone = m.shared_head_keeps_redone;
+    o.shared_head_keep_missed = m.shared_head_keep_missed;
+    o.shared_head_snapshot_shared = m.shared_head_snapshot_shared;
+    o.batch_admit_steps = m.batch_admit_steps;   o.batch_admit_prompts = m.batch_admit_prompts;
+    o.batch_admit_join_refused = m.batch_admit_join_refused;
+    o.batch_split_joins = m.batch_split_joins;   o.batch_split_opens = m.batch_split_opens;
+    o.batch_split_head_waits = m.batch_split_head_waits;
+    o.batch_close_waiting = m.batch_close_waiting; o.batch_close_rows = m.batch_close_rows;
+    o.batch_close_alone = m.batch_close_alone;     o.batch_close_opener = m.batch_close_opener;
+    o.batch_close_seqs = m.batch_close_seqs;
     o.prefix_publish_held_tokens = m.prefix_publish_held_tokens;
     o.eors_reserved = m.eors_reserved;        o.eors_committed = m.eors_committed;
     o.eors_ahead_withheld = m.eors_ahead_withheld;

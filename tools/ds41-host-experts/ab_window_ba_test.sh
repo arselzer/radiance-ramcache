@@ -5,8 +5,12 @@
 #      the switch 0, the same arm with Ba with 256 and with Ba128 with 128 (prefill alone on in all three),
 #      and with Kld (a KL run) with the switch 0; Ba without Pf, without Lc, at N1, beside Pc, with Kld (the
 #      scheduler refuses it under --kld-record, and a Kld arm never reaches arm()'s startup-line check), at
-#      a row count outside 32-2048, and twice are skipped, each with its reason; Ba beside Pc and Ba2048 beside
+#      a row count outside 32-4096, and twice are skipped, each with its reason; Ba beside Pc and Ba2048 beside
 #      Pc-Pce-Pcg16 with P1 are launched, Ba beside Pcn, Ba1024 without P1 and Ba2048 above Lc1024 are skipped;
+#      Ba4096 beside Lc4096 (M4096, Pci4096) with P1 is launched cold and beside Pc-Pce-Pcg16, Ba4096 above
+#      Lc2048 and Ba4096 at Lc4096 without P1 are skipped; Bs (RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT) beside
+#      Ba2048-Pc is launched with the switch 1 (every other arm 0), Bs without Ba or without Pc is skipped, and
+#      arm()'s Bs row matches the scheduler's "batch split: on" line for a Bs arm only;
 #   2. the startup-line guard arm() applies (its Ba and BaPc rows of the switch table): a Ba arm's pattern
 #      matches the scheduler's line for its N only, and an arm without the part flags any such line;
 #   3. the shutdown gate: an arm whose scheduler counts a batched prompt outside the covered case is set aside;
@@ -41,16 +45,24 @@ PCN=$R-$N8-Pcn-Ba
 BIG=$R-L1024-Pf-N32-C32-Pmr8-Ba2048-Pc-Pce-Pcg16
 BIGNOP1=${R/-P1-Qe64/}-$N8-Ba1024
 BIGLC=${R/Lc2048/Lc1024}-$N8-Ba2048
+R4K=${R/M2048/M4096}; R4K=${R4K/Lc2048/Lc4096}
+BIG4K=$R4K-L1024-Pf-N32-C32-Pmr8-Ba4096-Pci4096
+BIG4KPC=$R4K-L1024-Pf-N32-C32-Pmr8-Ba4096-Pc-Pce-Pcg16-Pci4096
+BIG4KLC=$R-L1024-Pf-N32-C32-Pmr8-Ba4096
+BIG4KNOP1=${R4K/-P1-Qe64/}-L1024-Pf-N32-C32-Pmr8-Ba4096-Pci4096
 KLDOK=$R-$N8-Kld
 KLD=$R-$N8-Ba-Kld
 LOW=$R-$N8-Ba16
-HIGH=$R-$N8-Ba4096
+HIGH=$R4K-$N8-Ba4112-Pci4096
+BS=$R-L1024-Pf-N32-C32-Pmr8-Ba2048-Pc-Pch-Bs
+BSNOBA=$R-$N8-Pc-Bs
+BSNOPC=$R-$N8-Ba-Bs
 TWICE=$R-$N8-Ba-Ba128
 SH=$R-L1024-Pf-N32-C32-Pmr8-Pc-Pch
 SH128=$R-L1024-Pf-N32-C32-Pmr8-Ba2048-Pc-Pch128
 SHNOPC=$R-$N8-Pch
 SHLOW=$R-$N8-Pc-Pch8
-ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $KLD $LOW $HIGH $TWICE $SH $SH128 $SHNOPC $SHLOW"
+ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $BIG4K $BIG4KPC $BIG4KLC $BIG4KNOP1 $BS $BSNOBA $BSNOPC $KLD $LOW $HIGH $TWICE $SH $SH128 $SHNOPC $SHLOW"
 (
   set +u
   log() { echo "LOG: $*"; }
@@ -106,6 +118,25 @@ skipped "$ONE" "Ba needs NK with K above 1" "Ba at N1"
 skipped "$PCN" "Ba with Pcn" "Ba beside Pcn"
 skipped "$BIGNOP1" "Ba1024 above 256 rows needs P1" "Ba1024 without P1"
 skipped "$BIGLC" "Ba2048 above the chunk Lc1024" "Ba2048 above Lc1024"
+# Ba4096 beside Lc4096 (M4096, Pci4096): launched cold and beside Pc-Pce-Pcg16, at chunks of 4,096 under P1
+for spec in "$BIG4K|Ba4096 beside Lc4096" "$BIG4KPC|Ba4096 beside Lc4096 and Pc-Pce-Pcg16"; do
+  IFS='|' read -r a what <<< "$spec"
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "$what not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  has "$what" "$sec" RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT 4096
+  has "$what" "$sec" RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE 1
+  has "$what" "$sec" RADIANCE_EXPERIMENTAL_DS41_LCP 4096
+  has "$what" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1 1
+  has "$what" "$sec" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES 4096
+  if grep -qF -- '--max-num-batched-tokens 4096' <<< "$sec"; then ok "$what: --max-num-batched-tokens 4096"; else bad "$what: no --max-num-batched-tokens 4096"; fi
+  if grep -qF -- '--checkpoint-interval 4096' <<< "$sec"; then ok "$what: --checkpoint-interval 4096"; else bad "$what: no --checkpoint-interval 4096"; fi
+done
+sec=$(section "$BIG4KPC")
+if [[ -n "$sec" ]]; then
+  if grep -qF -- '--prefix-resume exact' <<< "$sec"; then ok "Ba4096: --prefix-resume exact"; else bad "Ba4096: no --prefix-resume exact"; fi
+fi
+skipped "$BIG4KLC" "Ba4096 above the chunk Lc2048" "Ba4096 above Lc2048"
+skipped "$BIG4KNOP1" "Ba4096 above 256 rows needs P1" "Ba4096 at Lc4096 without P1"
 # Ba2048 beside Pc-Pce-Pcg16: the exact resume and the end-of-request snapshots on a 16-token grid
 sec=$(section "$BIG")
 if [[ -n "$sec" ]]; then
@@ -114,9 +145,33 @@ if [[ -n "$sec" ]]; then
   has "Ba2048" "$sec" RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID 16
 fi
 skipped "$KLD" "Ba with a Kld part" "Ba with Kld"
-skipped "$LOW" "a batch holds 32-256 rows, or up to 2048 with P1" "Ba16"
-skipped "$HIGH" "a batch holds 32-256 rows, or up to 2048 with P1" "Ba4096"
+skipped "$LOW" "a batch holds 32-256 rows, or up to the Lc chunk (at most 4096) with P1" "Ba16"
+skipped "$HIGH" "a batch holds 32-256 rows, or up to the Lc chunk (at most 4096) with P1" "Ba4112"
 skipped "$TWICE" "duplicate Ba part" "Ba twice"
+# Bs: the switch 1 beside Ba2048-Pc, 0 in every other arm; skipped without Ba or without Pc
+sec=$(section "$BS")
+if [[ -z "$sec" ]]; then bad "Bs not launched: $(grep -m3 "arm $BS" "$T/loop.txt")"
+else
+  has "Bs" "$sec" RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT 1
+  has "Bs" "$sec" RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT 2048
+fi
+for a in "$BASE" "$BA" "$BIG"; do
+  sec=$(section "$a"); [[ -n "$sec" ]] && has "no Bs part" "$sec" RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT 0
+done
+skipped "$BSNOBA" "Bs needs a Ba part" "Bs without Ba"
+skipped "$BSNOPC" "Bs needs Pc or Pc0" "Bs without Pc"
+row=$(grep -E '^Bs\|' "$W")
+if [[ -z "$row" ]]; then bad "no Bs row in arm()'s switch table"
+else
+  bsline="I batch split: on (RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1) -- a prompt's chunk that ends before ..."
+  for spec in "1|1|a Bs arm's pattern matches the line" "|1|an arm without Bs flags the line"; do
+    IFS='|' read -r ARM_BS want what <<< "$spec"
+    eval "r=\"$row\""
+    IFS='|' read -r part on pat <<< "$r"
+    n=$(grep -cE "$pat" <<< "$bsline")
+    if [[ "$n" == "$want" && "$on" == "$ARM_BS" ]]; then ok "guard: $what"; else bad "guard: $what (pattern '$pat', on '$on', $n matches)"; fi
+  done
+fi
 
 # ---- 2. the startup-line guard: arm()'s Ba row of its switch table, as the heredoc expands it
 row=$(grep -E '^Ba\$\{ARM_BA' "$W")
@@ -135,6 +190,8 @@ else
   guard 128 256 0 "Ba128's pattern does not match the line for 256"
   guard "" 256 1 "an arm without Ba flags the line (the switch set for the window)"
   guard 2048 2048 1 "Ba2048's pattern matches the line for 2048"
+  guard 4096 4096 1 "Ba4096's pattern matches the line for 4096"
+  guard 4096 2048 0 "Ba4096's pattern does not match the line for 2048"
 fi
 # The BaPc row: a Ba arm beside Pc must have the scheduler's prefix-cache line, any other arm must not.
 row=$(grep -E '^BaPc\|' "$W")

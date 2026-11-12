@@ -322,7 +322,19 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         /* Shared heads: keep points set, snapshots written there, prompts published at their
          * prefill's end (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD; 0 without it). */
         o["shared_heads"] = { { "keeps", m.shared_head_keeps }, { "snapshots", m.shared_head_snapshots },
-                              { "prefill_end_published", m.prefill_end_published } };
+                              { "prefill_end_published", m.prefill_end_published },
+                              { "keeps_redone", m.shared_head_keeps_redone },
+                              { "keep_missed", m.shared_head_keep_missed },
+                              { "snapshot_shared", m.shared_head_snapshot_shared } };
+        /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT / _BATCH_SPLIT: batched steps, and why each prefill-only
+         * step beside the prefix cache stopped taking prompts. 0 without the switches. */
+        o["batch_admit"] = { { "steps", m.batch_admit_steps }, { "prompts", m.batch_admit_prompts },
+                             { "joins_refused", m.batch_admit_join_refused },
+                             { "split_joins", m.batch_split_joins }, { "split_opens", m.batch_split_opens },
+                             { "split_head_waits", m.batch_split_head_waits },
+                             { "closed", { { "waiting", m.batch_close_waiting }, { "rows", m.batch_close_rows },
+                                           { "alone", m.batch_close_alone }, { "opener", m.batch_close_opener },
+                                           { "seqs", m.batch_close_seqs } } } };
         /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: computed tokens left unpublished, past the
          * chunks an idle cold prefill cuts alike. 0 without the switch. */
         o["publish_held_tokens"] = (double)m.prefix_publish_held_tokens;

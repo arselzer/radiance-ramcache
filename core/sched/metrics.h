@@ -52,6 +52,18 @@ struct SchedMetrics {
     /* Prompts whose join admit_one refused beside the prefix cache (their hit left another chunk than
      * the batch takes); each ended its batch and was admitted later as before. */
     int64_t batch_admit_join_refused = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT: joins whose chunk ends before their prompt does (at its
+     * keep point), and batches a running prompt's next chunk opened. Then, beside the prefix cache,
+     * why each prefill-only step stopped taking prompts: nothing (more) waiting, the next prompt's
+     * chunk past the rows left, its chunk not the one it takes alone (or writing another snapshot), the
+     * step's first entry not one a batch holds, --max-num-seqs reached. */
+    int64_t batch_split_joins = 0;
+    int64_t batch_split_opens = 0;
+    /* ... and joins refused because another entry of the step snapshots the same head (the prompt
+     * resumes from it a step later instead of computing it beside it). */
+    int64_t batch_split_head_waits = 0;
+    int64_t batch_close_waiting = 0, batch_close_rows = 0, batch_close_alone = 0;
+    int64_t batch_close_opener = 0, batch_close_seqs = 0;
     /* --prefill-interleave: decode-only steps the hold inserted, issued ahead or not; each kept a
      * ready chunk out. */
     int64_t steps_held = 0;
@@ -155,6 +167,14 @@ struct SchedMetrics {
      * and the snapshots written at one; with the switch, prompts published at their prefill's end. */
     int64_t shared_head_keeps = 0;
     int64_t shared_head_snapshots = 0;
+    /* Of the keep points a lookup set: those a refused batch join set back (the next attempt looks up
+     * afresh; keeps counts an admission's keep once, when it is admitted), and those whose prefill
+     * passed the keep with no snapshot there (the store refused it, or the consumer skip dropped it),
+     * and the snapshots an entry left to another entry of the same step writing the same slot (two
+     * prompts computing one head together: written once). */
+    int64_t shared_head_keeps_redone = 0;
+    int64_t shared_head_keep_missed = 0;
+    int64_t shared_head_snapshot_shared = 0;
     int64_t prefill_end_published = 0;
     /* Checkpoints the consumer skip did not write: below their prompt's target, where its cut
      * leaves the last layers' windows incomplete (core/sched/consumer_skip.h), and outside the

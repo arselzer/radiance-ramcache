@@ -1452,7 +1452,13 @@ lowest figure, the holds, the cache's size against its budget and the peak RSS, 
 per-sequence figure can be set. Exact by construction: the limit only decides whether a unit is
 cached; a refused one is read from the container through the mover's windows as before
 (`native_mapped_copy_mover_test` `mapped_slab_growth_limit_*`, `native_file_cache_test`,
-`ram_budget_test`). `..._PREGROW` and `..._CACHE_WARM` run at `serve()` inside the budget. Arm part
+`ram_budget_test`). `..._PREGROW` and `..._CACHE_WARM` run at `serve()` inside the budget. The
+largest other item is the prefix cache's pinned snapshot store (641 slots of 22.59 MiB, 14.14 GiB, at
+N128 with the window's `--max-model-len 147456`); in this mode `--checkpoint-slots auto` sizes it for
+sessions of `..._RAM_BUDGET_SESSION_TOKENS` (default min(--max-model-len, 4096)) instead, plus one
+slot a sequence under `RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD` (startup line `ram budget: the
+snapshot store is sized for N-token sessions`); fewer slots mean fewer resume points, never other
+bytes. Arm part
 `mA` (or `mAN`, a reserve of N MiB, at least 1024), beside `mN` for the cap; an `mA` arm is measured
 only with both `ram budget: on` and `may hold` lines in its server log, a plain arm only with neither
 (`ram_budget_gate`; `ab_window_shared_test.sh`). For the GPU window to settle: replies identical to

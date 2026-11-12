@@ -7,7 +7,7 @@ trap 'rm -rf "$T"' EXIT
 fail=0
 ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
-for fn in serving_cards serving_cards_ok ar_rows_parse ag_rows_parse ar_ag_shared_arm ar_ag_shared_receipt_ok ar_ag_shared_check ar_ag_shared_gate; do
+for fn in serving_cards serving_cards_ok ar_rows_parse ag_rows_parse ar_ag_shared_arm ar_ag_shared_receipt_ok ar_ag_shared_check ar_ag_shared_gate ram_budget_gate; do
   eval "$(sed -n "/^$fn() {/,/^}/p" "$W")"
   declare -F "$fn" >/dev/null || { bad "missing $fn"; exit 1; }
 done
@@ -123,5 +123,46 @@ done
 for a in base base-Ar1280-Ag1024-BT1024 base-Ar1280-BT2048 base-Ar1280-Ag1024-BT4096; do
   grep -qx "SHARED_GATE $a" <<<"$out" && bad "unexpected mixed gate: $a"
 done
+
+# mA (RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET): the acted-check on the server log, and the parts' env.
+R=$T/ram.log
+printf '%s\n' 'I ram budget: on (RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1): the expert RAM cache is sized at serve' \
+  'I ram budget: later 25600 MiB  per-sequence growth' \
+  'I ram budget: the expert RAM cache may hold 151.98 GiB (37.99 GiB a rank on 4 rank(s)) of 192.00 GiB configured; room bound by x' >"$R"
+ram_budget_gate "$R" 1 >/dev/null && ok 'mA with both budget lines is measured' || bad 'mA with both lines refused'
+ram_budget_gate "$R" "" >/dev/null && bad 'no mA part accepted a budget' || ok 'no mA part with budget lines is not measured'
+printf '%s\n' 'I ram budget: on (--expert-ram-cache-total-mib auto): x' 'I ram budget: the expert RAM cache may hold 0 B (0 B a rank on 4 rank(s)) of x' >"$R"
+ram_budget_gate "$R" 1 >/dev/null && ok 'mA with the flag form and a 0 B budget is measured' || bad 'flag form refused'
+sed -n 1p "$R" >"$R.1"; mv "$R.1" "$R"
+why=$(ram_budget_gate "$R" 1) && bad 'mA without the serve line accepted' || ok "mA without the serve line: $why"
+: >"$R"
+ram_budget_gate "$R" "" >/dev/null && ok 'no mA part, no lines: measured' || bad 'plain arm refused'
+ram_budget_gate "$R" 1 >/dev/null && bad 'mA with no lines accepted' || ok 'mA with no lines is not measured'
+ARMS='base base-mA base-mA20480-m196608 base-mA512 base-m65536'
+out=$(
+  set +u
+  log() { echo "LOG $*"; }; power_set() { :; }; power_restore() { :; }
+  ar_rows_gate() { return 0; }; ag_rows_gate() { return 0; }; ar_ag_shared_gate() { return 0; }
+  arm() { echo "ARM $1 CACHE_MIB=$CACHE_MIB ${*:2}"; }
+  HX_THREADS=16 SILU=/dev/null RHOME=$H PROMPTS=$T/prompts.json
+  echo '{}' >"$PROMPTS"
+  CANCEL=/nonexistent/cancel
+  unset RADIANCE_TUNE
+  eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+  s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
+  e=$(awk -v s="$s" 'NR > s && /^done$/ {print NR; exit}' "$W")
+  eval "$(sed -n "${s},${e}p" "$W")"
+)
+line() { grep -E "^ARM $1 " <<<"$out"; }
+[[ $(line base) == *' RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=0'* ]] && ok 'base runs with the budget off' || bad "base: $(line base)"
+[[ $(line base-mA) == *' RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1'* && $(line base-mA) == *'CACHE_MIB=81920 '* &&
+   $(line base-mA) != *RAM_RESERVE_MIB* ]] && ok 'mA: the switch on, the default cap and reserve' || bad "mA: $(line base-mA)"
+[[ $(line base-mA20480-m196608) == *' RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1'* &&
+   $(line base-mA20480-m196608) == *' RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB=20480'* &&
+   $(line base-mA20480-m196608) == *'CACHE_MIB=196608 '* ]] && ok 'mAN with mN: the reserve and the cap' || bad "mAN: $(line base-mA20480-m196608)"
+[[ -z $(line base-mA512) ]] && grep -q 'LOG arm base-mA512: mA512: the reserve is at least 1024 MiB' <<<"$out" &&
+  ok 'a reserve under 1 GiB is skipped' || bad 'mA512 not skipped'
+[[ $(line base-m65536) == *' RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=0'* && $(line base-m65536) == *'CACHE_MIB=65536 '* ]] &&
+  ok 'mN alone: a fixed cache, the budget off' || bad "mN: $(line base-m65536)"
 (( fail )) && exit 1
 echo 'ab_window_shared_test: all checks passed'

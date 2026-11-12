@@ -755,6 +755,9 @@ private:
      * shutdown with this rank's device current and no pass in flight, every lent resident read back once
      * more behind the last pass, before p1_stats_line counts. */
 public:
+    /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET (Engine::ram_budget_serve): ..._CACHE_WARM again, once
+     * serve() has given the cache its budget (at init its growth limit of 0 held the warm at none). */
+    int warm_ram_cache() { return hx_miss_rows_ > 0 && !hx_bg_.empty() ? hx_warm() : 0; }
     bool p1_lend_audits() const { return p1_ && p1_->lending() && p1_tun_.lend_audit; }
     void p1_lend_audit_final();
 private:

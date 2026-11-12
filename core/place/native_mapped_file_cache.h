@@ -108,12 +108,28 @@ private:
     std::atomic<uint64_t> layout_refusals_{0};
     int allocator_device_=0;
     static constexpr size_t guard=64,MiB=1u<<20;
-    static size_t quoted(void*,size_t bytes) noexcept {
+    /* The growth limit (set_growth_limit; RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET): the payload
+     * charge the owners may reach. A quote past it is 0, "unavailable", which the helpers take as
+     * no room: the slab cache then replaces within its slabs (victim_for), the per-entry cache
+     * bypasses, and the mover reads the unit from the container as before. SIZE_MAX (the default)
+     * never binds, so without the mode every quote is the one it always was. */
+    std::atomic<size_t> growth_limit_{SIZE_MAX};
+    std::atomic<size_t> growth_charged_{0};   //charged_, readable without mutex_ (quotes hold the helper's lock)
+    std::atomic<uint64_t> growth_refusals_{0};
+    static size_t limited(void* context,size_t quote) noexcept {
+        auto& self=*static_cast<NativeMappedFileCache*>(context);
+        const size_t limit=self.growth_limit_.load(std::memory_order_relaxed);
+        if(!quote||limit==SIZE_MAX)return quote;
+        const size_t charged=self.growth_charged_.load(std::memory_order_relaxed);
+        if(charged>limit||quote>limit-charged){self.growth_refusals_.fetch_add(1,std::memory_order_relaxed);return 0;}
+        return quote;
+    }
+    static size_t quoted(void* context,size_t bytes) noexcept {
         if(bytes!=GU&&bytes!=DN)return 0;
         const size_t requested=(bytes+63)/64*64+3*guard;
         const size_t pages=(requested+4095)/4096*4096;
         //Conservative no-SVM retained bound (not measured RSS or observed unpin).
-        return (pages+2*MiB-1)/(2*MiB)*(2*MiB)+2*MiB;
+        return limited(context,(pages+2*MiB-1)/(2*MiB)*(2*MiB)+2*MiB);
     }
     using Clock=std::chrono::steady_clock;
     static uint64_t elapsed_ns(Clock::time_point start) noexcept {
@@ -152,7 +168,7 @@ private:
         std::memset(h+guard+bytes,0,usable-bytes);
         std::memset(h+guard+usable,0xbd,guard);
         self.first_free_=r.next;r={base,h+guard,d+guard,bytes,usable,charge,SIZE_MAX};
-        self.logical_+=bytes;self.charged_+=charge;
+        self.logical_+=bytes;self.charged_+=charge;self.growth_charged_.store(self.charged_,std::memory_order_relaxed);
         *out={&r,r.host,r.device,usable,charge};return true;
     }
     static bool free(void* context,const Cache::Allocation& allocation) noexcept {
@@ -171,7 +187,7 @@ private:
         for(size_t k=r.payload;k<r.usable;++k)if(r.host[k]!=0)return false;
         //This is an API invocation; the public free API does not return an unpin status.
         free_api_locked(self,r.base);
-        self.logical_-=r.payload;self.charged_-=r.charge;
+        self.logical_-=r.payload;self.charged_-=r.charge;self.growth_charged_.store(self.charged_,std::memory_order_relaxed);
         r={};r.next=self.first_free_;self.first_free_=index;return true;
     }
     static size_t quoted_slab(void* context,size_t bytes) noexcept {
@@ -179,7 +195,7 @@ private:
         const size_t pair=sizes[0]+sizes[1]+6*guard;
         if(!bytes||bytes%pair||bytes>32*pair)return 0;
         const size_t pages=(bytes+4095)/4096*4096;
-        return (pages+2*MiB-1)/(2*MiB)*(2*MiB)+2*MiB;
+        return limited(context,(pages+2*MiB-1)/(2*MiB)*(2*MiB)+2*MiB);
     }
     static bool allocate_slab(void* context,size_t bytes,size_t cap,Cache::Allocation* out) noexcept {
         auto& self=*static_cast<NativeMappedFileCache*>(context);
@@ -207,7 +223,7 @@ private:
         //Adopt EVERY returned owner, even malformed aliases. The slab helper poisons
         //that result and retires it terminally; no false zero-byte cleanup refund.
         self.first_free_=r.next;r={base,h,d,bytes,bytes,charge,SIZE_MAX};
-        self.logical_+=bytes;self.charged_+=charge;
+        self.logical_+=bytes;self.charged_+=charge;self.growth_charged_.store(self.charged_,std::memory_order_relaxed);
         *out={&r,h,d,bytes,charge};return true;
     }
     static bool free_slab(void* context,const Cache::Allocation& allocation) noexcept {
@@ -223,6 +239,7 @@ private:
         //SlabCache validates every guard before any cleanup. This consumes a public
         //owner handle only; no successful physical-unpin claim/refund/regrowth.
         free_api_locked(self,r.base);self.logical_-=r.payload;self.charged_-=r.charge;
+        self.growth_charged_.store(self.charged_,std::memory_order_relaxed);
         r={};r.next=self.first_free_;self.first_free_=index;return true;
     }
 
@@ -249,6 +266,7 @@ public:
         if(actual_device<0)return RAD_E_INVAL;
         if(layout==Layout::Packed&&(!want_slabs||!SlabCache::sizes_valid(packed_sizes)))return RAD_E_INVAL;
         RAD_TRY(clear());
+        growth_limit_.store(SIZE_MAX,std::memory_order_relaxed); //configure quotes unlimited; the owner limits after
         //A previous terminal void-free cannot establish reclaimed physical capacity.
         //Start a new owning Engine/process rather than spend that backing again.
         if(slab_cache_.stats().cache.payload_charge)return RAD_E_STATE;
@@ -268,6 +286,13 @@ public:
         slab_policy_=want_slabs;layout_=layout;return RAD_OK;
     }
     bool packed() const noexcept { return layout_==Layout::Packed; }
+    /* The payload charge (whole slabs or entries, as quoted) the cache may grow to; SIZE_MAX, the
+     * default, is none. Lowering it below what is held evicts nothing: the cache stops growing and
+     * replaces within what it holds. Any thread, any time after configure (an atomic). */
+    void set_growth_limit(size_t bytes) noexcept { growth_limit_.store(bytes,std::memory_order_relaxed); }
+    size_t growth_limit() const noexcept { return growth_limit_.load(std::memory_order_relaxed); }
+    size_t growth_charged() const noexcept { return growth_charged_.load(std::memory_order_relaxed); }
+    uint64_t growth_refusals() const noexcept { return growth_refusals_.load(std::memory_order_relaxed); }
     //The slots' payload bytes: gate_up's and down's (block_mxfp4's GU and DN unless packed).
     SlabCache::Sizes slot_bytes() const noexcept { return slab_sizes_; }
     // Resident without a lease, an LRU touch or a statistic; slab policy only (false otherwise).

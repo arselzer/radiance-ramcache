@@ -417,6 +417,25 @@ static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit)
     return std::max<int64_t>(most, 0);
 }
 
+int64_t host_room_now(std::string* why) {
+    std::string w;
+    if (meminfo_bytes("MemAvailable") < 0) { if (why) *why = "MemAvailable unreadable"; return -1; }
+    const int64_t r = lockable_bytes(0, 0, &w);
+    if (why) *why = w;
+    return r;
+}
+
+int64_t host_pin_room_now() {
+    if (device_is_host()) return INT64_MAX;
+    bool lifted = false;
+    const int64_t cap = amdgpu_pin_cap(&lifted);
+    if (lifted || cap <= 0) return INT64_MAX;
+    int64_t pinned = 0, mapped = 0;
+    rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
+    rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
+    return std::max<int64_t>(cap - pinned - mapped, 0);
+}
+
 /* The copy is table_copy_make's (core/format/table_copy.h), or for a card, table_copy_fill into
  * pinned memory every card maps (rad_dev_alloc RAD_MEM_HOST_MAPPED, locked in pieces). With
  * --ngram-placement ram=DIR the pinned memory is a file in DIR mapped shared (core/format/
@@ -3239,6 +3258,8 @@ int Engine::load_weights() {
                 return RAD_E_INVAL;
             const int64_t total = cfg_.expert_ram_cache_total_mib * MiB;
             mc.native_file_cache_bytes = total / cfg_.tp / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+            /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET: nothing grows until serve() sizes it. */
+            if (ram_budget_on_) mc.native_cache_growth_limit = 0;
         }
         /* A file-tier weight the kernel relayouts is relaid on every read, by the kernel's own
          * relayout, as the relayout pool does once for a resident one. */
@@ -4223,6 +4244,9 @@ int Engine::start() {
         return RAD_E_INVAL;
     }
     startup_begin_ns_ = rad_mono_ns();
+    /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET / --expert-ram-cache-total-mib auto
+     * (engine_rambudget.cpp): before any check reads the cache's figure. Off, it returns at once. */
+    RAD_TRY(ram_budget_begin());
     if (!draft_experiment_.valid()) {
         RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict; "
                 "%s absent, 0, 1 or T[,W[,R]] (T in (0, 64], W 1..64, R 1..4096), and not with compute OFF; "

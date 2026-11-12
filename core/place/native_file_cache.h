@@ -37,6 +37,11 @@ public:
     int copy(size_t weight, int64_t bytes, void* dst, int64_t dst_cap, bool* hit, NativeFileCacheReadPolicy policy = NativeFileCacheReadPolicy::Normal);
     int insert(size_t weight, const void* src, int64_t bytes);
     Stats stats() const;
+    /* The payload charge inserts may grow to (RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET); INT64_MAX,
+     * the default, is none. An insert past it evicts in LRU order as a full budget does, so the
+     * cache stops growing and keeps replacing. An atomic: any thread, any time. */
+    void set_growth_limit(int64_t bytes) { growth_limit_.store(bytes, std::memory_order_relaxed); }
+    int64_t growth_limit() const { return growth_limit_.load(std::memory_order_relaxed); }
 
 private:
     friend struct NativeFileCacheConcurrentTest; // private HOST lifetime/overlap seam
@@ -77,6 +82,7 @@ private:
     mutable std::shared_mutex payload_mutex_;
     mutable std::mutex mutex_;
     std::atomic<bool> concurrent_copy_{false};
+    std::atomic<int64_t> growth_limit_{INT64_MAX};
     std::unique_ptr<Entry[]> entries_;
     size_t count_ = 0, first_ = none, last_ = none;
     Stats stats_;

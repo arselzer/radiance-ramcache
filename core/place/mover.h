@@ -337,6 +337,10 @@ struct MoverConfig {
      * Engine divides the configured server-wide capacity; it is separate from the fixed pool. */
     int64_t native_file_cache_bytes = 0;
     int native_cache_allocation_device = 0; //Engine actual device, never EP rank ordinal
+    /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET: the payload the RAM cache may grow to from init on
+     * (set_cache_growth_limit); -1, the default, is none. Engine passes 0 so that nothing grows
+     * before serve() sizes the cache from what startup left. */
+    int64_t native_cache_growth_limit = -1;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -844,7 +848,30 @@ public:
      *                   relayout read (an f32 router gemm_nt_f32bf16 keeps as its bf16 halves). */
     bool  read_weight_file(const WeightInfo& w, void* dst);
     bool  mapped_cache_on() const { return mapped_file_cache_on_; }
-    int64_t mapped_cache_bytes() const { return mapped_file_cache_on_ ? cfg_.native_file_cache_bytes : 0; }
+    /* The budget, or the growth limit where one is set and lower (set_cache_growth_limit). */
+    int64_t mapped_cache_bytes() const {
+        if (!mapped_file_cache_on_) return 0;
+        const size_t l = mapped_file_cache_.growth_limit();
+        return l < (size_t)cfg_.native_file_cache_bytes ? (int64_t)l : cfg_.native_file_cache_bytes;
+    }
+    /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET (Engine::ram_budget_serve, the guard): the payload
+     * charge the RAM cache (mapped or not) may grow to; negative removes the limit. Below what it
+     * holds it evicts nothing: the cache stops growing and replaces within what it holds. Only
+     * where a unit is read from changes, never its bytes. An atomic store: any thread. */
+    void set_cache_growth_limit(int64_t bytes) {
+        if (mapped_file_cache_on_) mapped_file_cache_.set_growth_limit(bytes < 0 ? SIZE_MAX : (size_t)bytes);
+        if (native_file_cache_on_) native_file_cache_.set_growth_limit(bytes < 0 ? INT64_MAX : bytes);
+    }
+    bool    ram_cache_on() const { return mapped_file_cache_on_ || native_file_cache_on_; }
+    /* The payload charge the limit compares against, and the growths it refused (mapped only). */
+    int64_t cache_growth_charged() const {
+        if (mapped_file_cache_on_) return (int64_t)mapped_file_cache_.growth_charged();
+        if (native_file_cache_on_) return native_file_cache_.stats().payload_charge;
+        return 0;
+    }
+    uint64_t cache_growth_refusals() const {
+        return mapped_file_cache_on_ ? mapped_file_cache_.growth_refusals() : 0;
+    }
     /* The host memory the mapped cache holds now, against its mapped_cache_bytes() budget: its
      * slabs' backing (every slab once ..._PREGROW pinned them at init, the grown ones otherwise),
      * or the entries' payload without slabs. 0 with the cache off. Engine::host_headroom_bytes

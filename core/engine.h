@@ -278,9 +278,34 @@ private:
          * metadata may already exist at the later checks; counting it again is conservative.
          * Less what its slabs already back, under RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED
          * (cache_backed_bytes_; 0 otherwise, which is the whole budget as before). */
-        return host_headroom_total(cfg_.host_headroom_mib, cfg_.expert_ram_cache_total_mib,
+        /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET: the cache is sized at serve() from what startup
+         * leaves, so no startup check reserves it (it grows nothing before then). */
+        return host_headroom_total(cfg_.host_headroom_mib,
+                                   ram_budget_on_ ? 0 : cfg_.expert_ram_cache_total_mib,
                                    cache_backed_bytes_);
     }
+    /* ---------------- RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET (engine_rambudget.cpp) ----------------
+     * --expert-ram-cache-total-mib auto, or the switch beside a number that then caps it: startup
+     * configures each rank's cache at its cap with a growth limit of 0, every other host
+     * allocation sizes itself as without a cache, and serve() gives the cache what is left of
+     * MemAvailable less what grows later and the reserve (core/ram_budget.h), item by item in the
+     * log. A guard thread then holds the cache's growth while MemAvailable is below its floor. */
+    int  ram_budget_begin();     /* start(), before any allocation: the switch, reserve, cap */
+    int  ram_budget_serve();     /* serve(), before the rank threads: the budget and the guard */
+    void ram_guard_stop();       /* serve()'s end and ~Engine: joins the guard, logs its summary */
+    void ram_guard_loop();
+    void ram_limits_apply(bool held);
+    bool    ram_budget_on_ = false;
+    bool    ram_cap_given_ = false;      /* a number beside the switch caps the cache */
+    int64_t ram_reserve_bytes_ = 0;
+    int64_t ram_floor_bytes_ = 0;
+    int64_t ram_guard_ms_ = 250;
+    int64_t ram_avail_at_start_ = -1, ram_rss_at_start_ = -1;
+    std::vector<int64_t> ram_rank_limit_;   /* the serve-time budget, per rank */
+    std::thread             ram_guard_thread_;
+    std::mutex              ram_guard_mu_;
+    std::condition_variable ram_guard_cv_;
+    bool                    ram_guard_quit_ = false;
     /* RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1: the bytes every rank's RAM cache slabs held
      * when configure_kv began (Mover::mapped_cache_backed_bytes), which host_headroom_bytes()
      * stops reserving a second time. Set once the weights are loaded, so the checks that size

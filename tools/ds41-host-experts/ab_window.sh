@@ -829,6 +829,26 @@ vp_server_gate() {
   return 0
 }
 
+# mA (RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET, core/engine_rambudget.cpp): an arm that names it must
+# log the switch's startup line and serve()'s budget for the RAM cache once each; an arm that does
+# not must log neither (the switch left set for the window). Arguments: the server log, the arm's mA
+# (non-empty: on). 0 when the arm may be measured; otherwise 1, the reason on stdout.
+ram_budget_gate() {
+  local f=$1 ma=$2 on held
+  on=$(grep -cE 'ram budget: on \((RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1|--expert-ram-cache-total-mib auto)\)' "$f")
+  held=$(grep -cE 'ram budget: the expert RAM cache may hold [0-9.]+ ([KMGT]i)?B ' "$f")
+  if [[ -n "$ma" ]]; then
+    [[ "$on" == 1 && "$held" == 1 ]] && return 0
+    echo "mA, but the server log has $on 'ram budget: on' and $held 'ram budget: the expert RAM cache may hold' lines (one of each wanted)"
+    return 1
+  fi
+  if [[ "$on" != 0 || "$held" != 0 ]]; then
+    echo "no mA part, but the server sized its RAM cache from the host ($on startup, $held budget lines; the switch set for the window?)"
+    return 1
+  fi
+  return 0
+}
+
 arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (default 81920)
   local name=$1; shift
   local n=${ARM_N:-${AB_REQUESTS:-8}}; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
@@ -914,6 +934,10 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   hp_check PcmN "${ARM_TIER:-}" "kv tiers: a finished conversation's KV is copied"
   hp_check Pcr "${ARM_KVREP:-}" 'KV_REPLICATED: [0-9]+ paged group'
   hp_check PchN "${ARM_SHEAD:-}" "shared heads: on \\(RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=${ARM_SHEAD:-[0-9]+}\\)"
+  # mA (ram_budget_gate): the budget's startup and serve lines, item by item, into the window log.
+  local rbg_why
+  rbg_why=$(ram_budget_gate "$OUT/$name.server.log" "${ARM_RAMB:-}") || hp_bad+=" $rbg_why;"
+  [[ -n "${ARM_RAMB:-}" ]] && grep -E 'ram budget: ' "$OUT/$name.server.log" | cut -c1-400 | tee -a "$OUT/window.log"
   if [[ -n "$hp_bad" ]]; then
     log "arm $name: not measured:$hp_bad $(grep -m2 -E 'end-of-request snapshots: refused|RESUME_GRID=[^ ]* refused|KV_REPLICATED refused|shared heads: refused' "$OUT/$name.server.log" | tr '\n' ' ')"
     stop_server; return 1
@@ -2898,6 +2922,7 @@ for a in $ARMS; do
   arm_checkpoint_interval=2048
   psc="" prs=12 pk="" pw="" ns="" pv=""
   hpe="" hpg="" hpl="" hpb="" hpm="" hpr="" hph=""
+  ma=""   # mA / mAN (the RAM budget)
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
@@ -2909,6 +2934,13 @@ for a in $ARMS; do
       x)       mkdir -p "$OUT/trace-$a"; env+=(RADIANCE_EXPERIMENTAL_DS41_ACCESS_TRACE=$OUT/trace-$a) ;;
       s[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SPIN_US=${p#s}) ;;
       n[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE=${p#n}) ;;
+      mA|mA[0-9]*)                                                    # the RAM cache sized at serve from what startup left (RAM_BUDGET),
+               ma=1                                                   # at most the mN figure; mAN: a reserve of N MiB (10240)
+               env+=(RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1)
+               if [[ $p != mA ]]; then
+                 if [[ ${p#mA} =~ ^[0-9]+$ ]] && (( 10#${p#mA} >= 1024 )); then env+=(RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB=$((10#${p#mA})))
+                 else log "arm $a: $p: the reserve is at least 1024 MiB; the arm is skipped"; skip=1; fi
+               fi ;;
       m[0-9]*) CACHE_MIB=${p#m} ;;
       M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
       Mr[0-9]*) # pool jobs of up to N token rows of one expert (1-64, default 4; above 4, jobs of 4+ rows take the many-row kernel)
@@ -3394,6 +3426,9 @@ for a in $ARMS; do
   [[ -n "$hpr" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=0)
   [[ -n "$hph" ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=0)
   ARM_EORS=$hpe ARM_RGRID=$hpg ARM_SLRU=$hpl ARM_STOREMIB=$hpb ARM_TIER=$hpm ARM_KVREP=$hpr ARM_SHEAD=$hph
+  # mA: arms without it run with the RAM budget off, whatever the window's environment.
+  [[ -n "$ma" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=0)
+  ARM_RAMB=$ma
   # MrN: arms without it take jobs of the default 4 rows, whatever the window's environment (0 is
   # not this switch's off: any value outside 1-32 turns host experts off).
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=4)

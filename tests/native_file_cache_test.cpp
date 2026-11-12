@@ -97,6 +97,30 @@ TEST(native_cache_variable_size_lru_respects_hits_and_budget) {
     s=c.stats();CHECK_EQ(s.hits,uint64_t(4));CHECK_EQ(s.misses,uint64_t(1));CHECK_EQ(s.hit_bytes,uint64_t(2*a.size()+cbytes.size()+d.size()));CHECK_EQ(s.miss_bytes,uint64_t(b.size()));charge_bounds(s);
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET's growth limit: held at what the cache holds, an insert
+ * evicts in LRU order as a full budget does instead of growing; 0 bypasses; lifted, it grows. The
+ * bytes a hit copies are always the inserted ones. */
+TEST(native_cache_growth_limit_replaces_in_lru_order_instead_of_growing) {
+    const auto a=payload(11,256),b=payload(12,256),d=payload(13,256);
+    NativeFileCache c;REQUIRE_EQ(c.configure(setup_budget,8),RAD_OK);
+    CHECK_EQ(c.growth_limit(),INT64_MAX);
+    c.set_growth_limit(0);
+    REQUIRE_EQ(c.insert(0,a.data(),int64_t(a.size())),RAD_OK);
+    auto s=c.stats();CHECK_EQ(s.entries,size_t(0));CHECK_EQ(s.bypasses,uint64_t(1));
+    c.set_growth_limit(INT64_MAX);
+    REQUIRE_EQ(c.insert(0,a.data(),int64_t(a.size())),RAD_OK);
+    REQUIRE_EQ(c.insert(1,b.data(),int64_t(b.size())),RAD_OK);
+    const int64_t held=c.stats().payload_charge;
+    c.set_growth_limit(held);
+    REQUIRE_EQ(c.insert(2,d.data(),int64_t(d.size())),RAD_OK);
+    s=c.stats();CHECK_EQ(s.entries,size_t(2));CHECK_EQ(s.evictions,uint64_t(1));CHECK(s.payload_charge<=held);charge_bounds(s);
+    expect_copy(c,0,a,false);expect_copy(c,1,b,true);expect_copy(c,2,d,true);
+    c.set_growth_limit(INT64_MAX);
+    REQUIRE_EQ(c.insert(0,a.data(),int64_t(a.size())),RAD_OK);
+    s=c.stats();CHECK_EQ(s.entries,size_t(3));CHECK_EQ(s.evictions,uint64_t(1));
+    expect_copy(c,0,a,true);
+}
+
 TEST(native_cache_oversize_bypass_does_not_evict_resident_payload) {
     const auto small=payload(5,91),large=payload(6,4097);const auto q=observed_charge(3,small);
     NativeFileCache c;REQUIRE_EQ(c.configure(q.metadata+q.payload,3),RAD_OK);

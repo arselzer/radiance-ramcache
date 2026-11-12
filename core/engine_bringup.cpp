@@ -3699,10 +3699,29 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
                          : "prefix caching is off (--no-prefix-cache)");
         return RAD_OK;
     }
-    const int64_t ctx = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
+    const int64_t model_len = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     const int64_t interval = geo_.checkpoint_interval;
     const std::unique_ptr<CheckpointPolicy> pol =
         make_checkpoint_policy(cfg_.checkpoint_policy, interval);
+    /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET: auto sizes the store for sessions of
+     * ..._RAM_BUDGET_SESSION_TOKENS (default min(--max-model-len, 4096)) rather than
+     * --max-model-len, which an A/B window sets to the whole KV pool (147K tokens: 641 slots,
+     * 14 GiB at 128 sequences, for ~1K-token prompts), and one more a sequence for a shared head
+     * under RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD. Fewer slots only mean fewer resume points
+     * (more recompute), never other bytes. Off, ctx is --max-model-len and extra 0, as before. */
+    const int64_t ctx = ram_budget_on_ ? std::min(model_len, ram_session_tokens_ > 0 ? ram_session_tokens_ : 4096)
+                                       : model_len;
+    int64_t extra = 0;
+    if (ram_budget_on_) {
+        const char* sh = std::getenv("RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD");
+        extra = sh && *sh && std::strcmp(sh, "0") ? 1 : 0;
+        RAD_INFO("ram budget: the snapshot store is sized for %lld-token sessions (%s; --max-model-len "
+                 "%lld): %lld a sequence by %s%s", (long long)ctx,
+                 ram_session_tokens_ > 0 ? "RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET_SESSION_TOKENS"
+                                         : "the default, min(--max-model-len, 4096)",
+                 (long long)model_len, (long long)(pol->held(ctx, interval) + 1 + extra), pol->name(),
+                 extra ? ", one of them a shared head's (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD)" : "");
+    }
 
     int64_t still = cfg_.prefix_cache_mib * ((int64_t)1 << 20);
     for (const auto& r : ranks_) still += arena_host_bytes(r->program);
@@ -3711,7 +3730,7 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
      * with the model's own state -- any hybrid's linear layers, any KV encoding's mirror -- since
      * it is measured from this rank's slot and the host's own spare memory. */
     const int64_t floor_slots =
-        std::min<int64_t>(checkpoint_slots_want(*pol, cfg_.max_seqs, ctx, interval),
+        std::min<int64_t>(checkpoint_slots_want(*pol, cfg_.max_seqs, ctx, interval, extra),
                           kCheckpointSlotsFloor);
     const int64_t floor_bytes =
         slot > INT64_MAX / std::max<int64_t>(floor_slots, 1) ? INT64_MAX : floor_slots * slot;
@@ -3797,7 +3816,7 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     }
 
     const CheckpointSlots c = checkpoint_slots_auto(*pol, cfg_.max_seqs, ctx, interval, slot,
-                                                    share, room);
+                                                    share, room, extra);
     cfg_.checkpoint_slots = c.slots;
 
     const std::string need =

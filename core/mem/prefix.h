@@ -228,12 +228,15 @@ struct CheckpointSlots {
 
 /* What --checkpoint-slots auto wants before any byte budget applies: the policy's hold for one
  * --max-model-len session plus one for its running turn, for each of --max-num-seqs. */
+/* `extra_per_seq` (default 0): more snapshots a sequence holds beside the policy's, such as a
+ * shared head's (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD under RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET). */
 int64_t checkpoint_slots_want(const CheckpointPolicy& policy, int64_t max_seqs, int64_t ctx,
-                              int64_t interval);
+                              int64_t interval, int64_t extra_per_seq = 0);
 
 CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t max_seqs,
                                       int64_t ctx, int64_t interval, int64_t slot_bytes,
-                                      int64_t share_bytes, int64_t room_bytes);
+                                      int64_t share_bytes, int64_t room_bytes,
+                                      int64_t extra_per_seq = 0);
 
 /* The reserve to charge a store whose floor `need_bytes` must fit. `room_bytes` is what the host
  * can pin with `margin_bytes` (--host-headroom-mib) held free; it is what the engine measures, not

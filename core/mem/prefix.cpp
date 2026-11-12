@@ -125,10 +125,11 @@ std::unique_ptr<CheckpointPolicy> make_checkpoint_policy(const std::string& name
 
 CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t max_seqs,
                                       int64_t ctx, int64_t interval, int64_t slot_bytes,
-                                      int64_t share_bytes, int64_t room_bytes) {
+                                      int64_t share_bytes, int64_t room_bytes,
+                                      int64_t extra_per_seq) {
     CheckpointSlots c;
-    c.per_seq = policy.held(ctx, interval) + 1;
-    c.want = checkpoint_slots_want(policy, max_seqs, ctx, interval);
+    c.per_seq = policy.held(ctx, interval) + 1 + std::max<int64_t>(extra_per_seq, 0);
+    c.want = checkpoint_slots_want(policy, max_seqs, ctx, interval, extra_per_seq);
     if (slot_bytes <= 0) return c;
     const int64_t share = std::max<int64_t>(share_bytes, 0) / slot_bytes;
     const int64_t room = std::max<int64_t>(room_bytes, 0) / slot_bytes;
@@ -142,8 +143,8 @@ CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t ma
 }
 
 int64_t checkpoint_slots_want(const CheckpointPolicy& policy, int64_t max_seqs, int64_t ctx,
-                              int64_t interval) {
-    const int64_t per = policy.held(ctx, interval) + 1;
+                              int64_t interval, int64_t extra_per_seq) {
+    const int64_t per = policy.held(ctx, interval) + 1 + std::max<int64_t>(extra_per_seq, 0);
     const int64_t seqs = std::max<int64_t>(max_seqs, 1);
     return seqs > INT64_MAX / per ? INT64_MAX : seqs * per;
 }

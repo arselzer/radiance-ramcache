@@ -3655,6 +3655,26 @@ TEST(the_host_reserve_gives_way_to_a_stores_floor_and_no_further) {
     CHECK_EQ(checkpoint_slots_want(KeepTipOnly(), 1, 200000, 2048), 2ll);
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET's sizing: a session of 4096 tokens rather than the window's
+ * 147,456-token --max-model-len, and one more a sequence for a shared head. The default (extra 0) is
+ * the old figure. */
+TEST(the_auto_store_for_a_short_session_and_a_shared_head) {
+    const GeometricBackoff g(2048);
+    const int64_t slot = (int64_t)(22.59 * (1 << 20)), lots = INT64_MAX;
+    const CheckpointSlots wide = checkpoint_slots_auto(g, 128, 147456, 2048, slot, lots, lots);
+    CHECK_EQ(wide.per_seq, (int64_t)(g.held(147456, 2048) + 1));
+    CHECK_EQ(checkpoint_slots_auto(g, 128, 147456, 2048, slot, lots, lots, 0).want, wide.want);
+    const CheckpointSlots shrt = checkpoint_slots_auto(g, 128, 4096, 2048, slot, lots, lots);
+    CHECK(shrt.per_seq < wide.per_seq);
+    CHECK_EQ(shrt.want, 128 * (int64_t)(g.held(4096, 2048) + 1));
+    const CheckpointSlots head = checkpoint_slots_auto(g, 128, 4096, 2048, slot, lots, lots, 1);
+    CHECK_EQ(head.per_seq, shrt.per_seq + 1);
+    CHECK_EQ(head.want, shrt.want + 128);
+    CHECK_EQ(head.slots, head.want);
+    CHECK_EQ(checkpoint_slots_want(g, 128, 4096, 2048, 1), head.want);
+    CHECK_EQ(checkpoint_slots_want(g, 128, 4096, 2048, -3), shrt.want);   /* never fewer */
+}
+
 /* --checkpoint-slots auto: the policy's share plus one for each sequence, held to the share of
  * memory but not below the floor, and to the room the host has. */
 TEST(the_auto_store_gives_every_sequence_its_sessions_share) {

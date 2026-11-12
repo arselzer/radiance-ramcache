@@ -69,7 +69,10 @@ int Engine::ram_budget_begin() {
         return RAD_E_INVAL;
     if (!env_num("RADIANCE_EXPERIMENTAL_DS41_RAM_GUARD_FLOOR_MIB", 0, reserve_mib, reserve_mib / 2,
                  &floor_mib) ||
-        !env_num("RADIANCE_EXPERIMENTAL_DS41_RAM_GUARD_MS", 10, 60000, 250, &ram_guard_ms_))
+        !env_num("RADIANCE_EXPERIMENTAL_DS41_RAM_GUARD_MS", 10, 60000, 250, &ram_guard_ms_) ||
+        /* --checkpoint-slots auto's session length (Engine::size_checkpoint_store). */
+        !env_num("RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET_SESSION_TOKENS", 1, (int64_t)1 << 32, 0,
+                 &ram_session_tokens_))
         return RAD_E_INVAL;
     ram_reserve_bytes_ = reserve_mib * kMiB;
     ram_floor_bytes_ = floor_mib * kMiB;
@@ -133,7 +136,8 @@ int Engine::ram_budget_serve() {
     const int64_t tp = (int64_t)ranks_.size();
     in.held.push_back({ "host pools, pinned once a rank", tp * cfg_.host_pool_total_mib() * kMiB,
                         "core/mem/pools.cpp, --host-pool-mib + RAM tables" });
-    in.held.push_back({ "prefix-cache snapshot store", ck_store_.cap_bytes(),
+    in.held.push_back({ fmt("prefix-cache snapshot store, %lld slots of %s", (long long)ck_store_.capacity(),
+                            humanb(ck_store_.slot_bytes()).c_str()), ck_store_.cap_bytes(),
                         "engine_bringup.cpp configure_kv ck_store_.open, --checkpoint-slots" });
     if (cfg_.prefix_cache && cfg_.prefix_cache_mib > 0)
         in.held.push_back({ "prefix cache host KV tier", cfg_.prefix_cache_mib * kMiB,

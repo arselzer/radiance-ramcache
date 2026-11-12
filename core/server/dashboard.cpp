@@ -319,6 +319,10 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["linear_hit_rate"] = m.linear_hit_rate;
         o["linear_cached_tokens"] = (double)m.linear_cached_tokens;
         o["checkpoints_written"] = (double)m.checkpoints_written;
+        /* Shared heads: keep points set, snapshots written there, prompts published at their
+         * prefill's end (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD; 0 without it). */
+        o["shared_heads"] = { { "keeps", m.shared_head_keeps }, { "snapshots", m.shared_head_snapshots },
+                              { "prefill_end_published", m.prefill_end_published } };
         /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: computed tokens left unpublished, past the
          * chunks an idle cold prefill cuts alike. 0 without the switch. */
         o["publish_held_tokens"] = (double)m.prefix_publish_held_tokens;

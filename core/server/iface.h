@@ -95,6 +95,8 @@ struct SchedMetrics {
     int64_t attn_cached_tokens = 0;
     int64_t linear_cached_tokens = 0;
     int64_t checkpoints_written = 0;
+    /* SchedMetrics::shared_head_keeps / shared_head_snapshots / prefill_end_published. */
+    int64_t shared_head_keeps = 0, shared_head_snapshots = 0, prefill_end_published = 0;
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: computed tokens left unpublished (the
      * scheduler's SchedMetrics::prefix_publish_held_tokens). 0 without the switch. */
     int64_t prefix_publish_held_tokens = 0;

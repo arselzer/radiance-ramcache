@@ -1551,6 +1551,7 @@ int Engine::step_loop() {
     sched_.draft_conf_report();
     /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT: the steps that admitted whole prompts together. */
     sched_.batch_admit_report();
+    sched_.shared_head_report();
     dmeasure_report();
     eors_report();
     return RAD_OK;

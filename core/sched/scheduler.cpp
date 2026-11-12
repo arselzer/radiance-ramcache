@@ -313,6 +313,63 @@ int Scheduler::batch_admit_init(const Config& cfg) {
 }
 
 /* ------------------------------------------------------------------ init */
+/* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=<F> (sh_floor_, scheduler.h). Why a batch of prompts behind
+ * a few system prompts resumed so little without it (128 NL-to-SQL prompts at 32 streams: 56 found
+ * their head's blocks and no snapshot, 6 snapshots written below the prompts' ends):
+ *  1. CacheHit::branch_at named only the entry a prompt departs from, and only where two cached
+ *     prompts had left it. On the cache's 2-token entries a question that starts as one cached
+ *     question does ("How many ...") departs past the system prompt from an entry with one child, so
+ *     no head was named, and no prompt ever snapshotted the system prompt the others leave from.
+ *  2. The cache counts a child only when a request closes (close_request publishes), so the prompts
+ *     admitted while the first of their group still decode found one child or none: at 32 streams
+ *     most of a wave.
+ *  3. A head of fewer than kSharedHeadMin (256) tokens past the hit was never snapshotted (a cost
+ *     floor: the chunk split that takes it).
+ * With the switch: the cache names the head from every entry of the chain, the prompt departing an
+ * entry counting as one more way on (shared_head_pick); a prompt is also published when its prefill
+ * ends (publish_prefix), so the next admission sees it; and F replaces both floors (kSharedHeadMin and
+ * kWindowSnapshotMin). Which snapshot is taken where changes, never what a resume computes from it: a
+ * keep point is written as before (plan_chunk splits the chunk there, the snapshot after its last
+ * row), and a hit resumes at a snapshot as at any other (exact under --prefix-resume exact by the
+ * partition invariance the keep point already stands on). */
+int Scheduler::shared_head_init(const Config& cfg) {
+    sh_floor_ = 0;
+    const char* v = std::getenv(kSharedHeadEnv);
+    if (!v || !*v || !std::strcmp(v, "0")) return RAD_OK;
+    char* end = nullptr;
+    const long long n = std::strtoll(v, &end, 10);
+    if (end == v || *end || n < kSharedHeadFloorMin || n > kSharedHeadFloorMax) {
+        RAD_ERR("%s=%s: the fewest tokens a shared head's snapshot must save, %lld to %lld (0 or unset: "
+                "off)", kSharedHeadEnv, v, (long long)kSharedHeadFloorMin, (long long)kSharedHeadFloorMax);
+        return RAD_E_INVAL;
+    }
+    if (!cfg.prefix_cache || !pc_ || !geo_.checkpoints()) {
+        RAD_WARN("shared heads: refused (%s=%s) -- %s; shared heads are snapshotted as before", kSharedHeadEnv,
+                 v, !cfg.prefix_cache || !pc_ ? "the prefix cache is off"
+                                               : "this model takes no snapshots (no checkpoint interval)");
+        return RAD_OK;
+    }
+    sh_floor_ = n;
+    pc_->set_shared_head(sh_floor_);
+    RAD_INFO("shared heads: on (%s=%lld) -- a prompt snapshots the head the most cached prompts leave "
+             "(every entry of its matched chain counts, the entry it departs from with one other way on), "
+             "at least %lld tokens past what its hit resumes (was %lld; a window's tail snapshot from "
+             "%lld, was %lld); a prompt is published when its prefill ends, so the next admission "
+             "resumes at its head while it decodes",
+             kSharedHeadEnv, n, n, (long long)kSharedHeadMin, n, (long long)kWindowSnapshotMin);
+    return RAD_OK;
+}
+
+void Scheduler::shared_head_report() const {
+    if (!cfg_.prefix_cache || !pc_) return;
+    const SchedMetrics& m = m_;
+    RAD_INFO("shared heads: %lld admissions set a keep point at a shared head, %lld snapshots written "
+             "there; %lld prompts published at their prefill's end (floor %lld%s)",
+             (long long)m.shared_head_keeps, (long long)m.shared_head_snapshots,
+             (long long)m.prefill_end_published, (long long)(sh_floor_ > 0 ? sh_floor_ : kSharedHeadMin),
+             sh_floor_ > 0 ? ", RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD" : "");
+}
+
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
                     const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo,
                     const DraftExperiment* experiment) {
@@ -972,6 +1029,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* Whole prompts admitted together (batch_rows_): after prefill alone, large-chunk prefill and the
      * consumer skip, whose decisions it reads. */
     RAD_TRY(batch_admit_init(cfg));
+    /* Shared heads (sh_floor_): after the geometry and the prefix cache it reads. */
+    RAD_TRY(shared_head_init(cfg));
 
     /* ---------------------------------------------------------- end-of-request snapshots off the
      *                                                            chunk grid
@@ -1467,19 +1526,16 @@ void Scheduler::trim_prefix_cache(const Request* spare, int64_t spare_tokens) {
     else (void)pc_->trim(short_by);
 }
 
-void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
-                              bool publish, int status, const char* why) {
-    /* An in-flight verification still gets paired at commit, including a cancelled request.
-     * Otherwise this pending proposal can never acquire a target outcome. */
-    if (dprob_on_ && s.entry < 0 && s.entry_next < 0)
-        dprob_discard(s, st == ReqState::Cancelled ? "cancelled" : "request_closed", st == ReqState::Cancelled);
-    ++step_finished_;
-    /* Publish before freeing: this is the only moment the whole prefix is both computed and still
-     * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
-     * and failed requests are published too; their prompts were computed, and a client that hangs
-     * up mid-answer is likely to ask for that prefix again. */
-    if (publish && cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
-        s.req->n_computed > 0 && !kv_->has_runtime_window(s.req->id)) {
+/* Publish what sequence `s` computed (close_request, before its blocks are freed), or, at its
+ * prefill's end under RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (`at_close` false), its prompt while it
+ * goes on decoding: insert() takes its own references and indexes whole entries only, so it names no
+ * block the sequence writes again (decode writes from the prompt's end on, past every whole entry, and
+ * a hit adopts whole blocks below the snapshot it resumes at). Whether anything was published. */
+bool Scheduler::publish_prefix(SchedReq& s, bool at_close) {
+    if (!(cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) && s.req->n_computed > 0 &&
+          !kv_->has_runtime_window(s.req->id)))
+        return false;
+    {
         /* R-SWA: a sequence with a runtime window is not published (KVManager::set_window). Its
          * table is a reference plus a ring rather than a prefix from position 0, and the window
          * length is runtime data that no cache key carries; a hit would adopt blocks for a window
@@ -1500,7 +1556,7 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
         int64_t n_pub = s.req->n_computed;
         if (ok && exact_publish_) {
             const int64_t upto = std::max<int64_t>(0, std::min<int64_t>(n_pub, s.grid_upto));
-            m_.prefix_publish_held_tokens += n_pub - upto;
+            if (at_close) m_.prefix_publish_held_tokens += n_pub - upto;
             RAD_DEBUG("prefix cache: request %llu publishes %lld of its %lld computed tokens, the "
                       "chunks an idle cold prefill cuts alike", (unsigned long long)s.req->id,
                       (long long)upto, (long long)n_pub);
@@ -1511,10 +1567,29 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
             if (rc < 0)
                 RAD_DEBUG("prefix cache: request %llu not published: %s",
                           (unsigned long long)s.req->id, rad_strerror(rc));
+            /* At a prefill's end (shared_head_floor_) the sequence still holds every block it
+             * published, so the cache holds nothing more for the reserve to trim. */
+            if (!at_close) return rc >= 0;
             if (eors_ && rc >= 0) trim_prefix_cache(s.req.get(), n_pub);
             else trim_prefix_cache();
+            return rc >= 0;
         }
     }
+    return false;
+}
+
+void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
+                              bool publish, int status, const char* why) {
+    /* An in-flight verification still gets paired at commit, including a cancelled request.
+     * Otherwise this pending proposal can never acquire a target outcome. */
+    if (dprob_on_ && s.entry < 0 && s.entry_next < 0)
+        dprob_discard(s, st == ReqState::Cancelled ? "cancelled" : "request_closed", st == ReqState::Cancelled);
+    ++step_finished_;
+    /* Publish before freeing: this is the only moment the whole prefix is both computed and still
+     * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
+     * and failed requests are published too; their prompts were computed, and a client that hangs
+     * up mid-answer is likely to ask for that prefix again. */
+    if (publish) (void)publish_prefix(s, /*at_close=*/true);
 
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
     /* Prompt lookup's index is this text's alone. */
@@ -1621,6 +1696,9 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
     /* One below the target that the cut makes whole (StepEntry::consumer_ckpt). */
     if (below) ++m_.consumer_ckpt_whole;
     if (eors) ++m_.eors_reserved;
+    /* One at the request's keep point (Request::checkpoint_at on the quantum): a shared head's. */
+    const int64_t q = std::max<int64_t>(geo_.quantum, 1);
+    if (!eors && r.checkpoint_at > 0 && pos == r.checkpoint_at / q * q) ++m_.shared_head_snapshots;
 }
 
 int Scheduler::fail_prefilling(const char* why) {
@@ -2110,7 +2188,7 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
      * milliseconds, recomputing the prompt a prefill. */
     if (geo_.window_ckpt) {
         const int64_t t = (target - std::max<int64_t>(Q, 16)) / Q * Q;
-        return t >= std::min<int64_t>(I, kWindowSnapshotMin) ? t : -1;
+        return t >= std::min<int64_t>(I, sh_floor_ > 0 ? sh_floor_ : kWindowSnapshotMin) ? t : -1;
     }
     return tail > I && tail - tail / I * I >= std::max<int64_t>(Q, I / 4) ? tail : -1;
 }
@@ -2507,8 +2585,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * request with the same head skips it -- the same system prompt or instructions in front
          * of a different text, as TranslateGemma's chunks are. The interval and tail snapshots
          * miss it: the head is shorter than an interval, and each prompt's tail is its own. */
-        if (geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= kSharedHeadMin) {
+        const int64_t head_min = sh_floor_ > 0 ? sh_floor_ : kSharedHeadMin;
+        if (geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= head_min) {
             r.checkpoint_at = h.branch_at;
+            ++m_.shared_head_keeps;
             RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; a snapshot there",
                       (unsigned long long)r.id, (long long)h.branch_at);
         }
@@ -3947,6 +4027,9 @@ int Scheduler::commit(StepResult& res) {
              * `n_cached` is what the prefix cache supplied. */
             if (r.n_computed >= (int64_t)r.prompt.size()) {
                 server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
+                /* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD: the prompt is in the cache from here, for
+                 * the admissions behind it (publish_prefix), not only once its request closes. */
+                if (sh_floor_ > 0 && publish_prefix(s, /*at_close=*/false)) ++m_.prefill_end_published;
                 /* From here a decode step reads the ring, and the engine checks the resolve's
                  * overflow. */
                 last_prefill_ids_.push_back(r.id);

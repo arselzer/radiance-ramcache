@@ -150,6 +150,12 @@ struct SchedMetrics {
     int64_t prefix_held_tokens = 0;
     float   linear_hit_rate = 0.0f;
     int64_t checkpoints_written = 0;
+    /* Shared heads (CacheHit::branch_at; RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD lowers the floor and
+     * reads every entry of the chain): admissions that set a keep point there (Request::checkpoint_at),
+     * and the snapshots written at one; with the switch, prompts published at their prefill's end. */
+    int64_t shared_head_keeps = 0;
+    int64_t shared_head_snapshots = 0;
+    int64_t prefill_end_published = 0;
     /* Checkpoints the consumer skip did not write: below their prompt's target, where its cut
      * leaves the last layers' windows incomplete (core/sched/consumer_skip.h), and outside the
      * ones it makes whole (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT); and those below the

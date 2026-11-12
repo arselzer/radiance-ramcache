@@ -615,6 +615,16 @@ public:
      * or the interval where that is lower. A prompt reaches it at kWindowSnapshotMin +
      * max(quantum, 16) tokens: 528 at a quantum of 16. */
     static constexpr int64_t kWindowSnapshotMin = 512;
+    /* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=<F> (shared_head_init; off unset or 0): F in
+     * [kSharedHeadFloorMin, kSharedHeadFloorMax] replaces kSharedHeadMin and kWindowSnapshotMin as the
+     * floors, the cache reports a shared head from every entry of the chain a lookup matches
+     * (shared_head_pick, core/mem/prefix.h), and a prompt is published at its prefill's end, not only
+     * when its request closes (publish_prefix), so a prompt admitted while the ones before it still
+     * decode resumes at their head. Refused without the prefix cache or its snapshots. */
+    static constexpr const char* kSharedHeadEnv = "RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD";
+    static constexpr int64_t kSharedHeadFloorMin = 16, kSharedHeadFloorMax = 4096;
+    int64_t shared_head_floor() const { return sh_floor_; }
+    void    shared_head_report() const;
     /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
      * request's own checkpoint (Request::checkpoint_at), 0 for none. */
@@ -1005,6 +1015,10 @@ private:
     int64_t batch_join_ = 0;
     int64_t batch_p1_rows_ = 0;
     int     batch_admit_init(const Config& cfg);
+    /* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (kSharedHeadEnv): the floor once init took it, else 0. */
+    int64_t sh_floor_ = 0;
+    int     shared_head_init(const Config& cfg);
+    bool    publish_prefix(SchedReq& s, bool at_close);
     /* The chunk request `r`, at its computed tokens, takes alone in its step (plan_chunk at the whole
      * step's budget, as idle_prefill_checkpoint plans it) and the snapshot it writes there (-1 none). */
     int64_t batch_alone_plan(const Request& r, int64_t target, int64_t* ckpt) const;

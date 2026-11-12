@@ -164,6 +164,30 @@ Arm parts e.g. `...-Lc2048-P1-...-Pf-N32-C32-Ba2048-Pc-Pce-Pcg16-...` (`BaN` up 
 without `Ba`. Tests `sched_test` `batch_admission_beside_the_prefix_cache_*`,
 `batch_admission_to_the_chunk_is_refused_where_it_is_not_covered`, `p1_stager_test`
 `p1_arms_a_pass_of_several_prompts_as_a_lone_chunk_of_its_rows`, `ab_window_ba_test.sh`.
+
+**Shared-head snapshots** (`RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=N`, part `Pch` / `PchN`, beside `Pc` / `Pc0`;
+`claude/ds41-batch-prefill`; not yet measured on the cards). On 128 NL-to-SQL prompts at 32 streams with the prefix
+cache (exact resume) 56 prompts found their system prompt's blocks and no snapshot to resume from
+(`hit_cuts.no_snapshot` 56, 12,456 tokens recomputed), and only 6 snapshots were written below the prompts' ends.
+Three causes, from the code and a host simulation of the cache (`sched_test`
+`shared_heads_resume_a_batch_behind_a_few_system_prompts`): (1) the cache named a shared head
+(`CacheHit::branch_at`) only at the entry a prompt departs from, and only where two cached prompts had left it;
+on its 2-token entries a question starting as one cached question does ("How many ...") departs past the system
+prompt from an entry with one child, so the system prompt was never named; (2) the cache counts a prompt only when
+its request closes, so the prompts admitted while the first of their group still decode find none (most of a wave
+at 32 streams); (3) a head under 256 tokens past the hit was never snapshotted. With the switch the cache names the
+entry of the matched chain that the most cached prompts leave (the departure entry counting the prompt itself), at
+least N tokens past what the hit resumes (N replaces both the 256 shared-head floor and the 512 window-tail floor;
+`Pch` is 64); and a prompt is published when its prefill ends. Which snapshots are written where changes, not what
+a resume computes: a keep point splits the chunk there as before, and a resume at it is exact by the partition
+invariance it already stands on. Startup line `shared heads: on (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=N)`;
+shutdown line (every Pc arm) `shared heads: K admissions set a keep point at a shared head, S snapshots written
+there; P prompts published at their prefill's end`; `/stats` `shared_heads`. A `PchN` arm with P 0 is set aside.
+Gates for a window: replies and `Kh` hashes against the same arm without `Pch`, and against a cold (`Pc`-less)
+arm; the cost is one extra prefill step for each prompt that writes a head snapshot (the split), against the head
+skipped by every prompt after it. Tests `sched_test` `shared_heads_*`, `mem_test`
+`a_hit_reports_the_shared_head_from_every_entry_of_its_chain`, `shared_head_pick_prefers_the_most_ways_then_the_deepest`,
+`ab_window_ba_test.sh` (part 4).
 In the paragraphs from here to the two-batch overlap one, every 4- and 8-stream arm also ran
 `..._PREFETCH_MULTIROW=N` (parts `Pmr4` / `Pmr8`) with `--max-model-len 1024` (`L1024`), sending the 8 held-out
 requests N at a time. A total at N streams is N times the mean of the requests' `predicted_per_second`

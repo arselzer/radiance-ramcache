@@ -476,6 +476,8 @@ struct FakePC : IPrefixCache {
     }
     const std::vector<int32_t>& cached_groups() const override { return groups; }
     void set_drafter_floor(int64_t tokens) override { drafter_floor = tokens; }
+    int64_t shared_head = 0;     /* set_shared_head's last value */
+    void set_shared_head(int64_t floor) override { shared_head = floor; }
 
     /* What the scheduler published and asked to be evicted, recorded rather than acted on: these
      * tests check that the scheduler publishes before it frees and evicts before it preempts, not

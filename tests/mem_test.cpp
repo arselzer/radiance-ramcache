@@ -2257,6 +2257,66 @@ TEST(a_hit_reports_the_head_two_cached_prompts_left_differently) {
     CHECK_EQ(f.pc.lookup(d, {}).branch_at, 0);
 }
 
+/* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (PrefixCache::set_shared_head, shared_head_pick): every
+ * entry of the matched chain counts, and the one a prompt departs from counts the prompt as one more
+ * way on. One cached prompt past a head is then enough; a prompt that follows a cached one past the
+ * head (its text starts as another's does) still names the head the most ways leave, the deepest on a
+ * tie; the floor holds a head that close to what the hit resumes back; a prompt all cached or
+ * following one chain to its end, with no other way off it, names none. Off (floor 0), as before. */
+TEST(a_hit_reports_the_shared_head_from_every_entry_of_its_chain) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    f.pc.set_shared_head(16);
+    const auto head = tok_run(10, 64);
+    auto with_tail = [&](int32_t base) {
+        auto p = head;
+        for (int i = 0; i < 48; ++i) p.push_back(base + i);
+        return p;
+    };
+    const auto a = with_tail(1000), b = with_tail(2000), c = with_tail(3000);
+    publish(f, 1, a, 112);
+    /* one cached prompt past the head: the prompt departing it is the second way on */
+    CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, 64);
+    CHECK_EQ(f.pc.lookup(b, {}).branch_at, 64);
+    /* all cached, or one chain to its end: no other way off it */
+    CHECK_EQ(f.pc.lookup(a, {}).branch_at, 0);
+    publish(f, 2, b, 112);
+    /* d starts its text as a does (one entry past the head), then departs: the head (2 ways) and a's
+     * first tail entry (a, and d itself) tie, the deeper is named; with c cached too the head wins */
+    auto d = head;
+    for (int i = 0; i < 16; ++i) d.push_back(1000 + i);
+    for (int i = 0; i < 32; ++i) d.push_back(5000 + i);
+    CHECK_EQ(f.pc.lookup(d, {}).n_attn_tokens, 80);
+    CHECK_EQ(f.pc.lookup(d, {}).branch_at, 80);
+    publish(f, 3, c, 112);
+    CHECK_EQ(f.pc.lookup(d, {}).branch_at, 64);
+    /* a's next turn goes on past its end: the head others left is still named */
+    auto a2 = a;
+    for (int i = 0; i < 32; ++i) a2.push_back(4000 + i);
+    CHECK_EQ(f.pc.lookup(a2, {}).branch_at, 64);
+    /* the floor: a head under 72 tokens past the hit's resume point is not named */
+    f.pc.set_shared_head(72);
+    CHECK_EQ(f.pc.lookup(d, {}).branch_at, 80);
+    f.pc.set_shared_head(96);
+    CHECK_EQ(f.pc.lookup(d, {}).branch_at, 0);
+    /* off: the departure entry only, with two cached ways off it */
+    f.pc.set_shared_head(0);
+    CHECK_EQ(f.pc.lookup(d, {}).branch_at, 0);
+    CHECK_EQ(f.pc.lookup(with_tail(6000), {}).branch_at, 64);
+    CHECK_EQ(f.pc.lookup(a2, {}).branch_at, 0);
+}
+
+/* The pick itself: a head with a snapshot already at or past it is no head (resumable), and of equal
+ * counts the deeper wins. */
+TEST(shared_head_pick_prefers_the_most_ways_then_the_deepest) {
+    const uint8_t ch[6] = { 1, 1, 5, 1, 2, 1 };
+    CHECK_EQ(shared_head_pick(ch, 6, true, 16, 0, 16), 48);     /* 5 ways at entry 2 */
+    CHECK_EQ(shared_head_pick(ch, 6, true, 16, 48, 16), 96);    /* past 48: entry 5 (1 + the prompt) ties entry 4, deeper */
+    CHECK_EQ(shared_head_pick(ch, 6, false, 16, 48, 16), 80);   /* not departing: entry 4 only */
+    CHECK_EQ(shared_head_pick(ch, 6, true, 16, 0, 100), 0);     /* every head under the floor */
+    CHECK_EQ(shared_head_pick(ch, 0, true, 16, 0, 16), 0);
+}
+
 TEST(prefix_cache_lru_eviction_order) {
     Fixture f;
     CHECK_OK(f.build(/*with_linear=*/false));

@@ -130,6 +130,9 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
     o.checkpoints_written = m.checkpoints_written;
+    o.shared_head_keeps = m.shared_head_keeps;
+    o.shared_head_snapshots = m.shared_head_snapshots;
+    o.prefill_end_published = m.prefill_end_published;
     o.prefix_publish_held_tokens = m.prefix_publish_held_tokens;
     o.eors_reserved = m.eors_reserved;        o.eors_committed = m.eors_committed;
     o.eors_ahead_withheld = m.eors_ahead_withheld;

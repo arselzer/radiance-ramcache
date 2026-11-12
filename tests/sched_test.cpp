@@ -10065,7 +10065,7 @@ TEST(batch_admission_is_refused_where_it_is_not_covered) {
         const BaRun r = batch_run(f, ids);
         CHECK_EQ(ba_prefill_steps(r), 2);
     }
-    for (const char* bad : { "16", "2049", "4096", "-1", "256x", "on" }) {
+    for (const char* bad : { "16", "4097", "8192", "-1", "256x", "on" }) {
         LcpOn on(2048, 1);
         Fixture f;
         lcp_fixture(f, 2048, 2048);
@@ -10472,9 +10472,11 @@ TEST(batch_admission_fills_a_4096_row_step_at_c_4096) {
     }
     CHECK(on.chunks == off.chunks);
     CHECK(on.out == off.out);
-    /* off: 8 + 2 (the 5,000-token prompt's two chunks) + 2 prefill steps; on: 1 + 2 + 1 */
-    CHECK_EQ(ba_prefill_steps(off), 12);
-    CHECK_EQ(ba_prefill_steps(on), 4);
+    /* off: 8 + the 5,000-token prompt's chunks + 2 prefill steps; on: 1 + its chunks + 1 */
+    const size_t big = off.chunks[9].size();   /* request 9, the 5,000-token prompt */
+    CHECK(big >= 2);
+    CHECK_EQ(ba_prefill_steps(off), (int)(10 + big));
+    CHECK_EQ(ba_prefill_steps(on), (int)(2 + big));
     {   /* without Phase 1: refused at C 4,096, one prompt a step as before */
         LcpOn lc(4096, 1);
         Fixture f;

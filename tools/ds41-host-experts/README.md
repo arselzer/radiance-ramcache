@@ -141,6 +141,29 @@ identical to the engine without it, and so was every prefill hash at 8 streams; 
 8.3-12.9% / 8.5-9.3%, and at 8 streams the first reply's first token came about 1.9 s later and the last one's
 1.2-1.4 s earlier (the `..._BATCH_ADMIT` row of the table below). Prompts arriving apart and prompts longer than 256
 tokens are admitted as before and gain nothing.
+
+**Batch prefill up to the chunk, beside the prefix cache** (`claude/ds41-batch-prefill`; not yet measured on the
+cards). For offline batch jobs of many 600-900-token prompts behind a few shared system prompts, where each prompt
+alone in its prefill step spends most of the wall time there, `..._BATCH_ADMIT=N` takes N up to the chunk C (2048)
+beside prefill Phase 1 (`..._DS41_P1=1`): a shared step of Phase 1's threshold (320) or more rows is then the card
+path's, as a lone chunk of that height is (`FileStager::p1_pass_arms` reads the pass's rows and kind, not its
+sequences; T1 holds the twin row's bytes to the decode band's at every height, and the CPU path's too). N of 256 or
+less is as before (held below the threshold), and N above 256 without P1 is refused. With the prefix cache on
+under `--prefix-resume exact` (refused under `nearest`), a prompt joins a batch only where its chunk is the one it
+takes alone: its whole remaining prompt from its hit (the snapshot restored before the step), with the snapshot it
+writes alone, if any (e.g. its end on `..._DS41_RESUME_GRID`'s grid); a prompt whose hit leaves another chunk (a
+shared head it snapshots on its way, more than the rows left) is refused in admission before it takes a block, ends
+the batch, and runs as before. Prompts admitted together cannot hit each other's snapshots (those are written at
+the step's end), so the first wave behind a new system prompt computes it in each prompt; from then on each
+prompt's suffix shares a step. Startup lines `batch admission: on (...=N) ... Phase 1's card path computes a
+batch of 320 rows or more` and `batch admission: beside the prefix cache (--prefix-resume exact)`; shutdown lines
+`batch admission: K of those steps of 320 rows or more (Phase 1's card path)`, `... H batched prompts restored a
+snapshot and S wrote one; J joins refused ...; outside the covered case: 0` (an arm counting more is set aside).
+Arm parts e.g. `...-Lc2048-P1-...-Pf-N32-C32-Ba2048-Pc-Pce-Pcg16-...` (`BaN` up to 2048 with `P1`, at most the
+`Lc` chunk; beside `Pc` / `Pc0`, not `Pcn`). Gates for a window: replies and `Kh` hashes against the same arm
+without `Ba`. Tests `sched_test` `batch_admission_beside_the_prefix_cache_*`,
+`batch_admission_to_the_chunk_is_refused_where_it_is_not_covered`, `p1_stager_test`
+`p1_arms_a_pass_of_several_prompts_as_a_lone_chunk_of_its_rows`, `ab_window_ba_test.sh`.
 In the paragraphs from here to the two-batch overlap one, every 4- and 8-stream arm also ran
 `..._PREFETCH_MULTIROW=N` (parts `Pmr4` / `Pmr8`) with `--max-model-len 1024` (`L1024`), sending the 8 held-out
 requests N at a time. A total at N streams is N times the mean of the requests' `predicted_per_second`

@@ -10021,8 +10021,9 @@ TEST(batch_admission_survives_a_cancel_and_a_pool_that_refuses) {
 
 /* Where it is not covered the switch is refused with the reason, and the scheduler admits one prompt a
  * step as before: without prefill alone, without large-chunk prefill, at --max-num-seqs 1, with the
- * prefix cache. A value outside 32..256 refuses to start. Under prefill Phase 1 the rows are held below
- * its threshold, so a batch never arms the card path. */
+ * prefix cache under --prefix-resume nearest. A value outside 32..2048 refuses to start. Under prefill
+ * Phase 1 a value of at most 256 holds the rows below its threshold, so such a batch never arms the card
+ * path. */
 TEST(batch_admission_is_refused_where_it_is_not_covered) {
     auto refused = [](Fixture& f, const char* what, bool alone, int64_t seqs) {
         std::string err;
@@ -10057,13 +10058,14 @@ TEST(batch_admission_is_refused_where_it_is_not_covered) {
         Fixture f;
         lcp_fixture(f, 2048, 2048);
         f.cfg.prefix_cache = true;
-        refused(f, "the prefix cache is on", true, 8);
+        f.cfg.prefix_exact = false;
+        refused(f, "the prefix cache is on under --prefix-resume nearest", true, 8);
         /* refused, it admits one prompt a step */
         const std::vector<uint64_t> ids = submit_all(f, { 46, 40 }, 2);
         const BaRun r = batch_run(f, ids);
         CHECK_EQ(ba_prefill_steps(r), 2);
     }
-    for (const char* bad : { "16", "257", "1024", "-1", "256x", "on" }) {
+    for (const char* bad : { "16", "2049", "4096", "-1", "256x", "on" }) {
         LcpOn on(2048, 1);
         Fixture f;
         lcp_fixture(f, 2048, 2048);
@@ -10117,6 +10119,290 @@ TEST(batch_admission_is_refused_where_it_is_not_covered) {
         Fixture f;
         lcp_fixture(f, 2048, 2048);
         refused(f, "leaves fewer than 32 rows", true, 8);
+    }
+}
+
+/* ================================================================== batch admission to the chunk, beside the
+ * prefix cache */
+/* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT above 256 rows (beside prefill Phase 1, up to the chunk C) and beside
+ * the prefix cache (--prefix-resume exact): a batched run plans every prompt's chunks, the snapshot each
+ * restores and the ones it writes, at the positions the unbatched run plans them, and only the steps'
+ * composition changes. */
+namespace {
+
+struct P1Env {
+    explicit P1Env(const char* min_rows = nullptr) {
+        setenv(ds41p1::kEnv, "1", 1);
+        if (min_rows) setenv(ds41p1::kMinRowsEnv, min_rows, 1);
+        else unsetenv(ds41p1::kMinRowsEnv);
+    }
+    ~P1Env() { unsetenv(ds41p1::kEnv); unsetenv(ds41p1::kMinRowsEnv); }
+};
+
+/* What a run plans for each request, step by step, and what its steps were. */
+struct PcRun {
+    /* request -> its prefill chunks (ctx_len, n_tokens), the snapshot each restores (-1 none) and the
+     * position of the snapshot each writes (-1 none), in step order */
+    std::map<uint64_t, std::vector<std::tuple<int32_t, int32_t, int32_t, int64_t>>> chunks;
+    std::map<uint64_t, std::vector<int64_t>> decode_snaps;   /* decode-written snapshots (EORS) */
+    std::map<uint64_t, std::pair<int64_t, size_t>> end;      /* n_computed and tokens out, as last seen */
+    std::vector<int64_t> pf_rows;                             /* every prefill step's rows */
+    std::vector<int> pf_seqs;                                 /* and its sequences */
+    int bad = 0;                                              /* a step outside what a batch may be */
+};
+
+PcRun pc_run(Fixture& f, const std::vector<uint64_t>& ids, int64_t p1_thr = 0) {
+    PcRun r;
+    for (int k = 0; k < 2000; ++k) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        int pf = 0, dec = 0;
+        for (const StepEntry& e : p.e) {
+            const int64_t snap = e.ckpt_slot >= 0 && e.ckpt_tok >= 0 ? (int64_t)e.ctx_len + e.ckpt_tok + 1 : -1;
+            if (e.is_prefill) {
+                ++pf;
+                r.chunks[e.seq].emplace_back(e.ctx_len, e.n_tokens, e.ckpt_restore >= 0 ? e.ctx_len : -1, snap);
+            } else {
+                ++dec;
+                if (snap >= 0) r.decode_snaps[e.seq].push_back(snap);
+            }
+        }
+        if (pf > 0) {
+            r.pf_rows.push_back(b->n_tok);
+            r.pf_seqs.push_back(pf);
+            /* a prefill step is prefill alone: no decode row, a pure prefill pass, at most C rows */
+            r.bad += dec != 0 || b->phase != RAD_PHASE_PREFILL || b->n_tok_decode != 0 || b->n_spec != 0 ||
+                     b->n_seq != pf || b->n_tok > f.sch.lcp_rows();
+            if (pf > 1) r.bad += b->lcp_admit_row != 0;
+            (void)p1_thr;
+        }
+        f.commit_plain();
+        for (uint64_t id : ids)
+            if (const Request* q = f.sch.find(id)) r.end[id] = { (int64_t)q->n_computed, q->output.size() };
+    }
+    return r;
+}
+
+/* lcp_fixture at C 2,048 with the prefix cache on (--prefix-resume exact, the A/B's Pc), --max-num-seqs 8;
+ * `admit` the switch, `eors` end-of-request snapshots on a 16-token grid (the A/B's Pce-Pcg16). */
+int pc_start(Fixture& f, const char* admit, bool eors, std::string* log = nullptr) {
+    lcp_fixture(f, 2048, 2048);
+    f.cfg.prefix_cache = true;
+    f.cfg.prefix_exact = true;
+    if (eors) {
+        setenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS", "1", 1);
+        setenv("RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID", "16", 1);
+    }
+    int rc = 0;
+    const std::string l = info_of([&] { rc = batch_start(f, admit, 8); });
+    unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS");
+    unsetenv("RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID");
+    if (log) *log = l;
+    return rc;
+}
+
+/* The workload the switch is for: prompts of 600-1,100 tokens behind a shared 512-token head the cache
+ * holds with its snapshot (each prompt's hit restores it, and its suffix is what is left). */
+const std::vector<int> kPcPrompts = { 800, 736, 900, 650, 1100, 704, 833, 960, 1500, 610 };
+
+}  /* namespace */
+
+/* Off and on (2,048 rows, Phase 1 on at its default threshold 320), every prompt hits the 512-token head
+ * with its snapshot: each prompt's chunk is [512, n), restoring the snapshot at 512, and writes the snapshot
+ * at its end where n is on the 16-token grid (800, 736, 704, 960), exactly as alone; on, the suffixes share
+ * steps of up to 2,048 rows, each of Phase 1's threshold or more: 1,818 rows of six prompts (the seventh's
+ * 321 rows do not fit: its join is refused after its lookup, and it opens the next step), then 769 of two
+ * (--max-num-seqs 8 leaves no sequence for a third), then 1,086 of two. Each sequence ends at the same position with the same tokens out. */
+TEST(batch_admission_beside_the_prefix_cache_plans_each_prompt_as_alone) {
+    for (const bool eors : { false, true }) {
+        PcRun off, on;
+        for (const char* admit : { "0", "2048" }) {
+            P1Env p1;
+            LcpOn lc(2048, 1);
+            Fixture f;
+            std::string log;
+            REQUIRE_EQ(pc_start(f, admit, eors, &log), RAD_OK);
+            const bool batching = std::strcmp(admit, "0") != 0;
+            CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)(batching ? 2048 : 0));
+            CHECK_EQ(f.sch.batch_admit_prefix(), batching);
+            CHECK_EQ(has(log, "batch admission: on (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=2048)"), batching);
+            CHECK_EQ(has(log, "batch admission: beside the prefix cache (--prefix-resume exact)"), batching);
+            CHECK_EQ(has(log, "Phase 1's card path computes a batch of 320 rows or more"), batching);
+            CHECK(!has(log, "batch admission: refused"));
+            f.pc.seed(512);
+            f.pc.lin = 512;
+            f.pc.src = 3;
+            const std::vector<uint64_t> ids = submit_all(f, kPcPrompts, 20);
+            (batching ? on : off) = pc_run(f, ids);
+            const SchedMetrics m = f.sch.metrics();
+            if (batching) {
+                CHECK_EQ(m.batch_admit_steps, (int64_t)3);
+                CHECK_EQ(m.batch_admit_prompts, (int64_t)kPcPrompts.size());
+                CHECK_EQ(m.batch_admit_hits, (int64_t)kPcPrompts.size());
+                CHECK_EQ(m.batch_admit_snapshots, (int64_t)(eors ? 4 : 0));
+                CHECK_EQ(m.batch_admit_p1_steps, m.batch_admit_steps);
+                CHECK_EQ(m.batch_admit_outside, (int64_t)0);
+                CHECK_EQ(m.batch_admit_join_refused, (int64_t)1);   /* the 7th's 321 rows past 1,818 */
+                const std::string rep = info_of([&] { f.sch.batch_admit_report(); });
+                CHECK(has(rep, "outside the covered case: 0"));
+                CHECK(has(rep, "(Phase 1's card path)"));
+            } else {
+                CHECK_EQ(m.batch_admit_steps, (int64_t)0);
+            }
+        }
+        CHECK_EQ(off.bad, 0);
+        CHECK_EQ(on.bad, 0);
+        /* Off: one prompt a step, each its suffix from the snapshot. */
+        CHECK_EQ(off.pf_rows.size(), kPcPrompts.size());
+        CHECK(on.pf_rows.size() < off.pf_rows.size() / 2);
+        for (size_t i = 0; i < on.pf_rows.size(); ++i) CHECK(on.pf_rows[i] >= 320 && on.pf_rows[i] <= 2048);
+        REQUIRE(!on.pf_seqs.empty());
+        CHECK_EQ(on.pf_seqs[0], 6);   /* 288 + 224 + 388 + 138 + 588 + 192 = 1,818; the 7th's 321 would pass 2,048 */
+        CHECK(on.pf_rows == std::vector<int64_t>({ 1818, 769, 1086 }));
+        /* The plans, request by request: equal. */
+        CHECK(on.chunks == off.chunks);
+        CHECK(on.decode_snaps == off.decode_snaps);
+        CHECK(on.end == off.end);
+        for (size_t i = 0; i < kPcPrompts.size(); ++i) {
+            const uint64_t id = (uint64_t)(i + 1);
+            const auto it = off.chunks.find(id);
+            REQUIRE(it != off.chunks.end());
+            REQUIRE_EQ(it->second.size(), (size_t)1);
+            const auto& [ctx, n, restore, snap] = it->second[0];
+            CHECK_EQ(ctx, 512);
+            CHECK_EQ(n, kPcPrompts[i] - 512);
+            CHECK_EQ(restore, 512);
+            CHECK_EQ(snap, (int64_t)(eors && kPcPrompts[i] % 16 == 0 ? kPcPrompts[i] : -1));
+            if (eors) CHECK(!off.decode_snaps[id].empty());
+        }
+    }
+}
+
+/* A miss (the cache holds nothing): each prompt whole from 0, as without the prefix cache, and the same
+ * plans on and off; at Ba256 under Phase 1 the batches stay below its threshold as before. */
+TEST(batch_admission_beside_the_prefix_cache_takes_misses_whole) {
+    for (const char* admit : { "2048", "256" }) {
+        PcRun off, on;
+        for (const char* a : { "0", admit }) {
+            P1Env p1;
+            LcpOn lc(2048, 1);
+            Fixture f;
+            REQUIRE_EQ(pc_start(f, a, true), RAD_OK);
+            const std::vector<uint64_t> ids = submit_all(f, { 300, 250, 400, 180, 900, 96, 128 }, 6);
+            (std::strcmp(a, "0") ? on : off) = pc_run(f, ids);
+            if (std::strcmp(a, "0")) {
+                CHECK_EQ(f.sch.metrics().batch_admit_outside, (int64_t)0);
+                CHECK_EQ(f.sch.metrics().batch_admit_hits, (int64_t)0);
+                CHECK(f.sch.metrics().batch_admit_steps >= 1);
+            }
+        }
+        CHECK_EQ(on.bad, 0);
+        CHECK(on.chunks == off.chunks);
+        CHECK(on.end == off.end);
+        CHECK(on.pf_rows.size() < off.pf_rows.size());
+        if (!std::strcmp(admit, "256"))
+            for (int64_t n : on.pf_rows) CHECK(n < 320 || n == 400 || n == 900);   /* a lone prompt as before */
+    }
+}
+
+/* A hit that leaves another chunk than the whole suffix (a shared head deeper than the hit, so the prompt
+ * snapshots it on its way: [512, 896) then [896, n)) is never joined: admit_one refuses it before it takes a
+ * block (counted), it runs alone as before, and the plans on and off stay equal. */
+TEST(batch_admission_beside_the_prefix_cache_refuses_a_join_whose_chunk_is_not_its_alone_one) {
+    PcRun off, on;
+    int64_t refused = -1;
+    for (const char* a : { "0", "2048" }) {
+        P1Env p1;
+        LcpOn lc(2048, 1);
+        Fixture f;
+        REQUIRE_EQ(pc_start(f, a, false), RAD_OK);
+        f.pc.seed(512);
+        f.pc.lin = 512;
+        f.pc.src = 3;
+        /* Every lookup sees a head shared to 900 (the fake answers every lookup alike): only the
+         * 1,200-token prompt reaches it (the keep point lies past the other two prompts' ends). */
+        f.pc.branch_at = 900;
+        const std::vector<uint64_t> ids = { f.submit(700, 4), f.submit(1200, 4), f.submit(640, 4) };
+        (std::strcmp(a, "0") ? on : off) = pc_run(f, ids);
+        if (std::strcmp(a, "0")) {
+            refused = f.sch.metrics().batch_admit_join_refused;
+            CHECK_EQ(f.sch.metrics().batch_admit_outside, (int64_t)0);
+        }
+    }
+    CHECK(refused >= 1);
+    CHECK_EQ(on.bad, 0);
+    CHECK(on.chunks == off.chunks);
+    CHECK(on.end == off.end);
+    /* the 1,200-token prompt: its chunk to the shared head, writing its snapshot there, then the rest */
+    const auto& c = off.chunks[2];
+    REQUIRE_EQ(c.size(), (size_t)2);
+    CHECK(c[0] == std::make_tuple(512, 384, 512, (int64_t)896));   /* the head on the 16-token quantum */
+    CHECK(c[1] == std::make_tuple(896, 304, -1, (int64_t)-1));
+}
+
+/* Refusals and bounds: above 256 rows without Phase 1 (refused, one a step), above 2,048 (refuses to start),
+ * the prefix cache under --prefix-resume nearest (refused); under Phase 1 at Ba1024 the rows are 1,024
+ * (not held below the threshold), at Ba256 still held below it. */
+TEST(batch_admission_to_the_chunk_is_refused_where_it_is_not_covered) {
+    {
+        LcpOn lc(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        std::string err;
+        int rc = 0;
+        err = info_of([&] { rc = batch_start(f, "1024", 8); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(err, "batch admission: refused"));
+        CHECK(has(err, "taken only beside prefill Phase 1"));
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)0);
+    }
+    for (const char* bad : { "2049", "4096", "16" }) {
+        P1Env p1;
+        LcpOn lc(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = batch_start(f, bad, 8); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+        CHECK(has(err, "or up to 2048 beside prefill Phase 1"));
+    }
+    {
+        P1Env p1;
+        LcpOn lc(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        f.cfg.prefix_cache = true;
+        f.cfg.prefix_exact = false;
+        std::string err;
+        int rc = 0;
+        err = info_of([&] { rc = batch_start(f, "2048", 8); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(err, "--prefix-resume nearest"));
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)0);
+        CHECK(!f.sch.batch_admit_prefix());
+    }
+    for (const char* a : { "1024", "256" }) {
+        P1Env p1;
+        LcpOn lc(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        std::string err;
+        int rc = 0;
+        err = info_of([&] { rc = batch_start(f, a, 8); });
+        REQUIRE_EQ(rc, RAD_OK);
+        const bool big = !std::strcmp(a, "1024");
+        CHECK_EQ(f.sch.batch_admit_rows(), (int64_t)(big ? 1024 : 256));
+        CHECK_EQ(has(err, "held below Phase 1's threshold"), false);
+        CHECK(!f.sch.batch_admit_prefix());
+        const std::vector<uint64_t> ids = submit_all(f, { 400, 300, 200, 500, 100 }, 2);
+        const BaRun r = batch_run(f, ids);
+        REQUIRE(!r.steps.empty());
+        if (big) CHECK_EQ(r.steps[0].n_tok, (int64_t)900);    /* 400 + 300 + 200; 500 would pass 1,024 */
+        else CHECK_EQ(r.steps[0].n_tok, (int64_t)400);        /* 400 alone (longer than 256) */
+        const std::string rep = info_of([&] { f.sch.batch_admit_report(); });
+        CHECK(has(rep, "outside the covered case: 0"));
+        CHECK_EQ(has(rep, "(Phase 1's card path)"), big);
     }
 }
 

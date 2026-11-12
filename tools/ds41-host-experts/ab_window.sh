@@ -978,6 +978,7 @@ Ns${ARM_NS:-}|${ARM_NS:-}|side store: the planes of up to [0-9]+ units a rank
 Pv|${ARM_PV:-}|router predictor: every posted router input is recorded to
 Tb|${ARM_TB:-}|two-batch overlap \(RADIANCE_EXPERIMENTAL_SCHED_TBO=1\): a decode step
 Ba${ARM_BA:-}|${ARM_BA:-}|batch admission: on \(RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=${ARM_BA:-[0-9]+}\)
+BaPc|${ARM_BAPC:-}|batch admission: beside the prefix cache \(--prefix-resume exact\)
 Ax${ARM_AX:-}|${ARM_AX:-}|$ax_on
 Axv|${ARM_AXV:-}|$axv_on
 AxS|${ARM_AXS:-}|aux experts: sharing: policy ${ARM_AXS:-[a-z]+}
@@ -1495,7 +1496,15 @@ EOF2
   fi
   # Ba: the steps that admitted whole prompts together (the scheduler's shutdown line). A Ba arm that
   # sent requests together (CK, K > 1) and batched no step did not do what its name says: set aside.
-  grep -E 'batch admission: [0-9]+ steps admitted' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  grep -E 'batch admission: ([0-9]+ steps admitted|[0-9]+ of those steps|beside the prefix cache, [0-9]+|outside the covered case)' \
+    "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Ba: a shared step's entry outside the covered case (a chunk not the one its prompt takes alone) must not
+  # happen; an arm that counts one is set aside (with Pc, the snapshots and hits it batched are on its line).
+  if [[ -n "${ARM_BA:-}" ]] &&
+     grep -qE 'batch admission: .*outside the covered case: [1-9]' "$OUT/$name.server.log"; then
+    log "arm $name: Ba, but the scheduler counted a batched prompt outside the covered case; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
   if [[ -n "${ARM_BA:-}" && "${ARM_OBS_CONC:-${ARM_CONC:-${AB_CONCURRENCY:-1}}}" -gt 1 ]] &&
      ! grep -qE 'batch admission: [1-9][0-9]* steps admitted' "$OUT/$name.server.log"; then
     log "arm $name: Ba, but no step admitted two prompts together; not measured (results kept as $name.unmeasured.json)"
@@ -2719,11 +2728,15 @@ for a in $ARMS; do
 # tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); Tb a decode step of two or
 # more sequences issued as two micro-batches, each layer's MoE gather of one behind the other's card
 # work (RADIANCE_EXPERIMENTAL_SCHED_TBO; a radiance and deepseek41 from claude/ds41-tbo); Ba / BaN whole
-# prompts waiting together admitted into one prefill-only step of at most 256 / N (32-256) rows instead of
-# one a step (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=N, experimental; needs Pf, Lc, NK above 1 and no Pc
-# or Kld part; a radiance from claude/ds41-batch-admit): measured only with the scheduler's startup line
-# "batch admission: on (...=N)" (every other arm states the switch 0 and must not have it), and a Ba arm
-# that sent requests together but batched no step is set aside; rN a repeat (ignored).
+# prompts waiting together admitted into one prefill-only step of at most 256 / N (32-256, or up to the
+# chunk and 2048 with P1, whose card path then computes a batch of its threshold's rows or more) rows
+# instead of one a step (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=N, experimental; needs Pf, Lc, NK above 1
+# and no Pcn or Kld part; with Pc / Pc0 a prompt joins only with the chunk it takes alone, its suffix from
+# its hit; a radiance from claude/ds41-batch-prefill for N above 256 or beside Pc): measured only with the
+# scheduler's startup line "batch admission: on (...=N)" (every other arm states the switch 0 and must not
+# have it) and, with Pc, its "beside the prefix cache" line; a Ba arm that sent requests together but
+# batched no step, or whose shutdown line counts a prompt outside the covered case, is set aside; rN a
+# repeat (ignored).
 # Ax / AxN the aux expert worker (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS=N MiB, AUX_MIB or 26000 for Ax; core/place/
 # aux_expert_worker.h; a radiance from claude/ds41-aux-worker): an extra card of the ranks' ISA (aux_find, by
 # capability from the KFD topology; AUX_UUID or AUX_BDF narrow it) appended last to the window's mask of the four
@@ -2860,7 +2873,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" sg=""
+  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" sg="" pcn=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -2996,7 +3009,7 @@ for a in $ARMS; do
       Pc)      pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact)                          # prefix cache on (exact resume, the default, named)
                env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... and pinned slabs not reserved twice
       Pc0)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                      # prefix cache on, the margin as before (the control)
-      Pcn)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume nearest)                        # prefix cache on, a hit resumes at the deepest snapshot
+      Pcn)     pc=1 pcn=1 ARM_NOPC= ; ARGS+=(--prefix-resume nearest)                  # prefix cache on, a hit resumes at the deepest snapshot
                env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... (Kh against a cold arm checks it stays exact)
       Pci[0-9]*) pcopt+=" $p"; arm_checkpoint_interval=${p#Pci}; ARGS+=(--checkpoint-interval "${p#Pci}") ;;  # interval (default2048)
       Pcs[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                       # snapshot store slots (auto)
@@ -3011,8 +3024,8 @@ for a in $ARMS; do
       Ba|Ba[0-9]*)                                                     # whole prompts waiting together in one prefill step (BATCH_ADMIT)
                if [[ -n "$ba" ]]; then log "arm $a: duplicate Ba part; the arm is skipped"; skip=1; fi
                ba=${p#Ba}; ba=${ba:-256}
-               if [[ $ba =~ ^[0-9]+$ ]] && (( 10#$ba >= 32 && 10#$ba <= 256 )); then ba=$((10#$ba))
-               else log "arm $a: $p: a batch holds 32-256 rows; the arm is skipped"; skip=1; fi ;;
+               if [[ $ba =~ ^[0-9]+$ ]] && (( 10#$ba >= 32 && 10#$ba <= 2048 )); then ba=$((10#$ba))
+               else log "arm $a: $p: a batch holds 32-256 rows, or up to 2048 with P1; the arm is skipped"; skip=1; fi ;;
       Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
@@ -3257,19 +3270,25 @@ for a in $ARMS; do
   ARM_TB=$tb
   # Ba / BaN: stated by every arm (0 off), so a window's VAR=val cannot batch another arm's admissions;
   # arm() checks the scheduler's startup line both ways. It acts only beside prefill alone (Pf), large-
-  # chunk prefill (Lc), more than one sequence (NK, or MAX_SEQS), the prefix cache off (no Pc part) and
-  # outside KL mode (no Kld part; a Kld arm goes to kld_finish before arm() checks the startup line): the
-  # scheduler refuses it otherwise, and the arm would run without what its name says.
+  # chunk prefill (Lc), more than one sequence (NK, or MAX_SEQS), the prefix cache off or under the exact
+  # resume (no Pc part, or Pc / Pc0; not Pcn), outside KL mode (no Kld part; a Kld arm goes to kld_finish
+  # before arm() checks the startup line), and N above 256 only with P1 and at most the chunk: the
+  # scheduler refuses it otherwise, and the arm would run without what its name says. With Pc / Pc0 the
+  # scheduler's second line ("batch admission: beside the prefix cache") is checked both ways too.
   if [[ -n "$ba" ]]; then
     [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 "* ]] ||
       { log "arm $a: Ba needs Pf (prefill alone); the arm is skipped"; skip=1; }
     [[ -n "$lc" ]] || { log "arm $a: Ba needs an Lc part (large-chunk prefill); the arm is skipped"; skip=1; }
     (( 10#${nseq:-${MAX_SEQS:-1}} > 1 )) || { log "arm $a: Ba needs NK with K above 1; the arm is skipped"; skip=1; }
-    [[ -z "$pc" ]] || { log "arm $a: Ba with a Pc part (the scheduler refuses the prefix cache); the arm is skipped"; skip=1; }
+    [[ -z "$pcn" ]] || { log "arm $a: Ba with Pcn (the scheduler takes the prefix cache under the exact resume only); the arm is skipped"; skip=1; }
+    if [[ $ba =~ ^[0-9]+$ ]] && (( ba > 256 )); then
+      [[ -n "$p1" ]] || { log "arm $a: Ba$ba above 256 rows needs P1 (the scheduler takes it only beside Phase 1's card path); the arm is skipped"; skip=1; }
+      [[ -z "$lc" ]] || (( ba <= 10#$lc )) || { log "arm $a: Ba$ba above the chunk Lc$lc; the arm is skipped"; skip=1; }
+    fi
     [[ -z "$kld" ]] || { log "arm $a: Ba with a Kld part (the scheduler refuses batch admission under --kld-record); the arm is skipped"; skip=1; }
   fi
   env+=(RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=${ba:-0})
-  ARM_BA=$ba
+  ARM_BA=$ba ARM_BAPC=; [[ -n "$ba" && -n "$pc" ]] && ARM_BAPC=1
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   # Pi8 / Pi4, PkN, Pw, NsN, Pv: each acts only with what it changes (a predictor; Pi; Ei and the

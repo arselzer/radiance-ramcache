@@ -204,6 +204,18 @@ constexpr const char* kLendAuditEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT"
  * card path's prefill chunks have the drive to themselves, and the lent slots stay as they were through a
  * prompt's chunks and the decode right after them. 0: none of it (the lender as before). Residency waits,
  * bytes do not change (card_expert_stager.h, the rest). */
+/* Decode passes on the cards (kDecodeRowsEnv=N; 0 off, the default; else kMinArmRows to kTwinMaxRows): a pure
+ * trunk decode pass (decode rows only, no draft pass, no speculation, no consumer cut, no media row) of at least
+ * N and at most the chunk's rows arms the card path for its routed layers exactly as a pure prefill pass of the
+ * threshold's rows does (FileStager::p1_decode_pass_arms): the card path's cost is the layer's experts read once
+ * whatever its rows, the CPU path's grows with them. Every routed expert row is then the twin row's, which T1
+ * holds byte for byte to the decode band's for the same activation row at every M up to kTwinMaxRows, as the CPU
+ * path's is; the dense ops are the ones a pass of that height runs either way. A shorter decode pass, and every
+ * other pass, runs as without it. Needs kEnv; refused beside the two-batch overlap (a sliced layer launches its
+ * expert ops twice a pass) and above the chunk (it could never arm). Not yet measured on the cards. */
+constexpr const char* kDecodeRowsEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS";
+/* A decode threshold kDecodeRowsEnv takes: 0 (off) or kMinArmRows to kTwinMaxRows. */
+constexpr bool decode_rows_ok(long n) { return n == 0 || (n >= kMinArmRows && n <= kTwinMaxRows); }
 constexpr const char* kLendRestEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS";
 constexpr int kDefLendRestMs = 5000, kMaxLendRestMs = 600000;
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
@@ -247,6 +259,7 @@ constexpr const char* kLogLendHeat = "ds41 p1: lent heat";      /* rank 0, at st
 constexpr const char* kLogLendSlab = "ds41 p1: lent slab";      /* rank 0, at startup, with kLendSlabEnv */
 constexpr const char* kLogLendAudit = "ds41 p1: lent audit";    /* rank 0, at startup, with kLendAuditEnv; and every difference */
 constexpr const char* kLogLendRest = "ds41 p1: lent rest";      /* rank 0, at startup, with a rest (kLendRestEnv) */
+constexpr const char* kLogDecode = "ds41 p1: decode passes on the cards";   /* rank 0, at startup, with kDecodeRowsEnv */
 
 /* Whether the lent arena is asked for (kEnv `p1` on, kLendArenaEnv `lend` a count from 1 to kMaxLend):
  * the deepseek41 plugin then declares at a smaller step too. A value the core refuses counts as not

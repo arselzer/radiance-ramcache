@@ -80,7 +80,22 @@ struct EpCountsHostProbe {
         fs.p1_lend_asked_ = lend;
         return fs.hx_need_rows();
     }
-    static void disarm(FileStager& fs) { fs.p1_armed_ = false; fs.layers_.clear(); fs.pass_row0_.clear(); }
+    static void disarm(FileStager& fs) {
+        fs.p1_armed_ = false;
+        fs.p1_decode_pass_ = false;
+        fs.layers_.clear();
+        fs.pass_row0_.clear();
+    }
+    /* ..._P1_DECODE_ROWS: a pass armed (or not) as begin_pass arms pass `b` at the threshold min_rows, the decode
+     * threshold decode_rows and the chunk C, uncut, over n routed layers; whether it armed as a decode pass. */
+    static bool arm_as(FileStager& fs, const RadBatch& b, int32_t n, int64_t min_rows, int64_t decode_rows, int64_t C) {
+        bool decode = false;
+        const bool armed = FileStager::p1_arms_pass(b, min_rows, decode_rows, C, &decode);
+        cut(fs, armed, b.n_tok, {}, n, min_rows, C);
+        fs.p1_decode_rows_ = decode_rows;
+        fs.p1_decode_pass_ = armed && decode;
+        return fs.p1_decode_pass_;
+    }
     /* The host-pool source (FileStager::p1_pool_source) over a mover and its plan. */
     static void bind(FileStager& fs, Mover* m, const Plan* plan, const Program* prog) {
         fs.mover_ = m;
@@ -1272,6 +1287,154 @@ TEST(p1_arms_a_pass_of_several_prompts_as_a_lone_chunk_of_its_rows) {
         }
 }
 
+/* ---- decode passes on the cards (..._P1_DECODE_ROWS) ------------------------------------------------------
+ *
+ * The switch is off unless set (0, unset or empty), and takes 17 to 4096 otherwise: below 17 a pass runs on the
+ * gemv rows, which honour no mark (kMinArmRows), above 4096 the twin's bound. */
+TEST(p1_decode_rows_tunable_is_default_off_and_takes_0_or_17_to_4096) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.decode_rows, 0);
+    env[ds41p1::kDecodeRowsEnv] = "";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.decode_rows, 0);
+    for (const char* ok : { "0", "17", "128", "200", "256", "2048", "4096" }) {
+        env[ds41p1::kDecodeRowsEnv] = ok;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.decode_rows, std::atoi(ok));
+        CHECK_EQ(t.min_rows, ds41p1::kDefMinRows);   /* the prefill threshold is its own */
+    }
+    for (const char* bad : { "1", "16", "4097", "x", "-200", "200x", " 200", "2.5" }) {
+        env[ds41p1::kDecodeRowsEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kDecodeRowsEnv) != std::string::npos);
+    }
+    env[ds41p1::kDecodeRowsEnv] = "16";
+    CHECK(!parse_tunables(get, &t, &why));
+    CHECK(why.find("0 (off) or a whole number from 17 to 4096") != std::string::npos);
+    CHECK(ds41p1::decode_rows_ok(0));
+    CHECK(!ds41p1::decode_rows_ok(1));
+    CHECK(!ds41p1::decode_rows_ok(16));
+    CHECK(ds41p1::decode_rows_ok(17));
+    CHECK(ds41p1::decode_rows_ok(4096));
+    CHECK(!ds41p1::decode_rows_ok(4097));
+}
+
+/* Which passes arm as decode passes: a pure trunk decode pass (every token a decode row, no draft pass, no
+ * speculation, no media row, uncut, no admission row) of the decode threshold's rows (and 17) to the chunk. With
+ * the switch 0 none does, and p1_arms_pass is then p1_pass_arms exactly; a prefill pass arms by its own
+ * threshold whatever the decode one. */
+TEST(p1_decode_pass_arms_pure_trunk_decode_passes_from_the_threshold_only) {
+    const int32_t row0[4] = { 0, 0, 0, 0 };
+    for (int64_t C : { 1024, 2048 })
+        for (int64_t N : { 0, 17, 128, 200, 256, 1024, 2048 })
+            for (int64_t n : { 1, 2, 16, 17, 64, 127, 128, 199, 200, 201, 255, 256, 257, 319, 320, 1024, 1025, 2048, 2049 }) {
+                RadBatch d{};
+                d.phase = RAD_PHASE_DECODE;
+                d.n_tok = d.n_tok_decode = n;
+                d.n_seq = d.n_seq_decode = (int32_t)n;
+                const bool want = N > 0 && n >= 17 && n >= N && n <= C;
+                CHECK_EQ(FileStager::p1_decode_pass_arms(d, N, C), want);
+                bool dec = !want;
+                CHECK_EQ(FileStager::p1_arms_pass(d, 320, N, C, &dec), want);
+                CHECK_EQ(dec, want);
+                CHECK(!FileStager::p1_pass_arms(d, 320, C));   /* the prefill rule never takes a decode pass */
+                CHECK(!FileStager::p1_pass_arms(d, 17, C));
+                /* Any other kind of pass of the same rows: never a decode arm. */
+                RadBatch mixed = d;
+                mixed.n_tok_decode = n - 1;
+                RadBatch draft = d;
+                draft.draft_pass = -1;
+                RadBatch spec = d;
+                spec.n_spec = 3;
+                RadBatch media = d;
+                media.n_mm_rows = 1;
+                RadBatch full = d;
+                full.consumer_full = 1;
+                RadBatch cut = d;
+                cut.consumer_row0 = row0;
+                RadBatch admit = d;
+                admit.lcp_admit_row = 1;
+                RadBatch pre = d;
+                pre.phase = RAD_PHASE_PREFILL;
+                for (const RadBatch* x : { &mixed, &draft, &spec, &media, &full, &cut, &admit, &pre })
+                    CHECK(!FileStager::p1_decode_pass_arms(*x, N, C));
+                /* The prefill rule on a prefill pass of n rows, whatever N. */
+                RadBatch p{};
+                p.phase = RAD_PHASE_PREFILL;
+                p.n_tok = n;
+                dec = true;
+                CHECK_EQ(FileStager::p1_arms_pass(p, 320, N, C, &dec), FileStager::p1_pass_arms(p, 320, C));
+                CHECK(!dec);
+                /* Off: exactly the prefill rule on every kind of pass. */
+                for (const RadBatch* x : { &d, &mixed, &draft, &spec, &media, &full, &cut, &admit, &pre, &p })
+                    CHECK_EQ(FileStager::p1_arms_pass(*x, 320, 0, C), FileStager::p1_pass_arms(*x, 320, C));
+            }
+}
+
+/* An armed decode pass's routed layers are all the card path's at the decode threshold, below the prefill
+ * threshold too (a decode pass of 256 rows beside ..._P1_MIN_ROWS=320); an unarmed one's none; a prefill pass
+ * keeps the prefill threshold, and the CPU path's miss bound (hx_miss_need) is the layer's rows when armed. */
+TEST(p1_decode_armed_pass_puts_every_layer_on_the_card_path_at_the_decode_threshold) {
+    FileStager fs;
+    const int32_t nl = 43;
+    for (int64_t N : { 17, 128, 200, 256 })
+        for (int64_t n : { 16, 17, 100, 128, 199, 200, 256, 300, 319, 320, 1024 }) {
+            RadBatch d{};
+            d.phase = RAD_PHASE_DECODE;
+            d.n_tok = d.n_tok_decode = n;
+            d.n_seq = d.n_seq_decode = (int32_t)n;
+            const bool armed = EpCountsHostProbe::arm_as(fs, d, nl, 320, N, 2048);
+            CHECK_EQ(armed, n >= 17 && n >= N);
+            for (int32_t li = 0; li < nl; ++li) {
+                CHECK_EQ(EpCountsHostProbe::rows(fs, li), n);
+                CHECK_EQ(EpCountsHostProbe::card(fs, li), armed);
+                CHECK_EQ(EpCountsHostProbe::miss_need(fs, li), n);
+            }
+            EpCountsHostProbe::disarm(fs);
+            RadBatch p{};
+            p.phase = RAD_PHASE_PREFILL;
+            p.n_tok = n;
+            CHECK(!EpCountsHostProbe::arm_as(fs, p, nl, 320, N, 2048));
+            for (int32_t li = 0; li < nl; ++li) CHECK_EQ(EpCountsHostProbe::card(fs, li), n >= 320);
+            EpCountsHostProbe::disarm(fs);
+        }
+    /* Off (0): a decode pass of any height arms nothing. */
+    for (int64_t n : { 17, 256, 320, 2048 }) {
+        RadBatch d{};
+        d.phase = RAD_PHASE_DECODE;
+        d.n_tok = d.n_tok_decode = n;
+        CHECK(!EpCountsHostProbe::arm_as(fs, d, nl, 320, 0, 2048));
+        for (int32_t li = 0; li < nl; ++li) CHECK(!EpCountsHostProbe::card(fs, li));
+        EpCountsHostProbe::disarm(fs);
+    }
+}
+
+/* p1_init's refusals: a threshold above the chunk (no decode pass could arm), out of range, or beside the
+ * two-batch overlap (a split step launches a layer's expert ops once a micro-batch); 0 always taken. */
+TEST(p1_decode_refusals_above_the_chunk_and_beside_the_two_batch_overlap) {
+    CHECK(FileStager::p1_decode_refusal(0, 2048, false).empty());
+    CHECK(FileStager::p1_decode_refusal(0, 2048, true).empty());
+    CHECK(FileStager::p1_decode_refusal(200, 2048, false).empty());
+    CHECK(FileStager::p1_decode_refusal(2048, 2048, false).empty());
+    CHECK(FileStager::p1_decode_refusal(17, 1024, false).empty());
+    std::string why = FileStager::p1_decode_refusal(2049, 2048, false);
+    CHECK(why.find("above the chunk") != std::string::npos);
+    CHECK(why.find(ds41p1::kDecodeRowsEnv) != std::string::npos);
+    why = FileStager::p1_decode_refusal(1025, 1024, false);
+    CHECK(why.find("above the chunk") != std::string::npos);
+    why = FileStager::p1_decode_refusal(200, 2048, true);
+    CHECK(why.find("two-batch overlap") != std::string::npos);
+    why = FileStager::p1_decode_refusal(16, 2048, false);
+    CHECK(why.find("0 (off) or 17 to 4096") != std::string::npos);
+}
+
 /* ---- the lent ring ------------------------------------------------------------------------------------------
  *
  * RingLender against a simulated host: loads land and copies pass at random host calls, the host's two reload
@@ -1727,6 +1890,59 @@ TEST(p1_lend_decode_beside_the_card_path_sees_residency_change_only_between_pass
         seen = h.published();
     }
     CHECK_EQ(l.residents(), 4);
+    CHECK_EQ(h.violations, 0);
+    if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+}
+
+/* ..._P1_DECODE_ROWS beside the lent ring: an armed decode pass takes the slots back as an armed prefill pass does
+ * (their slots are the ring the card path copies into), a shorter decode pass keeps them; once the tall decode
+ * steps stop, the slots come back after the grace, published only at a pass's begin. Off, no decode pass takes
+ * them, whatever its height. */
+TEST(p1_lend_an_armed_decode_pass_takes_the_slots_back_and_shorter_decode_keeps_them) {
+    auto dec = [](int64_t n) {
+        RadBatch d{};
+        d.phase = RAD_PHASE_DECODE;
+        d.n_tok = d.n_tok_decode = n;
+        d.n_seq = d.n_seq_decode = (int32_t)n;
+        return d;
+    };
+    const RadBatch d128 = dec(128), d256 = dec(256), d199 = dec(199), d200 = dec(200);
+    FakeLend h(23, 4);
+    h.land_pct = h.copy_pct = 100;
+    RingLender l;
+    REQUIRE_EQ(l.init(&h, 4, 300), 0);
+    int64_t t = 0;
+    auto arms = [](const RadBatch& b, int64_t N) { return FileStager::p1_arms_pass(b, 320, N, 2048); };
+    for (int i = 0; i < 10; ++i) lend_pass(l, h, arms(d128, 200), t += 5);
+    CHECK_EQ(l.residents(), 4);
+    lend_pass(l, h, arms(d199, 200), t += 5);
+    CHECK_EQ(l.residents(), 4);
+    /* Off: a 256-row decode pass keeps them. */
+    lend_pass(l, h, arms(d256, 0), t += 5);
+    CHECK_EQ(l.residents(), 4);
+    /* At the threshold: taken back, once; the steps after it find nothing to take. */
+    CHECK_EQ(lend_pass(l, h, arms(d200, 200), t += 5), 1);
+    CHECK_EQ(l.residents(), 0);
+    l.end_p1(t += 1500);
+    for (int i = 0; i < 5; ++i) {
+        CHECK_EQ(lend_pass(l, h, arms(d256, 200), t += 5), 0);
+        CHECK_EQ(h.published(), 0);
+        l.end_p1(t += 1500);
+    }
+    /* The batch shrinks below the threshold: held back for the grace from the last tall step's end, then
+     * reloaded and published between passes. */
+    lend_pass(l, h, arms(d128, 200), t + 299);
+    CHECK(l.lent());
+    CHECK_EQ(l.residents(), 0);
+    t += 300;
+    int seen = 0;
+    for (int i = 0; i < 40; ++i) {
+        lend_pass(l, h, arms(d128, 200), t += 5);
+        CHECK(h.published() >= seen);
+        seen = h.published();
+    }
+    CHECK_EQ(l.residents(), 4);
+    for (const auto& x : h.s) CHECK_EQ(x.loads, 2);
     CHECK_EQ(h.violations, 0);
     if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
 }

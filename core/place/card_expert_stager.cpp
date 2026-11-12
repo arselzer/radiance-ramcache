@@ -50,6 +50,8 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kLendHeatPriorEnv, 0, ds41p1::kMaxLendHeatHalfRows, &r.lend_heat_prior },
         /* Behind the heat and the slab: unset, the rest is theirs (0 without both). */
         { ds41p1::kLendRestEnv, 0, ds41p1::kMaxLendRestMs, &r.lend_rest_ms },
+        /* Decode passes on the cards: 0 off, else 17 to 4096 (below 17 the gemv rows, which honour no mark). */
+        { ds41p1::kDecodeRowsEnv, 0, ds41p1::kTwinMaxRows, &r.decode_rows },
     };
     for (const K& k : ks) {
         const char* v = get(k.env);
@@ -62,6 +64,12 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         }
     }
     if (r.lend_heat_prior < 0) r.lend_heat_prior = r.lend_heat_half;   /* unset: one half-life */
+    if (!ds41p1::decode_rows_ok(r.decode_rows)) {
+        if (why) *why = std::string(ds41p1::kDecodeRowsEnv) + "=" + std::to_string(r.decode_rows) +
+                        ": 0 (off) or a whole number from " + std::to_string(ds41p1::kMinArmRows) + " to " +
+                        std::to_string(ds41p1::kTwinMaxRows);
+        return false;
+    }
     if (const char* a = get(ds41p1::kAlignEnv); a && *a) {
         if (!std::strcmp(a, "end")) r.align_end = true;
         else if (!std::strcmp(a, "start")) r.align_end = false;

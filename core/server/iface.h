@@ -97,6 +97,13 @@ struct SchedMetrics {
     int64_t checkpoints_written = 0;
     /* SchedMetrics::shared_head_keeps / shared_head_snapshots / prefill_end_published. */
     int64_t shared_head_keeps = 0, shared_head_snapshots = 0, prefill_end_published = 0;
+    /* SchedMetrics::shared_head_keeps_redone / _keep_missed / _snapshot_shared, and the batch admission
+     * counters beside the prefix cache (batch_admit_*, batch_split_*, batch_close_*). */
+    int64_t shared_head_keeps_redone = 0, shared_head_keep_missed = 0, shared_head_snapshot_shared = 0;
+    int64_t batch_admit_steps = 0, batch_admit_prompts = 0, batch_admit_join_refused = 0;
+    int64_t batch_split_joins = 0, batch_split_opens = 0, batch_split_head_waits = 0;
+    int64_t batch_close_waiting = 0, batch_close_rows = 0, batch_close_alone = 0, batch_close_opener = 0,
+            batch_close_seqs = 0;
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: computed tokens left unpublished (the
      * scheduler's SchedMetrics::prefix_publish_held_tokens). 0 without the switch. */
     int64_t prefix_publish_held_tokens = 0;

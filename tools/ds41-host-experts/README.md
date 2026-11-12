@@ -58,11 +58,13 @@ and batch admission at 2048. With a fifth card and up to 128 streams, add `RADIA
 the passes the worker would). Size host memory first: an arm that exhausted the box's RAM at 256 streams took the
 kernel down (an amdgpu bug on the OOM path); the RAM budget keeps that margin.
 
-The snapshot store's automatic size is 4 slots a sequence: at 256 streams 1,024 slots of 22.59 MiB, 23 GiB pinned,
+The snapshot store's automatic size was 4 slots a sequence: at 256 streams 1,024 slots of 22.59 MiB, 23 GiB pinned,
 of which a batch of shared-head prompts used 36 (11 at 128 streams). Under the RAM budget that memory comes out of the
 expert cache (184 GiB instead of 205), and the experts that no longer fit are read from the drive on every card-path
 chunk: rank 0 read 447 GB and waited 196 s on the drive. With 128 slots it read 52 GB and waited 1.2 s, and prefill
-fell from 341 to 177 s. At 128 streams the cache was nearly big enough already (171 -> 172 s).
+fell from 341 to 177 s. At 128 streams the cache was nearly big enough already (171 -> 172 s). Under the RAM budget the automatic size is now
+32 sequences' worth at most (min(4 x streams, 128) here, the measured `--checkpoint-slots 128`; up to 32 streams
+unchanged; host-tested, not yet in a GPU window); `--checkpoint-slots N` still sets it.
 
 ## What runs where
 
@@ -1584,7 +1586,10 @@ largest other item is the prefix cache's pinned snapshot store (641 slots of 22.
 N128 with the window's `--max-model-len 147456`); in this mode `--checkpoint-slots auto` sizes it for
 sessions of `..._RAM_BUDGET_SESSION_TOKENS` (default min(--max-model-len, max(--max-model-len / --max-num-seqs, 4096)): a lone agent session keeps its full context, a batch of short prompts few) instead, plus one
 slot a sequence under `RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD` (startup line `ram budget: the
-snapshot store is sized for N-token sessions`); fewer slots mean fewer resume points, never other
+snapshot store is sized for N-token sessions`), and for at most 32 sequences' worth
+(`kRamBudgetCheckpointSeqs`, `core/mem/prefix.h`: min(4 x `--max-num-seqs`, 128) slots for a batch of short
+shared-head prompts; unchanged up to 32 sequences; the `checkpoint slots: auto` line says when it applies; an explicit
+`--checkpoint-slots N` wins); fewer slots mean fewer resume points, never other
 bytes. Arm part
 `mA` (or `mAN`, a reserve of N MiB, at least 1024), beside `mN` for the cap; an `mA` arm is measured
 only with both `ram budget: on` and `may hold` lines in its server log, a plain arm only with neither

@@ -88,9 +88,10 @@ void tail_range(const int32_t* off, int e, int T, int* s, int* t) {
     *t = b < a ? a : b;
 }
 
-void check_compaction(const Route& r, const std::vector<uint8_t>& worker) {
-    Compact c;
-    REQUIRE_EQ(compact(r.sorted.data(), r.off.data(), r.AR, kTopK, kExperts, worker.data(), r.counts.data(), kExperts, &c), 0);
+void check_compaction(const Route& r, const std::vector<uint8_t>& worker, int max_rows = kMaxRows) {
+    static Compact c;   /* 24 KiB: off the stack */
+    REQUIRE_EQ(compact(r.sorted.data(), r.off.data(), r.AR, kTopK, kExperts, worker.data(), r.counts.data(), kExperts, &c,
+                       max_rows), 0);
     int j = 0;
     CHECK_EQ(c.off[0], 0);
     for (int e = 0; e < kExperts; ++e) {
@@ -137,6 +138,54 @@ TEST(compaction_follows_the_cpu_rows_slot_rule) {
                 check_compaction(r, one);
                 check_compaction(r, last);
             }
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS above 16: the same slot rule at 17..512 rows with the bound raised; a pass
+ * taller than the bound (or than kRowsCap) is a shape outside the worker's, and the default bound is today's 16. */
+TEST(taller_passes_compact_by_the_same_rule) {
+    for (int AR : { 17, 24, 33, 64, 100, 128, 200, 256, 512 })
+        for (uint32_t seed = 1; seed <= 3; ++seed)
+            for (int form = 0; form < 4; ++form) {
+                const Route r = route(AR, seed * 977 + (uint32_t)AR, form & 1, form & 2);
+                std::vector<uint8_t> all(kExperts, 0), third(kExperts, 0), last(kExperts, 0);
+                for (int e = 0; e < kExperts; ++e) {
+                    all[(size_t)e] = r.counts[(size_t)e] > 0;
+                    third[(size_t)e] = r.counts[(size_t)e] > 0 && e % 3 == 1;
+                }
+                last[kExperts - 1] = r.counts[kExperts - 1] > 0;
+                check_compaction(r, all, AR);
+                check_compaction(r, third, 512);
+                check_compaction(r, last, std::max(AR, 256));
+            }
+    static Compact c;
+    const Route r = route(128, 5, false, false);
+    std::vector<uint8_t> all(kExperts, 1);
+    CHECK_EQ(compact(r.sorted.data(), r.off.data(), r.AR, kTopK, kExperts, all.data(), r.counts.data(), kExperts, &c),
+             kCompactShape);                                              /* the default bound: 16 */
+    CHECK_EQ(compact(r.sorted.data(), r.off.data(), r.AR, kTopK, kExperts, all.data(), r.counts.data(), kExperts, &c, 127),
+             kCompactShape);
+    CHECK_EQ(compact(r.sorted.data(), r.off.data(), r.AR, kTopK, kExperts, all.data(), r.counts.data(), kExperts, &c, 128), 0);
+    CHECK_EQ(compact(r.sorted.data(), r.off.data(), r.AR, kTopK, kExperts, all.data(), r.counts.data(), kExperts, &c,
+                     kRowsCap + 1), kCompactShape);                       /* past Compact's arrays */
+    CHECK_EQ(compact(r.sorted.data(), r.off.data(), r.AR, kTopK, kExperts, all.data(), r.counts.data(), kExperts, &c, 0),
+             kCompactShape);
+    /* A whole pass of 512 rows all on this rank's experts: 3072 slots, exactly the arrays' capacity. */
+    Route w;
+    w.AR = 512;
+    w.T = 512 * kTopK;
+    w.counts.assign(kExperts, 0);
+    w.off.assign(kExperts + 1, 0);
+    std::vector<std::vector<int32_t>> by(kExperts);
+    for (int t = 0; t < w.AR; ++t)
+        for (int k = 0; k < kTopK; ++k) by[(size_t)((t + 16 * k) % kExperts)].push_back(t * kTopK + k);
+    for (int e = 0; e < kExperts; ++e) {
+        w.off[(size_t)e] = (int32_t)w.sorted.size();
+        for (int32_t x : by[(size_t)e]) w.sorted.push_back(x);
+        w.counts[(size_t)e] = (int32_t)by[(size_t)e].size();
+    }
+    w.off[kExperts] = (int32_t)w.sorted.size();
+    REQUIRE_EQ((int)w.sorted.size(), w.T);
+    check_compaction(w, all, 512);
 }
 
 TEST(the_ranks_last_expert_runs_to_T_over_other_ranks_slots) {

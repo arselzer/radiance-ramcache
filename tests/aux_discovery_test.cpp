@@ -95,6 +95,7 @@ TEST(the_switch_on_and_refused) {
     CHECK_EQ(c.deadline_us, kDeadlineDef);
     CHECK_EQ(c.backoff, kBackoffDef);
     CHECK_EQ(c.force_late, (int64_t)0);
+    CHECK_EQ(c.rows, (int64_t)16);   /* RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS unset: today's 16 */
     CHECK(c.device.empty());
     for (const char* v : { "512", "-1", "26000x", " 26000", "on", "1048577", "+26000", "1023" }) {
         Env b;
@@ -118,6 +119,8 @@ TEST(the_other_switches_ranges) {
         { kDeadlineEnv, "100", 1 }, { kDeadlineEnv, "1000000", 1 }, { kDeadlineEnv, "99", -1 }, { kDeadlineEnv, "2ms", -1 },
         { kBackoffEnv, "0", 1 }, { kBackoffEnv, "65536", 1 }, { kBackoffEnv, "65537", -1 }, { kBackoffEnv, "-1", -1 },
         { kForceLateEnv, "0", 1 }, { kForceLateEnv, "7", 1 }, { kForceLateEnv, "1000001", -1 },
+        { kRowsEnv, "16", 1 }, { kRowsEnv, "128", 1 }, { kRowsEnv, "512", 1 }, { kRowsEnv, "15", -1 },
+        { kRowsEnv, "513", -1 }, { kRowsEnv, "0", -1 }, { kRowsEnv, "128 ", -1 }, { kRowsEnv, "-128", -1 },
         { kDeviceEnv, "0000:c3:00.0", 1 }, { kDeviceEnv, "C3:00.0", 1 }, { kDeviceEnv, "GPU-0123456789abcdef", 1 },
         { kDeviceEnv, "GPU-0123456789ABCDEF", 1 }, { kDeviceEnv, "c3:00", -1 }, { kDeviceEnv, "0000:c3:20.0", -1 },
         { kDeviceEnv, "GPU-0123", -1 }, { kDeviceEnv, "4", -1 },
@@ -141,9 +144,11 @@ TEST(the_other_switches_ranges) {
     e.v[kHeadroomEnv] = "2048";
     e.v[kForceLateEnv] = "5";
     e.v[kDeviceEnv] = "C3:00.0";
+    e.v[kRowsEnv] = "256";
     Config c;
     std::string why;
     REQUIRE_EQ(parse_env(e, &c, &why), 1);
+    CHECK_EQ(c.rows, (int64_t)256);
     CHECK(c.verify);
     CHECK_EQ(c.deadline_us, (int64_t)1500);
     CHECK_EQ(c.backoff, (int64_t)8);

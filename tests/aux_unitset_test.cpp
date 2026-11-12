@@ -103,6 +103,77 @@ TEST(layout_and_capacity) {
     CHECK_EQ(capacity(1, 4, 40, L.stride, 100), (int64_t)0);         /* the fixed part does not fit */
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS (ds41_aux.h, "taller passes"): ws(16) is ws() byte for byte (today's record:
+ * sorted' at 0, off' at 512, x at 1024); ws(rows) holds rows token rows and rows * 6 slots in every region, each
+ * 4 KiB aligned and in order; the fixed part and the capacity follow the lanes' size; no workspace past the cap. */
+TEST(taller_workspaces) {
+    const Ws a = ws(), b = ws(16);
+    CHECK_EQ(a.sorted, (int64_t)0);
+    CHECK_EQ(a.off, (int64_t)512);
+    CHECK_EQ(a.x, (int64_t)1024);
+    CHECK(a.sorted == b.sorted && a.off == b.off && a.x == b.x && a.rec == b.rec && a.gu_out == b.gu_out &&
+          a.act == b.act && a.dn_out == b.dn_out && a.bytes == b.bytes && a.out == b.out);
+    CHECK_EQ(fixed_bytes(4, 40), fixed_bytes(4, 40, 16));
+    const Layout L = layout(11999296, 6001984);
+    CHECK_EQ(capacity(26000, 4, 40, L.stride, 1000000), capacity(26000, 4, 40, L.stride, 1000000, 16));
+    int64_t prev = a.bytes;
+    for (int rows : { 17, 32, 64, 128, 256, 512 }) {
+        const Ws w = ws(rows);
+        const int64_t slots = (int64_t)rows * kTopK;
+        CHECK_EQ(w.sorted, (int64_t)0);
+        CHECK(w.off >= slots * 4 && w.off % 512 == 0);
+        CHECK(w.x >= w.off + (kExperts + 1) * 4 && w.x % 512 == 0);
+        CHECK(w.rec >= w.x + (int64_t)rows * kEmbd * 2 && w.rec % 4096 == 0);
+        CHECK_EQ(w.gu_out, w.rec);
+        CHECK(w.act >= w.gu_out + slots * kGuN * 2 && w.act % 4096 == 0);
+        CHECK(w.dn_out >= w.act + slots * kFf * 2 && w.dn_out % 4096 == 0);
+        CHECK(w.bytes >= w.dn_out + slots * kEmbd * 2 && w.bytes % 4096 == 0);
+        CHECK_EQ(w.out, slots * kEmbd * 2);
+        CHECK(w.bytes > prev);
+        prev = w.bytes;
+        CHECK_EQ(fixed_bytes(4, 40, rows), tables_bytes(4, 40) + 4 * w.bytes);
+        CHECK_EQ(capacity(26000, 4, 40, L.stride, 1000000, rows),
+                 (((int64_t)26000 << 20) - fixed_bytes(4, 40, rows)) / L.stride);
+    }
+    CHECK(ws(256).bytes < 42 * ((int64_t)1 << 20));   /* about 41 MB a lane at 256 rows */
+    CHECK(ws(512).bytes < 82 * ((int64_t)1 << 20));
+    /* 26000 MiB at 256 rows: about 8 units fewer than at 16. */
+    const int64_t n16 = capacity(26000, 4, 40, L.stride, 1000000), n256 = capacity(26000, 4, 40, L.stride, 1000000, 256);
+    CHECK(n256 < n16 && n16 - n256 <= 10);
+    CHECK_EQ(ws(0).bytes, (int64_t)0);
+    CHECK_EQ(ws(kRowsCap + 1).bytes, (int64_t)0);
+    CHECK_EQ(kRowsCap, 512);
+    CHECK_EQ(kCapSlots, 3072);
+}
+
+/* The deadline's scale and the shutdown line's height buckets. */
+TEST(taller_deadline_and_heights) {
+    for (int r = 1; r <= 16; ++r) CHECK_EQ(deadline_us_for(2000, r), (int64_t)2000);   /* today's D at 16 or fewer */
+    CHECK_EQ(deadline_us_for(2000, 17), (int64_t)4000);
+    CHECK_EQ(deadline_us_for(2000, 32), (int64_t)4000);
+    CHECK_EQ(deadline_us_for(2000, 33), (int64_t)6000);
+    CHECK_EQ(deadline_us_for(2000, 128), (int64_t)16000);
+    CHECK_EQ(deadline_us_for(2000, 512), (int64_t)64000);
+    CHECK_EQ(deadline_us_for(100000, 512), kDeadlineMax);   /* capped */
+    CHECK_EQ(height_bucket(1), 0);
+    CHECK_EQ(height_bucket(16), 0);
+    CHECK_EQ(height_bucket(17), 1);
+    CHECK_EQ(height_bucket(32), 1);
+    CHECK_EQ(height_bucket(33), 2);
+    CHECK_EQ(height_bucket(128), 3);
+    CHECK_EQ(height_bucket(129), 4);
+    CHECK_EQ(height_bucket(256), 4);
+    CHECK_EQ(height_bucket(257), 5);
+    CHECK_EQ(height_bucket(512), 5);
+    CHECK_EQ(height_bucket(100000), kHeightBuckets - 1);
+    for (int b = 0; b < kHeightBuckets; ++b) {
+        CHECK_EQ(height_bucket(height_lo(b)), b);
+        CHECK_EQ(height_bucket(height_hi(b)), b);
+    }
+    CHECK_EQ(height_lo(0), 1);
+    CHECK_EQ(height_hi(kHeightBuckets - 1), kRowsCap);
+}
+
 TEST(quotas_follow_the_global_order_and_are_deterministic) {
     std::vector<Cand> all;
     for (int r = 0; r < 4; ++r) {

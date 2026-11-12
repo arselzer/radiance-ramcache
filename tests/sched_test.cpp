@@ -10770,6 +10770,210 @@ TEST(shared_heads_resume_a_batch_behind_a_few_system_prompts) {
     CHECK_EQ(off.m.prefill_end_published, (int64_t)0);
 }
 
+/* ---- the NL-to-SQL batch (window ab-20261112T142114Z): 5 system prompts behind a common 256-token
+ * preamble, each question starting with one of four openers (two share their first 6 tokens), ~600
+ * tokens a prompt, every prompt sent at once (C = N), Pch64, Phase 1 at C 2,048, prefix cache under the
+ * exact resume. nl_run runs it with or without Ba2048 and with or without the scheduler switches below,
+ * and records every prompt's chunks, the snapshots and the steps. */
+namespace {
+
+const int kNlSys[5] = { 250, 210, 280, 230, 300 };
+
+std::vector<int32_t> nl_prompt(int j) {
+    std::vector<int32_t> p;
+    for (int i = 0; i < 256; ++i) p.push_back(10000 + i);
+    for (int i = 0; i < kNlSys[j % 5]; ++i) p.push_back(20000 + 1000 * (j % 5) + i);
+    const int op = (j / 5) % 4;
+    for (int i = 0; i < 10; ++i) p.push_back(30000 + (i < 6 && op < 2 ? 0 : 100 * op) + i);
+    const int n = 30 + (37 * j) % 90;
+    for (int i = 0; i < n; ++i) p.push_back(33000 + (120 * j + i) % 32000);   /* below the fixture's vocabulary */
+    return p;
+}
+
+struct NlStep { int64_t rows = 0; int pf = 0; int fresh = 0; int cont = 0; int snaps = 0; };
+struct NlRun {
+    /* request index -> its prefill chunks (ctx_len, n_tokens, restored, snapshot position or -1) */
+    std::map<int, std::vector<std::tuple<int32_t, int32_t, bool, int64_t>>> chunks;
+    std::vector<NlStep> steps;
+    std::set<int> done;
+    SchedMetrics m;
+    std::string report;
+    /* Chunks that are not the one the prompt takes alone from where it stood (plan_chunk at the whole
+     * step, its keep point the end of its chunk that ends before its prompt), or whose snapshot is not
+     * the one it writes alone (a snapshot another entry of the step wrote counts as written); and
+     * chunks not contiguous from the resume point to the prompt's end, or restoring past the first. */
+    int bad_plan = 0, bad_cover = 0;
+};
+
+struct NlOpt {
+    const char* batch = "2048";     /* null: off */
+    const char* split = nullptr;    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT */
+    int n = 128;
+    int conc = 128;
+};
+
+NlRun nl_run(const NlOpt& o) {
+    NlRun out;
+    LcpOn lc(2048, 1);
+    P1Env p1;
+    TreePC pc;
+    Fixture f;
+    f.build(65536, o.conc + 8, /*max_tok=*/2048, 8192, /*windowed=*/true, /*linear=*/true);
+    f.prog.meta.n_ctx_train = 8192;
+    f.prog.ops.resize(1);
+    f.kv.snap = { 3 };
+    f.pc.groups = { 0 };
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefix_cache = true;
+    f.cfg.prefix_exact = true;
+    f.cfg.max_seqs = o.conc;
+    pc.kv = &f.kv;
+    pc.groups = f.pc.groups;
+    setenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE", "1", 1);
+    setenv(Scheduler::kSharedHeadEnv, "64", 1);
+    if (o.batch) setenv(Scheduler::kBatchAdmitEnv, o.batch, 1);
+    if (o.split) setenv("RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT", o.split, 1);
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    int rc = 0;
+    out.report = info_of([&] { rc = f.sch.init(f.prog, f.cfg, &f.kv, &pc, rio, nullptr, nullptr); });
+    unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+    unsetenv(Scheduler::kSharedHeadEnv);
+    unsetenv(Scheduler::kBatchAdmitEnv);
+    unsetenv("RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT");
+    CHECK_EQ(rc, (int)RAD_OK);
+    if (rc != RAD_OK) return out;
+    std::map<uint64_t, int> idx;
+    int sent = 0;
+    bool refused = false;
+    auto send = [&] {
+        auto r = f.request(1, 6);
+        r->prompt = nl_prompt(sent);
+        const uint64_t id = r->id;
+        if (!f.add(std::move(r))) refused = true;
+        idx[id] = sent++;
+    };
+    while (sent < std::min(o.conc, o.n) && !refused) send();
+    CHECK(!refused);
+    for (int k = 0; k < 20000 && !refused; ++k) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        NlStep st;
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (!e.is_prefill) continue;
+            const int j = idx[e.seq];
+            const int64_t snap = e.ckpt_slot >= 0 && e.ckpt_tok >= 0 ? (int64_t)e.ctx_len + e.ckpt_tok + 1 : -1;
+            const bool first = !out.chunks.count(j);
+            out.chunks[j].emplace_back(e.ctx_len, e.n_tokens, e.ckpt_restore >= 0, snap);
+            ++st.pf;
+            st.rows += e.n_tokens;
+            (first ? st.fresh : st.cont) += 1;
+            st.snaps += snap >= 0;
+        }
+        if (st.pf > 0) out.steps.push_back(st);
+        f.commit_plain();
+        int finished = 0;
+        for (const auto& [id, j] : idx) {
+            const Request* q = f.sch.find(id);
+            if ((!q || q->state == ReqState::Finished) && out.done.insert(j).second) ++finished;
+        }
+        for (; finished > 0 && sent < o.n; --finished) send();
+    }
+    out.m = f.sch.metrics();
+    out.report += info_of([&] { f.sch.shared_head_report(); f.sch.batch_admit_report(); });
+    for (const auto& [j, c] : out.chunks) {
+        const int64_t n = (int64_t)nl_prompt(j).size();
+        int64_t keep = 0;
+        for (const auto& [ctx, nt, rest, snap] : c)
+            if ((int64_t)ctx + nt < n) { keep = (int64_t)ctx + nt; break; }
+        int64_t pos = std::get<0>(c[0]);
+        for (size_t i = 0; i < c.size(); ++i) {
+            const auto& [ctx, nt, rest, snap] = c[i];
+            if ((int64_t)ctx != pos || (i > 0 && rest)) ++out.bad_cover;
+            int64_t ck = -1;
+            const int64_t alone = f.sch.plan_chunk(ctx, n, 2048, &ck, keep);
+            if (alone != nt || !(snap == ck || (snap < 0 && ck == keep && o.split))) ++out.bad_plan;
+            pos += nt;
+        }
+        if (pos != n) ++out.bad_cover;
+    }
+    return out;
+}
+
+void nl_print(const char* what, const NlRun& r) {
+    const SchedMetrics& m = r.m;
+    FILE* const fo = stderr;
+    {
+        fprintf(fo, "    %s: %zu prefill steps; keeps %lld (redone %lld, shared %lld, missed %lld), snapshots %lld; "
+                    "no-snapshot hits %lld (%lld tokens); batch steps %lld (%lld prompts), joins refused %lld, split "
+                    "joins %lld opens %lld waits %lld; closed waiting %lld rows %lld alone %lld opener %lld seqs %lld; linear "
+                    "cached %lld of %lld; bad %d/%d\n", what, r.steps.size(),
+                (long long)m.shared_head_keeps, (long long)m.shared_head_keeps_redone,
+                (long long)m.shared_head_snapshot_shared, (long long)m.shared_head_keep_missed,
+                (long long)m.shared_head_snapshots, (long long)m.hit_cut_no_snapshot, (long long)m.hit_cut_tokens,
+                (long long)m.batch_admit_steps, (long long)m.batch_admit_prompts,
+                (long long)m.batch_admit_join_refused, (long long)m.batch_split_joins, (long long)m.batch_split_opens,
+                (long long)m.batch_split_head_waits,
+                (long long)m.batch_close_waiting, (long long)m.batch_close_rows, (long long)m.batch_close_alone,
+                (long long)m.batch_close_opener, (long long)m.batch_close_seqs, (long long)m.linear_cached_tokens,
+                (long long)m.prompt_tokens, r.bad_plan, r.bad_cover);
+        int hist[8] = {};
+        for (const NlStep& st : r.steps) ++hist[std::min(st.pf, 7)];
+        fprintf(fo, "      steps by prompts: 1:%d 2:%d 3:%d 4:%d 5:%d 6:%d 7+:%d\n", hist[1], hist[2], hist[3],
+                hist[4], hist[5], hist[6], hist[7]);
+        fflush(fo);
+    }
+}
+
+}  /* namespace */
+
+/* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT beside Ba2048 and the prefix cache: a prompt's chunk to its keep
+ * point joins and opens batches, and so does a running prompt's next chunk, so the keepers no longer take
+ * two steps of their own each. Every prompt's chunks are the ones it takes alone from where it stood, each
+ * with the snapshot it writes alone (or one another entry of the same step writes once for both), as off;
+ * every keep point the cache names ends in its snapshot; the switch's lines say so. */
+TEST(batch_split_shares_steps_and_keeps_every_prompt_s_chunks) {
+    for (int n : { 128, 256 }) {
+        NlOpt o;
+        o.n = n;
+        o.conc = n;
+        const NlRun ba = nl_run(o);
+        o.split = "1";
+        const NlRun sp = nl_run(o);
+        o.split = nullptr;
+        o.batch = nullptr;
+        const NlRun off = nl_run(o);
+        char w[64];
+        std::snprintf(w, sizeof w, "N%d Ba2048 split", n);
+        nl_print(w, sp);
+        std::snprintf(w, sizeof w, "N%d Ba2048", n);
+        nl_print(w, ba);
+        std::snprintf(w, sizeof w, "N%d off", n);
+        nl_print(w, off);
+        CHECK(has(sp.report, "batch split: on (RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1)"));
+        CHECK(!has(ba.report, "batch split: on"));
+        for (const NlRun* r : { &off, &ba, &sp }) {
+            CHECK_EQ(r->done.size(), (size_t)n);
+            CHECK_EQ(r->bad_plan, 0);
+            CHECK_EQ(r->bad_cover, 0);
+            CHECK_EQ(r->m.batch_admit_outside, (int64_t)0);
+            CHECK_EQ(r->m.shared_head_keep_missed, (int64_t)0);
+        }
+        /* every admitted keep ends in its snapshot, written by it or by a prompt beside it */
+        CHECK_EQ(sp.m.shared_head_keeps, sp.m.shared_head_snapshots + sp.m.shared_head_snapshot_shared);
+        CHECK_EQ(ba.m.shared_head_keeps, ba.m.shared_head_snapshots);
+        CHECK(sp.m.batch_split_joins > 0);
+        CHECK(sp.m.batch_split_opens > 0);
+        /* the host model: 24 -> 10 prefill steps at N128, 30 -> 15 at N256, the hits as without it */
+        CHECK(sp.steps.size() * 2 <= ba.steps.size());
+        CHECK(sp.m.linear_cached_tokens * 100 >= ba.m.linear_cached_tokens * 99);
+        CHECK_EQ(sp.m.batch_close_opener, (int64_t)0);
+        CHECK(ba.m.batch_close_opener > 0);
+        CHECK(has(sp.report, "batch split: "));
+        CHECK(has(sp.report, "prefill-only steps closed by"));
+    }
+}
+
 /* Bounds: a floor outside 16..4096 refuses to start; without the prefix cache the switch is refused,
  * with the reason, and the cache is never told; 0 or unset is off and the cache keeps its rule. */
 TEST(shared_heads_switch_bounds_and_refusals) {

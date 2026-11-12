@@ -32,13 +32,14 @@ plus 3.2 KB a token), so the cards hold 256 sequences. Every row below has repli
 
 | 128 streams, 128 prompts | wall | decode-only tok/s |
 |---|---:|---:|
-| no prefix cache, no batched prefill | 530 s | - |
-| + prefix cache with shared heads (`Pc-Pch64`) and batch admission `Ba2048` | 268 s | - |
-| + RAM budget (`mA`) | 242 s | 82.8 |
+| no prefix cache, no batched prefill (ab-20261111T165742Z) | 539 s | 82.7 |
+| + prefix cache with shared heads (`Pc-Pch64`), batch admission `Ba2048` and the RAM budget (`mA`) | 242 s | 82.8 |
 | + fifth card for tall passes (`AUX_ROWS=128`) | 214 s | 134.8 |
 | **+ batched keep points (`SCHED_BATCH_SPLIT=1`)** | **171 s** | - |
 | the same with `Ba4096` | 169 s | - |
 | card-path decode `Qd64` and `Bs` with the fifth card | 171 s | 117.8 |
+| four cards only: card-path decode `Qd64`, `Bs`, `--checkpoint-slots 128` (ab-20261112T210213Z) | 199 s | 107.9 |
+| the same with replies up to 512 tokens instead of 128 | 208 s | 98.1 |
 
 | 256 streams, 256 prompts | wall | decode-only tok/s | prefill |
 |---|---:|---:|---:|

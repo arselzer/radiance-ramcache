@@ -73,13 +73,19 @@ int FileStager::aux_candidates(std::vector<ds41aux::Cand>* out) const {
 
 /* ---- the rows a job relaunches -------------------------------------------------------------------- */
 
-int FileStager::aux_resolve(std::string* why) {
+int FileStager::aux_resolve(std::string* why, int max_rows) {
     aux_rows_.assign(layers_.size(), AuxRows{});
     aux_op_.assign(ep_program_ ? ep_program_->ops.size() : 0, -1);
     if (!ep_program_ || !plan_) {
         *why = "the stager has no program";
         return RAD_E_STATE;
     }
+    if (max_rows < ds41aux::kMaxRows || max_rows > ds41aux::kRowsCap) {
+        *why = fmt("passes of up to %d rows: %s takes %lld to %lld", max_rows, ds41aux::kRowsEnv,
+                   (long long)ds41aux::kRowsMin, (long long)ds41aux::kRowsMax);
+        return RAD_E_INVAL;
+    }
+    aux_rows_max_ = max_rows;
     int usable = 0;
     std::string first_bad;
     for (size_t li = 0; li < layers_.size(); ++li) {
@@ -100,16 +106,19 @@ int FileStager::aux_resolve(std::string* why) {
                 bad = fmt("its %s (%s) is not ranged by M", aux_op_name(k), op.op.c_str());
                 break;
             }
-            const int hi_m = k == 1 ? ds41aux::kMaxSlots : ds41aux::kMaxRows;
+            const int hi_m = k == 1 ? max_rows * ds41aux::kTopK : max_rows;
             if (op.range_lo > 1 || op.range_hi < hi_m) {
                 bad = fmt("its %s issues at M in [%lld, %lld], not every height up to %d", aux_op_name(k),
                           (long long)op.range_lo, (long long)op.range_hi, hi_m);
                 break;
             }
-            const char* want = k == 1 ? "swiglu_clamped_bf16" : ds41p1::kGemvVpRow;
             std::vector<const Resolved*>& v = k == 0 ? R.gu : k == 1 ? R.sw : R.dn;
             v.assign((size_t)hi_m + 1, nullptr);
             for (int M = 1; M <= hi_m && bad.empty(); ++M) {
+                /* Above 16 rows (ds41aux::kRowsEnv): the P1 twin, gemv_vp's kernel at every height (T1, T2 of
+                 * ds41_p1.h), as the rank cards run it there; ds41_aux.h "taller passes". */
+                const char* want = k == 1 ? "swiglu_clamped_bf16"
+                                   : M <= ds41aux::kMaxRows ? ds41p1::kGemvVpRow : ds41p1::kTwinRow;
                 const Band* b = nullptr;
                 for (const Band& x : op.bands)
                     if (M <= x.hi) { b = &x; break; }
@@ -118,7 +127,11 @@ int FileStager::aux_resolve(std::string* why) {
                 /* Only gemv_vp decodes the packed form every table entry of the worker names (T2 of ds41_p1.h:
                  * the plain gemv would read a packed slot as block_mxfp4). */
                 if (!name || std::strcmp(name, want) || !r->row->info->launch)
-                    bad = fmt("its %s's row at M %d is %s, not %s", aux_op_name(k), M, name ? name : "none", want);
+                    bad = fmt("its %s's row at M %d is %s, not %s%s", aux_op_name(k), M, name ? name : "none", want,
+                              M > ds41aux::kMaxRows && k != 1
+                                  ? fmt(" (%s=%d: above 16 rows the worker needs the P1 twin, %s=1 beside "
+                                        "RADIANCE_EXPERIMENTAL_DS41_LCP)", ds41aux::kRowsEnv, max_rows, ds41p1::kEnv).c_str()
+                                  : "");
                 else if (r->scratch_bytes > 0 || r->instance)
                     bad = fmt("its %s's row %s takes scratch or an instance", aux_op_name(k), name);
                 else
@@ -425,8 +438,8 @@ int FileStager::aux_warm_job(aux::Lane* lane, int32_t u, int32_t li, Mover::Host
     rc = hx_pool_->submit(&cj, 1, &t);
     if (rc >= 0) hx_pool_->wait(&t);
     else hx_pool_->unreserve(cj.cost);
-    mover_->release_host_unit(&hu);
     if (rc < 0) {
+        mover_->release_host_unit(&hu);
         *why = fmt("rank %d's warm-up: the CPU pool refused the job (%d)", r, rc);
         return rc;
     }
@@ -434,10 +447,97 @@ int FileStager::aux_warm_job(aux::Lane* lane, int32_t u, int32_t li, Mover::Host
         int first = -1;
         const int bad = ds41aux::row_diff(cpu.data(), lane->rows() + (int64_t)k * ds41aux::kEmbd, ds41aux::kEmbd, &first);
         if (!bad) continue;
+        mover_->release_host_unit(&hu);
         *why = fmt("rank %d's warm-up job (unit %d, layer %d expert %d): row %d has %d of %d values unlike the CPU "
                    "pool's (first at %d: 0x%04x on the CPU, 0x%04x on the extra card)", r, u, layers_[(size_t)li].layer,
                    e, k, bad, ds41aux::kEmbd, first, cpu[(size_t)first],
                    lane->rows()[(int64_t)k * ds41aux::kEmbd + first]);
+        return RAD_E_STATE;
+    }
+    /* RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS above 16: a second job at the tallest height, aux_rows_max_ token rows each
+     * with one slot on expert e (T' = AR), through the rows above 16 (the P1 twin); every row against the CPU pool's
+     * for the same lease. The first tall launch also loads that kernel on the extra card here, not in a pass. */
+    rc = aux_rows_max_ > ds41aux::kMaxRows ? aux_warm_tall(lane, u, li, &hu, gu_tab, dn_tab, r, why) : RAD_OK;
+    mover_->release_host_unit(&hu);
+    return rc;
+}
+
+int FileStager::aux_warm_tall(aux::Lane* lane, int32_t u, int32_t li, Mover::HostUnit* hup, const void* gu_tab,
+                              const void* dn_tab, int r, std::string* why) {
+    const Mover::HostUnit& hu = *hup;
+    const int e = plan_->units[(size_t)u].expert, AR = aux_rows_max_;
+    const AuxRows& R = aux_rows_[(size_t)li];
+    if ((size_t)AR >= R.gu.size() || (size_t)AR >= R.dn.size() || (size_t)AR >= R.sw.size()) {
+        *why = fmt("rank %d's tall warm-up: no rows resolved at %d", r, AR);
+        return RAD_E_STATE;
+    }
+    std::vector<uint16_t> x((size_t)AR * ds41aux::kEmbd), cpu((size_t)AR * ds41aux::kEmbd);
+    uint32_t s = 0x85ebca6bu ^ (uint32_t)u * 2246822519u;
+    for (uint16_t& h : x) {   /* fixed rows of values in (-2, 2) */
+        s = s * 1664525u + 1013904223u;
+        h = ds41hx::f32_to_bf16((float)((int32_t)(s >> 8) - (1 << 23)) / (float)(1 << 22));
+    }
+    std::vector<int32_t> sorted((size_t)AR), off(ds41aux::kExperts + 1);
+    for (int i = 0; i < AR; ++i) sorted[(size_t)i] = i * ds41aux::kTopK;   /* token i's slot 0 */
+    for (int i = 0; i <= ds41aux::kExperts; ++i) off[(size_t)i] = i <= e ? 0 : AR;
+    aux::Job j;
+    j.AR = AR;
+    j.T = AR;
+    j.x = x.data();
+    j.sorted = sorted.data();
+    j.off = off.data();
+    j.gu = launch_of(R.gu[(size_t)AR]);
+    j.sw = launch_of(R.sw[(size_t)AR]);
+    j.dn = launch_of(R.dn[(size_t)AR]);
+    j.gu_w = R.gu_w;
+    j.dn_w = R.dn_w;
+    j.gu_w.data = const_cast<void*>(gu_tab);
+    j.dn_w.data = const_cast<void*>(dn_tab);
+    j.rank = plan_->rank;
+    j.world = plan_->world_size;
+    int rc = lane->submit(j);
+    const int got = rc >= 0 ? lane->wait(aux_now_ns() + 30'000'000'000LL) : rc;
+    if (got != 1) {
+        if (got == 0) lane->abandon(false);
+        *why = fmt("rank %d's tall warm-up job (%d rows, unit %d, layer %d expert %d) %s", r, AR, u,
+                   layers_[(size_t)li].layer, e,
+                   got == 0 ? "did not complete in 30 s" : ("failed: " + lane->why_dead()).c_str());
+        return RAD_E_DEVICE;
+    }
+    std::vector<HostExpertPool::Job> jobs((size_t)AR);
+    const int g = hu.bytes[0] == HostExpertPool::kGuBytes ? 0 : 1;
+    int64_t cost = 0;
+    for (int i = 0; i < AR; ++i) {
+        HostExpertPool::Job& cj = jobs[(size_t)i];
+        cj.gu = hu.host[g];
+        cj.dn = hu.host[1 - g];
+        cj.packed = true;
+        cj.gu_bytes = hu.slot[g];
+        cj.dn_bytes = hu.slot[1 - g];
+        cj.x = x.data() + (int64_t)i * ds41aux::kEmbd;
+        cj.y = cpu.data() + (int64_t)i * ds41aux::kEmbd;
+        cj.urgent = true;
+        cj.cost = HostExpertPool::job_cost(1);
+        cost += cj.cost;
+    }
+    HostExpertPool::Ticket t;
+    hx_pool_->reserve(cost);
+    rc = hx_pool_->submit(jobs.data(), AR, &t);
+    if (rc >= 0) hx_pool_->wait(&t);
+    else hx_pool_->unreserve(cost);
+    if (rc < 0) {
+        *why = fmt("rank %d's tall warm-up: the CPU pool refused the jobs (%d)", r, rc);
+        return rc;
+    }
+    for (int k = 0; k < AR; ++k) {
+        int first = -1;
+        const int bad = ds41aux::row_diff(cpu.data() + (int64_t)k * ds41aux::kEmbd,
+                                          lane->rows() + (int64_t)k * ds41aux::kEmbd, ds41aux::kEmbd, &first);
+        if (!bad) continue;
+        *why = fmt("rank %d's tall warm-up job (%d rows, unit %d, layer %d expert %d): row %d has %d of %d values unlike "
+                   "the CPU pool's (first at %d: 0x%04x on the CPU, 0x%04x on the extra card)", r, AR, u,
+                   layers_[(size_t)li].layer, e, k, bad, ds41aux::kEmbd, first,
+                   cpu[(size_t)k * ds41aux::kEmbd + first], lane->rows()[(int64_t)k * ds41aux::kEmbd + first]);
         return RAD_E_STATE;
     }
     return RAD_OK;
@@ -454,6 +554,7 @@ void FileStager::aux_bind(aux::Lane* lane, const aux::RankView* view, const aux:
     aux_view_ = view;
     aux_verify_ = cfg.verify;
     aux_deadline_ns_ = cfg.deadline_us * 1000;
+    aux_rows_max_ = (int)std::clamp<int64_t>(cfg.rows, ds41aux::kMaxRows, ds41aux::kRowsCap);
     aux_force_late_ = cfg.force_late;
     aux_seq_ = 0;
     aux_guard_bad_ = false;
@@ -550,7 +651,7 @@ int FileStager::aux_prepare(int* appended) {
         if (e >= 0 && e < ds41aux::kExperts) worker[e] = 1;
     }
     const int rc = ds41aux::compact(hx_idx_, hx_idx_ + hx_sorted_max(), (int)layer_rows(hx_li_), (int)o.top_k,
-                                    (int)o.n_expert, worker, counts_host_, (int)counts_cap_, &aux_cmp_);
+                                    (int)o.n_expert, worker, counts_host_, (int)counts_cap_, &aux_cmp_, aux_rows_max_);
     if (rc == ds41aux::kCompactShape) {
         RAD_ERR("host experts: layer %d: the aux worker's compaction refused a pass of %lld rows",
                 layers_[(size_t)hx_li_].layer, (long long)layer_rows(hx_li_));
@@ -594,6 +695,10 @@ void FileStager::aux_submit() {
     ++aux_stats_.jobs;
     aux_stats_.units += aux_list_.size();
     aux_stats_.rows += (uint64_t)T;
+    const int hb = ds41aux::height_bucket(AR);
+    ++aux_stats_.jobs_h[hb];
+    aux_stats_.rows_h[hb] += (uint64_t)T;
+    aux_job_rows_ = AR;
     const int64_t t0 = aux_now_ns();
     const int rc = aux_->submit(j);
     aux_stats_.submit_ns += (uint64_t)(aux_now_ns() - t0);
@@ -617,7 +722,12 @@ int FileStager::aux_finish() {
         /* Late only if still pending at the later of the deadline from the submit and a short grace after
          * the pool's rows are in: a pool slower than the deadline must not abandon a finished job. The wait
          * queries at least once. */
-        const int64_t deadline = std::max(aux_t0_ns_ + aux_deadline_ns_, t_pool + ds41aux::kGraceUs * 1000);
+        /* A pass taller than 16 rows (ds41aux::kRowsEnv) gets D * ceil(rows / 16) (ds41aux::deadline_us_for); at
+         * 16 rows or fewer D itself. */
+        const int64_t dl_ns = aux_job_rows_ > ds41aux::kMaxRows
+                                  ? ds41aux::deadline_us_for(aux_deadline_ns_ / 1000, aux_job_rows_) * 1000
+                                  : aux_deadline_ns_;
+        const int64_t deadline = std::max(aux_t0_ns_ + dl_ns, t_pool + ds41aux::kGraceUs * 1000);
         got = aux_->wait(deadline);
         const int64_t t = aux_now_ns();
         aux_stats_.wait_ns += (uint64_t)(t - t_pool);
@@ -645,12 +755,14 @@ int FileStager::aux_finish() {
         }
         /* Verify: only rows the CPU wrote (a unit it borrowed or read as a miss); any other's hx_out_ row is
          * stale. */
-        uint8_t have[ds41aux::kMaxSlots] = {};
+        const int cap = aux_rows_max_ * ds41aux::kTopK;   /* the pass's sorted rows at most */
+        uint8_t have[ds41aux::kCapSlots];
+        std::memset(have, 0, (size_t)cap);
         for (int32_t i : hx_rows_)
-            if (i >= 0 && i < ds41aux::kMaxSlots) have[i] = 1;
+            if (i >= 0 && i < cap) have[i] = 1;
         for (int j = 0; j < T; ++j) {
             const int32_t i = aux_cmp_.row_of[j];
-            if (i < 0 || i >= ds41aux::kMaxSlots || !have[i]) {
+            if (i < 0 || i >= cap || !have[i]) {
                 ++aux_stats_.not_compared;
                 continue;
             }
@@ -749,7 +861,10 @@ void FileStager::aux_guard(int32_t op, const RadArgs* a, int (*launch)(const Rad
     const int k = code % 3;
     if (li >= aux_rows_.size() || !aux_rows_[li].ok) return;
     const int64_t rows = layer_rows((int32_t)li);
-    if (rows < 1 || rows > ds41aux::kMaxRows) return;   /* a height the worker never takes */
+    if (rows < 1 || rows > aux_rows_max_) return;   /* a height the worker never takes */
+    /* A layer of an armed P1 pass the card path computes (p1_layer_on: never the CPU path's, so never the worker's);
+     * reached only with ds41aux::kRowsEnv at P1's threshold or above. */
+    if (p1_layer_on((int32_t)li)) return;
     const AuxRows& R = aux_rows_[li];
     const std::vector<const Resolved*>& v = k == 0 ? R.gu : k == 1 ? R.sw : R.dn;
     const int64_t M = k == 1 ? (a->n_t >= 2 ? a->t[1].shape[0] : -1) : rows;

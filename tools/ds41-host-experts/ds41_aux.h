@@ -47,7 +47,11 @@ namespace ds41aux {
  *                 core/place/stager.cpp aux_finish for the exact rule).
  *   kBackoffEnv   layer jobs a lane declines after a deadline miss, once the late job completed.
  *   kForceLateEnv 0 off; N: every Nth job of a lane is abandoned as if late (its rows computed by
- *                 the CPU fallback), so a window exercises the fallback on real data. */
+ *                 the CPU fallback), so a window exercises the fallback on real data.
+ *   kRowsEnv      the tallest routed layer pass the worker takes (16 by default, kRowsMin..kRowsMax): above
+ *                 16 rows its gate_up and down run libr4d's P1 twin (ds41p1::kTwinRow, gemv_vp's kernel at
+ *                 every height, contract T1 of ds41_p1.h) as the rank cards do at those heights, so the rows
+ *                 stay the CPU pool's (see "taller passes" below). 16 is today's worker, byte for byte. */
 constexpr const char* kEnv          = "RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS";
 constexpr const char* kDeviceEnv    = "RADIANCE_EXPERIMENTAL_DS41_AUX_DEVICE";
 constexpr const char* kPolicyEnv    = "RADIANCE_EXPERIMENTAL_DS41_AUX_POLICY";
@@ -55,6 +59,7 @@ constexpr const char* kHeadroomEnv  = "RADIANCE_EXPERIMENTAL_DS41_AUX_HEADROOM_M
 constexpr const char* kDeadlineEnv  = "RADIANCE_EXPERIMENTAL_DS41_AUX_DEADLINE_US";
 constexpr const char* kBackoffEnv   = "RADIANCE_EXPERIMENTAL_DS41_AUX_BACKOFF";
 constexpr const char* kForceLateEnv = "RADIANCE_EXPERIMENTAL_DS41_AUX_FORCE_LATE";
+constexpr const char* kRowsEnv      = "RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS";
 
 /* ---- card sharing and the online unit set (work/aux-dyn/SPEC.md §2) ------------------------------
  *
@@ -98,6 +103,9 @@ constexpr int64_t kHeadroomMin = 256, kHeadroomMax = 65536, kHeadroomDef = 1024;
 constexpr int64_t kDeadlineMin = 100, kDeadlineMax = 1000000, kDeadlineDef = 2000;
 constexpr int64_t kBackoffMin = 0, kBackoffMax = 65536, kBackoffDef = 64;
 constexpr int64_t kForceLateMin = 0, kForceLateMax = 1000000;
+/* kRowsEnv: kRowsMin (today's 16) .. kRowsMax. The lanes' workspaces and pinned buffers are sized for the value
+ * (ws(rows)): about 41 MB of VRAM and 18 MB pinned a rank at 256 rows, 81 / 36 MB at 512. */
+constexpr int64_t kRowsMin = 16, kRowsMax = 512, kRowsDef = 16;
 /* After the pool's rows are in, a job still pending gets at least this long before it is late. */
 constexpr int64_t kGraceUs = 50;
 
@@ -114,6 +122,7 @@ struct Config {
     int64_t     deadline_us = kDeadlineDef;
     int64_t     backoff = kBackoffDef;
     int64_t     force_late = 0;
+    int64_t     rows = kRowsDef;   /* kRowsEnv: the tallest pass the worker takes */
     /* Card sharing (work/aux-dyn/SPEC.md part A). */
     int         share = kShareAlways;
     std::string allow = "^whisper";
@@ -317,7 +326,8 @@ int parse(Get&& get, Config* c, std::string* why) {
     const Num nums[] = { { kHeadroomEnv, kHeadroomMin, kHeadroomMax, &c->headroom_mib },
                          { kDeadlineEnv, kDeadlineMin, kDeadlineMax, &c->deadline_us },
                          { kBackoffEnv, kBackoffMin, kBackoffMax, &c->backoff },
-                         { kForceLateEnv, kForceLateMin, kForceLateMax, &c->force_late } };
+                         { kForceLateEnv, kForceLateMin, kForceLateMax, &c->force_late },
+                         { kRowsEnv, kRowsMin, kRowsMax, &c->rows } };
     for (const Num& m : nums) {
         const char* s = get(m.name);
         if (!s || !*s) continue;
@@ -567,8 +577,11 @@ inline Decision decide(const std::vector<Card>& cards, const std::vector<int>& r
 
 constexpr int     kEmbd = 5120, kFf = 2304, kGuN = 2 * kFf;
 constexpr int     kTopK = 6, kExperts = 96;
-constexpr int     kMaxRows = 16;                       /* passes the worker takes: at most 16 rows */
+constexpr int     kMaxRows = 16;                       /* passes the worker takes by default: at most 16 rows */
 constexpr int     kMaxSlots = kMaxRows * kTopK;        /* 96: a rank's slots in such a pass */
+/* kRowsEnv's bound: the tallest pass any configuration takes, and its slots (Compact's arrays). */
+constexpr int     kRowsCap = (int)kRowsMax;
+constexpr int     kCapSlots = kRowsCap * kTopK;        /* 3072 */
 constexpr int64_t kGuBlockBytes = (int64_t)kGuN * (kEmbd / 32) * 17;   /* 12,533,760 */
 constexpr int64_t kDnBlockBytes = (int64_t)kEmbd * (kFf / 32) * 17;    /*  6,266,880 */
 
@@ -590,35 +603,42 @@ inline Layout layout(int64_t gu_slot, int64_t dn_slot) {
 }
 
 /* The record the rank fills (pinned, the extra card's only), with the layout of the lane's `in` in VRAM:
- * sorted' at 0, off' at 512, then the rows, so a job's inputs reach the card in one copy of
- * x + AR rows. Then the lane's VRAM outputs, each 4 KiB aligned. */
+ * sorted' at 0, off' after it, then the rows, so a job's inputs reach the card in one copy of
+ * x + AR rows. Then the lane's VRAM outputs, each 4 KiB aligned. ws(rows) sizes all of it for passes of
+ * up to `rows` rows (rows * kTopK slots); ws() = ws(kMaxRows) is today's layout, byte for byte: sorted'
+ * at 0, off' at 512, x at 1024. */
 struct Ws {
     int64_t sorted = 0, off = 0, x = 0, rec = 0;       /* the record (also `in`'s layout) */
     int64_t gu_out = 0, act = 0, dn_out = 0, bytes = 0;  /* the lane's VRAM workspace: in, then these */
     int64_t out = 0;                                    /* the pinned output rows */
 };
-inline Ws ws() {
+inline Ws ws(int rows = kMaxRows) {
     Ws w;
+    if (rows < 1 || rows > kRowsCap) return w;   /* bytes 0: no workspace for such a height */
+    const int64_t slots = (int64_t)rows * kTopK;
     w.sorted = 0;
-    w.off = 512;
-    w.x = 1024;
-    static_assert(kMaxSlots * 4 <= 512 && (kExperts + 1) * 4 <= 512, "the record's index arrays");
-    w.rec = align_up(w.x + (int64_t)kMaxRows * kEmbd * 2, 4096);
+    w.off = align_up(slots * 4, 512);
+    w.x = w.off + align_up((int64_t)(kExperts + 1) * 4, 512);
+    static_assert(kMaxSlots * 4 <= 512 && (kExperts + 1) * 4 <= 512, "the record's index arrays at 16 rows");
+    w.rec = align_up(w.x + (int64_t)rows * kEmbd * 2, 4096);
     w.gu_out = w.rec;
-    w.act = align_up(w.gu_out + (int64_t)kMaxSlots * kGuN * 2, 4096);
-    w.dn_out = align_up(w.act + (int64_t)kMaxSlots * kFf * 2, 4096);
-    w.bytes = align_up(w.dn_out + (int64_t)kMaxSlots * kEmbd * 2, 4096);
-    w.out = (int64_t)kMaxSlots * kEmbd * 2;
+    w.act = align_up(w.gu_out + slots * kGuN * 2, 4096);
+    w.dn_out = align_up(w.act + slots * kFf * 2, 4096);
+    w.bytes = align_up(w.dn_out + slots * kEmbd * 2, 4096);
+    w.out = slots * kEmbd * 2;
     return w;
 }
 /* The tables: per rank and routed layer a gate_up and a down table of kExperts entries. */
 inline int64_t tables_bytes(int ranks, int layers) {
     return align_up((int64_t)ranks * layers * 2 * kExperts * 8, 4096);
 }
-inline int64_t fixed_bytes(int ranks, int layers) { return tables_bytes(ranks, layers) + (int64_t)ranks * ws().bytes; }
+inline int64_t fixed_bytes(int ranks, int layers, int rows = kMaxRows) {
+    return tables_bytes(ranks, layers) + (int64_t)ranks * ws(rows).bytes;
+}
 /* Units the arena holds: min(candidates, floor((cap - fixed) / stride)), 0 when nothing fits. */
-inline int64_t capacity(int64_t cap_mib, int ranks, int layers, int64_t stride, int64_t candidates) {
-    const int64_t room = (cap_mib << 20) - fixed_bytes(ranks, layers);
+inline int64_t capacity(int64_t cap_mib, int ranks, int layers, int64_t stride, int64_t candidates,
+                        int rows = kMaxRows) {
+    const int64_t room = (cap_mib << 20) - fixed_bytes(ranks, layers, rows);
     if (room <= 0 || stride <= 0) return 0;
     return std::min<int64_t>(candidates, room / stride);
 }
@@ -679,17 +699,20 @@ inline std::vector<int64_t> quotas(std::vector<Cand> all, int64_t n, int ranks) 
  * top_k, the row the CPU's job reads) and row_of[j] = i, the sorted row the CPU would write. */
 struct Compact {
     int     T = 0;
-    int32_t sorted[kMaxSlots] = {};
+    int32_t sorted[kCapSlots] = {};
     int32_t off[kExperts + 1] = {};
-    int32_t row_of[kMaxSlots] = {};
+    int32_t row_of[kCapSlots] = {};
 };
 constexpr int kCompactShape = -1000;
-/* 0, kCompactShape for a shape outside the worker's, or -(e + 1) for a held expert whose live slots differ
- * from counts[e] (the scatter's count: the order was not read as the card reads it). */
+/* 0, kCompactShape for a shape outside the worker's (AR above `max_rows`, kMaxRows unless kRowsEnv raised it),
+ * or -(e + 1) for a held expert whose live slots differ from counts[e] (the scatter's count: the order was not
+ * read as the card reads it). */
 inline int compact(const int32_t* sorted, const int32_t* off, int AR, int top_k, int ne, const uint8_t* worker,
-                   const int32_t* counts, int n_counts, Compact* out) {
-    if (!sorted || !off || !worker || !out || AR < 1 || AR > kMaxRows || top_k != kTopK || ne != kExperts)
+                   const int32_t* counts, int n_counts, Compact* out, int max_rows = kMaxRows) {
+    if (!sorted || !off || !worker || !out || max_rows < 1 || max_rows > kRowsCap || AR < 1 || AR > max_rows ||
+        top_k != kTopK || ne != kExperts)
         return kCompactShape;
+    const int cap = max_rows * kTopK;
     const int T = AR * top_k;
     int k = 0;
     out->off[0] = 0;
@@ -701,7 +724,7 @@ inline int compact(const int32_t* sorted, const int32_t* off, int AR, int top_k,
             hi = std::clamp(hi, lo, T);
             for (int i = lo; i < hi; ++i) {
                 if (sorted[i] < 0 || sorted[i] / top_k >= AR) continue;
-                if (k >= kMaxSlots) return kCompactShape;
+                if (k >= cap) return kCompactShape;
                 out->sorted[k] = sorted[i];
                 out->row_of[k] = i;
                 ++k;
@@ -714,6 +737,37 @@ inline int compact(const int32_t* sorted, const int32_t* off, int AR, int top_k,
     out->T = k;
     return 0;
 }
+
+/* ---- taller passes (kRowsEnv above 16) --------------------------------------------------------------
+ *
+ * Why 16: the worker relaunches the rank's own row at the job's height, and below 17 rows that is gemv_vp,
+ * whose launcher serves the decode band only (libr4d/r4d_ds41_mxfp4.hip mx_moe: `gemv && (tokens <= 16 ||
+ * tall)`, and a marked table refused on the tiled path). Above 16 the rank cards run, under prefill Phase 1
+ * (RADIANCE_EXPERIMENTAL_DS41_P1=1 beside LCP, the only way VRAM_PACKED, which the worker needs, admits taller
+ * passes: FileStager::lcp_init), the P1 twin ds41p1::kTwinRow: gemv_vp's kernel at every height, packed marks
+ * honoured, each output row the decode band's bytes for its activation row (T1), so the CPU pool's. A
+ * compacted launch keeps them for the reason the 16-row one does: each output value depends on its weight
+ * row, its activation row and K only (the P1 twin's work split and row passes change no sum; T1, T5). The
+ * worker takes a pass taller than 16 only when every height 17..rows of the layer's gate_up and down resolved
+ * to that twin (FileStager::aux_resolve) and the card check `auxtall` (ds41_mxfp4_device_check) passed on the
+ * extra card and a rank card: the compacted twin chain at 17..rows against the gemv_vp chain in passes of 16,
+ * the plain gemv over block_mxfp4 and the host chain, the two cards' outputs byte-identical.
+ *
+ * The deadline scales with the height: a job of AR rows is late at max(its submit + D * ceil(AR / 16), the
+ * pool's end + kGraceUs), D the switch's (2000 us), at most kDeadlineMax. At 16 rows or fewer it is D. */
+inline int64_t deadline_us_for(int64_t deadline_us, int rows) {
+    const int64_t f = rows <= kMaxRows ? 1 : (rows + kMaxRows - 1) / kMaxRows;
+    return std::min<int64_t>(deadline_us * f, kDeadlineMax);
+}
+/* The shutdown line's heights: 1-16, 17-32, 33-64, 65-128, 129-256, 257-512. */
+constexpr int kHeightBuckets = 6;
+inline int height_bucket(int rows) {
+    int b = 0;
+    for (int hi = kMaxRows; b < kHeightBuckets - 1 && rows > hi; hi *= 2) ++b;
+    return b;
+}
+inline int height_lo(int b) { return b == 0 ? 1 : (kMaxRows << (b - 1)) + 1; }
+inline int height_hi(int b) { return kMaxRows << b; }
 
 /* ---- verify counting -------------------------------------------------------------------------- */
 /* Values of a row of n bf16 that differ, and the first one's column (-1 none). */

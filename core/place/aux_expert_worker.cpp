@@ -82,17 +82,26 @@ std::string selector_bdf(const Config& cfg, const std::string& sysfs) {
 
 /* ------------------------------------------------------------------ the shutdown line */
 
-std::string stats_line(int r, const Stats& s, bool released) {
+std::string stats_line(int r, const Stats& s, bool released, int max_rows) {
     const double rt = s.rt_n ? (double)s.rt_sum_ns / (double)s.rt_n * 1e-3 : 0.0;
     const std::string rel = released ? fmt(", %llu while released", (unsigned long long)s.declined_released) : "";
+    /* ds41aux::kRowsEnv above 16: the jobs, their rows and the rows the CPU path met, by pass height. */
+    std::string by;
+    if (max_rows > ds41aux::kMaxRows) {
+        by = "; by height:";
+        for (int b = 0; b < ds41aux::kHeightBuckets && ds41aux::height_lo(b) <= max_rows; ++b)
+            by += fmt("%s %d-%d: %llu jobs, %llu of %llu rows", b ? ";" : "", ds41aux::height_lo(b),
+                      std::min(ds41aux::height_hi(b), max_rows), (unsigned long long)s.jobs_h[b],
+                      (unsigned long long)s.rows_h[b], (unsigned long long)s.eligible_h[b]);
+    }
     return fmt("%s%d: %llu layer jobs, %llu units, %llu rows on the extra card of %llu rows the CPU path met in passes "
                "of up to %d rows; declined: %llu taller, %llu draft, %llu without usable kernel rows, %llu while the "
                "lane was busy or backing off, %llu after it failed%s; %llu worker units not cached (CPU miss path); "
                "waited %.1f ms beyond the CPU's rows, round trip %.1f us mean, %.1f us max; %llu deadline misses "
                "(%llu forced; %llu units, %llu rows recomputed on the CPU in %.1f ms), %llu launch failures; verify: "
-               "%llu rows compared, %llu differ (%llu values), %llu not compared",
+               "%llu rows compared, %llu differ (%llu values), %llu not compared%s",
                ds41aux::kLogRank, r, (unsigned long long)s.jobs, (unsigned long long)s.units,
-               (unsigned long long)s.placed, (unsigned long long)s.eligible_rows, ds41aux::kMaxRows,
+               (unsigned long long)s.placed, (unsigned long long)s.eligible_rows, max_rows,
                (unsigned long long)s.declined_tall, (unsigned long long)s.declined_draft,
                (unsigned long long)s.declined_rows, (unsigned long long)s.declined_busy,
                (unsigned long long)s.declined_dead, rel.c_str(), (unsigned long long)s.uncached, (double)s.wait_ns * 1e-6, rt,
@@ -100,13 +109,13 @@ std::string stats_line(int r, const Stats& s, bool released) {
                (unsigned long long)s.fallback_units, (unsigned long long)s.fallback_rows,
                (double)s.fallback_ns * 1e-6, (unsigned long long)s.failed, (unsigned long long)s.verified,
                (unsigned long long)s.differ_rows, (unsigned long long)s.differ_values,
-               (unsigned long long)s.not_compared);
+               (unsigned long long)s.not_compared, by.c_str());
 }
 
 /* ------------------------------------------------------------------ the lane */
 
-DeviceLane::DeviceLane(int device, int rank, char* ws, int64_t backoff)
-    : dev_(device), rank_(rank), ws_(ws), backoff_(backoff) {}
+DeviceLane::DeviceLane(int device, int rank, char* ws, int64_t backoff, int rows)
+    : dev_(device), rank_(rank), rows_(rows), ws_(ws), backoff_(backoff) {}
 
 DeviceLane::~DeviceLane() {
     if (leaked_) return;   /* a job may still run on the queue: the process exit reclaims it all */
@@ -117,7 +126,11 @@ DeviceLane::~DeviceLane() {
 }
 
 int DeviceLane::init(std::string* why) {
-    const ds41aux::Ws w = ds41aux::ws();
+    const ds41aux::Ws w = ds41aux::ws(rows_);
+    if (w.bytes <= 0) {
+        *why = fmt("rank %d's lane: no workspace for passes of %d rows", rank_, rows_);
+        return RAD_E_INVAL;
+    }
     if (rad_stream_create(&s_, 0) < 0) {
         s_ = nullptr;
         *why = fmt("rank %d's queue on device %d: %s", rank_, dev_, rad_dev_last_error());
@@ -175,8 +188,8 @@ void DeviceLane::declined() {
 int DeviceLane::submit(const Job& j) {
     if (dead_) return RAD_E_STATE;
     if (pending_) return retire("a submit while a job was in flight", RAD_E_STATE);
-    const ds41aux::Ws w = ds41aux::ws();
-    if (j.AR < 1 || j.AR > ds41aux::kMaxRows || j.T < 1 || j.T > ds41aux::kMaxSlots || !j.x || !j.sorted || !j.off ||
+    const ds41aux::Ws w = ds41aux::ws(rows_);
+    if (j.AR < 1 || j.AR > rows_ || j.T < 1 || j.T > rows_ * ds41aux::kTopK || !j.x || !j.sorted || !j.off ||
         !j.gu.fn || !j.sw.fn || !j.dn.fn || !j.gu_w.data || !j.dn_w.data)
         return retire("a job's shape", RAD_E_INVAL);
     /* From here on the job is in flight: a step that fails leaves it failed (wait answers < 0). */
@@ -410,7 +423,7 @@ int Worker::build(int layers, int64_t slots, const ds41aux::Layout& L, int resto
 
 int Worker::carve(int layers, int64_t slots, const ds41aux::Layout& L, std::string* why) {
     const int R = (int)ranks_.size();
-    const ds41aux::Ws w = ds41aux::ws();
+    const ds41aux::Ws w = ds41aux::ws((int)cfg_.rows);
     const int64_t tb = ds41aux::tables_bytes(R, layers);
     if (!arena_ || layers <= 0 || slots < 0 || tb + R * w.bytes + slots * L.stride > arena_bytes_) {
         *why = fmt("the arena of %s does not hold the tables (%s), %d lanes (%s) and %lld slots of %s",
@@ -448,7 +461,7 @@ void Worker::plan(int layers, int64_t slots, const ds41aux::Layout& L) {
 
 int Worker::make_lanes(int restore_device, std::string* why) {
     const int R = (int)ranks_.size();
-    const ds41aux::Ws w = ds41aux::ws();
+    const ds41aux::Ws w = ds41aux::ws((int)cfg_.rows);
     if (rad_dev_set(card_.ord) < 0) {
         *why = fmt("device %d could not be selected: %s", card_.ord, rad_dev_last_error());
         (void)rad_dev_set(restore_device);
@@ -456,7 +469,8 @@ int Worker::make_lanes(int restore_device, std::string* why) {
     }
     int rc = RAD_OK;
     for (int r = 0; r < R && rc >= 0; ++r) {
-        lanes_.emplace_back(new DeviceLane(card_.ord, r, ws_ ? ws_ + r * w.bytes : nullptr, cfg_.backoff));
+        lanes_.emplace_back(new DeviceLane(card_.ord, r, ws_ ? ws_ + r * w.bytes : nullptr, cfg_.backoff,
+                                           (int)cfg_.rows));
         rc = lanes_.back()->init(why);
     }
     /* Later bring-up takes the current device (pinned memory's NUMA node, among others): rank 0's again. */

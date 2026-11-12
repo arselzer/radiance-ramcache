@@ -802,7 +802,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
     /* The dynamic worker (work/aux-dyn/SPEC.md): no lane is held across passes (a safety net: every layer leaves
      * it), and the online set counts the tokens of the passes it counts the hits of (B.2). */
     if (aux_in_lane_) aux_lane_leave();
-    if (aux_online_ && aux_pass_ && b->n_tok <= ds41aux::kMaxRows) aux_hit_tok_ += (uint64_t)b->n_tok;
+    if (aux_online_ && aux_pass_ && b->n_tok <= aux_rows_max_) aux_hit_tok_ += (uint64_t)b->n_tok;
     if (tbo_) tbo_enter(0);
     if (hx_ra_) {   /* predictions for this pass may come; units of earlier ones are stale */
         hx_ra_at_.store((uint64_t)trace_pass_ << 32, std::memory_order_release);
@@ -2389,7 +2389,7 @@ void FileStager::hx_choose(int32_t li) {
     if (aux_) {
         /* The online set's count (work/aux-dyn/SPEC.md B.2): the rows each selected candidate unit meets in a pass
          * the worker could take, whatever the lane or the gate. */
-        if (aux_online_ && aux_pass_ && layer_rows(li) <= ds41aux::kMaxRows && layers_[(size_t)li].layer < n_model_layers_ &&
+        if (aux_online_ && aux_pass_ && layer_rows(li) <= aux_rows_max_ && layers_[(size_t)li].layer < n_model_layers_ &&
             (size_t)li < aux_rows_.size() && aux_rows_[(size_t)li].ok)
             for (int32_t u : want_)
                 if (u >= 0 && (size_t)u < aux_cand_.size() && aux_cand_[(size_t)u]) {
@@ -2401,7 +2401,7 @@ void FileStager::hx_choose(int32_t li) {
         for (int32_t u : want_) res = res || aux_view_->is_resident(u);
         if (res) {   /* a decline counts only for a layer with a selected resident unit */
             if (!aux_pass_ || layers_[(size_t)li].layer >= n_model_layers_) ++aux_stats_.declined_draft;
-            else if (layer_rows(li) > ds41aux::kMaxRows) ++aux_stats_.declined_tall;
+            else if (layer_rows(li) > aux_rows_max_) ++aux_stats_.declined_tall;
             else if (aux_guard_bad_ || (size_t)li >= aux_rows_.size() || !aux_rows_[(size_t)li].ok)
                 ++aux_stats_.declined_rows;
             else if (aux_gate_ && !aux_lane_enter()) ++aux_stats_.declined_released;   /* card sharing: released */
@@ -4431,7 +4431,10 @@ int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
     }
     /* The aux worker: its rows placed (or compared, or computed by the CPU from the kept leases) before the
      * leases go back and before the copy below. */
-    if (aux_ && layer_rows(hx_li_) <= ds41aux::kMaxRows) aux_stats_.eligible_rows += hx_rows_.size();
+    if (aux_ && layer_rows(hx_li_) <= aux_rows_max_) {
+        aux_stats_.eligible_rows += hx_rows_.size();
+        aux_stats_.eligible_h[ds41aux::height_bucket((int)layer_rows(hx_li_))] += hx_rows_.size();
+    }
     if (aux_job_ != kAuxNone) RAD_TRY(aux_finish());
     for (int k = 0; k < hx_n_; ++k) mover_->release_host_unit(&hx_units_[k]);
     hx_n_ = 0;

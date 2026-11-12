@@ -567,8 +567,9 @@ public:
      *                 eligible trunk routed layers with the CPU path's decode shape, host-planes eligible,
      *                 not in a slab, not lent to P1, of the two block sizes and not refused by the packed cache.
      * aux_resolve     every such layer's gate_up, SwiGLU and down rows for the worker's heights (the band of
-     *                 each op's ranged M: 1..16 rows for the GEMMs, 1..96 for the SwiGLU), which must be
-     *                 moe_gemm_ggml_mxfp4_gemv_vp and swiglu_clamped_bf16, scratch-free and instance-free, and
+     *                 each op's ranged M: 1..max_rows rows for the GEMMs, 1..max_rows * 6 for the SwiGLU), which
+     *                 must be moe_gemm_ggml_mxfp4_gemv_vp to 16 rows (ds41p1::kTwinRow, the P1 twin, from 17 up
+     *                 to max_rows: ds41aux::kRowsEnv) and swiglu_clamped_bf16, scratch-free and instance-free, and
      *                 the weight-table operands as the issue path builds them. < 0 with *why otherwise.
      * aux_load        `list` (in order) into the worker's slots [first, first + quota) through rank `r`'s lane:
      *                 each unit from its packed RAM-cache slot (a read-only lease) or read and packed, copied,
@@ -579,7 +580,7 @@ public:
      *                 extra card before any pass.
      * aux_bind / aux_unbind  from the engine once init ran / before the worker goes. */
     int  aux_candidates(std::vector<ds41aux::Cand>* out) const;
-    int  aux_resolve(std::string* why);
+    int  aux_resolve(std::string* why, int max_rows = ds41aux::kMaxRows);
     struct AuxLoadStats {
         int64_t loaded = 0, cached = 0, packed = 0, skipped = 0;
         double  share = 0;
@@ -998,7 +999,7 @@ private:
     int       hx_told_ = 0;
     HostStats hx_stats_;
     /* ---- the aux expert worker's per-layer state (stager_aux.cpp; aux_ null: none of it runs) ---------
-     * hx_choose takes a layer of at most 16 rows of a trunk, non-draft pass while the lane is ready
+     * hx_choose takes a layer of at most 16 rows (aux_rows_max_ under ds41aux::kRowsEnv) of a trunk, non-draft pass while the lane is ready
      * (aux_take_); in serve mode a selected resident unit's lease goes to aux_units_ (the base's admit, so
      * the RAM cache's LRU evolves as in the base) and its slot code is -3: no pool job, no reservation, an
      * alias like a CPU unit's. hx_submit compacts their slots (aux_prepare, before the pool's submit: its
@@ -1010,6 +1011,8 @@ private:
     const aux::RankView* aux_view_ = nullptr;
     bool    aux_verify_ = false;
     int64_t aux_deadline_ns_ = 0;
+    int     aux_rows_max_ = ds41aux::kMaxRows;   /* ds41aux::kRowsEnv: the tallest pass the worker takes */
+    int     aux_job_rows_ = 0;                    /* the job in flight's pass height (its deadline's scale) */
     int64_t aux_force_late_ = 0;      /* ..._AUX_FORCE_LATE: every Nth job abandoned as late */
     uint64_t aux_seq_ = 0;            /* jobs submitted, for the forced lateness */
     bool    aux_pass_ = false;        /* this pass may take jobs (begin_pass) */
@@ -1025,8 +1028,9 @@ private:
     bool    aux_fb_ = false;
     std::vector<HostExpertPool::Job> aux_fb_jobs_;
     std::vector<int32_t> aux_op_;     /* by op: li * 3 + k (gate_up 0, SwiGLU 1, down 2), or -1 */
-    /* By routed layer: the rows a job relaunches by height (index M: 1..16 for the GEMMs, 1..96 for the
-     * SwiGLU), the weight-table operands' descriptors (data set per job), and whether the layer is usable. */
+    /* By routed layer: the rows a job relaunches by height (index M: 1..aux_rows_max_ for the GEMMs, 1..
+     * aux_rows_max_ * 6 for the SwiGLU), the weight-table operands' descriptors (data set per job), and whether the
+     * layer is usable. */
     struct AuxRows {
         std::vector<const Resolved*> gu, sw, dn;
         RadTensor gu_w{}, dn_w{};
@@ -1053,6 +1057,9 @@ private:
     }
     int  aux_warm_job(aux::Lane* lane, int32_t u, int32_t li, Mover::HostUnit* hu, const void* gu_tab,
                       const void* dn_tab, int r, std::string* why);
+    /* ds41aux::kRowsEnv above 16: the warm-up's second job, aux_rows_max_ rows on the unit through the tall rows. */
+    int  aux_warm_tall(aux::Lane* lane, int32_t u, int32_t li, Mover::HostUnit* hu, const void* gu_tab,
+                       const void* dn_tab, int r, std::string* why);
     int  aux_prepare(int* appended);
     void aux_submit();
     int  aux_finish();

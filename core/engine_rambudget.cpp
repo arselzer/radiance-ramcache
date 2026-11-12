@@ -164,12 +164,12 @@ int Engine::ram_budget_serve() {
                             fmt("/proc/self/status VmRSS, %s at start()", hb(ram_rss_at_start_).c_str()) });
     /* Allocated after this point: subtracted. */
     int64_t per_seq_mib = 0;
-    if (!env_num("RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB", 0, 1 << 20, 100, &per_seq_mib))
+    if (!env_num("RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB", 0, 1 << 20, 32, &per_seq_mib))
         return RAD_E_INVAL;
     in.later.push_back({ fmt("per-sequence growth, %lld MiB x --max-num-seqs %lld", (long long)per_seq_mib,
                              (long long)cfg_.max_seqs),
                          per_seq_mib * kMiB * cfg_.max_seqs,
-                         "measured 2026-11-12 (MemAvailable per stream), not itemized; "
+                         "measured with the budget on (ab-20261112T142114Z): ~17 MiB a sequence at 128, ~14 at 256; 32 kept; not itemized; "
                          "RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB" });
     in.later.push_back({ "scored rows' pinned logits, grown on the first scored step", scored,
                          "core/engine.cpp stage_scored_rows, --max-num-batched-tokens x vocab shard" });

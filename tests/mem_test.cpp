@@ -3675,6 +3675,19 @@ TEST(the_auto_store_for_a_short_session_and_a_shared_head) {
     CHECK_EQ(checkpoint_slots_want(g, 128, 4096, 2048, -3), shrt.want);   /* never fewer */
 }
 
+/* The RAM budget's default session: a lone 32K agent session keeps its context (13 harness turns lost
+ * their resume points at 4096: TTFT 57 -> 135 s, window ab-20261112T142114Z); a 128-sequence batch in a
+ * 147K pool gets 4096; an explicit session wins; never past --max-model-len. */
+TEST(the_ram_budget_session_follows_each_sequences_share) {
+    CHECK_EQ(ram_budget_session_ctx(32768, 1, 0), 32768ll);
+    CHECK_EQ(ram_budget_session_ctx(32768, 4, 0), 8192ll);
+    CHECK_EQ(ram_budget_session_ctx(147456, 128, 0), 4096ll);
+    CHECK_EQ(ram_budget_session_ctx(2048, 1, 0), 2048ll);
+    CHECK_EQ(ram_budget_session_ctx(147456, 128, 1200), 1200ll);
+    CHECK_EQ(ram_budget_session_ctx(32768, 1, 100000), 32768ll);
+    CHECK_EQ(ram_budget_session_ctx(32768, 0, 0), 32768ll);
+}
+
 /* --checkpoint-slots auto: the policy's share plus one for each sequence, held to the share of
  * memory but not below the floor, and to the room the host has. */
 TEST(the_auto_store_gives_every_sequence_its_sessions_share) {

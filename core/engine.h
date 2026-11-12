@@ -300,7 +300,7 @@ private:
     int64_t ram_reserve_bytes_ = 0;
     int64_t ram_floor_bytes_ = 0;
     int64_t ram_guard_ms_ = 250;
-    int64_t ram_session_tokens_ = 0;   /* ..._RAM_BUDGET_SESSION_TOKENS; 0: min(--max-model-len, 4096) */
+    int64_t ram_session_tokens_ = 0;   /* ..._RAM_BUDGET_SESSION_TOKENS; 0: min(--max-model-len, max(--max-model-len / --max-num-seqs, 4096)) */
     int64_t ram_avail_at_start_ = -1, ram_rss_at_start_ = -1;
     std::vector<int64_t> ram_rank_limit_;   /* the serve-time budget, per rank */
     std::thread             ram_guard_thread_;

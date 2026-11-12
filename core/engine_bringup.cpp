@@ -3725,12 +3725,12 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     const std::unique_ptr<CheckpointPolicy> pol =
         make_checkpoint_policy(cfg_.checkpoint_policy, interval);
     /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET: auto sizes the store for sessions of
-     * ..._RAM_BUDGET_SESSION_TOKENS (default min(--max-model-len, 4096)) rather than
+     * ..._RAM_BUDGET_SESSION_TOKENS (default min(--max-model-len, max(--max-model-len / --max-num-seqs, 4096))) rather than
      * --max-model-len, which an A/B window sets to the whole KV pool (147K tokens: 641 slots,
      * 14 GiB at 128 sequences, for ~1K-token prompts), and one more a sequence for a shared head
      * under RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD. Fewer slots only mean fewer resume points
      * (more recompute), never other bytes. Off, ctx is --max-model-len and extra 0, as before. */
-    const int64_t ctx = ram_budget_on_ ? std::min(model_len, ram_session_tokens_ > 0 ? ram_session_tokens_ : 4096)
+    const int64_t ctx = ram_budget_on_ ? ram_budget_session_ctx(model_len, cfg_.max_seqs, ram_session_tokens_)
                                        : model_len;
     int64_t extra = 0;
     if (ram_budget_on_) {
@@ -3739,7 +3739,7 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
         RAD_INFO("ram budget: the snapshot store is sized for %lld-token sessions (%s; --max-model-len "
                  "%lld): %lld a sequence by %s%s", (long long)ctx,
                  ram_session_tokens_ > 0 ? "RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET_SESSION_TOKENS"
-                                         : "the default, min(--max-model-len, 4096)",
+                                         : "the default, min(--max-model-len, max(--max-model-len / --max-num-seqs, 4096))",
                  (long long)model_len, (long long)(pol->held(ctx, interval) + 1 + extra), pol->name(),
                  extra ? ", one of them a shared head's (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD)" : "");
     }

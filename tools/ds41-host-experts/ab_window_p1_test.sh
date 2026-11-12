@@ -19,7 +19,13 @@
 #      pass outside the decode band and no verify pass over 16 rows); in the arm loop the adopted fast
 #      arm with Sg8, Sga8 or Sg15 on top is launched with the speculation's arguments and every other
 #      switch as without it, with N2 Sg7 too, and Sg16, N2 with Sg8 and N8 with Sg2 (more than 16 decode
-#      rows a step) are skipped with the reason.
+#      rows a step) are skipped with the reason;
+#   5. QdN (decode passes on the cards, ..._P1_DECODE_ROWS): qd_gate on synthetic logs (a Qd arm is measured only
+#      with rank 0's decode line naming its N and chunk, and at exit only when every rank's stats line counts its
+#      decode passes and some rank armed one; an arm without the part only without the line and with none armed),
+#      alone and through lcp_check; in the arm loop the fast arm with Qd200 is launched with the switch at 200
+#      and every arm without the part states it 0, while Qd above the chunk, Qd16, Qd beside Tb and Qd without
+#      P1 are skipped with the reason.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -32,6 +38,8 @@ bad() { echo "FAIL $*"; fail=1; }
 # ---- 1. the server-log gate
 eval "$(sed -n '/^lcp_check() {/,/^}/p' "$W")"
 declare -F lcp_check >/dev/null || { echo "FAIL no lcp_check in $W"; exit 1; }
+eval "$(sed -n '/^qd_gate() {/,/^}/p' "$W")"
+declare -F qd_gate >/dev/null || { echo "FAIL no qd_gate in $W"; exit 1; }
 OUT=$T/logs
 mkdir -p "$OUT"
 log() { echo "LOG: $*" >> "$OUT/window.log"; }
@@ -116,6 +124,43 @@ sglc 0 "lcp_check: the P1 arm with Sg8 and Cs, its lines"            sgall  1024
 sglc 1 "lcp_check: the P1 arm with Sg8, no consumer skip line"       sgnocs 1024 8 1
 sglc 1 "lcp_check: the P1 arm without Sg on a server that took it"   sgall  1024 "" 1
 sglc 0 "lcp_check: the P1 arm without Sg, as before"                 p1def  1024 "" 1
+
+# ---- 5a. QdN: qd_gate on synthetic logs, alone and through lcp_check.
+qd_line() { echo "I[0] ds41 p1: decode passes on the cards: every routed expert row of a pure decode pass of $1 to ${2:-1024} rows on the cards, as a prefill pass's layer of the threshold's rows (RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=$1; ...)"; }
+qd_stats() { echo "I[$1] ds41 p1 stats, rank $1: passes 40, ...; leases at pass end 0, verify rows 0, differ 0; touched experts 900: ...; decode passes armed $2, rows $(( $2 * 256 )) (at most 256 a pass), issue 20.500 s; decode passes of 17 to 199 rows on the CPU path 3"; }
+mk qd200 "$lc_line" "$(p1_line 320)" "$(qd_line 200)"
+mk qd200x2048 "$lc_line" "$(p1_line 320)" "$(qd_line 200 2048)"
+{ cat "$OUT/qd200.server.log"; for r in 0 1 2 3; do qd_stats $r 12; done; } > "$OUT/qdexit.server.log"
+{ cat "$OUT/qd200.server.log"; for r in 0 1 2 3; do qd_stats $r 0; done; } > "$OUT/qdidle.server.log"
+{ cat "$OUT/qd200.server.log"; qd_stats 0 12; echo "I[1] ds41 p1 stats, rank 1: passes 40, leases at pass end 0, verify rows 0, differ 0"; } > "$OUT/qdodd.server.log"
+{ cat "$OUT/p1def.server.log"; for r in 0 1 2 3; do qd_stats $r 5; done; } > "$OUT/qdstray.server.log"
+qdexpect() {   # want(0/1) what log QD LC stage
+  local want=$1 what=$2 rc
+  qd_gate "$OUT/$3.server.log" "$4" "$5" "$6" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want"; fi
+}
+qdexpect 0 "Qd200, its line"                                        qd200      200 1024 start
+qdexpect 1 "Qd256 on a server that took 200"                        qd200      256 1024 start
+qdexpect 1 "Qd200 at Lc2048 on a server whose line names 1024"      qd200      200 2048 start
+qdexpect 0 "Qd200 at Lc2048, its line"                              qd200x2048 200 2048 start
+qdexpect 1 "Qd200, no decode line"                                  p1def      200 1024 start
+qdexpect 1 "no Qd part on a server that arms decode passes"         qd200      ""  1024 start
+qdexpect 0 "no Qd part, no decode line"                             p1def      ""  1024 start
+qdexpect 0 "Qd200 at exit: ranks armed decode passes"               qdexit     200 1024 exit
+qdexpect 1 "Qd200 at exit: no rank armed one (the switch never acted)" qdidle  200 1024 exit
+qdexpect 1 "Qd200 at exit: a stats line without its decode counts"  qdodd      200 1024 exit
+qdexpect 1 "Qd200 at exit: no stats line"                           qd200      200 1024 exit
+qdexpect 1 "no Qd part at exit, but a rank armed decode passes"     qdstray    ""  1024 exit
+qdexpect 0 "no Qd part at exit, none armed"                         p1def      ""  1024 exit
+qdlc() {   # want(0/1) what log QD
+  local want=$1 what=$2 rc
+  ARM_LC=1024 ARM_P1=1 ARM_QM=320 ARM_QL="" ARM_QE="" ARM_QD=$4 lcp_check "$3" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want ($(tail -1 "$OUT/window.log"))"; fi
+}
+qdlc 0 "lcp_check: the P1 arm with Qd200, its line"                 qd200 200
+qdlc 1 "lcp_check: the P1 arm with Qd200, no decode line"           p1def 200
+qdlc 1 "lcp_check: the P1 arm without Qd on a server that arms decode" qd200 ""
+qdlc 0 "lcp_check: the P1 arm without Qd, as before"                p1def ""
 
 # Qsp's startup and useful-work gates, independent of ordinary P1 startup admission.
 eval "$(sed -n '/^qsp_gate() {/,/^}/p' "$W")"
@@ -211,15 +256,21 @@ N2SG7=$FAST-N2-Sg7
 N2SG8=$FAST-N2-Sg8
 N8SG2=$FAST-Sg2-N8
 SG0=$FAST-Sg0
+QD200=$FAST-Qd200
+QD4096=$FAST-Qd4096
+QD16=$FAST-Qd16
+QDTB=$FAST-Qd200-Tb
+QDNOP=$REF-Qd200
 ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP $COLD4K $PC4K $NOINT4K $LOWINT4K $NOPC4K $OVER4K"
 ARMS="$ARMS $FAST $SG8 $SGA8 $SG15 $SG16 $N2SG7 $N2SG8 $N8SG2 $SG0"
+ARMS="$ARMS $QD200 $QD4096 $QD16 $QDTB $QDNOP"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE
@@ -347,6 +398,33 @@ done
 sec=$(section "$SG0")
 if [[ -z "$sec" ]]; then bad "the Sg0 arm was not launched: $(grep -m3 "arm $SG0" "$T/loop.txt")"
 else grep -qx "  ARM_SG: " <<< "$sec" && ok "Sg0: no speculation, no gate" || bad "Sg0: ARM_SG is '$(grep '  ARM_SG:' <<< "$sec")'"; fi
+
+# ---- 5b. QdN in the arm loop: Qd200 on the fast arm states the switch at 200 and every other switch as the fast
+# arm; every arm without the part states it 0; Qd above the chunk, Qd16, Qd beside Tb and Qd without P1 skipped.
+sec=$(section "$QD200")
+if [[ -z "$sec" ]]; then bad "the Qd200 arm was not launched: $(grep -m3 "arm $QD200" "$T/loop.txt")"
+else
+  has "Qd200" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS 200
+  grep -qx "  ARM_QD: 200" <<< "$sec" && ok "Qd200: the arm is gated on its decode line (ARM_QD=200)" || bad "Qd200: ARM_QD is '$(grep '  ARM_QD:' <<< "$sec")'"
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA \
+           RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES \
+           RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS RADIANCE_EXPERIMENTAL_SCHED_TBO; do
+    has "Qd200 as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+fi
+for a in "$REF" "$NEW" "$BIG" "$FAST" "$SG8"; do
+  has "no Qd part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS 0
+done
+grep -qx "  ARM_QD: " <<< "$fast" && ok "the fast arm names no Qd" || bad "the fast arm's ARM_QD is '$(grep '  ARM_QD:' <<< "$fast")'"
+qdskip() {   # arm, the reason's pattern
+  if [[ -n "$(section "$1")" ]]; then bad "arm $1 was launched"
+  elif grep -q "LOG: arm $1: $2" "$T/loop.txt"; then ok "skipped: $(grep -m1 "LOG: arm $1: $2" "$T/loop.txt" | sed "s|LOG: arm $1: ||" | cut -c1-100)"
+  else bad "arm $1 not skipped for '$2': $(grep -m1 "LOG: arm $1: " "$T/loop.txt")"; fi
+}
+qdskip "$QD4096" "Qd4096 is above the chunk Lc2048.*skipped"
+qdskip "$QD16" "Qd16: Qd takes 17-4096.*skipped"
+qdskip "$QDTB" "Qd200 with Tb.*skipped"
+qdskip "$QDNOP" "the Q parts (RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=200) need P1.*skipped"
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do

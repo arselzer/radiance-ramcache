@@ -93,6 +93,7 @@ struct Tunables {
     int  lend_slab = 0;                                         /* the lent slab's slots a rank (0 off) */
     bool lend_audit = false;                                    /* every lent slot read back and compared */
     int  lend_rest_ms = 0;                                      /* the rest after a long prefill (0 none) */
+    int  decode_rows = 0;                                       /* decode passes on the cards from N rows (0 off) */
     bool align_end = true;
     bool swiglu_span = false;
 };
@@ -100,7 +101,7 @@ struct Tunables {
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
  * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-100000000 (unset: 100, or 2000 with lend_slab),
  * lend_heat_margin 100-1000, lend_heat_prior 0-100000000 (unset: the half-life), lend_slab 0-256, lend_rest_ms 0-600000 (unset: 5000 with lend_heat or lend_slab, else
- * 0)), align "end" or "start", swiglu_span and lend_audit 0/off or
+ * 0), decode_rows 0 or 17-4096), align "end" or "start", swiglu_span and lend_audit 0/off or
  * 1/on (default off). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 

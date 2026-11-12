@@ -714,6 +714,51 @@ TEST(mapped_slab_real_HOST_adapter_full_payload_guards_reuse_and_terminal_once){
     need(adapter.clear(),"idempotent terminal cleanup");CHECK_EQ(adapter.stats().api.free_invocations,uint64_t(1));
     CHECK_EQ(adapter.configure(22*MiB,4,0),RAD_E_STATE); //no spend-after-void-free refund
 }
+/* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET's growth limit (set_growth_limit): 0 grows nothing (a
+ * bypass, no allocation); held at what the cache holds, the slab fills its free slots and then
+ * replaces in LRU order without a second slab; lifted, it grows again. Every hit reads the bytes
+ * inserted: the limit changes only whether a unit is cached, never its bytes. */
+TEST(mapped_slab_growth_limit_holds_growth_and_replaces_within_the_slabs){
+    Environment environment("1","1");Adapter adapter;
+    adapter.set_growth_limit(0); //configure quotes unlimited (its minimum quote), whatever the limit was
+    need(adapter.configure(128*MiB,8,0),"room for a second slab");CHECK_EQ(adapter.growth_limit(),SIZE_MAX);
+    const auto a=adapter_pattern(Adapter::GU,21001);
+    adapter.set_growth_limit(0);
+    CHECK(adapter.insert(0,a.data(),a.size())==Adapter::Status::Bypass);
+    CHECK_EQ(adapter.stats().allocations,uint64_t(0));CHECK(adapter.growth_refusals()>0);
+    adapter.set_growth_limit(SIZE_MAX);
+    REQUIRE(adapter.insert(0,a.data(),a.size())==Adapter::Status::Ok);check_adapter_hit(adapter,0,a);
+    const auto grown=adapter.stats();CHECK_EQ(grown.allocations,uint64_t(1));
+    const size_t slots=grown.slabs.classes[0].capacity_slots;REQUIRE(slots>=1&&slots+3<8);
+    CHECK_EQ(adapter.growth_charged(),grown.mapped_policy_charge);
+    adapter.set_growth_limit(adapter.growth_charged());
+    for(size_t k=1;k<slots+3;++k){
+        const auto p=adapter_pattern(Adapter::GU,30000+k);
+        REQUIRE(adapter.insert(k,p.data(),p.size())==Adapter::Status::Ok);check_adapter_hit(adapter,k,p);
+    }
+    CHECK_EQ(adapter.stats().allocations,uint64_t(1));
+    {Adapter::Lease gone;CHECK(adapter.borrow(0,a.size(),&gone)==Adapter::Status::Miss);} //replaced, LRU
+    adapter.set_growth_limit(SIZE_MAX);
+    const auto z=adapter_pattern(Adapter::GU,40001);
+    REQUIRE(adapter.insert(slots+3,z.data(),z.size())==Adapter::Status::Ok);check_adapter_hit(adapter,slots+3,z);
+    CHECK_EQ(adapter.stats().allocations,uint64_t(2));
+    need(adapter.clear(),"terminal cleanup");
+}
+/* The per-entry owners (no slabs): a limit at what is held bypasses a new key and keeps the old. */
+TEST(mapped_entry_growth_limit_bypasses_without_evicting){
+    Environment environment("1","0");Adapter adapter;need(adapter.configure(64*MiB,8,0),"per-entry budget");
+    const auto a=adapter_pattern(Adapter::GU,51001),b=adapter_pattern(Adapter::DN,52001);
+    adapter.set_growth_limit(0);
+    CHECK(adapter.insert(0,a.data(),a.size())==Adapter::Status::Bypass);CHECK_EQ(adapter.stats().allocations,uint64_t(0));
+    adapter.set_growth_limit(SIZE_MAX);
+    REQUIRE(adapter.insert(0,a.data(),a.size())==Adapter::Status::Ok);
+    adapter.set_growth_limit(adapter.growth_charged());
+    CHECK(adapter.insert(1,b.data(),b.size())==Adapter::Status::Bypass);
+    CHECK_EQ(adapter.stats().allocations,uint64_t(1));check_adapter_hit(adapter,0,a);
+    adapter.set_growth_limit(SIZE_MAX);
+    REQUIRE(adapter.insert(1,b.data(),b.size())==Adapter::Status::Ok);check_adapter_hit(adapter,1,b);
+    need(adapter.clear(),"terminal cleanup");
+}
 /* The packed layout (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE) is a hard tag: its slots have their
  * own sizes, only reserve_packed/borrow_packed reach them and their leases say packed(), and every
  * block_mxfp4 call -- the card's copy path -- misses or bypasses (counted), even for a resident key,

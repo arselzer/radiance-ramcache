@@ -154,6 +154,25 @@ TEST(trusted_proxy_repeats_and_refuses_anything_but_a_cidr) {
 }
 
 /* A flag written last with no argument is refused rather than reading past argv. */
+/* --expert-ram-cache-total-mib auto (RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET's flag form): no cap,
+ * the disk tier required as for a number, and a later number replaces it. */
+TEST(expert_ram_cache_auto_parses_needs_the_disk_tier_and_a_number_replaces_it) {
+    Config c;
+    CHECK_EQ(parse({ "--weights-disk-tier", "--expert-ram-cache-total-mib", "auto" }, &c), RAD_OK);
+    CHECK(c.expert_ram_cache_auto);
+    CHECK_EQ(c.expert_ram_cache_total_mib, 0ll);
+    CHECK_EQ(parse_fresh({ "--expert-ram-cache-total-mib", "auto" }), RAD_E_INVAL);
+    Config d;
+    CHECK_EQ(parse({ "--weights-disk-tier", "--expert-ram-cache-total-mib", "auto",
+                     "--expert-ram-cache-total-mib", "64" }, &d), RAD_OK);
+    CHECK(!d.expert_ram_cache_auto);
+    CHECK_EQ(d.expert_ram_cache_total_mib, 64ll);
+    Config e;
+    CHECK_EQ(parse({ "--weights-disk-tier", "--expert-ram-cache-total-mib", "64" }, &e), RAD_OK);
+    CHECK(!e.expert_ram_cache_auto);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-ram-cache-total-mib", "autox" }), RAD_E_INVAL);
+}
+
 TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     Config c;
     CHECK_EQ(parse({ "--tp" }, &c), RAD_E_INVAL);

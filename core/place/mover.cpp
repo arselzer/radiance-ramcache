@@ -431,6 +431,9 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
                                                      want_packed ? NativeMappedFileCache::Layout::Packed
                                                                  : NativeMappedFileCache::Layout::Block, slots)); //fixed flags/stats/alignment reserve
                 mapped_file_cache_on_ = true;
+                /* Before ..._PREGROW below: under RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET it pins
+                 * nothing until serve() sets the limit. */
+                if (cfg_.native_cache_growth_limit >= 0) set_cache_growth_limit(cfg_.native_cache_growth_limit);
                 if (want_packed) {
                     packed_refused_.reset(new std::atomic<uint8_t>[plan.units.size()]());
                     RAD_INFO("native mapped cache: packed for the CPU only (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE): "
@@ -456,6 +459,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             } else {
                 RAD_TRY(native_file_cache_.configure(cfg_.native_file_cache_bytes, prog.weights.size()));
                 native_file_cache_on_ = true;
+                if (cfg_.native_cache_growth_limit >= 0) set_cache_growth_limit(cfg_.native_cache_growth_limit);
                 RAD_INFO("native file RAM cache: %s for this rank, including %s of entry metadata",
                          humanb(cfg_.native_file_cache_bytes).c_str(),
                          humanb(native_file_cache_.stats().metadata_bytes).c_str());

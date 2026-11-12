@@ -76,6 +76,7 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    ram_guard_stop();   /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET: before the ranks it reads go */
     /* work/aux-dyn/SPEC.md: the aux worker's control thread stops before anything below reads its counters or
      * tears the worker down (idempotent; null without its switches). */
     aux_ctl_stop();
@@ -2748,6 +2749,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
     }
 
+    /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET (engine_rambudget.cpp): the cache's budget from what
+     * startup left, and the guard, before the bank's checks read the budget and before any rank
+     * thread runs. Off, it returns at once. */
+    RAD_TRY(ram_budget_serve());
     if (draft_bank_config_.on) RAD_TRY(draft_bank_lend_open());
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
@@ -2790,6 +2795,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    ram_guard_stop();   /* its summary line; a no-op without the switch */
     aux_ctl_stop();   /* no boundary and no rank uses the worker from here on */
     xstats_close();
     const int bank_close = draft_bank_loan_ ? draft_bank_lend_close() : RAD_OK;

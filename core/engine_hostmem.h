@@ -37,4 +37,13 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks, std
  * negative figure or a sum past int64. */
 int64_t host_headroom_total(int64_t headroom_mib, int64_t cache_mib, int64_t backed_bytes);
 
+/* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET (engine_rambudget.cpp), defined in engine_bringup.cpp
+ * beside the checks they reuse. host_room_now: MemAvailable, or less where a memory cgroup leaves
+ * less, with the binding limit in `why`; -1 when MemAvailable is unreadable. host_pin_room_now:
+ * what the amdgpu driver's pin cap leaves this process (its cap less everything this process has
+ * pinned or mapped through rad_dev_alloc, a ledger that never counts down, so it errs low);
+ * INT64_MAX when the cap is lifted or unknown, or on a host without cards. */
+int64_t host_room_now(std::string* why);
+int64_t host_pin_room_now();
+
 }  /* namespace rad */

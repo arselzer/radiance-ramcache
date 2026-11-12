@@ -196,7 +196,8 @@ int NativeFileCache::insert_mapped_locked(size_t weight, const void* src, int64_
     const int64_t mapped = ((bytes + page - 1) / page) * page;
     if (uint64_t(mapped) > SIZE_MAX) return RAD_E_INVAL;
     const int64_t charge = mapped + 64;
-    const int64_t room = stats_.budget_bytes - stats_.metadata_bytes;
+    const int64_t room = std::min(stats_.budget_bytes - stats_.metadata_bytes,
+                                  growth_limit_.load(std::memory_order_relaxed));
     if (charge > room) { ++stats_.bypasses; return RAD_OK; }
     Mapping retained;
     while (stats_.payload_charge > room - charge) {
@@ -253,7 +254,8 @@ int NativeFileCache::insert(size_t weight, const void* src, int64_t bytes) {
     if (stats_.mmap_reuse_enabled) return insert_mapped_locked(weight, src, bytes);
     // Legacy default-OFF allocation and charge policy; same victim order and bypass semantics.
     const int64_t charge = ((bytes + 63) / 64) * 64 + 64;
-    const int64_t room = stats_.budget_bytes - stats_.metadata_bytes;
+    const int64_t room = std::min(stats_.budget_bytes - stats_.metadata_bytes,
+                                  growth_limit_.load(std::memory_order_relaxed));
     if (charge > room) { ++stats_.bypasses; return RAD_OK; }
     while (stats_.payload_charge > room - charge) {
         const int rc = evict_locked(last_);

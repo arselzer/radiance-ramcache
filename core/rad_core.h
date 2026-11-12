@@ -939,6 +939,11 @@ struct Config {
     /* Server-wide native RAM cache for file-tier experts, partitioned across ranks. Includes
      * entry metadata; pageable payloads copy through existing pinned windows. Zero disables. */
     int64_t expert_ram_cache_total_mib = 0;
+    /* --expert-ram-cache-total-mib auto (or RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1 beside a
+     * number, which then caps it): the cache is sized at serve() from the host memory startup left,
+     * less what grows later and RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB (core/ram_budget.h,
+     * Engine::ram_budget_serve), and a guard thread stops its growth below a MemAvailable floor. */
+    bool    expert_ram_cache_auto = false;
     /* --expert-plane-mirror DIR: the checkpoint's model-*.safetensors on another drive than the
      * container. DeepSeek-V4.1's CPU expert path reads part of each missed expert from it beside
      * the container (place/plane_mirror.h). Empty, the default, reads the container only.

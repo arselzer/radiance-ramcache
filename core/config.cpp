@@ -129,7 +129,10 @@ static const Flag g_flags[] = {
     "                                    a time, so a step is paced by the drive" },
     { "--expert-ram-cache-total-mib", "MIB", "native expert RAM cache across all ranks (default 0, off);\n"
     "                                    includes cache metadata, separate from the fixed host pool;\n"
-    "                                    requires --weights-disk-tier" },
+    "                                    requires --weights-disk-tier. auto (experimental): sized at\n"
+    "                                    serve from the host memory startup left, less what grows\n"
+    "                                    later and RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB, with a\n"
+    "                                    guard that stops its growth when MemAvailable runs low" },
     { "--expert-plane-mirror", "DIR",   "DeepSeek-V4.1 with host experts: the checkpoint's\n"
     "                                    model-*.safetensors on another drive than the container;\n"
     "                                    part of each missed expert is read from it beside the\n"
@@ -702,8 +705,15 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
         else if (S("--expert-ram-cache-total-mib")) {
-            if (!num(0, INT64_MAX / ((int64_t)1 << 20), &c->expert_ram_cache_total_mib))
-                return RAD_E_INVAL;
+            if (i + 1 < argc && !std::strcmp(argv[i + 1], "auto")) {
+                ++i;
+                c->expert_ram_cache_auto = true;
+                c->expert_ram_cache_total_mib = 0;   /* no cap: Engine::start takes MemTotal */
+            } else {
+                if (!num(0, INT64_MAX / ((int64_t)1 << 20), &c->expert_ram_cache_total_mib))
+                    return RAD_E_INVAL;
+                c->expert_ram_cache_auto = false;
+            }
         }
         else if (S("--expert-plane-mirror"))   { if (!(v = need(i))) return RAD_E_INVAL; c->expert_plane_mirror = v; }
         else if (S("--expert-plane-mirror-share") || S("--expert-plane-mirror-decode-share")) {
@@ -1352,7 +1362,7 @@ int config_parse(int argc, char** argv, Config* c) {
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
 
-    if (c->expert_ram_cache_total_mib > 0 && !c->weights_disk_tier) {
+    if ((c->expert_ram_cache_total_mib > 0 || c->expert_ram_cache_auto) && !c->weights_disk_tier) {
         RAD_ERR("--expert-ram-cache-total-mib needs --weights-disk-tier");
         return RAD_E_INVAL;
     }
@@ -1444,7 +1454,11 @@ const ShowRow kShow[] = {
           return c.ngram_share_dir.empty() ? v : v + "=" + c.ngram_share_dir; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
-    { "--expert-ram-cache-total-mib", [](const Config& c) { return num(c.expert_ram_cache_total_mib); } },
+    { "--expert-ram-cache-total-mib", [](const Config& c) {
+          if (!c.expert_ram_cache_auto) return num(c.expert_ram_cache_total_mib);
+          return c.expert_ram_cache_total_mib > 0
+                     ? "auto, at most " + num(c.expert_ram_cache_total_mib)
+                     : std::string("auto"); } },
     { "--expert-plane-mirror", [](const Config& c) { return or_none(c.expert_plane_mirror, "none"); } },
     { "--expert-plane-mirror-share", [](const Config& c) { return fmt("%.4g", c.expert_plane_mirror_share); } },
     { "--expert-plane-mirror-min-rows", [](const Config& c) { return num(c.expert_plane_mirror_min_rows); } },

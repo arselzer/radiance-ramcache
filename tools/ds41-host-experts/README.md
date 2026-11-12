@@ -1442,6 +1442,39 @@ A hash that differs is (A) failing for some op on the cards: if the `Pc` arm wit
 adopts decode-written cache blocks too, from the third turn on) agrees, suspect the decode-written
 window or compressor-tail state in the snapshot; if it differs too, the decode-written blocks.
 
+## Sizing the RAM cache from the host (`RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET`, part `mA`)
+
+Not yet measured on the cards. On 12 Nov an arm at 256 sequences with a 192 GiB cache (`m196608`)
+ran the host out of RAM (MemAvailable at its lowest: ~22 GB at 8 streams, ~16 GB at 32 with `Pc`,
+~6 GB at 128, under 4 GB at 256); the OOM killer fired and an amdgpu bug on that path (a NULL
+dereference in `amdgpu_hmm_range_valid` under a KFD SVM ioctl) panicked the kernel. With
+`RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1` (the `--expert-ram-cache-total-mib` figure then caps the
+cache; `--expert-ram-cache-total-mib auto` is the same without a cap) startup configures each rank's
+cache with a growth limit of 0, so every other host allocation (pools, snapshot store, arenas, KV
+mirrors, staging) sizes itself as without a cache and none of startup's checks reserves it. At
+`serve()`, with all of that already out of MemAvailable, the cache gets MemAvailable (or less where a
+memory cgroup or the amdgpu pin cap leaves less) less what grows later and
+`..._RAM_RESERVE_MIB` (10240), split evenly over the ranks (`core/ram_budget.h`,
+`core/engine_rambudget.cpp`). What grows later is counted as `..._RAM_PER_SEQ_MIB` (100, the 12 Nov
+figure per stream, not itemized; it may include the cache's own growth in those arms, so it errs
+low for the cache) times `--max-num-seqs`, plus the scored rows' pinned logits. Every line goes to
+the log (`ram budget: held ...`, `later ...`, `reserve`, `MemAvailable ...`, `room ...`, then `ram
+budget: the expert RAM cache may hold X (Y a rank on N rank(s)) of Z`). A guard thread then reads
+MemAvailable every `..._RAM_GUARD_MS` (250) and, below `..._RAM_GUARD_FLOOR_MIB` (half the reserve),
+lowers every rank's limit to what its cache holds: the cache stops growing and replaces within its
+slabs (`ram guard: MemAvailable ... below the floor`); at the reserve again it may grow to its
+budget. Its shutdown line `ram guard: stopped after N samples: lowest MemAvailable ...` gives the
+lowest figure, the holds, the cache's size against its budget and the peak RSS, from which the
+per-sequence figure can be set. Exact by construction: the limit only decides whether a unit is
+cached; a refused one is read from the container through the mover's windows as before
+(`native_mapped_copy_mover_test` `mapped_slab_growth_limit_*`, `native_file_cache_test`,
+`ram_budget_test`). `..._PREGROW` and `..._CACHE_WARM` run at `serve()` inside the budget. Arm part
+`mA` (or `mAN`, a reserve of N MiB, at least 1024), beside `mN` for the cap; an `mA` arm is measured
+only with both `ram budget: on` and `may hold` lines in its server log, a plain arm only with neither
+(`ram_budget_gate`; `ab_window_shared_test.sh`). For the GPU window to settle: replies identical to
+the same arm at the fixed figure the budget gave (`m<that>` against `mA`), the lowest MemAvailable at
+N128 / N256 with `Pc` above the floor, and whether the guard ever holds.
+
 ## Correctness
 
 Each row the CPU computes uses the card's arithmetic: the same lane and block order, butterfly,

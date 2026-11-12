@@ -2766,7 +2766,7 @@ for a in $ARMS; do
 # more sequences issued as two micro-batches, each layer's MoE gather of one behind the other's card
 # work (RADIANCE_EXPERIMENTAL_SCHED_TBO; a radiance and deepseek41 from claude/ds41-tbo); Ba / BaN whole
 # prompts waiting together admitted into one prefill-only step of at most 256 / N (32-256, or up to the
-# chunk and 2048 with P1, whose card path then computes a batch of its threshold's rows or more) rows
+# Lc chunk and 4096 with P1, whose card path then computes a batch of its threshold's rows or more) rows
 # instead of one a step (RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=N, experimental; needs Pf, Lc, NK above 1
 # and no Pcn or Kld part; with Pc / Pc0 a prompt joins only with the chunk it takes alone, its suffix from
 # its hit; a radiance from claude/ds41-batch-prefill for N above 256 or beside Pc): measured only with the
@@ -3073,8 +3073,8 @@ for a in $ARMS; do
       Ba|Ba[0-9]*)                                                     # whole prompts waiting together in one prefill step (BATCH_ADMIT)
                if [[ -n "$ba" ]]; then log "arm $a: duplicate Ba part; the arm is skipped"; skip=1; fi
                ba=${p#Ba}; ba=${ba:-256}
-               if [[ $ba =~ ^[0-9]+$ ]] && (( 10#$ba >= 32 && 10#$ba <= 2048 )); then ba=$((10#$ba))
-               else log "arm $a: $p: a batch holds 32-256 rows, or up to 2048 with P1; the arm is skipped"; skip=1; fi ;;
+               if [[ $ba =~ ^[0-9]+$ ]] && (( 10#$ba >= 32 && 10#$ba <= 4096 )); then ba=$((10#$ba))
+               else log "arm $a: $p: a batch holds 32-256 rows, or up to the Lc chunk (at most 4096) with P1; the arm is skipped"; skip=1; fi ;;
       Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)

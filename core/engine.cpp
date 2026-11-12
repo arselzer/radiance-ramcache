@@ -194,7 +194,8 @@ Engine::~Engine() {
                      (double)hx.miss_read_ns / 1e6);
         /* RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS (place/aux_expert_worker.h): this rank's jobs. */
         if (r->fstager.aux_bound())
-            RAD_INFO("%s", aux::stats_line(r->index, r->fstager.aux_stats(), aux_ctl_ && aux_cfg_.controller()).c_str());
+            RAD_INFO("%s", aux::stats_line(r->index, r->fstager.aux_stats(), aux_ctl_ && aux_cfg_.controller(),
+                                             (int)aux_cfg_.rows).c_str());
         if (hx.d_waits[0] || hx.d_waits[1])
             RAD_INFO("host experts, one-token passes: %llu gathers without a miss waited %.1f ms for the "
                      "CPU's rows (%.1f us each), %llu with one %.1f ms (%.1f us each)",

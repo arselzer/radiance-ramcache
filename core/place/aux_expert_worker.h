@@ -159,10 +159,15 @@ struct Stats {
     uint64_t failed = 0, wait_ns = 0, submit_ns = 0, rt_sum_ns = 0, rt_max_ns = 0, rt_n = 0;
     uint64_t verified = 0, differ_rows = 0, differ_values = 0, not_compared = 0;
     uint64_t declined_released = 0;   /* card sharing: a layer whose rank found the gate shut */
+    /* By pass height (ds41aux::height_bucket): layer jobs, their rows on the extra card, and the rows the CPU path
+     * met in the passes the worker could take. */
+    uint64_t jobs_h[ds41aux::kHeightBuckets] = {}, rows_h[ds41aux::kHeightBuckets] = {};
+    uint64_t eligible_h[ds41aux::kHeightBuckets] = {};
 };
 /* The shutdown line of rank r (ds41aux::kLogRank); `released`: with a controller, the declines while released
- * ("..., L while released" after "... after it failed"). */
-std::string stats_line(int r, const Stats& s, bool released = false);
+ * ("..., L while released" after "... after it failed"); `max_rows`: the tallest pass the worker takes
+ * (ds41aux::kRowsEnv; above 16 the line ends with "; by height: ..." for every height bucket up to it). */
+std::string stats_line(int r, const Stats& s, bool released = false, int max_rows = ds41aux::kMaxRows);
 
 class DeviceLane;
 
@@ -263,7 +268,9 @@ private:
  * (mapped on the extra card only), its VRAM workspace (in the arena). */
 class DeviceLane final : public Lane {
 public:
-    DeviceLane(int device, int rank, char* ws, int64_t backoff);
+    /* `rows`: the tallest job (ds41aux::kRowsEnv): the pinned record and rows, and the workspace ws, are
+     * ds41aux::ws(rows)'s. */
+    DeviceLane(int device, int rank, char* ws, int64_t backoff, int rows = ds41aux::kMaxRows);
     ~DeviceLane() override;
     /* Creates the queue (on the current device: the caller sets the extra card), the event and the pinned
      * buffers. */
@@ -297,7 +304,7 @@ private:
     /* `fault`: a failed query or a device fault (the queue's state unknown: never drained); otherwise a host-side
      * refusal, which drain_release probes. */
     int  retire(const char* step, int rc, bool fault = false);
-    int  dev_, rank_;
+    int  dev_, rank_, rows_;
     char* ws_;                  /* VRAM: in (ds41aux::ws()'s record layout), gu_out, act, dn_out */
     RadStream s_ = nullptr;
     RadEvent  ev_ = nullptr;

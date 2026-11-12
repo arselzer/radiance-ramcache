@@ -165,7 +165,7 @@ int Engine::aux_start() {
         }
     std::string why;
     for (auto& r : ranks_)
-        if (r->fstager.aux_resolve(&why) < 0) {
+        if (r->fstager.aux_resolve(&why, (int)aux_cfg_.rows) < 0) {
             aux_off(fmt("rank %d: %s", r->index, why.c_str()), true);
             return RAD_OK;
         }
@@ -206,10 +206,10 @@ int Engine::aux_start() {
     const ds41aux::Layout L = ds41aux::layout(gu_slot, dn_slot);
     const int R = (int)ranks_.size();
     const int layers = (int)ranks_[0]->fstager.aux_routed_layers();
-    const int64_t N = ds41aux::capacity(aux_cfg_.cap_mib, R, layers, L.stride, (int64_t)all.size());
+    const int64_t N = ds41aux::capacity(aux_cfg_.cap_mib, R, layers, L.stride, (int64_t)all.size(), (int)aux_cfg_.rows);
     if (N <= 0) {
         aux_off(fmt("%lld MiB hold no unit beside the tables and lanes (%s)", (long long)aux_cfg_.cap_mib,
-                    humanb(ds41aux::fixed_bytes(R, layers)).c_str()), true);
+                    humanb(ds41aux::fixed_bytes(R, layers, (int)aux_cfg_.rows)).c_str()), true);
         return RAD_OK;
     }
     /* The online set keeps `spare` slots free for its copies (work/aux-dyn/SPEC.md §3.4): the set holds N - spare
@@ -368,6 +368,12 @@ int Engine::aux_start() {
     }
     (void)rad_dev_set(ranks_[0]->device);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    /* RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS above 16 (ds41_aux.h, "taller passes"): said on the startup line. */
+    const std::string tall = aux_cfg_.rows > ds41aux::kMaxRows
+        ? fmt("; %s=%lld: passes of 17-%lld rows by %s, the deadline D * ceil(rows / 16), lanes of %s each",
+              ds41aux::kRowsEnv, (long long)aux_cfg_.rows, (long long)aux_cfg_.rows, ds41p1::kTwinRow,
+              humanb(ds41aux::ws((int)aux_cfg_.rows).bytes).c_str())
+        : std::string();
     int64_t cached = 0, packed = 0, skipped = 0;
     double share = 0;
     std::string per_rank;
@@ -381,21 +387,21 @@ int Engine::aux_start() {
     if (released)
         RAD_INFO("%s%s; nothing loaded on device %d (%lld slots, %zu candidate units, profile share %.4f); "
                  "passes of up to %d rows, policy %s, deadline %lld us, backoff %lld, headroom %lld MiB, cap %lld MiB, "
-                 "forced lateness %lld (0 off)",
+                 "forced lateness %lld (0 off)%s",
                  ds41aux::kLogReleased, rel_why.c_str(), aux_->device(), (long long)N, all.size(), share_all,
-                 ds41aux::kMaxRows, aux_cfg_.verify ? "verify" : "serve", (long long)aux_cfg_.deadline_us,
+                 (int)aux_cfg_.rows, aux_cfg_.verify ? "verify" : "serve", (long long)aux_cfg_.deadline_us,
                  (long long)aux_cfg_.backoff, (long long)aux_cfg_.headroom_mib, (long long)aux_cfg_.cap_mib,
-                 (long long)aux_cfg_.force_late);
+                 (long long)aux_cfg_.force_late, tall.c_str());
     else
     RAD_INFO("%s%lld units (%s) resident on device %d: %s; profile share %.4f of the ranks' %.4f over %zu candidate "
              "units; loaded in %.1f s (%lld from the packed RAM cache, %lld packed from the container, %lld skipped), "
              "read back identical; warm-up rows equal the CPU pool's; passes of up to %d rows, policy %s, deadline "
-             "%lld us, backoff %lld, headroom %lld MiB, cap %lld MiB, forced lateness %lld (0 off)",
+             "%lld us, backoff %lld, headroom %lld MiB, cap %lld MiB, forced lateness %lld (0 off)%s",
              ds41aux::kLogOn, (long long)aux_->units(), humanb(aux_->units() * L.stride).c_str(), aux_->device(),
              per_rank.c_str(), share, share_all, all.size(), secs, (long long)cached, (long long)packed,
-             (long long)skipped, ds41aux::kMaxRows, aux_cfg_.verify ? "verify" : "serve",
+             (long long)skipped, (int)aux_cfg_.rows, aux_cfg_.verify ? "verify" : "serve",
              (long long)aux_cfg_.deadline_us, (long long)aux_cfg_.backoff, (long long)aux_cfg_.headroom_mib,
-             (long long)aux_cfg_.cap_mib, (long long)aux_cfg_.force_late);
+             (long long)aux_cfg_.cap_mib, (long long)aux_cfg_.force_late, tall.c_str());
     if (aux_ctl_) {
         for (const std::string& l : aux_ctl_->startup_lines()) RAD_INFO("%s", l.c_str());
         aux_ctl_->start();

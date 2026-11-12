@@ -21,6 +21,41 @@ On the loop's eight held-out prompts (64 tokens, greedy, TP4) the path takes dec
 about 17 tok/s and the time to first token summed over the prompts from 64.0 to about 15.5 s. Every
 step was measured as an A/B window; the log is `/home/as/ds41-decode-review-20261028/NIGHT-LOG.md`.
 
+## Batch jobs: 128 and 256 concurrent streams (measured 12 November)
+
+A batch of short prompts that share long heads (128 or 256 NL-to-SQL questions over a few schemas, sent at once, one
+stream each) is bound by the experts read from RAM each step, not by the cards: at 128 streams a decode step reads about
+the same weights as at 8 and serves 16 times the rows. The DeepSeek KV cache is small (about 6.5 MiB a sequence a card
+plus 3.2 KB a token), so the cards hold 256 sequences. Every row below has replies byte-identical to the base engine's
+(windows ab-20261112T142114Z, ab-20261112T170128Z, ab-20261112T182640Z; `Bs` also with identical prefill hashes,
+128 of 128). Wall is the client's time for the whole batch; decode-only is decode tokens over the decode steps' time.
+
+| 128 streams, 128 prompts | wall | decode-only tok/s |
+|---|---:|---:|
+| no prefix cache, no batched prefill | 530 s | - |
+| + prefix cache with shared heads (`Pc-Pch64`) and batch admission `Ba2048` | 268 s | - |
+| + RAM budget (`mA`) | 242 s | 82.8 |
+| + fifth card for tall passes (`AUX_ROWS=128`) | 214 s | 134.8 |
+| **+ batched keep points (`SCHED_BATCH_SPLIT=1`)** | **171 s** | - |
+| the same with `Ba4096` | 169 s | - |
+| card-path decode `Qd64` and `Bs` with the fifth card | 171 s | 117.8 |
+
+| 256 streams, 256 prompts | wall | decode-only tok/s | prefill |
+|---|---:|---:|---:|
+| `mA`, `Pc-Pch64`, `Ba2048` | 911 s | 85.4 | 634 s |
+| + card-path decode (`P1_DECODE_ROWS=64`) | 793 s | 142.5 | - |
+| **+ `SCHED_BATCH_SPLIT=1`** | **493 s** | **149.9** | 341 s |
+| the same with `Ba4096` | 520 s | 145.1 | 363 s |
+| fifth card `AUX_ROWS=256` and `Bs` instead of `Qd64` | 552 s | 131.8 | 379 s |
+
+Recommended for batch jobs, on top of the configuration below: `RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1` with an
+explicit cache cap, the prefix cache with shared heads, `RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1` and batch
+admission at 2048. With a fifth card and up to 128 streams, add `RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=<streams>`; at
+256 streams, use `RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=64` instead (the two do not stack: the card path takes
+the passes the worker would). Size host memory first: an arm that exhausted the box's RAM at 256 streams took the
+kernel down (an amdgpu bug on the OOM path); the RAM budget keeps that margin. Prefill is still about 70% of the
+256-stream wall.
+
 ## What runs where
 
 - `core/place/host_expert_pool.*`: one process-wide pool of CPU workers, shared by the four rank
@@ -196,7 +231,7 @@ skipped by every prompt after it. Tests `sched_test` `shared_heads_*`, `mem_test
 `ab_window_ba_test.sh` (part 4).
 
 **Batched keep points and running chunks** (`RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1`, part `Bs`, beside `Ba` and
-`Pc` / `Pc0`; `claude/ds41-batch4096`; not yet measured on the cards). Window ab-20261112T142114Z (NL-to-SQL,
+`Pc` / `Pc0`; `claude/ds41-batch4096`; measured exact: 256 streams with `Qd64` wall 793 -> 493 s, prefill hashes identical). Window ab-20261112T142114Z (NL-to-SQL,
 `...-Pc-Pch64-L<pool>-Pf-N<n>-C<n>-Ba2048`) took 124 prefill steps for 256 prompts against 38 for 128. Cause
 (`core/sched/scheduler.cpp`, `admit_one`'s join check and `step()`'s batch opener): beside the prefix cache a prompt
 joined a batch only with a chunk finishing its prompt, so a prompt splitting at a shared head's keep point ran
@@ -1033,7 +1068,7 @@ rows the CPU recomputed, launch failures, verify counts) and
 `aux_compact_test`, `aux_stager_test` (switch-off identity, the deadline fallback, the pin set on the host backend),
 `r4d_emu_ds41aux` and `r4d_emu_ds41aux_tail` (the compacted launches on the emulator), `ab_window_aux_test.sh`.
 
-### Taller passes (`RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=N`, not yet measured on the cards)
+### Taller passes (`RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=N`; measured exact: 128 streams decode-only 82.8 -> 131.8-134.8 tok/s)
 
 Branch `claude/ds41-auxtall`. At large batch the worker computes nothing: a 128-stream decode pass is one routed layer
 pass of 128 rows a rank, and the worker declines every pass above 16 rows (`declined: N taller`). The limit is its
@@ -1938,7 +1973,7 @@ block order, so the bytes equal 16-token passes. Gate: `ds41_mxfp4_device_check 
 LCP twin and 30 for lcpfast's balanced twin.
 
 Decode passes on the cards (`RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=N`, 0 off, the default; 17 to the
-chunk; the window's part `QdN`). Not yet measured on the cards. The card path costs a layer's experts read
+chunk; the window's part `QdN`). Measured exact: decode-only 82.8 -> 109.2 tok/s at 128 streams, 85.4 -> 142.5 at 256 (`Qd64`). The card path costs a layer's experts read
 once whatever its rows (~1.7 s a step), the CPU pool's cost grows with rows (~3 s a decode step at 256
 sequences), so above some batch a decode step should be cheaper on the cards. With the switch, a pure trunk
 decode pass (decode rows only, no draft pass, no speculation, no media row, uncut, no admission row) of N rows

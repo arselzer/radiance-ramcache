@@ -593,8 +593,11 @@ public:
     static constexpr int64_t kBatchAdmitMin = 32, kBatchAdmitMax = 256;
     /* Above kBatchAdmitMax, up to the chunk C and at most kBatchAdmitMaxP1, only beside prefill Phase 1
      * (RADIANCE_EXPERIMENTAL_DS41_P1=1): a batch of its threshold's rows or more is then the card path's,
-     * as a lone prompt's chunk of that height is (batch_admit_init). */
-    static constexpr int64_t kBatchAdmitMaxP1 = 2048;
+     * as a lone prompt's chunk of that height is (batch_admit_init). 4096: large-chunk prefill's admitted
+     * maximum C (kEpRouteLcpMax), which is also the P1 twin row's bound (ds41p1::kTwinMaxRows) and the
+     * height its card check sweeps to (P1_CHECK_M); scheduler.cpp asserts they agree. The rows are still
+     * held to the chunk C init admitted, so at C 2,048 a batch never holds more than 2,048 rows. */
+    static constexpr int64_t kBatchAdmitMaxP1 = 4096;
     int64_t batch_admit_rows() const { return batch_rows_; }
     /* Whether init took it beside the prefix cache (--prefix-resume exact; batch_pc_). */
     bool    batch_admit_prefix() const { return batch_pc_; }

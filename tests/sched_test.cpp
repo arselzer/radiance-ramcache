@@ -10406,6 +10406,289 @@ TEST(batch_admission_to_the_chunk_is_refused_where_it_is_not_covered) {
     }
 }
 
+/* ================================================================== shared heads */
+/* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (Scheduler::shared_head_init) over a cache that answers as
+ * prefix.cpp does: chained 16-token entries, each counting the entries published right after it, a
+ * hit ending where the prompt departs the cached chains, CacheHit::branch_at as PrefixCache::lookup
+ * names it (shared_head_pick with the switch, the departure entry with two cached ways off it
+ * without), and snapshots keyed by the tokens before them, offered once committed. A batch of
+ * prompts behind three system prompts (300, 200 and 450 tokens), each question starting with one of
+ * four 20-token openers, sent eight at a time. */
+namespace {
+
+struct TreePC : FakePC {
+    struct Ent { std::vector<int32_t> blocks; int n_children = 0; };
+    std::map<std::vector<int32_t>, Ent> ents;                       /* by the tokens up to its end */
+    struct Snap { int64_t pos = 0; int32_t slot = -1; bool valid = false; };
+    std::map<std::vector<int32_t>, Snap> snaps;
+    int64_t floor = 0;
+    void set_shared_head(int64_t f) override { floor = f; FakePC::set_shared_head(f); }
+
+    static std::vector<int32_t> toks(const Request& r) {
+        std::vector<int32_t> t = r.prompt;
+        t.insert(t.end(), r.output.begin(), r.output.end());
+        return t;
+    }
+    static std::vector<int32_t> head(const std::vector<int32_t>& t, int64_t n) {
+        return std::vector<int32_t>(t.begin(), t.begin() + n);
+    }
+    CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* out,
+                    const HitCap*) const override {
+        ++lookups;
+        const std::vector<int32_t>& t = r.prompt;
+        const int64_t n_full = (int64_t)t.size() / 16;
+        int64_t matched = 0;
+        bool departed = false;
+        std::vector<uint8_t> ch;
+        for (; matched < n_full; ++matched) {
+            auto it = ents.find(head(t, (matched + 1) * 16));
+            if (it == ents.end()) { departed = true; break; }
+            ch.push_back((uint8_t)std::min(it->second.n_children, 255));
+        }
+        CacheHit h;
+        if (floor == 0 && departed && matched > 0 && ch[(size_t)matched - 1] >= 2)
+            h.branch_at = (int32_t)(matched * 16);
+        const int64_t all = matched;
+        if (matched * 16 >= (int64_t)t.size() && matched > 0) --matched;
+        int64_t best = 0;
+        int32_t slot = -1;
+        for (const auto& [k, s] : snaps)
+            if (s.valid && s.pos <= matched * 16 && s.pos > best && (int64_t)t.size() >= s.pos &&
+                std::equal(k.begin(), k.end(), t.begin())) { best = s.pos; slot = s.slot; }
+        if (floor > 0 && all > 0) h.branch_at = shared_head_pick(ch.data(), all, departed, 16, best, floor);
+        h.n_attn_tokens = (int32_t)(matched * 16);
+        h.n_linear_tokens = (int32_t)best;
+        h.checkpoint_slot = slot;
+        if (out) {
+            out->assign(groups.size(), {});
+            for (int64_t b = 0; b < matched; ++b)
+                (*out)[0].push_back(ents.find(head(t, (b + 1) * 16))->second.blocks[0]);
+        }
+        return h;
+    }
+    int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks, int64_t n) override {
+        published.push_back({ r.id, n, blocks.size() });
+        const std::vector<int32_t> t = toks(r);
+        for (int64_t b = 0; b < n / 16; ++b) {
+            const std::vector<int32_t> k = head(t, (b + 1) * 16);
+            if (ents.count(k)) continue;
+            Ent e;
+            e.blocks = { blocks[0][(size_t)b] };
+            kv->retain(groups[0], e.blocks[0]);
+            ents.emplace(k, e);
+            if (b > 0) ++ents[head(t, b * 16)].n_children;
+        }
+        return RAD_OK;
+    }
+    int reserve_checkpoint(const Request& r, int64_t pos, int32_t* slot) override {
+        const std::vector<int32_t> k = head(toks(r), pos);
+        auto it = snaps.find(k);
+        if (it != snaps.end()) { *slot = it->second.slot; return RAD_OK; }
+        ++reserved;
+        reserved_at.push_back(pos);
+        snaps[k] = Snap{ pos, next_slot, false };
+        *slot = next_slot++;
+        return RAD_OK;
+    }
+    void commit_checkpoint(const Request& r, int64_t pos) override {
+        committed.push_back(pos);
+        auto it = snaps.find(head(toks(r), pos));
+        if (it != snaps.end()) it->second.valid = true;
+    }
+};
+
+const int kShHeads[3] = { 300, 200, 450 };
+
+/* Prompt j: system prompt j % 3, opener (j / 3) % 4, then a text of its own. */
+std::vector<int32_t> sh_prompt(int j) {
+    std::vector<int32_t> p;
+    for (int i = 0; i < kShHeads[j % 3]; ++i) p.push_back(20000 + 1000 * (j % 3) + i);
+    for (int i = 0; i < 20; ++i) p.push_back(30000 + 100 * ((j / 3) % 4) + i);
+    const int n = 150 + (37 * j) % 300;
+    for (int i = 0; i < n; ++i) p.push_back(40000 + 1000 * j + i);
+    return p;
+}
+
+struct ShRun {
+    /* request index -> its prefill chunks (ctx_len, n_tokens, restored, snapshot position or -1) */
+    std::map<int, std::vector<std::tuple<int32_t, int32_t, bool, int64_t>>> chunks;
+    std::map<int, int> order;          /* request index -> its admission order */
+    std::set<int> done;                /* requests that finished */
+    SchedMetrics m;
+};
+
+/* `n` prompts, `conc` in flight at a time (the next sent as one finishes), 6 tokens each; the switch
+ * at `floor` (null: unset). */
+ShRun sh_run(const char* floor, int n, int conc, std::string* log = nullptr) {
+    ShRun out;
+    LcpOn lc(2048, 1);
+    TreePC pc;                         /* outlives the scheduler, whose fini may still call it */
+    Fixture f;
+    lcp_fixture(f, 2048, 2048);
+    f.cfg.prefix_cache = true;
+    f.cfg.prefix_exact = true;
+    f.cfg.max_seqs = conc;
+    pc.kv = &f.kv;
+    pc.groups = f.pc.groups;
+    setenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE", "1", 1);
+    if (floor) setenv(Scheduler::kSharedHeadEnv, floor, 1);
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog });
+    int rc = 0;
+    const std::string l = info_of([&] { rc = f.sch.init(f.prog, f.cfg, &f.kv, &pc, rio, nullptr, nullptr); });
+    unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+    unsetenv(Scheduler::kSharedHeadEnv);
+    if (log) *log = l;
+    CHECK_EQ(rc, (int)RAD_OK);
+    if (rc != RAD_OK) return out;
+    std::map<uint64_t, int> idx;
+    int sent = 0, admitted = 0;
+    auto send = [&] {
+        auto r = f.request(1, 6);
+        r->prompt = sh_prompt(sent);
+        const uint64_t id = r->id;
+        REQUIRE(f.add(std::move(r)) != 0);
+        idx[id] = sent++;
+    };
+    while (sent < std::min(conc, n)) send();
+    for (int k = 0; k < 4000; ++k) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (!e.is_prefill) continue;
+            const int j = idx[e.seq];
+            if (!out.order.count(j)) out.order[j] = admitted++;
+            const int64_t snap = e.ckpt_slot >= 0 && e.ckpt_tok >= 0 ? (int64_t)e.ctx_len + e.ckpt_tok + 1 : -1;
+            out.chunks[j].emplace_back(e.ctx_len, e.n_tokens, e.ckpt_restore >= 0, snap);
+        }
+        f.commit_plain();
+        int finished = 0;
+        for (const auto& [id, j] : idx) {
+            const Request* q = f.sch.find(id);
+            if ((!q || q->state == ReqState::Finished) && out.done.insert(j).second) ++finished;
+        }
+        for (; finished > 0 && sent < n; --finished) send();
+    }
+    out.m = f.sch.metrics();
+    f.sch.shared_head_report();
+    return out;
+}
+
+}  /* namespace */
+
+/* Without the switch (as measured: prompts that find their head's blocks and no snapshot), and with it
+ * at 64 tokens: each prompt's chunks are its prefill from where its hit resumes to its end, split only
+ * at its own keep point. With the switch every prompt after the first two of its system prompt resumes
+ * at that system prompt or past it (a snapshot at the entry the most cached prompts leave, 288 / 192 /
+ * 448), the 200-token one too (under the old floor of 256), and a prompt admitted while the ones before
+ * it decode resumes there (published at their prefill's end); every snapshot is written by a chunk
+ * ending at it (the state after its last row, as the cold run's chunk computes it, by the partition
+ * invariance the keep point stands on). Off, fewer resume. */
+TEST(shared_heads_resume_a_batch_behind_a_few_system_prompts) {
+    const int n = 24;
+    std::string on_log, off_log;
+    const ShRun off = sh_run(nullptr, n, 8, &off_log);
+    const ShRun on = sh_run("64", n, 8, &on_log);
+    CHECK(has(on_log, "shared heads: on (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=64)"));
+    CHECK(!has(off_log, "shared heads: on"));
+    REQUIRE_EQ(on.chunks.size(), (size_t)n);
+    REQUIRE_EQ(off.chunks.size(), (size_t)n);
+    CHECK_EQ(on.done.size(), (size_t)n);
+    CHECK_EQ(off.done.size(), (size_t)n);
+    auto resumed_at_head = [](const ShRun& r, int j) {
+        const auto& c = r.chunks.at(j);
+        const int64_t h = kShHeads[j % 3] / 16 * 16;
+        return std::get<2>(c[0]) && std::get<0>(c[0]) >= h;
+    };
+    int on_resumed = 0, off_resumed = 0;
+    for (int j = 0; j < n; ++j) {
+        const std::vector<int32_t> p = sh_prompt(j);
+        for (const ShRun* r : { &off, &on }) {
+            const auto& c = r->chunks.at(j);
+            /* contiguous from the resume point to the prompt's end; a restore only on the first */
+            int64_t pos = std::get<0>(c[0]);
+            for (size_t i = 0; i < c.size(); ++i) {
+                CHECK_EQ((int64_t)std::get<0>(c[i]), pos);
+                if (i > 0) CHECK(!std::get<2>(c[i]));
+                const int64_t snap = std::get<3>(c[i]);
+                /* a snapshot only where its chunk ends (a keep point; EORS is off) */
+                if (snap >= 0) CHECK_EQ(snap, (int64_t)std::get<0>(c[i]) + std::get<1>(c[i]));
+                pos += std::get<1>(c[i]);
+            }
+            CHECK_EQ(pos, (int64_t)p.size());
+            CHECK(c.size() <= 2);
+        }
+        if (resumed_at_head(on, j)) ++on_resumed;
+        if (resumed_at_head(off, j)) ++off_resumed;
+    }
+    /* with the switch: all but the first two admissions of each system prompt */
+    for (int j = 0; j < n; ++j) {
+        int before = 0;
+        for (int i = 0; i < n; ++i)
+            if (i % 3 == j % 3 && on.order.at(i) < on.order.at(j)) ++before;
+        if (before >= 2) CHECK(resumed_at_head(on, j));
+        if (before >= 2 && !resumed_at_head(on, j)) fprintf(stderr, "    prompt %d (head %d) not resumed\n", j, kShHeads[j % 3]);
+    }
+    fprintf(stderr, "    shared heads: resumed at the head %d of %d with the switch, %d without; snapshots %lld / %lld, "
+                    "no-snapshot hits %lld / %lld\n", on_resumed, n, off_resumed,
+            (long long)on.m.shared_head_snapshots, (long long)off.m.shared_head_snapshots,
+            (long long)on.m.hit_cut_no_snapshot, (long long)off.m.hit_cut_no_snapshot);
+    CHECK(on_resumed >= n - 6);
+    CHECK(off_resumed < on_resumed);
+    CHECK(on.m.hit_cut_no_snapshot < off.m.hit_cut_no_snapshot);
+    CHECK(on.m.shared_head_snapshots >= 3);
+    CHECK(on.m.shared_head_snapshots <= on.m.shared_head_keeps);
+    CHECK(on.m.prefill_end_published >= n);
+    CHECK_EQ(off.m.prefill_end_published, (int64_t)0);
+}
+
+/* Bounds: a floor outside 16..4096 refuses to start; without the prefix cache the switch is refused,
+ * with the reason, and the cache is never told; 0 or unset is off and the cache keeps its rule. */
+TEST(shared_heads_switch_bounds_and_refusals) {
+    for (const char* bad : { "8", "4097", "-1", "64x", "on" }) {
+        Fixture f;
+        f.build();
+        setenv(Scheduler::kSharedHeadEnv, bad, 1);
+        int rc = 0;
+        (void)info_of([&] { rc = f.start(); });
+        unsetenv(Scheduler::kSharedHeadEnv);
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+    }
+    {
+        Fixture f;
+        f.build();
+        f.cfg.prefix_cache = false;
+        setenv(Scheduler::kSharedHeadEnv, "128", 1);
+        int rc = 0;
+        const std::string l = info_of([&] { rc = f.start(); });
+        unsetenv(Scheduler::kSharedHeadEnv);
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(l, "shared heads: refused"));
+        CHECK(has(l, "the prefix cache is off"));
+        CHECK_EQ(f.sch.shared_head_floor(), (int64_t)0);
+        CHECK_EQ(f.pc.shared_head, (int64_t)0);
+    }
+    for (const char* v : { "0", "128" }) {
+        Fixture f;
+        f.build();
+        setenv(Scheduler::kSharedHeadEnv, v, 1);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        unsetenv(Scheduler::kSharedHeadEnv);
+        const int64_t want = std::strcmp(v, "0") ? 128 : 0;
+        CHECK_EQ(f.sch.shared_head_floor(), want);
+        CHECK_EQ(f.pc.shared_head, want);
+        /* the floor: a head 192 past the hit is snapshotted at 128, not at the old 256 */
+        f.pc.seed(640);
+        f.pc.lin = 512;
+        f.pc.src = 3;
+        f.pc.branch_at = 704;
+        const uint64_t a = f.submit(1100, 1);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(a)->checkpoint_at, (int64_t)(want ? 704 : 0));
+        CHECK_EQ(f.sch.metrics().shared_head_keeps, (int64_t)(want ? 1 : 0));
+    }
+}
+
 /* ================================================================== end-of-request snapshots */
 /* RADIANCE_EXPERIMENTAL_PREFIX_EORS (Scheduler::eors_): a decode step whose row completes a
  * position on the resume grid past its prompt snapshots the state there, a prompt ending on the

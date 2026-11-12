@@ -64,7 +64,11 @@
 # memory and restored on its next turn); Pcr the compressed and index key caches declared
 # replicated, so a host-tier entry holds one copy rather than one a rank
 # (RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED; a deepseek41 plugin from claude/ds41-eors, run home
-# home-eors). The harness receipt is Uharness (work/extra-prompts/harness-receipt.json: two
+# home-eors); Pch / PchN shared-head snapshots (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=N, 64 for Pch,
+# 16-4096: a prompt snapshots the head the most cached prompts leave, from every entry of its chain,
+# at least N tokens past its hit (was 256), and is published when its prefill ends; a radiance from
+# claude/ds41-batch-prefill): an arm with it whose shutdown line counts no prompt published at its
+# prefill's end is set aside. The harness receipt is Uharness (work/extra-prompts/harness-receipt.json: two
 # interleaved agent sessions, a system prompt of 2-3K tokens and tool outputs of public texts from
 # the repository, 6 and 7 turns, final contexts of about 8K and 10K tokens) at Lm32768, whose pool
 # holds both without a trim; Uharness1 is its first session alone. Each Pc* arm's startup and
@@ -909,8 +913,9 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   hp_check PcbN "${ARM_STOREMIB:-}" 'checkpoint slots: a byte budget'
   hp_check PcmN "${ARM_TIER:-}" "kv tiers: a finished conversation's KV is copied"
   hp_check Pcr "${ARM_KVREP:-}" 'KV_REPLICATED: [0-9]+ paged group'
+  hp_check PchN "${ARM_SHEAD:-}" "shared heads: on \\(RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=${ARM_SHEAD:-[0-9]+}\\)"
   if [[ -n "$hp_bad" ]]; then
-    log "arm $name: not measured:$hp_bad $(grep -m2 -E 'end-of-request snapshots: refused|RESUME_GRID=[^ ]* refused|KV_REPLICATED refused' "$OUT/$name.server.log" | tr '\n' ' ')"
+    log "arm $name: not measured:$hp_bad $(grep -m2 -E 'end-of-request snapshots: refused|RESUME_GRID=[^ ]* refused|KV_REPLICATED refused|shared heads: refused' "$OUT/$name.server.log" | tr '\n' ' ')"
     stop_server; return 1
   fi
   # RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8 (the F8 parts): the plugin names the weights it reads from
@@ -1503,6 +1508,14 @@ EOF2
   if [[ -n "${ARM_BA:-}" ]] &&
      grep -qE 'batch admission: .*outside the covered case: [1-9]' "$OUT/$name.server.log"; then
     log "arm $name: Ba, but the scheduler counted a batched prompt outside the covered case; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  # Pc arms: the shared-head shutdown line (keep points, snapshots there, prompts published at their
+  # prefill's end). A PchN arm that published no prompt at its prefill's end did not act: set aside.
+  grep -E 'shared heads: [0-9]+ admissions set a keep point' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  if [[ -n "${ARM_SHEAD:-}" ]] &&
+     ! grep -qE 'shared heads: [0-9]+ admissions set a keep point at a shared head, [0-9]+ snapshots written there; [1-9][0-9]* prompts published' "$OUT/$name.server.log"; then
+    log "arm $name: PchN, but the scheduler published no prompt at its prefill's end; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   if [[ -n "${ARM_BA:-}" && "${ARM_OBS_CONC:-${ARM_CONC:-${AB_CONCURRENCY:-1}}}" -gt 1 ]] &&
@@ -2884,7 +2897,7 @@ for a in $ARMS; do
   fn128=""
   arm_checkpoint_interval=2048
   psc="" prs=12 pk="" pw="" ns="" pv=""
-  hpe="" hpg="" hpl="" hpb="" hpm="" hpr=""
+  hpe="" hpg="" hpl="" hpb="" hpm="" hpr="" hph=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
@@ -3020,6 +3033,10 @@ for a in $ARMS; do
       Pcb[0-9]*) pcopt+=" $p"; hpb=1; env+=(RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=${p#Pcb}) ;;   # snapshot store as N MiB
       Pcm[0-9]*) pcopt+=" $p"; hpm=1; ARGS+=(--prefix-cache-mib "${p#Pcm}") ;;                 # host KV tier of N MiB
       Pcr)     pcopt+=" $p"; hpr=1; env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1) ;;       # index/compressed caches replicated
+      Pch|Pch[0-9]*) pcopt+=" $p"; hph=${p#Pch}; hph=${hph:-64}                                 # shared-head snapshots, floor N
+               if [[ $hph =~ ^[0-9]+$ ]] && (( 10#$hph >= 16 && 10#$hph <= 4096 )); then hph=$((10#$hph))
+               else log "arm $a: $p: a shared head's floor is 16-4096 tokens; the arm is skipped"; skip=1; fi
+               env+=(RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=$hph) ;;
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
       Ba|Ba[0-9]*)                                                     # whole prompts waiting together in one prefill step (BATCH_ADMIT)
                if [[ -n "$ba" ]]; then log "arm $a: duplicate Ba part; the arm is skipped"; skip=1; fi
@@ -3375,7 +3392,8 @@ for a in $ARMS; do
   [[ -n "$hpl" ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=0)
   [[ -n "$hpb" ]] || env+=(RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=)
   [[ -n "$hpr" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=0)
-  ARM_EORS=$hpe ARM_RGRID=$hpg ARM_SLRU=$hpl ARM_STOREMIB=$hpb ARM_TIER=$hpm ARM_KVREP=$hpr
+  [[ -n "$hph" ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=0)
+  ARM_EORS=$hpe ARM_RGRID=$hpg ARM_SLRU=$hpl ARM_STOREMIB=$hpb ARM_TIER=$hpm ARM_KVREP=$hpr ARM_SHEAD=$hph
   # MrN: arms without it take jobs of the default 4 rows, whatever the window's environment (0 is
   # not this switch's off: any value outside 1-32 turns host experts off).
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=4)

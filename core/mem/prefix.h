@@ -115,6 +115,34 @@ struct HitCap {
     int64_t max_give_back = 0;
 };
 
+/* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (PrefixCache::set_shared_head, Scheduler::admit_one): the
+ * head a prompt snapshots on its way past, from the entries of its matched chain. Without the switch
+ * CacheHit::branch_at is the entry the prompt departs from, and only where two cached prompts already
+ * left it differently: a prompt whose own text shares its first tokens with one cached prompt (two
+ * NL-to-SQL questions both starting "How many", on 2-token entries) departs from an entry with one
+ * child, deeper than the system prompt, and no head is ever snapshotted. With it every entry on the
+ * chain counts: `children[b]` is entry b's n_children (b < matched); an entry the prompt goes on past
+ * is a head where two or more ways leave it, and the one it departs from (`departed`: its next entry is
+ * not cached) where one does, the prompt itself being another. Of those at least `floor` tokens past
+ * what the hit resumes (`resumable`), the one most ways leave, the deepest on a tie: the system prompt
+ * every question leaves, not a question two of them share the start of. 0 for none. */
+inline int32_t shared_head_pick(const uint8_t* children, int64_t matched, bool departed,
+                                int64_t block, int64_t resumable, int64_t floor) {
+    int64_t best = 0, best_n = 0;
+    for (int64_t b = 0; b < matched; ++b) {
+        int64_t n = children[b];
+        if (b == matched - 1) {
+            if (!departed) continue;
+            ++n;
+        }
+        if (n < 2) continue;
+        const int64_t pos = (b + 1) * block;
+        if (pos - resumable < floor) continue;
+        if (n >= best_n) { best_n = n; best = pos; }
+    }
+    return (int32_t)best;
+}
+
 /* ------------------------------------------------------------------ retention policy */
 /* Which checkpoints a session keeps. Spec §19.1 treats geometric backoff as unmeasured, so the
  * policy is a replaceable class with two alternatives alongside it. */
@@ -271,6 +299,9 @@ public:
     void set_policy(std::unique_ptr<CheckpointPolicy> p);
     /* The drafter's refill window (CheckpointPolicy::set_floor), held across set_policy. */
     void set_drafter_floor(int64_t tokens);
+    /* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (shared_head_pick): CacheHit::branch_at from every
+     * entry of the matched chain, at least `floor` tokens past what the hit resumes; 0 as before. */
+    void set_shared_head(int64_t floor) { shared_head_floor_ = floor > 0 ? floor : 0; }
     const CheckpointPolicy& policy() const { return *policy_; }
 
     /* ---------------- full attention ---------------- */
@@ -613,6 +644,8 @@ private:
     std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator store_victim();
     std::unique_ptr<CheckpointPolicy> policy_;
     int64_t drafter_floor_ = 0;
+    int64_t shared_head_floor_ = 0;
+    mutable std::vector<uint8_t> children_;   /* lookup's scratch (shared_head_pick) */
     mutable Stats stats_;
     std::string report_;
 };

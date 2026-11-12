@@ -193,6 +193,10 @@ struct IPrefixCache {
     /* The drafter's refill window (Scheduler::init): retention keeps a snapshot that deep below a
      * session's tip, so a refill-capped hit has one to end on (PrefixCache::set_drafter_floor). */
     virtual void set_drafter_floor(int64_t) {}
+    /* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (Scheduler::shared_head_init): CacheHit::branch_at from
+     * every entry of the chain a lookup matches, at least `floor` tokens past what the hit resumes
+     * (shared_head_pick, core/mem/prefix.h); 0 as before. */
+    virtual void set_shared_head(int64_t) {}
 
     /* Publish what this sequence computed so a later request sharing the prefix can adopt it.
      * `blocks[i]` is the block table of cached_groups()[i]; `n_tokens` is how many tokens are
@@ -517,6 +521,7 @@ struct PCBinding final : IPrefixCache {
     void release(const Request& r) override { m->release(r.id); }
     const std::vector<int32_t>& cached_groups() const override { return m->cached_groups(); }
     void set_drafter_floor(int64_t tokens) override { m->set_drafter_floor(tokens); }
+    void set_shared_head(int64_t floor) override { m->set_shared_head(floor); }
 
     /* Indexes prompt ++ output: the next turn sends the reply back in its prompt, so indexing the
      * prompt alone would stop hitting at the first assistant token. */

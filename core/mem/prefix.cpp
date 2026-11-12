@@ -347,8 +347,16 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
         if (!same_tokens(it->second, tokens.data() + matched * block_size_)) break;
     }
 
-    if (departed && matched > 0 && map_.find(hs[(size_t)matched - 1])->second.n_children >= 2)
+    if (shared_head_floor_ == 0 && departed && matched > 0 &&
+        map_.find(hs[(size_t)matched - 1])->second.n_children >= 2)
         hit.branch_at = (int32_t)(matched * block_size_);
+    /* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD: every entry of the chain (shared_head_pick), once
+     * what the hit resumes is known (below). */
+    const int64_t matched_all = matched;
+    if (shared_head_floor_ > 0) {
+        children_.resize((size_t)matched);
+        for (int64_t b = 0; b < matched; ++b) children_[(size_t)b] = map_.find(hs[(size_t)b])->second.n_children;
+    }
 
     /* Back a full hit off by one entry so one token remains to compute a logit from. */
     if (matched * block_size_ >= (int64_t)tokens.size() && matched > 0) --matched;
@@ -372,6 +380,10 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
             }
         }
     }
+
+    if (shared_head_floor_ > 0 && matched_all > 0)
+        hit.branch_at = shared_head_pick(children_.data(), matched_all, departed, block_size_,
+                                         reusable(matched), shared_head_floor_);
 
     const uint64_t now = rad_mono_ns();
     /* Deepest first, so the chain's first block is the most recent: under pressure a conversation

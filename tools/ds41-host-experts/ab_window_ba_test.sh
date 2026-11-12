@@ -9,7 +9,10 @@
 #      Pc-Pce-Pcg16 with P1 are launched, Ba beside Pcn, Ba1024 without P1 and Ba2048 above Lc1024 are skipped;
 #   2. the startup-line guard arm() applies (its Ba and BaPc rows of the switch table): a Ba arm's pattern
 #      matches the scheduler's line for its N only, and an arm without the part flags any such line;
-#   3. the shutdown gate: an arm whose scheduler counts a batched prompt outside the covered case is set aside.
+#   3. the shutdown gate: an arm whose scheduler counts a batched prompt outside the covered case is set aside;
+#   4. Pch / PchN (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD): 64 for Pch, N for PchN, 0 for every other arm;
+#      without Pc and outside 16-4096 skipped; its startup row matches the line for its N only, and an arm
+#      whose shutdown line publishes no prompt at its prefill's end is set aside.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -43,7 +46,11 @@ KLD=$R-$N8-Ba-Kld
 LOW=$R-$N8-Ba16
 HIGH=$R-$N8-Ba4096
 TWICE=$R-$N8-Ba-Ba128
-ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $KLD $LOW $HIGH $TWICE"
+SH=$R-L1024-Pf-N32-C32-Pmr8-Pc-Pch
+SH128=$R-L1024-Pf-N32-C32-Pmr8-Ba2048-Pc-Pch128
+SHNOPC=$R-$N8-Pch
+SHLOW=$R-$N8-Pc-Pch8
+ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $KLD $LOW $HIGH $TWICE $SH $SH128 $SHNOPC $SHLOW"
 (
   set +u
   log() { echo "LOG: $*"; }
@@ -158,6 +165,41 @@ else
     if [[ "$want" == kept && -f "$d/x.json" ]] || [[ "$want" == "set aside" && -f "$d/x.unmeasured.json" && ! -f "$d/x.json" ]]; then
       ok "gate: outside $cnt -> $want"
     else bad "gate: outside $cnt, want $want ($(ls "$d"))"; fi
+  done
+fi
+# ---- 4. Pch / PchN
+for spec in "$BASE|0|base" "$PC|0|Ba beside Pc" "$SH|64|Pch" "$SH128|128|Pch128 beside Ba2048"; do
+  IFS='|' read -r a want what <<< "$spec"
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "$what not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  has "$what" "$sec" RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD "$want"
+done
+skipped "$SHNOPC" "without Pc or Pc0" "Pch without Pc"
+skipped "$SHLOW" "a shared head's floor is 16-4096 tokens" "Pch8"
+line=$(grep -E '^  hp_check PchN ' "$W")
+if [[ -z "$line" ]]; then bad "no PchN startup check"
+else
+  pat=$(sed -E 's/^  hp_check PchN "[^"]*" //' <<< "$line")
+  for spec in "64|64|1" "64|128|0" "|64|1"; do
+    IFS='|' read -r ARM_SHEAD n want <<< "$spec"
+    eval "p=$pat"
+    got=$(grep -cE "$p" <<< "I shared heads: on (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=$n) -- a prompt snapshots ...")
+    if [[ "$got" == "$want" ]]; then ok "PchN startup check: arm '${ARM_SHEAD}' against the line for $n"
+    else bad "PchN startup check: arm '${ARM_SHEAD}', line $n: $got matches (pattern $p)"; fi
+  done
+fi
+gate=$(awk '/# Pc arms: the shared-head shutdown line/ { p = 1 } p { print } p && /^  fi$/ { exit }' "$W")
+if [[ -z "$gate" ]]; then bad "no shared-head shutdown gate"
+else
+  for spec in "64|5|kept" "64|0|set aside" "|0|kept"; do
+    IFS='|' read -r sh pub want <<< "$spec"
+    d=$T/shgate-$sh-$pub; mkdir -p "$d"
+    echo "I shared heads: 9 admissions set a keep point at a shared head, 4 snapshots written there; $pub prompts published at their prefill's end (floor 64)" > "$d/x.server.log"
+    echo '{}' > "$d/x.json"
+    ( OUT=$d name=x ARM_SHEAD=$sh; log() { :; }; eval "$gate" ) > /dev/null
+    if [[ "$want" == kept && -f "$d/x.json" ]] || [[ "$want" == "set aside" && -f "$d/x.unmeasured.json" && ! -f "$d/x.json" ]]; then
+      ok "shared-head gate: Pch '$sh', $pub published -> $want"
+    else bad "shared-head gate: Pch '$sh', $pub published, want $want ($(ls "$d"))"; fi
   done
 fi
 (( fail == 0 )) && echo "PASS ab_window_ba_test" || echo "FAIL ab_window_ba_test (loop output: $T/loop.txt)"

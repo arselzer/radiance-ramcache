@@ -52,7 +52,8 @@ plus 3.2 KB a token), so the cards hold 256 sequences. Every row below has repli
 | the same with `--checkpoint-slots 128` | 331 s | 132.7 | 160 s |
 
 Recommended for batch jobs, on top of the configuration below: `RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1` with an
-explicit cache cap, the prefix cache with shared heads and `--checkpoint-slots 128`, `RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1`
+explicit cache cap, the prefix cache with shared heads at a 32-token floor (`RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=32`) and
+`--checkpoint-slots 128`, `RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1`
 and batch admission at 2048. With a fifth card and up to 128 streams, add `RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=<streams>`; at
 256 streams, use `RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=64` instead (the two do not stack: the card path takes
 the passes the worker would). Size host memory first: an arm that exhausted the box's RAM at 256 streams took the
@@ -63,6 +64,12 @@ of which a batch of shared-head prompts used 36 (11 at 128 streams). Under the R
 expert cache (184 GiB instead of 205), and the experts that no longer fit are read from the drive on every card-path
 chunk: rank 0 read 447 GB and waited 196 s on the drive. With 128 slots it read 52 GB and waited 1.2 s, and prefill
 fell from 341 to 177 s. At 128 streams the cache was nearly big enough already (171 -> 172 s).
+
+Shared-head floor 32 instead of 64 (ab-20261112T224535Z): the prompts' common opening is 57-62 tokens and about a sixth of
+them share nothing deeper, so at a 64-token floor no keep point was set for them and each recomputed from the start
+(`hit_cuts.no_snapshot` 46 at 256 streams). At 32: 4 such prompts, 6.8% fewer prefill tokens computed, prefill hashes of
+all 256 prompts identical; 365 against 371 s at 256 streams and 187 against 199 s at 128 (all arms with `Kh`, which
+itself costs about 45 s of prefill at 256 streams).
 
 ## What runs where
 

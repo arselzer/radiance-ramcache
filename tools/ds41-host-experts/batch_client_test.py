@@ -81,6 +81,30 @@ def main():
     check(Stub.tokenized.count("SCHEMA") == 1, "the shared system text tokenized once")
     check([b for p, b in Stub.seen if b["prompt"][:2] == [0, 128803]] != [], "no system: BOS then <|User|>")
     check(Stub.most[0] == 4, "4 requests in flight at most and at once (%d)" % Stub.most[0])
+    # --receipt: an ab_window.sh receipt's first 8 requests, framed as ab_requests.py frames them.
+    Stub.seen.clear()
+    with tempfile.TemporaryDirectory() as d:
+        reqs = [{"name": "r-%d" % i, "request": {"model": "m", "max_tokens": 9, "temperature": 0, "stream": False,
+                                                 "seed": 5, "chat_system": "S", "chat_turns": [{"user": "u%d" % i}]}}
+                for i in range(9)]
+        reqs[1] = {"name": "r-1", "request": {"max_tokens": 3, "temperature": 0, "chat_text": "t"}}
+        rec = os.path.join(d, "rec.json")
+        with open(rec, "w") as f:
+            json.dump({"benchmark_requests": reqs + [{"name": "multi", "request": {"chat_turns": [{"user": "a"}, {"user": "b"}]}}]}, f)
+        run = lambda *a: subprocess.run([sys.executable, "-I", os.path.join(HERE, "batch_client.py"), "--receipt", *a],
+                                        capture_output=True, text=True, timeout=60)
+        r = run("--first", "8", rec, os.path.join(d, "o.jsonl"), "--url", url, "--concurrency", "8",
+                "--prompts-out", os.path.join(d, "p.jsonl"))
+        out = [json.loads(l) for l in open(os.path.join(d, "o.jsonl"))]
+        check(r.returncode == 0 and [o["id"] for o in out] == ["r-%d" % i for i in range(8)], "--receipt --first 8: 8 replies by name")
+        got = {tuple(b["prompt"]): b for _, b in Stub.seen}
+        b0 = got[tuple([0] + tok("S") + [128803] + tok("u0") + [128804, 128822])]
+        check((b0["model"], b0["max_tokens"], b0["seed"], b0["temperature"]) == ("m", 9, 5, 0), "a chat_turns request: its framing and fields")
+        b1 = got.get(tuple([0, 128803] + tok("t") + [128804, 128822]))
+        check(b1 is not None and b1["max_tokens"] == 3, "a chat_text request: its framing and max_tokens")
+        check(len(Stub.seen) == 8 and len(open(os.path.join(d, "p.jsonl")).readlines()) == 8, "8 sent, 8 prompt lines kept")
+        r = run(rec, os.path.join(d, "o2.jsonl"), "--url", url)
+        check(r.returncode == 2 and "multi" in r.stdout, "a multi-turn request refused: %s" % r.stdout.strip())
     srv.shutdown()
     print("batch_client_test: all passed" if not fail else "batch_client_test: FAILED")
     return 1 if fail else 0

@@ -259,5 +259,78 @@ else
     else bad "shared-head gate: Pch '$sh', $pub published, want $want ($(ls "$d"))"; fi
   done
 fi
+# ---- 5. Sb (the server through serve-batch.sh) and Xnp (no --expert-profile): the arm loop, every action stubbed
+# but sb_check, which runs serve-batch.sh --dry-run against the arm's launch (launch_words); arm()'s Sb launch
+# and batch_client.py run with a stub binary and a stub client.
+B256=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs
+SB=$B256-Sb SBNP=$B256-Sb-Xnp SBXQ=$B256-Sb-Xqprof SBRES=${B256/-mA-/-mA20480-}-Sb SB64=${B256/Pch32/Pch64}-Sb
+SBRD=${B256/Rd13/Rd12}-Sb SBNOMA=${B256/-mA-/-}-Sb SBL=${B256/L294912/L294913}-Sb SBPCS=${B256/Pcs128/Pcs64}-Sb
+SBBOTH=$B256-Sb-Xnp-Xqprof SBQD=${B256/-Qd64/}-Sb
+mkdir -p "$T/profiles"; echo '{}' > "$T/profiles/prof.json"
+(
+  set +u
+  log() { echo "LOG: $*"; }
+  power_set() { :; }; power_restore() { :; }
+  vpack_gate() { return 0; }
+  aux_clients_gate() { return 0; }
+  arm() { echo "ARM $1"; }
+  HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T PROMPTS=$T/prompts.json
+  BIN=/stub/radiance MODEL=/stub/model.rad PORT=18089 PROFILE=/stub/sealed.json EXTRA_PROFILES=$T/profiles
+  SB_TOOLS=$(cd "$(dirname "$W")" && pwd)
+  unset RADIANCE_TUNE
+  SUM=$(sha256sum "$H/kernels/libr4d.so" | cut -d' ' -f1); LIB=$H/kernels/libr4d.so
+  TALL_OK=1 TALL_WHY=test TALL_SUM=$SUM TALL_LIB=$LIB DK_OK=1 DK_WHY=test DK_SUM=$SUM DK_LIB=$LIB
+  RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=4096
+  BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=4096 P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
+  AUX_OK=1 AUX_LIB=$LIB AUX_SUM=$SUM AUX_UUID=GPU-00000000000000aa AUX_MIB=26000
+  OUT=$T/sbout; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
+  eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^launch_words() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^sb_check() {/,/^}/p' "$W")"
+  HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
+  ARMS="$SB $SBNP $SBXQ $SBRES $SB64 $SBRD $SBNOMA $SBL $SBPCS $SBBOTH $SBQD"
+  s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
+  e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
+  eval "$(sed -n "${s},${e}p" "$W")"
+) > "$T/sbloop.txt" 2>&1
+for a in "$SB" "$SBNP" "$SBXQ" "$SBRES" "$SB64"; do
+  if grep -qx "ARM $a" "$T/sbloop.txt"; then ok "Sb: launched: ...${a#$B256}"
+  else bad "Sb: ...${a#$B256} not launched: $(grep -m2 -F "arm $a:" "$T/sbloop.txt")"; fi
+done
+sbskip() {   # arm, the reason's text, what
+  if ! grep -qx "ARM $1" "$T/sbloop.txt" && grep -F "arm $1:" "$T/sbloop.txt" | grep -qF "$2"; then ok "Sb: skipped: $3"
+  else bad "Sb: $3 not skipped with '$2': $(grep -m2 -F "arm $1:" "$T/sbloop.txt")"; fi
+}
+sbskip "$SBRD" "flag --expert-plane-mirror-decode-share" "Rd12 (the launcher's share is 0.13)"
+sbskip "$SBNOMA" "env RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET" "no mA"
+sbskip "$SBL" "is not a whole number of tokens" "L294913 over N256"
+sbskip "$SBPCS" "flag --checkpoint-slots" "Pcs64"
+sbskip "$SBBOTH" "Xnp and an Xq profile together" "Xnp with Xq"
+sbskip "$SBQD" "env RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS" "no Qd64"
+args=$(cat "$T/sbout/$SB.sb.args" 2>/dev/null | tr '\n' ' ')
+[[ $args == *"--streams 256 --ctx-per-stream 1152 "* && $args == *"--served-name ds41-native-smoke"* && $args == *"--profile /stub/sealed.json"* &&
+   $args == *"--mirror $T"* && $args == *"--radiance-home $H"* && $args == *"--shared-head 32"* && $args != *--reserve-mib* ]] &&
+  ok "Sb: the launcher's arguments for the measured arm" || bad "Sb: the launcher's arguments: $args"
+args=$(tr '\n' ' ' < "$T/sbout/$SBNP.sb.args" 2>/dev/null)
+[[ -n $args && $args != *--profile* ]] && ok "Sb Xnp: no --profile" || bad "Sb Xnp: $args"
+tr '\n' ' ' < "$T/sbout/$SBRES.sb.args" 2>/dev/null | grep -q -- '--reserve-mib 20480'  && ok "Sb mA20480: --reserve-mib 20480" || bad "Sb mA20480"
+tr '\n' ' ' < "$T/sbout/$SB64.sb.args" 2>/dev/null | grep -q -- '--shared-head 64'  && ok "Sb Pch64: --shared-head 64" || bad "Sb Pch64"
+# arm()'s Sb branch: the launch through serve-batch.sh (a stub binary that records its environment and arguments,
+# and answers like a server), then batch_client.py after the requests (a stub client).
+armfn=$(sed -n '/^arm() {   # name/,/^}/p' "$W")
+if [[ $armfn == *'bash "$SB_TOOLS/serve-batch.sh" "${SB_ARGS[@]}"'* && $armfn == *'sb_client "$name"'* ]]; then
+  ok "arm(): an Sb arm starts serve-batch.sh and runs sb_client after its requests"
+else bad "arm(): no Sb launch or sb_client call"; fi
+d=$T/sbclient; mkdir -p "$d/tools"
+cat > "$d/tools/batch_client.py" <<'EOS'
+import json, sys
+open(sys.argv[sys.argv.index("--prompts-out") + 1], "w").write(json.dumps(sys.argv[1:]) + "\n")
+EOS
+( OUT=$d PORT=18089 SB_TOOLS=$d/tools ARM_TIMEOUT=1800; log() { echo "LOG: $*" >> "$d/log"; }
+  eval "$(sed -n '/^sb_client() {/,/^}/p' "$W")"; sb_client armx "$T/rec.json" ) > /dev/null 2>&1
+got=$(cat "$d/armx.batch_client.prompts.jsonl" 2>/dev/null)
+[[ $got == *'"--receipt", "--first", "8", "'"$T"'/rec.json", "'"$d"'/armx.batch_client.jsonl"'* && $got == *'"--concurrency", "8"'* &&
+   $got == *'"--url", "http://127.0.0.1:18089"'* && $got == *'"--timeout", "1800"'* ]] &&
+  ok "sb_client: the first 8 of the receipt, 8 at a time, into <arm>.batch_client.jsonl" || bad "sb_client: $got"
 (( fail == 0 )) && echo "PASS ab_window_ba_test" || echo "FAIL ab_window_ba_test (loop output: $T/loop.txt)"
 exit $fail

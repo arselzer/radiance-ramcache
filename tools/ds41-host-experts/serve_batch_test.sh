@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # serve_batch_test.sh [ab_window.sh] -- serve-batch.sh against the window harness, with no GPU, no server and no model:
 #   1. the harness's own arm loop (every action stubbed, as ab_window_ba_test.sh) builds the measured four-card batch
-#      arm, and arm()'s own launch line (taken from ab_window.sh, its `env` captured) gives the server's environment
-#      and flags; serve-batch.sh --dry-run gives the same environment, each variable at its last assignment, and the
-#      same flags, each at its last value, apart from the port, --radiance-home and --served-model-name;
+#      arm, and arm()'s own launch words (ab_window.sh launch_words) give the server's environment and flags;
+#      serve-batch.sh --dry-run gives the same environment, each variable at its last assignment, and the same
+#      flags, each at its last value (serve_batch_match.py compare), apart from the port, --radiance-home and
+#      --served-model-name, and with serve_batch_match.py params' arguments all of them;
 #   2. --streams 128 gives the 128-stream arm's pool (L147456, N128), --reserve-mib the mAN variable, --shared-head
 #      the PchN floor, and no --profile / --mirror leaves those flags out;
 #   3. a missing --silu-table or --model, and a reserve under 1024 MiB, are refused.
@@ -22,17 +23,15 @@ ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm5
 mkdir -p "$T/home/kernels" "$T/mirror" "$T/profiles"; echo "{}" > "$T/profiles/prof.json"
 echo "not a library" > "$T/home/kernels/libr4d.so"
 echo '{}' > "$T/prompts.json"
-# arm()'s launch, its `env` a capture: one argument a line.
-LAUNCH=$(awk '/^  env "\$@" RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS/ { p = 1 } p { print } p && /server\.log" 2>&1 &$/ { exit }' "$W" |
-         sed -e '1s/^  env /  capture /' -e '$s/ >"\$OUT\/\$name\.server\.log" 2>&1 &$//')
-[[ $LAUNCH == *capture* && $LAUNCH == *'"${ARGS[@]}"' ]] || bad "arm()'s launch line not found in $W"
+LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
+[[ $LW == *'"$BIN" --radiance-home'* ]] || bad "no launch_words in $W"
 (
   set +u
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  capture() { printf '%s\n' "$@"; }
-  arm() { local name=$1; shift; echo "ARM $name"; eval "$LAUNCH"; }
+  eval "$LW"
+  arm() { local name=$1; shift; echo "ARM $name"; launch_words "$@"; printf '%s\n' "${LAUNCH[@]}"; }
   HX_THREADS=16 SILU=SILU RHOME=$T/home RADIANCE_HOME_DIR2=$T/home MIRROR=$T/mirror PROMPTS=$T/prompts.json
   BIN=BIN MODEL=MODEL PORT=18089 PROFILE=SEALED EXTRA_PROFILES=$T/profiles
   unset RADIANCE_TUNE
@@ -52,44 +51,17 @@ grep -q "^ARM $ARM$" "$T/loop.txt" && ok "the harness launches the arm" ||
   { bad "the harness did not launch the arm: $(grep -m3 -E 'skip|unknown' "$T/loop.txt")"; }
 awk -v a="ARM $ARM" '$0 == a { p = 1; next } p' "$T/loop.txt" > "$T/harness.txt"
 
-"$SB" --model MODEL --silu-table SILU --profile "$T/profiles/prof.json" --mirror "$T/mirror" --dry-run > "$T/sb.txt" ||
+RADIANCE_BIN=BIN "$SB" --model MODEL --silu-table SILU --profile "$T/profiles/prof.json" --mirror "$T/mirror" --dry-run > "$T/sb.txt" ||
   bad "serve-batch.sh --dry-run failed"
 
-python3 -I - "$T/harness.txt" "$T/sb.txt" <<'EOF' || fail=1
-import shlex, sys
-NOVAL = {"--weights-disk-tier", "--deterministic", "--no-prefix-cache"}
-def resolve(words):
-    env, order, i = {}, [], 0
-    while i < len(words) and "=" in words[i] and words[i].startswith("RADIANCE_"):
-        k, v = words[i].split("=", 1)
-        if k not in env: order.append(k)
-        env[k] = v; i += 1
-    binary, flags, i = words[i], {}, i + 1
-    while i < len(words):
-        k = words[i]
-        if k in NOVAL: flags[k] = None; i += 1
-        else: flags[k] = words[i + 1]; i += 2
-    return [(k, env[k]) for k in order], binary, flags
-h = resolve([l for l in open(sys.argv[1]).read().split("\n") if l != ""])
-lines = open(sys.argv[2]).read().splitlines()
-words = [l[4:] for l in lines if l.startswith("env ")] + shlex.split([l for l in lines if l.startswith("cmd ")][0][4:])
-s = resolve(words)
-bad = 0
-if h[0] == s[0]: print("ok   the environment: %d variables, the same values in the same order" % len(h[0]))
-else:
-    bad = 1
-    hd, sd = dict(h[0]), dict(s[0])
-    for k in sorted(set(hd) | set(sd)):
-        if hd.get(k) != sd.get(k): print("FAIL env %s: harness %r, serve-batch %r" % (k, hd.get(k), sd.get(k)))
-    if hd == sd: print("FAIL the environment's order differs")
-allowed = {"--port", "--radiance-home", "--served-model-name"}
-for k in sorted(set(h[2]) | set(s[2])):
-    if k in allowed: continue
-    if h[2].get(k, "<absent>") != s[2].get(k, "<absent>"):
-        bad = 1; print("FAIL flag %s: harness %r, serve-batch %r" % (k, h[2].get(k, "<absent>"), s[2].get(k, "<absent>")))
-if not bad: print("ok   the flags: %d, the same values (port, --radiance-home and the served name aside)" % len(h[2]))
-sys.exit(bad)
-EOF
+M=$HERE/serve_batch_match.py
+if python3 -I "$M" compare "$T/harness.txt" "$T/sb.txt" --port --radiance-home --served-model-name > "$T/cmp.txt"; then
+  ok "$(cat "$T/cmp.txt") (the port, --radiance-home and the served name aside)"
+else bad "serve-batch.sh against the arm: $(tr '\n' ';' < "$T/cmp.txt")"; fi
+if python3 -I "$M" params "$T/harness.txt" > "$T/params.txt" && mapfile -t P < "$T/params.txt" &&
+   RADIANCE_BIN=BIN "$SB" "${P[@]}" --dry-run > "$T/sb2.txt" && python3 -I "$M" compare "$T/harness.txt" "$T/sb2.txt" > "$T/cmp2.txt"; then
+  ok "with serve_batch_match.py params' arguments: $(cat "$T/cmp2.txt"), nothing aside"
+else bad "params: $(tr '\n' ' ' < "$T/params.txt") $(tr '\n' ';' < "$T/cmp2.txt" 2>/dev/null)"; fi
 
 # ---- 2. the parameters
 d128=$("$SB" --model M --silu-table S --streams 128 --dry-run)

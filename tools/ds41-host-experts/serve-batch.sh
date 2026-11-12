@@ -13,10 +13,12 @@
 #   - the placement profile: the arm's (agent3) holds private captures and is not shipped. --profile names yours;
 #     without it the server ranks experts by the container's own activation profile (unmeasured for batches).
 #   - the plane mirror (R, Rd13) only with --mirror; the measured arm had one on a second drive.
-#   - --served-model-name ds41 (a name only) and --radiance-home only when given (RADIANCE_HOME otherwise).
+#   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
+#     (RADIANCE_HOME otherwise).
 #
 # Usage: serve-batch.sh --model MODEL.rad --silu-table FILE [--streams 256] [--port 8000] [--reserve-mib N]
-#                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--dry-run]
+#                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
+#                       [--radiance-home DIR] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the server runs in the foreground
@@ -24,7 +26,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR=""
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR=""
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -37,6 +39,7 @@ while (( $# )); do
     --mirror) MIRROR=${2:?}; shift ;;
     --shared-head) SHEAD=${2:?}; shift ;;
     --radiance-home) HOME_DIR=${2:?}; shift ;;
+    --served-name) NAME=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -200,7 +203,7 @@ ENV=(
 # measured arms: 256 x 1152 = 294912 and 128 x 1152 = 147456 for prompts of about 1K tokens and 128-token replies.
 POOL=$((STREAMS * CTX))
 ARGS=(
-  --kernels libr4d,libref --model "$MODEL" --served-model-name ds41
+  --kernels libr4d,libref --model "$MODEL" --served-model-name "$NAME"
   --tp 4 --tp-wire exact --placement expert_tiered --weights-disk-tier
   --expert-ram-cache-total-mib 229376        # a cap: the RAM budget sizes the cache from what startup leaves
   --host-pool-mib 256 --host-headroom-mib 8192 --gpu-headroom-mib 256

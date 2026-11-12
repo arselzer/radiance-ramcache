@@ -55,7 +55,10 @@ tools/ds41-host-experts/serve-batch.sh --model /models/ds41.rad --silu-table sil
 ```
 
 `serve-batch.sh` sets exactly the measured arm's 131 environment variables and flags (checked against the window
-harness by `serve_batch_test.sh`; `--dry-run` prints them). The choices left to you:
+harness by `serve_batch_test.sh`; `--dry-run` prints them). In a window, an arm's `Sb` part starts its server through
+the launcher (skipped unless `serve-batch.sh --dry-run` gives the arm's whole launch, `serve_batch_match.py`; the
+scripts from `SB_TOOLS`, default the harness's directory) and afterwards sends the receipt's first 8 prompts through
+`batch_client.py` 8 at a time (`<arm>.batch_client.jsonl`); `Xnp` drops `--expert-profile`. The choices left to you:
 
 - `--streams`: concurrent sequences, 256 (default) or 128 were measured. Send that many requests at once.
 - `--ctx-per-stream` (1152): tokens a stream needs, prompt plus reply. The KV pool (`--max-model-len`) is streams x

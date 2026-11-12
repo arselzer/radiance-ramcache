@@ -27,7 +27,7 @@ A batch of short prompts that share long heads (128 or 256 NL-to-SQL questions o
 stream each) is bound by the experts read from RAM each step, not by the cards: at 128 streams a decode step reads about
 the same weights as at 8 and serves 16 times the rows. The DeepSeek KV cache is small (about 6.5 MiB a sequence a card
 plus 3.2 KB a token), so the cards hold 256 sequences. Every row below has replies byte-identical to the base engine's
-(windows ab-20261112T142114Z, ab-20261112T170128Z, ab-20261112T182640Z; `Bs` also with identical prefill hashes,
+(windows ab-20261112T142114Z, ab-20261112T170128Z, ab-20261112T182640Z, ab-20261112T195956Z; `Bs` also with identical prefill hashes,
 128 of 128). Wall is the client's time for the whole batch; decode-only is decode tokens over the decode steps' time.
 
 | 128 streams, 128 prompts | wall | decode-only tok/s |
@@ -46,15 +46,22 @@ plus 3.2 KB a token), so the cards hold 256 sequences. Every row below has repli
 | + card-path decode (`P1_DECODE_ROWS=64`) | 793 s | 142.5 | - |
 | **+ `SCHED_BATCH_SPLIT=1`** | **493 s** | **149.9** | 341 s |
 | the same with `Ba4096` | 520 s | 145.1 | 363 s |
+| **+ snapshot store capped at 128 slots (`--checkpoint-slots 128`)** | **329 s** | **149.3** | **177 s** |
 | fifth card `AUX_ROWS=256` and `Bs` instead of `Qd64` | 552 s | 131.8 | 379 s |
+| the same with `--checkpoint-slots 128` | 331 s | 132.7 | 160 s |
 
 Recommended for batch jobs, on top of the configuration below: `RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1` with an
-explicit cache cap, the prefix cache with shared heads, `RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1` and batch
-admission at 2048. With a fifth card and up to 128 streams, add `RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=<streams>`; at
+explicit cache cap, the prefix cache with shared heads and `--checkpoint-slots 128`, `RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1`
+and batch admission at 2048. With a fifth card and up to 128 streams, add `RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=<streams>`; at
 256 streams, use `RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=64` instead (the two do not stack: the card path takes
 the passes the worker would). Size host memory first: an arm that exhausted the box's RAM at 256 streams took the
-kernel down (an amdgpu bug on the OOM path); the RAM budget keeps that margin. Prefill is still about 70% of the
-256-stream wall.
+kernel down (an amdgpu bug on the OOM path); the RAM budget keeps that margin.
+
+The snapshot store's automatic size is 4 slots a sequence: at 256 streams 1,024 slots of 22.59 MiB, 23 GiB pinned,
+of which a batch of shared-head prompts used 36 (11 at 128 streams). Under the RAM budget that memory comes out of the
+expert cache (184 GiB instead of 205), and the experts that no longer fit are read from the drive on every card-path
+chunk: rank 0 read 447 GB and waited 196 s on the drive. With 128 slots it read 52 GB and waited 1.2 s, and prefill
+fell from 341 to 177 s. At 128 streams the cache was nearly big enough already (171 -> 172 s).
 
 ## What runs where
 

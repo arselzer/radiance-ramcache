@@ -1008,6 +1008,7 @@ Pv|${ARM_PV:-}|router predictor: every posted router input is recorded to
 Tb|${ARM_TB:-}|two-batch overlap \(RADIANCE_EXPERIMENTAL_SCHED_TBO=1\): a decode step
 Ba${ARM_BA:-}|${ARM_BA:-}|batch admission: on \(RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=${ARM_BA:-[0-9]+}\)
 BaPc|${ARM_BAPC:-}|batch admission: beside the prefix cache \(--prefix-resume exact\)
+Bs|${ARM_BS:-}|batch split: on \(RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1\)
 Ax${ARM_AX:-}|${ARM_AX:-}|$ax_on
 Axv|${ARM_AXV:-}|$axv_on
 AxS|${ARM_AXS:-}|aux experts: sharing: policy ${ARM_AXS:-[a-z]+}
@@ -1525,7 +1526,7 @@ EOF2
   fi
   # Ba: the steps that admitted whole prompts together (the scheduler's shutdown line). A Ba arm that
   # sent requests together (CK, K > 1) and batched no step did not do what its name says: set aside.
-  grep -E 'batch admission: ([0-9]+ steps admitted|[0-9]+ of those steps|beside the prefix cache, [0-9]+|outside the covered case)' \
+  grep -E 'batch admission: ([0-9]+ steps admitted|[0-9]+ of those steps|beside the prefix cache, [0-9]+|outside the covered case|prefill-only steps closed by)|batch split: [0-9]+ joins|shared heads: [0-9]+ keep points set back' \
     "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Ba: a shared step's entry outside the covered case (a chunk not the one its prompt takes alone) must not
   # happen; an arm that counts one is set aside (with Pc, the snapshots and hits it batched are on its line).
@@ -2910,7 +2911,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" sg="" pcn=""
+  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3075,6 +3076,7 @@ for a in $ARMS; do
                ba=${p#Ba}; ba=${ba:-256}
                if [[ $ba =~ ^[0-9]+$ ]] && (( 10#$ba >= 32 && 10#$ba <= 4096 )); then ba=$((10#$ba))
                else log "arm $a: $p: a batch holds 32-256 rows, or up to the Lc chunk (at most 4096) with P1; the arm is skipped"; skip=1; fi ;;
+      Bs)      bsp=1 ;;                                                # batched steps take keep-point and running chunks (BATCH_SPLIT)
       Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
@@ -3338,6 +3340,16 @@ for a in $ARMS; do
   fi
   env+=(RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=${ba:-0})
   ARM_BA=$ba ARM_BAPC=; [[ -n "$ba" && -n "$pc" ]] && ARM_BAPC=1
+  # Bs: RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1 (a chunk ending at the snapshot a prompt writes alone before
+  # its end, and a running prompt's next chunk, join or open a batch; claude/ds41-batch4096). Acts only beside
+  # Ba and the prefix cache under the exact resume (Pc / Pc0, not Pcn); stated by every arm (0 off) and checked
+  # both ways by arm()'s "batch split: on" row.
+  if [[ -n "$bsp" ]]; then
+    [[ -n "$ba" ]] || { log "arm $a: Bs needs a Ba part (batch admission); the arm is skipped"; skip=1; }
+    [[ -n "$pc" && -z "$pcn" ]] || { log "arm $a: Bs needs Pc or Pc0 (the prefix cache under the exact resume); the arm is skipped"; skip=1; }
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=${bsp:-0})
+  ARM_BS=$bsp
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   # Pi8 / Pi4, PkN, Pw, NsN, Pv: each acts only with what it changes (a predictor; Pi; Ei and the

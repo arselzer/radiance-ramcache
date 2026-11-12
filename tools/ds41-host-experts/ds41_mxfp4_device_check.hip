@@ -86,6 +86,15 @@
  *                                                      identical). Under the window's
  *                                                      RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL, left as it is.
  *                                                      Last line "PASS: aux: ..." or "FAIL: aux: ...".
+ *   ds41_mxfp4_device_check LIBR4D.so auxtall OUT [MMAX] [trials]
+ *                                                      the aux worker's passes of 17..MMAX rows (256; ds41aux::
+ *                                                      kRowsEnv, RADIANCE_EXPERIMENTAL_DS41_P1=1 and LCP=2048 set
+ *                                                      here): the P1 twin's compacted chains over tables of the
+ *                                                      held experts only against its full launch byte for byte,
+ *                                                      and the full launch against the gemv_vp and gemv chains in
+ *                                                      passes of 16 and the host chain; outputs into OUT (two
+ *                                                      cards' files must be identical). Last line "PASS: auxtall:
+ *                                                      ..." or "FAIL: auxtall: ...".
  *   ds41_mxfp4_device_check LIBR4D.so auxswap [rounds] the aux worker's slot swaps (work/aux-dyn/SPEC.md §9): a
  *                                                      compacted job on one queue while a second copies a new
  *                                                      expert into a free slot and its table entries; every row
@@ -3609,6 +3618,296 @@ int aux_rt(const Lib& lib, int jobs) {
     return 0;
 }
 
+/* ================================================================== `auxtall`: the aux worker's taller passes
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=N above 16 (ds41_aux.h, "taller passes"): a job of 17..N rows relaunches the
+ * rank's row at that height, the P1 twin ds41p1::kTwinRow (RADIANCE_EXPERIMENTAL_DS41_P1=1 beside LCP=2048, set by
+ * main as a P1 arm's server has them), for gate_up and down over the worker's packed slots, swiglu_clamped between,
+ * over the slots ds41aux::compact keeps at that height. `auxtall OUT [MMAX] [trials]` (MMAX 256 by default, 17 ..
+ * ds41aux::kRowsMax) holds, at heights 17..MMAX over 96 gate_up and down experts and five routings of a rank:
+ *   - the row table: the P1 twin present, reaching MMAX, its launcher the export this check calls;
+ *   - the full P1-twin chain over every expert packed against the decode band the worker runs at 16 rows: the
+ *     gemv_vp chain over the same packed experts in passes of 16 tokens (each pass's own sorted order), and the
+ *     plain gemv chain over block_mxfp4 in passes of 16 (the CPU's bits), gate_up, SwiGLU and down rows; a few
+ *     rows against the host chain (a NaN equal to any NaN between different kernels, counted apart);
+ *   - the compacted chains, as DeviceLane::submit launches them, over a table holding only the subset's entries
+ *     (every other entry null, as the worker's tables have them): every row byte for byte the full launch's,
+ *     NaN payloads included, and the 16-token passes' (NaN-tolerant);
+ * every output into OUT in a fixed order with fixed seeds, so two cards' files must be identical. Under the window's
+ * RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL, left as it is (the 16-token references run as the worker's do). Last line
+ * "PASS: auxtall: ..." or "FAIL: auxtall: ...". */
+int auxtall_check(const Lib& lib, const char* out_path, int mmax, int trials) {
+    if (!lib.moe_vp || !lib.swiglu || !lib.moe_p1) {
+        std::fprintf(stderr, "the library lacks r4d_rad_moe_gemm_mxfp4_gemv_vp, _gemv_tall_p1 or r4d_rad_swiglu_clamped\n");
+        return 2;
+    }
+    int rc_tab = 0;
+    {   /* the row table, as p1_check reads it: the twin the worker resolves above 16 rows */
+        const RadKernelInfo* twin = nullptr;
+        for (int i = 0; lib.count && i < lib.count(); ++i) {
+            const RadKernelInfo* k = lib.at(i);
+            if (k && k->name && !std::strcmp(k->name, ds41p1::kTwinRow)) twin = k;
+        }
+        long long reach = 0;
+        for (int i = 0; twin && i < twin->n_constraints; ++i)
+            if (!std::strcmp(twin->constraints[i].key, "M") && twin->constraints[i].op == RAD_C_LE)
+                reach = twin->constraints[i].ival;
+        const bool ok = twin && twin->launch == lib.moe_p1 && reach >= mmax;
+        std::printf("auxtall: row table: %s %s (reach %lld, MMAX %d)%s\n", ds41p1::kTwinRow, twin ? "present" : "missing",
+                    reach, mmax, ok ? "" : ": FAIL");
+        rc_tab = ok ? 0 : 1;
+    }
+    const char* lt = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL");
+    std::printf("auxtall: RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL %s (the window's), %d trial(s), M 17..%d\n",
+                lt && *lt ? lt : "unset", trials, mmax);
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    std::mt19937_64 rng(20261112);
+    P1Bank gu, dn;
+    p1_bank(&gu, 2 * kFf, kEmbd, rng);
+    p1_bank(&dn, kEmbd, kFf, rng);
+    std::vector<int> f_blk(kNe, 0), f_pk(kNe, 1);
+    auto upload = [&](const std::vector<void*>& t) {
+        std::unique_ptr<Dev> d(new Dev(kNe * sizeof(void*)));
+        d->put(t.data());
+        return d;
+    };
+    const auto tg_b = upload(p1_table(gu, f_blk, nullptr)), td_b = upload(p1_table(dn, f_blk, nullptr));
+    const auto tg_p = upload(p1_table(gu, f_pk, nullptr)), td_p = upload(p1_table(dn, f_pk, nullptr));
+    std::vector<float> silu(65536);
+    {
+        Dev d_t(65536 * 4);
+        silu_capture<<<256, 256, 0, s>>>((float*)d_t.p, kLimit);
+        HC(hipStreamSynchronize(s));
+        d_t.get(silu.data());
+    }
+    std::vector<int32_t> Ms;
+    for (int M : { 17, 24, 32, 33, 48, 64, 100, 128, 171, 256, 384, 512 })
+        if (M <= mmax) Ms.push_back(M);
+    if (Ms.empty() || Ms.back() != mmax) Ms.push_back(mmax);
+    FILE* out = std::fopen(out_path, "wb");
+    if (!out) { std::fprintf(stderr, "cannot write %s\n", out_path); return 2; }
+    {
+        const char magic[8] = { 'R', '4', 'D', 'A', 'U', 'X', 'T', '1' };
+        const uint32_t hdr[2] = { 1u, (uint32_t)Ms.size() };
+        std::fwrite(magic, 1, 8, out);
+        std::fwrite(hdr, 4, 2, out);
+        std::fwrite(Ms.data(), 4, Ms.size(), out);
+        const uint32_t zero = 0;
+        std::fwrite(&zero, 4, 1, out);   /* the case count, below */
+    }
+    auto record = [&](int M, int kind, int launch, int rows, const uint16_t* y) {
+        const int32_t h[4] = { M, kind, launch, rows };
+        std::fwrite(h, 4, 4, out);
+        std::fwrite(y, 2, (size_t)rows * kEmbd, out);
+    };
+    static const char* const kinds[] = { "uniform", "skewed", "hot", "edge", "local" };
+    static const char* const subset_names[] = { "one", "alternate", "all", "last", "half" };
+    const size_t G = 2 * kFf, A = kFf, E = kEmbd;
+    size_t bad_vp = 0, bad_blk = 0, bad_host = 0, bad_cmp = 0, bad_launch = 0, nans = 0;
+    size_t rows_full = 0, rows_cmp = 0, rows_host = 0;
+    int cases = 0, whole = 0, shown = 0;
+    for (int trial = 0; trial < trials; ++trial)
+        for (int M : Ms)
+            for (int k = 0; k < 5; ++k) {
+                P1Routing r = aux_routing(kinds[k], M, rng);
+                P1Pass full = p1_pass(r, 0, M);
+                for (int redraw = 0; !full.local && redraw < 100; ++redraw) {
+                    r = aux_routing(kinds[k], M, rng);
+                    full = p1_pass(r, 0, M);
+                }
+                const int T = M * kTop, L = full.local;
+                if (!L) continue;
+                std::vector<uint16_t> x((size_t)M * E);
+                for (int t = 0; t < M; ++t) {
+                    const auto row = make_x(kEmbd, rng, t % 5 == 3);
+                    std::copy(row.begin(), row.end(), x.begin() + (size_t)t * E);
+                }
+                std::vector<int> expert_of((size_t)L), row_of((size_t)T, -1), live_e;
+                int32_t counts[kNe];
+                for (int e = 0; e < kNe; ++e) {
+                    counts[e] = full.off[(size_t)e + 1] - full.off[(size_t)e];
+                    for (int i = full.off[(size_t)e]; i < full.off[(size_t)e + 1]; ++i) expert_of[(size_t)i] = e;
+                    if (counts[e]) live_e.push_back(e);
+                }
+                for (int i = 0; i < L; ++i) row_of[(size_t)full.sorted[(size_t)i]] = i;
+                Dev d_x(x.size() * 2), d_so((size_t)T * 4), d_of((kNe + 1) * 4);
+                d_x.put(x.data());
+                d_so.put(full.sorted.data());
+                d_of.put(full.off.data());
+                /* The full P1-twin chain over every expert packed: the tall launch the compacted ones are held to. */
+                std::vector<uint16_t> Gt((size_t)T * G), At((size_t)T * A), Yt((size_t)T * E);
+                {
+                    Dev dg((size_t)T * G * 2), da((size_t)T * A * 2), dy((size_t)T * E * 2);
+                    HC(hipMemset(dg.p, 0xAA, dg.n));
+                    HC(hipMemset(da.p, 0xAA, da.n));
+                    HC(hipMemset(dy.p, 0xAA, dy.n));
+                    if (aux_chain(lib.moe_p1, lib.swiglu, s, d_x.p, M, tg_p->p, td_p->p, d_so.p, d_of.p, T, dg.p, da.p,
+                                  dy.p)) {
+                        std::printf("FAIL auxtall M=%d %s: the full P1-twin launch was refused\n", M, kinds[k]);
+                        ++bad_launch;
+                        continue;
+                    }
+                    HC(hipStreamSynchronize(s));
+                    dg.get(Gt.data());
+                    da.get(At.data());
+                    dy.get(Yt.data());
+                }
+                /* The decode band in passes of 16 tokens: gemv_vp over packed (the worker at 16 rows) and the plain
+                 * gemv over block_mxfp4 (the CPU's bits), each pass's rows mapped to the full pass's sorted rows. */
+                size_t d_vp = 0, d_blk = 0;
+                bool refused = false;
+                for (int t0 = 0; t0 < M && !refused; t0 += 16) {
+                    const int t1 = std::min(M, t0 + 16), n = t1 - t0, Tn = n * kTop;
+                    const P1Pass pp = p1_pass(r, t0, t1);
+                    if (!pp.local) continue;
+                    Dev c_so((size_t)Tn * 4), c_of((kNe + 1) * 4);
+                    c_so.put(pp.sorted.data());
+                    c_of.put(pp.off.data());
+                    void* const cx = (char*)d_x.p + (size_t)t0 * E * 2;
+                    for (int v = 0; v < 2 && !refused; ++v) {
+                        Dev dg((size_t)Tn * G * 2), da((size_t)Tn * A * 2), dy((size_t)Tn * E * 2);
+                        if (aux_chain(v ? lib.moe : lib.moe_vp, lib.swiglu, s, cx, n, v ? tg_b->p : tg_p->p,
+                                      v ? td_b->p : td_p->p, c_so.p, c_of.p, Tn, dg.p, da.p, dy.p)) {
+                            std::printf("FAIL auxtall M=%d %s: a 16-token %s chain was refused\n", M, kinds[k],
+                                        v ? "gemv" : "gemv_vp");
+                            ++bad_launch;
+                            refused = true;
+                            break;
+                        }
+                        HC(hipStreamSynchronize(s));
+                        std::vector<uint16_t> g16((size_t)Tn * G), a16((size_t)Tn * A), y16((size_t)Tn * E);
+                        dg.get(g16.data());
+                        da.get(a16.data());
+                        dy.get(y16.data());
+                        for (int i = 0; i < pp.local; ++i) {
+                            const int f = pp.sorted[(size_t)i] + t0 * kTop, ra = row_of[(size_t)f];
+                            if (ra < 0) { ++bad_launch; continue; }
+                            const size_t d = aux_diff(&Gt[(size_t)ra * G], &g16[(size_t)i * G], G, true, &nans) +
+                                             aux_diff(&At[(size_t)ra * A], &a16[(size_t)i * A], A, true, &nans) +
+                                             aux_diff(&Yt[(size_t)ra * E], &y16[(size_t)i * E], E, true, &nans);
+                            if (d && shown++ < 8)
+                                std::printf("  auxtall M=%d %s: token %d slot %d (expert %d): the P1 twin differs from "
+                                            "the 16-token %s chain in %zu values\n", M, kinds[k], f / kTop, f % kTop,
+                                            expert_of[(size_t)ra], v ? "gemv" : "gemv_vp", d);
+                            (v ? d_blk : d_vp) += d;
+                        }
+                    }
+                }
+                if (refused) continue;
+                rows_full += (size_t)L;
+                bad_vp += d_vp;
+                bad_blk += d_blk;
+                size_t d_host = 0;
+                for (int q = 0; q < 2; ++q) {
+                    const int i = (int)(rng() % (uint64_t)L), e = expert_of[(size_t)i], f = full.sorted[(size_t)i];
+                    Mx WG, WD;
+                    WG.N = 2 * kFf; WG.K = kEmbd; WG.blocks = gu.host[(size_t)e].data();
+                    WD.N = kEmbd; WD.K = kFf; WD.blocks = dn.host[(size_t)e].data();
+                    std::vector<uint16_t> hg(G), ha(A), hy(E);
+                    gemv_avx2(WG, &x[(size_t)(f / kTop) * E], hg.data(), 0, (int)G);
+                    swiglu(silu.data(), hg.data(), ha.data(), kFf, kLimit);
+                    gemv_avx2(WD, ha.data(), hy.data(), 0, (int)E);
+                    d_host += aux_diff(hg.data(), &Gt[(size_t)i * G], G, true, &nans) +
+                              aux_diff(ha.data(), &At[(size_t)i * A], A, true, &nans) +
+                              aux_diff(hy.data(), &Yt[(size_t)i * E], E, true, &nans);
+                    ++rows_host;
+                }
+                bad_host += d_host;
+                record(M, k, 0, L, Yt.data());
+                /* The compacted launches over tables of the subset's entries only, as the worker's. */
+                std::vector<std::vector<int>> subsets(5);
+                subsets[0] = { live_e.front() };
+                for (size_t i = 0; i < live_e.size(); i += 2) subsets[1].push_back(live_e[i]);
+                subsets[2] = live_e;
+                subsets[3] = { live_e.back() };
+                for (int e : live_e)
+                    if (rng() % 2) subsets[4].push_back(e);
+                if (subsets[4].empty()) subsets[4] = { live_e[live_e.size() / 2] };
+                size_t d_cmp = 0;
+                std::string shapes;
+                for (int si = 0; si < 5; ++si) {
+                    uint8_t mask[kNe] = {};
+                    for (int e : subsets[(size_t)si]) mask[e] = 1;
+                    std::unique_ptr<ds41aux::Compact> c(new ds41aux::Compact());
+                    const int rc = ds41aux::compact(full.sorted.data(), full.off.data(), M, kTop, kNe, mask, counts, kNe,
+                                                    c.get(), mmax);
+                    if (rc != 0 || c->T < 1) {
+                        std::printf("FAIL auxtall M=%d %s %s: ds41aux::compact returned %d (T' %d)\n", M, kinds[k],
+                                    subset_names[si], rc, c->T);
+                        ++bad_launch;
+                        continue;
+                    }
+                    const int Tc = c->T;
+                    whole += Tc == T;
+                    std::vector<void*> tg(kNe, nullptr), td(kNe, nullptr);
+                    for (int e : subsets[(size_t)si]) {
+                        tg[(size_t)e] = (void*)((uintptr_t)gu.pkd[(size_t)e] | ds41p1::kMarkPacked);
+                        td[(size_t)e] = (void*)((uintptr_t)dn.pkd[(size_t)e] | ds41p1::kMarkPacked);
+                    }
+                    const auto t_g = upload(tg), t_d = upload(td);
+                    Dev c_so((size_t)Tc * 4), c_of((kNe + 1) * 4), cg((size_t)Tc * G * 2), ca((size_t)Tc * A * 2),
+                        cy((size_t)Tc * E * 2);
+                    c_so.put(c->sorted);
+                    c_of.put(c->off);
+                    HC(hipMemset(cg.p, 0xAA, cg.n));
+                    HC(hipMemset(ca.p, 0xAA, ca.n));
+                    HC(hipMemset(cy.p, 0xAA, cy.n));
+                    if (aux_chain(lib.moe_p1, lib.swiglu, s, d_x.p, M, t_g->p, t_d->p, c_so.p, c_of.p, Tc, cg.p, ca.p,
+                                  cy.p)) {
+                        std::printf("FAIL auxtall M=%d %s %s: a compacted launch was refused\n", M, kinds[k],
+                                    subset_names[si]);
+                        ++bad_launch;
+                        continue;
+                    }
+                    HC(hipStreamSynchronize(s));
+                    std::vector<uint16_t> Gc((size_t)Tc * G), Ac((size_t)Tc * A), Yc((size_t)Tc * E);
+                    cg.get(Gc.data());
+                    ca.get(Ac.data());
+                    cy.get(Yc.data());
+                    for (int j = 0; j < Tc; ++j) {
+                        const int i = c->row_of[j];
+                        /* The same kernel on the same row: every byte, NaN payloads included. */
+                        const size_t d = aux_diff(&Gc[(size_t)j * G], &Gt[(size_t)i * G], G, false, &nans) +
+                                         aux_diff(&Ac[(size_t)j * A], &At[(size_t)i * A], A, false, &nans) +
+                                         aux_diff(&Yc[(size_t)j * E], &Yt[(size_t)i * E], E, false, &nans);
+                        if (d && shown++ < 8)
+                            std::printf("  auxtall M=%d %s %s: compacted row %d (sorted row %d, expert %d) differs in "
+                                        "%zu values from the full P1-twin launch\n", M, kinds[k], subset_names[si], j, i,
+                                        expert_of[(size_t)i], d);
+                        d_cmp += d;
+                    }
+                    rows_cmp += (size_t)Tc;
+                    ++cases;
+                    shapes += (shapes.empty() ? "" : "/") + std::to_string(Tc);
+                    record(M, k, 1 + si, Tc, Yc.data());
+                }
+                bad_cmp += d_cmp;
+                std::printf("auxtall M=%-3d %-7s %4d rows of %2zu experts: P1 twin against 16-token passes: gemv_vp %zu, "
+                            "gemv %zu values differ, host %zu; compacted (T' %s of %d) %zu differ from the full launch\n",
+                            M, kinds[k], L, live_e.size(), d_vp, d_blk, d_host, shapes.c_str(), T, d_cmp);
+                std::fflush(stdout);
+            }
+    const long hpos = 8 + 8 + 4 * (long)Ms.size();
+    const uint32_t nc = (uint32_t)cases;
+    const bool wrote = std::fseek(out, hpos, SEEK_SET) == 0 && std::fwrite(&nc, 4, 1, out) == 1;
+    const bool closed = std::fclose(out) == 0;
+    (void)hipStreamDestroy(s);
+    std::printf("auxtall: %d compacted launches (%d whole), %zu rows; %zu full-launch rows; %zu host rows; %zu NaN "
+                "pairs between kernels; outputs in %s\n", cases, whole, rows_cmp, rows_full, rows_host, nans, out_path);
+    const bool ok = !rc_tab && wrote && closed && !bad_vp && !bad_blk && !bad_host && !bad_cmp &&
+                    !bad_launch && cases > 0 && whole > 0;
+    if (ok)
+        std::printf("PASS: auxtall: the P1 twin's compacted rows equal its full launch's and the gemv_vp and gemv "
+                    "chains' in passes of 16 at M17..%d (%d cases)\n", mmax, cases);
+    else
+        std::printf("FAIL: auxtall: values differing: against 16-token gemv_vp %zu, gemv %zu, host %zu, compacted %zu; "
+                    "%zu launches refused or not compacted; %d whole%s%s\n", bad_vp, bad_blk, bad_host, bad_cmp,
+                    bad_launch, whole, rc_tab ? "; the row table" : "",
+                    wrote && closed ? "" : "; the output file was not written");
+    return ok ? 0 : 1;
+}
+
 }  // namespace
 
 /* ================================================================== `auxswap`: the aux worker's slot swaps
@@ -3830,15 +4129,23 @@ int aux_swap(const Lib& lib, int rounds) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
     /* `lcp [C]`: RADIANCE_EXPERIMENTAL_DS41_LCP=C and EXACT_TALL unset, as an Lc arm's server has them;
      * `sweep` keeps an LCP already in the environment (its heights) instead of setting EXACT_TALL. */
     /* Every mode but `p1` runs without prefill Phase 1's switch (its twin replaces the LCP twin `lcp` checks). */
-    if (std::strcmp(argv[2], ds41p1::kCheckMode)) unsetenv(ds41p1::kEnv);
-    if (!std::strcmp(argv[2], ds41p1::kCheckMode)) {
+    if (std::strcmp(argv[2], ds41p1::kCheckMode) && std::strcmp(argv[2], "auxtall")) unsetenv(ds41p1::kEnv);
+    if (!std::strcmp(argv[2], "auxtall")) {
+        /* `auxtall`: LCP=2048 and P1, as the server of an AxrN arm has them (the worker's rows above 16 are the P1
+         * twin's); the live tail left as the window has it, as for `aux`. */
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
+        setenv(ds41p1::kEnv, "1", 1);
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE");
+        g_lcp = 2048;
+    } else if (!std::strcmp(argv[2], ds41p1::kCheckMode)) {
         /* `p1 [MMAX] [ROUTES]`: LCP=2048 and the switch, as a P1 arm's server has them. */
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
         setenv(ds41p1::kEnv, "1", 1);
@@ -3882,6 +4189,14 @@ int main(int argc, char** argv) {
     if (!std::strcmp(argv[2], "aux")) return aux_check(lib, argc > 3 ? argv[3] : "aux.bin", argc > 4 ? std::max(1, std::atoi(argv[4])) : 1);
     if (!std::strcmp(argv[2], "auxrt")) return aux_rt(lib, argc > 3 ? std::atoi(argv[3]) : 430);
     if (!std::strcmp(argv[2], "auxswap")) return aux_swap(lib, argc > 3 ? std::max(4, std::atoi(argv[3])) : 64);
+    if (!std::strcmp(argv[2], "auxtall")) {
+        const int mmax = argc > 4 ? std::atoi(argv[4]) : 256;
+        if (mmax < 17 || mmax > (int)ds41aux::kRowsMax) {
+            std::fprintf(stderr, "auxtall MMAX: 17 .. %lld\n", (long long)ds41aux::kRowsMax);
+            return 2;
+        }
+        return auxtall_check(lib, argc > 3 ? argv[3] : "auxtall.bin", mmax, argc > 5 ? std::max(1, std::atoi(argv[5])) : 1);
+    }
     if (!std::strcmp(argv[2], "ptime")) {
         /* ptime T[:P] ...; PTIME_LIB2=<libr4d.so> also runs and compares a second plugin */
         const char* l2 = std::getenv("PTIME_LIB2");

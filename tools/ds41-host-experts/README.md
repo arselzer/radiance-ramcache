@@ -983,6 +983,40 @@ rows the CPU recomputed, launch failures, verify counts) and
 `aux_compact_test`, `aux_stager_test` (switch-off identity, the deadline fallback, the pin set on the host backend),
 `r4d_emu_ds41aux` and `r4d_emu_ds41aux_tail` (the compacted launches on the emulator), `ab_window_aux_test.sh`.
 
+### Taller passes (`RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=N`, not yet measured on the cards)
+
+Branch `claude/ds41-auxtall`. At large batch the worker computes nothing: a 128-stream decode pass is one routed layer
+pass of 128 rows a rank, and the worker declines every pass above 16 rows (`declined: N taller`). The limit is its
+kernel: it relaunches the rank's own row at the job's height, and up to 16 rows that is gemv_vp, whose launcher serves
+the decode band only (`mx_moe` in `libr4d/r4d_ds41_mxfp4.hip`: the gemv path runs for `tokens <= 16 || tall`, and a
+marked table is refused on the tiled path above). `..._AUX_ROWS=N` (17-512; unset, empty or 16: today's worker, byte
+for byte) lets it take routed layer passes of up to N rows -- the decode rows of a batch, and prefill chunks below P1's
+threshold -- with the row the rank cards run at those heights: under P1 beside LCP (the only configuration in which
+`..._VRAM_PACKED`, which the worker needs, admits passes above 16) that is the P1 twin
+`moe_gemm_ggml_mxfp4_gemv_tall_p1`, gemv_vp's kernel at every height with the packed marks, each output row the decode
+band's bytes for its activation row (contract T1 of `ds41_p1.h`, held on the rank cards by the `p1` card check). A layer
+any of whose heights 17..N resolves gate_up or down to another row is not the worker's (rank 0 warns `... not
+moe_gemm_ggml_mxfp4_gemv_tall_p1 (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=N: ...)`), and with no layer left the worker is
+off (`aux experts: off: ...`). Exactness is the 16-row argument at the taller height: each output
+value depends on its weight row, its activation row and K only (the twin's work split and row passes change no sum),
+so the compacted launch over the worker's slots gives the full launch's bytes, which are the 16-token passes' and the
+CPU pool's. The card check `ds41_mxfp4_device_check LIB auxtall OUT [N]` (P1 and LCP=2048 set by the check) holds it
+on the extra card and a rank card: the twin's compacted chains (gate_up, SwiGLU, down, over tables holding only the
+subset's entries, as the worker's) byte for byte against its full launch, the full launch against the gemv_vp and
+plain gemv chains in passes of 16 tokens and the host chain, at 17..N rows over five routings, the two cards' outputs
+identical. The lanes' workspaces and pinned buffers grow with N (`ds41aux::ws(N)`: ~41 MB of VRAM and ~18 MB pinned a
+rank at 256 rows, ~8 fewer units in the arena at 26000 MiB); a job of AR rows is late at max(its submit + D x ceil(AR
+/ 16), the pool's end + 50 us). The startup line says `passes of up to N rows` and ends with
+`; RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS=N: passes of 17-N rows by moe_gemm_ggml_mxfp4_gemv_tall_p1, ...`; each rank's
+shutdown line ends with `; by height: 1-16: J jobs, R of E rows; 17-32: ...` (jobs, their rows on the extra card, and
+the rows the CPU path met in such passes) up to N. Window part `AxrN` (`Axr` 128; with `Ax` / `Axv`, `P1` and an `Lc`
+part, not beside `Kld`): `DEVICE_CHECKS=aux` runs `auxtall` at the window's tallest N on card 0 and the extra card,
+a serve arm needs an `Axv` arm with an `Axr` part of at least its N, and at exit every rank line must count jobs by
+height with at least one job above 16 rows over the ranks. Tests: `aux_compact_test` (the slot rule at 17-512 rows),
+`aux_unitset_test` (`ws(N)`, the deadline's scale, the height buckets), `aux_discovery_test` (the switch's range),
+`aux_stager_test` (tall passes compacted, queued, placed, late with the scaled deadline, declined above N; the lane at
+N rows; the shutdown line), `ab_window_aux_test.sh` §12.
+
 ### Sharing the card, and the online unit set (experimental, not yet measured on a card)
 
 Branch `claude/ds41-aux-dynamic` (work/aux-dyn/SPEC.md). Both are off unless asked for; unset, the worker above is

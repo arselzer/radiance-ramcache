@@ -555,6 +555,14 @@ set_tests_properties(ab_window_shared_test PROPERTIES LABELS "unit;fast" TIMEOUT
 add_test(NAME ab_window_ba_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_ba_test.sh)
 set_tests_properties(ab_window_ba_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# serve-batch.sh (the batch preset) against the harness's own arm loop and launch line: the same environment
+# and flags as the measured four-card batch arm. No card, no server, no model.
+add_test(NAME serve_batch_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/serve_batch_test.sh)
+set_tests_properties(serve_batch_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# batch_client.py (the batch preset's client) against a stub server on the loopback.
+add_test(NAME batch_client_test COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/batch_client_test.py)
+set_tests_properties(batch_client_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 # ab_window.sh's long-context prompt sets (receipts with max_context_tokens: the context gate and the request
 # timeout), the --hashes-ref step and the lsparse card check's wiring, all with every action stubbed.
 add_test(NAME ab_window_longctx_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_longctx_test.sh)

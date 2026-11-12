@@ -21,6 +21,76 @@ On the loop's eight held-out prompts (64 tokens, greedy, TP4) the path takes dec
 about 17 tok/s and the time to first token summed over the prompts from 64.0 to about 15.5 s. Every
 step was measured as an A/B window; the log is `/home/as/ds41-decode-review-20261028/NIGHT-LOG.md`.
 
+## Batch jobs: quickstart
+
+Many short prompts at once (for example a few hundred questions over a few shared schemas), answered by
+DeepSeek-V4.1-Flash on four cards with the measured best four-card batch configuration.
+
+**Hardware assumed.** Four 16 GB RDNA4 cards (RX 9070 XT, gfx1201) at TP4, a 24-core EPYC (7443, 48 threads: the
+preset runs 40 CPU expert threads), 256 GB of RAM and the model container on NVMe. Less RAM still runs: the RAM budget
+sizes the expert cache to what the host has, and the experts that do not fit are read from the drive, which is slower
+(unmeasured below 256 GB for batches). Fewer streams need less of everything; a smaller CPU needs fewer expert threads,
+which the preset does not change (pass a different `RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS` only knowingly). No fifth
+card is used; hide any other card with `ROCR_VISIBLE_DEVICES`.
+
+**Build.** Build radiance with HIP as in the top-level README ("Build from source"); the `deepseek41` plugin and
+`libr4d` must come from the same build. Build the card check (`make -C tools/ds41-host-experts mxfp4-check`, needs
+`hipcc`) and capture the SiLU table on one of your cards once per `libr4d` build:
+
+```
+HIP_VISIBLE_DEVICES=0 tools/ds41-host-experts/ds41_mxfp4_device_check build/radiance_home/kernels/libr4d.so \
+  swiglu silu_table_gfx1201.bin     # captures the card's silu(g) for every bf16 gate, then proves swiglu against the host
+```
+
+The measured runs also passed the window harness's card checks on their `libr4d` before the arms ran (`ab_window.sh`
+`DEVICE_CHECKS`: swiglu, lcp, p1, bal, the vpack check and the `gemm_nt_f32bf16` selftest); a new build should pass
+them too before its replies are taken as exact.
+
+**Serve.**
+
+```
+export RADIANCE_HOME=$PWD/build/radiance_home
+tools/ds41-host-experts/serve-batch.sh --model /models/ds41.rad --silu-table silu_table_gfx1201.bin \
+  --streams 256 --port 8000 [--profile decode-profile.json] [--mirror DIR] [--reserve-mib 10240]
+```
+
+`serve-batch.sh` sets exactly the measured arm's 131 environment variables and flags (checked against the window
+harness by `serve_batch_test.sh`; `--dry-run` prints them). The choices left to you:
+
+- `--streams`: concurrent sequences, 256 (default) or 128 were measured. Send that many requests at once.
+- `--ctx-per-stream` (1152): tokens a stream needs, prompt plus reply. The KV pool (`--max-model-len`) is streams x
+  this: 294,912 at 256 streams, 147,456 at 128, as measured with prompts of about 1K tokens and 128-token replies.
+  Raise it for longer prompts (KV is small: about 6.5 MiB a sequence a card plus 3.2 KB a token).
+- `--reserve-mib`: host RAM the budget keeps free (10,240 when not given; at least 1024).
+- `--profile`: the placement profile (`--expert-profile`). The measured arm used one blended from captures of the
+  same prompt families, which is not shipped; profiles are bound to the container they were recorded on. Without
+  one the server ranks experts by the container's own activation profile (not measured for batches). To make one,
+  serve representative prompts with `-- --expert-stats capture.json` and blend it with `profile_blend.py` (below).
+- `--mirror`: a second copy of the checkpoint's `model-*.safetensors` on another drive, read for part of the misses
+  (the measured arm had one; optional).
+- `--shared-head` (32): the shared-head floor (`RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD`). 32 is the pending default;
+  the rows below were measured with 64.
+
+**Send a batch.** `batch_client.py` reads a JSONL of `{"prompt": ..., "system": ...}` lines and sends them N at a
+time to the server's `/v1/completions`, framed in token ids as the measured runs framed them (DeepSeek's non-thinking
+chat form, greedy); `--chat` uses the OpenAI `/v1/chat/completions` endpoint instead (needs a container with a chat
+template). Put the text prompts share in `system`: the prefix cache prefills it once.
+
+```
+tools/ds41-host-experts/batch_client.py questions.jsonl answers.jsonl --concurrency 256 --max-tokens 128
+```
+
+**Expected throughput** (whole batch, client wall time, four cards, replies byte-identical to the base engine's;
+measured on a private NL-to-SQL set, prompts of about 1K tokens over a few shared schemas, 128-token replies; a run
+on a public BIRD set is pending): 128 questions 539 s -> 199 s, 256 questions 911 s -> 329 s, against the first
+configurations measured at each size (table below). At 256 streams decode runs at about 150 tok/s and prefill at
+about 380 tok/s of computed (not cached) prompt tokens.
+
+**Host memory must not run out.** An arm that exhausted the box's RAM at 256 streams took the kernel down (an amdgpu
+bug on the out-of-memory path). The RAM budget (`RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1`, on in the preset) sizes
+the expert cache from what startup leaves and holds its growth above the reserve; `serve-batch.sh` also stops the
+server if MemAvailable falls below 3 GiB (`MEMGUARD_MIB`). Do not run other large jobs beside it.
+
 ## Batch jobs: 128 and 256 concurrent streams (measured 12 November)
 
 A batch of short prompts that share long heads (128 or 256 NL-to-SQL questions over a few schemas, sent at once, one

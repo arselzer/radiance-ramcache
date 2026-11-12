@@ -748,7 +748,16 @@ bool FileStager::begin_pass(const RadBatch* b) {
      * readers of the file buffers before it. */
     p1_armed_ = false;
     p1_li_ = -1;
-    const bool p1_arms = p1_on() && lcp_ && p1_pass_arms(*b, p1_min_rows_, ep_rows_);
+    p1_decode_pass_ = false;
+    /* ..._P1_DECODE_ROWS (0 off: this is false and nothing below changes): a pure trunk decode pass of the
+     * decode threshold's rows or more arms the card path as a prefill pass of the threshold's does, the lent
+     * slots' take-back included. */
+    bool p1_decode = false;
+    const bool p1_arms = p1_on() && lcp_ && p1_arms_pass(*b, p1_min_rows_, p1_decode_rows_, ep_rows_, &p1_decode);
+    if (p1_on() && lcp_ && p1_decode_rows_ > 0 && !p1_arms && b->phase == RAD_PHASE_DECODE && b->draft_pass == 0 &&
+        b->n_spec == 0 && b->n_tok_decode == b->n_tok && b->n_tok >= ds41p1::kMinArmRows &&
+        b->n_tok < p1_decode_rows_)
+        ++p1_dec_below_;
     /* The lent ring (card_expert_stager.h): a pass that arms the card path takes the residents' slots
      * back, and its first ring copy waits on their last reader too; any other pass, once the grace has
      * run out, reloads them and publishes those whose copies have passed. Here only, before the run
@@ -778,6 +787,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
             RAD_ERR("ds41 p1: an armed pass could not begin; this pass goes to the CPU path");
         } else {
             p1_armed_ = true;
+            p1_decode_pass_ = p1_decode;
             p1_pass_rows_ = b->n_tok;
             p1_t0_ = std::chrono::steady_clock::now();
             p1_layers_ = 0;
@@ -792,6 +802,9 @@ bool FileStager::begin_pass(const RadBatch* b) {
               (b->n_tok <= kRoutedRows || (lcp_ && hx_capped_ && b->n_tok <= ep_rows_));
     /* A one-token pass, or with ..._PREFETCH_MULTIROW a trunk decode pass of 2..N rows. */
     hx_ra_pass_ = ra_pass_reads_ahead(b->phase == RAD_PHASE_DECODE, b->draft_pass, b->n_tok, hx_ra_rows_);
+    /* An armed decode pass reads nothing ahead for the CPU path, as an armed prefill pass (no layer of it is the
+     * CPU path's: uncut, every layer runs on the pass's rows). */
+    if (p1_armed_ && p1_decode_pass_) hx_ra_pass_ = false;
     /* Two-batch overlap (stager.h, tbo_): the architecture declared it (rad_declare_two_batch) and
      * issues this pass as two micro-batches, so each routed layer arrives as slice A, then slice B. */
     tbo_ = ep_program_ && ep_program_->two_batch && tbo::step_splits(b);
@@ -4767,13 +4780,25 @@ int FileStager::end_pass(RadStream s) {
         if (p1_rc >= 0) p1_rc = er;
         if (p1_li_ >= 0 && p1_rc >= 0) p1_rc = RAD_E_STATE;
         p1_li_ = -1;
+        /* Rank 0's drive reads since its last armed pass (a chunk line's, below). */
+        static uint64_t units0 = 0, bytes0 = 0;
+        uint64_t du = 0, db = 0;
         if (plan_->rank == 0) {
-            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - p1_t0_).count();
             const auto& c = p1_->counts();
-            static uint64_t units0 = 0, bytes0 = 0;
-            const uint64_t du = c.drive_units - units0, db = c.drive_bytes - bytes0;
+            du = c.drive_units - units0;
+            db = c.drive_bytes - bytes0;
             units0 = c.drive_units;
             bytes0 = c.drive_bytes;
+        }
+        if (p1_decode_pass_) {
+            /* ..._P1_DECODE_ROWS: counted for the shutdown line, no line a pass (one every step). */
+            ++p1_dec_passes_;
+            p1_dec_rows_ += (uint64_t)std::max<int64_t>(p1_pass_rows_, 0);
+            p1_dec_max_ = std::max<uint64_t>(p1_dec_max_, (uint64_t)std::max<int64_t>(p1_pass_rows_, 0));
+            p1_dec_ns_ += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - p1_t0_).count();
+        } else if (plan_->rank == 0) {
+            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - p1_t0_).count();
             long long avail_kb = -1;
             if (FILE* f = std::fopen("/proc/meminfo", "r")) {
                 char line[256];
@@ -4827,9 +4852,26 @@ int FileStager::quiesce_for_backing() {
  * SwiGLU and down cannot be named; a routed unit off the card neither in the container nor pinned in
  * the host pool of a static plan (a pooled unit is copied to the ring from its pool slot, p1_pool_; a
  * plan that moves units may relocate it between steps); a ring of fewer than kMinRingSlots slots. */
+std::string FileStager::p1_decode_refusal(int64_t decode_rows, int64_t lcp, bool two_batch) {
+    if (decode_rows <= 0) return std::string();
+    if (!ds41p1::decode_rows_ok((long)decode_rows))
+        return fmt("%s=%lld: 0 (off) or %d to %d", ds41p1::kDecodeRowsEnv, (long long)decode_rows,
+                   ds41p1::kMinArmRows, ds41p1::kTwinMaxRows);
+    if (decode_rows > lcp)
+        return fmt("%s=%lld: above the chunk (%s=%lld), so no decode pass could arm the card path",
+                   ds41p1::kDecodeRowsEnv, (long long)decode_rows, kLcpEnv, (long long)lcp);
+    if (two_batch)
+        return fmt("%s=%lld beside the two-batch overlap (RADIANCE_EXPERIMENTAL_SCHED_TBO=1): a split decode step "
+                   "issues each routed layer's expert ops once a micro-batch, and the card path takes a layer's rows "
+                   "in one launch", ds41p1::kDecodeRowsEnv, (long long)decode_rows);
+    return std::string();
+}
+
 int FileStager::p1_init(const Program& prog) {
     p1_.reset();
     p1_armed_ = false;
+    p1_decode_rows_ = 0;
+    p1_decode_pass_ = false;
     const char* v = std::getenv(ds41p1::kEnv);
     const int st = ds41p1::env_state(v);
     p1_state_ = st;
@@ -4851,6 +4893,10 @@ int FileStager::p1_init(const Program& prog) {
     if (t.lend_heat > 0 && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
         return refuse(fmt("%s=%d moves lent slots between units, and none is lent (%s, %s or %s)", ds41p1::kLendHeatEnv,
                           t.lend_heat, ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
+    /* Decode passes on the cards (..._P1_DECODE_ROWS): a pass is at most the chunk, so a threshold above it would
+     * never arm; and a split pass (the two-batch overlap, sched/tbo.h) issues each routed layer's expert ops
+     * twice, which the card path refuses (it takes a layer's rows in one launch). */
+    if (const std::string no = p1_decode_refusal(t.decode_rows, lcp_, prog.two_batch); !no.empty()) return refuse(no);
     if (t.lend_audit && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
         return refuse(fmt("%s=1 reads lent slots back, and none is lent (%s, %s or %s)", ds41p1::kLendAuditEnv,
                           ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
@@ -4989,6 +5035,7 @@ int FileStager::p1_init(const Program& prog) {
     p1_ = std::move(path);
     p1_min_rows_ = t.min_rows;
     p1_tun_ = t;
+    p1_decode_rows_ = t.decode_rows;
     /* With the lent arena the lending waits for the arena's top (p1_lend_arena, once the engine has bound
      * its level), and the ring's slots join it there. */
     p1_arena_asked_ = t.lend_arena > 0;
@@ -5007,6 +5054,13 @@ int FileStager::p1_init(const Program& prog) {
                  (long long)p1_cpu_rows(), p1_->ring_slots(), (long long)ds41p1::kSlotBytes,
                  (double)p1_->ring_slots() * (double)ds41p1::kSlotBytes / 1048576.0, t.wave, t.inflight, t.ready,
                  t.ahead, t.verify, t.align_end ? "prompt's end" : "chunk grid (start)", p1_pool_units_);
+    if (plan_->rank == 0 && p1_decode_rows_ > 0)
+        RAD_INFO("%s: every routed expert row of a pure decode pass of %lld to %lld rows on the cards, as a prefill "
+                 "pass's layer of the threshold's rows (%s=%lld; decode rows only, no draft pass, speculation, media "
+                 "row or consumer cut; a shorter decode pass takes the CPU path as without it); each such pass takes "
+                 "the lent slots back as an armed prefill pass does; counts in the shutdown stats line",
+                 ds41p1::kLogDecode, (long long)std::max<int64_t>(p1_decode_rows_, ds41p1::kMinArmRows),
+                 (long long)lcp_, ds41p1::kDecodeRowsEnv, (long long)p1_decode_rows_);
     if (plan_->rank == 0 && lcp_spec_)
         RAD_INFO("ds41 p1: prompt-lookup speculation admitted (--num-speculative-tokens %d, no draft head): a verify "
                  "step of at most %lld decode rows never arms the card path; its residents run in the plugin's own ops "
@@ -5609,6 +5663,13 @@ std::string FileStager::p1_stats_line() const {
     if (p1_heat_)
         line += fmt("; heat half-life %lld decode rows, %lld counted", (long long)p1_heat_->half_rows(),
                     (long long)p1_heat_->seen_rows());
+    /* ..._P1_DECODE_ROWS: the decode passes armed (ab_window.sh's Qd arm is measured only if some rank armed one). */
+    if (p1_decode_rows_ > 0)
+        line += fmt("; decode passes armed %llu, rows %llu (at most %llu a pass), issue %.3f s; decode passes of 17 "
+                    "to %lld rows on the CPU path %llu",
+                    (unsigned long long)p1_dec_passes_, (unsigned long long)p1_dec_rows_,
+                    (unsigned long long)p1_dec_max_, (double)p1_dec_ns_ * 1e-9, (long long)(p1_decode_rows_ - 1),
+                    (unsigned long long)p1_dec_below_);
     return line;
 }
 

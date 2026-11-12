@@ -1903,6 +1903,28 @@ block order, so the bytes equal 16-token passes. Gate: `ds41_mxfp4_device_check 
 1024-2048 it costs about 16.4 µs an expert-row in block form and 18.8 packed, against 2,238 for the served
 LCP twin and 30 for lcpfast's balanced twin.
 
+Decode passes on the cards (`RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=N`, 0 off, the default; 17 to the
+chunk; the window's part `QdN`). Not yet measured on the cards. The card path costs a layer's experts read
+once whatever its rows (~1.7 s a step), the CPU pool's cost grows with rows (~3 s a decode step at 256
+sequences), so above some batch a decode step should be cheaper on the cards. With the switch, a pure trunk
+decode pass (decode rows only, no draft pass, no speculation, no media row, uncut, no admission row) of N rows
+or more (`FileStager::p1_decode_pass_arms`) arms the card path for its routed layers exactly as a pure prefill
+pass of the threshold's rows does: every layer of it is the card path's at N (`p1_layer_min`; the prefill
+threshold stays the prefill passes'), its first ring copy waits on the file buffers' and the lent slots' last
+readers, and it takes the lent slots back as an armed prefill pass does (they are the ring), so the grace and
+the rest run from its end; it reads nothing ahead for the CPU path. Every other pass, and every decode pass
+below N, runs as without the switch. Exactness is P1's: each routed expert row is the twin row's, which T1
+holds byte for byte to the decode band's for the same activation row at every M up to 4096 (the device check
+`p1`), as the CPU path's is; the dense ops at a given height are the same kernels either way (LCP's
+admission). Refused beside the two-batch overlap (`Tb`: a split step launches a layer's expert ops once a
+micro-batch, and the card path takes a layer's rows in one launch) and above the chunk. Rank 0 says
+`ds41 p1: decode passes on the cards: every routed expert row of a pure decode pass of N to C rows ...` at
+startup, and each rank's `ds41 p1 stats, rank` line adds `decode passes armed A, rows R (at most M a pass),
+issue S s; decode passes of 17 to N-1 rows on the CPU path B` (armed decode passes print no chunk line). A
+`QdN` arm is measured only with the startup line and, at exit, some rank's A above 0. A hybrid (card path for
+a layer's units with many rows, CPU for the rest) is not built: the two paths own a layer's non-resident units
+whole (marks and waves on one side, aliases and the CPU rows' copy at the gather on the other).
+
 ## Adaptive residency: the lent slab, the heat over every lent slot, the read-back audit
 
 Not yet measured on the cards. Three switches, each off by default, and with all three off no computed

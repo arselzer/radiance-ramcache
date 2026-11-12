@@ -546,6 +546,30 @@ public:
         return b.phase == RAD_PHASE_PREFILL && b.n_tok_decode == 0 && b.draft_pass == 0 && b.n_spec == 0 &&
                b.n_tok >= ds41p1::kMinArmRows && b.n_tok >= min_rows && b.n_tok <= max_rows;
     }
+    /* RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=N (ds41_p1.h, kDecodeRowsEnv; 0 off): whether pass `b` is a
+     * pure trunk decode pass the card path is armed for: decode rows only (phase decode, every token a decode
+     * row), no draft pass, no speculation, no media row, uncut by the consumer skip and with no admission row,
+     * of at least N (and 17) and at most `max_rows` (the chunk) rows. Its routed layers are then each the card
+     * path's as a pure prefill pass's are (p1_layer_on: an uncut pass's layers all run on its rows). Any other
+     * pass, every pass with N 0, runs as without the switch; p1_pass_arms never takes a decode pass. */
+    static bool p1_decode_pass_arms(const RadBatch& b, int64_t decode_rows, int64_t max_rows) {
+        return decode_rows > 0 && b.phase == RAD_PHASE_DECODE && b.draft_pass == 0 && b.n_spec == 0 &&
+               b.n_mm_rows == 0 && b.consumer_full == 0 && b.consumer_row0 == nullptr && b.lcp_admit_row <= 0 &&
+               b.n_tok > 0 && b.n_tok_decode == b.n_tok && b.n_tok >= ds41p1::kMinArmRows &&
+               b.n_tok >= decode_rows && b.n_tok <= max_rows;
+    }
+    /* What begin_pass arms: a pure prefill pass at the threshold (p1_pass_arms) or, with decode_rows > 0, a pure
+     * decode pass at the decode threshold (p1_decode_pass_arms; *decode then true). The lent slots go back for
+     * either (begin_pass), as for every armed pass. */
+    static bool p1_arms_pass(const RadBatch& b, int64_t min_rows, int64_t decode_rows, int64_t max_rows,
+                             bool* decode = nullptr) {
+        const bool d = !p1_pass_arms(b, min_rows, max_rows) && p1_decode_pass_arms(b, decode_rows, max_rows);
+        if (decode) *decode = d;
+        return d || p1_pass_arms(b, min_rows, max_rows);
+    }
+    /* p1_init's refusals of ..._P1_DECODE_ROWS=decode_rows beside the chunk `lcp` and the program's two-batch
+     * overlap: empty when taken (0 always is). */
+    static std::string p1_decode_refusal(int64_t decode_rows, int64_t lcp, bool two_batch);
     /* The lent arena (..._P1_LEND_ARENA, card_expert_stager.h). Asked for, p1_init lends nothing yet;
      * the engine then binds the arena's smallest level and hands p1_lend_arena the arena's top [lo, lo +
      * bytes) above that level's buffers (steps of up to `rows` tokens) and guard, and `full`, whether
@@ -822,13 +846,23 @@ private:
      * (layer_rows: under the per-row cut a deep layer can run on fewer) at least the threshold and
      * never 16 or fewer (ds41p1::card_layer). Any other layer of an armed pass takes the CPU path for
      * its non-resident experts as a pass of its height does: plain aliases, no mark, no wave. */
-    bool p1_layer_on(int32_t li) const { return p1_armed_ && ds41p1::card_layer(layer_rows(li), p1_min_rows_); }
+    bool p1_layer_on(int32_t li) const { return p1_armed_ && ds41p1::card_layer(layer_rows(li), p1_layer_min()); }
+    /* The rows a layer of this armed pass needs to be the card path's: the decode threshold in an armed decode
+     * pass (..._P1_DECODE_ROWS), the threshold (..._P1_MIN_ROWS) in any other. */
+    int64_t p1_layer_min() const { return p1_decode_pass_ ? p1_decode_rows_ : p1_min_rows_; }
     /* The rows the CPU path's miss bound (..._MISSES, hx_miss_rows_) is held to: the pass's, or in an
      * armed pass the layer's own (a layer the card path does not take, below the threshold, beside
      * ..._MISSES of at least p1_cpu_rows). */
     int64_t hx_miss_need(int32_t li) const { return p1_armed_ ? layer_rows(li) : pass_tok_; }
     uint64_t p1_cpu_layers_ = 0;         /* this armed pass's routed layers on the CPU path (below the threshold) */
     int  p1_layer(int32_t li, RadStream s);
+    /* ..._P1_DECODE_ROWS (p1_decode_pass_arms): the threshold as p1_init read it (0 off); this pass armed as a
+     * decode pass; and the shutdown counts (p1_stats_line): decode passes armed, their rows, the tallest, their
+     * issue time from begin_pass to end_pass; and the pure decode passes of 17 rows or more below the
+     * threshold, which took the CPU path. */
+    int64_t  p1_decode_rows_ = 0;
+    bool     p1_decode_pass_ = false;
+    uint64_t p1_dec_passes_ = 0, p1_dec_rows_ = 0, p1_dec_max_ = 0, p1_dec_ns_ = 0, p1_dec_below_ = 0;
     bool p1_admits(int32_t li, int32_t e) const;
     /* ..._P1_VERIFY=N: after a layer's waves, N of its RAM-cache units' expert-rows recomputed by the
      * CPU pool from the cache's bytes (borrowed again, read-only) and compared with the card's down

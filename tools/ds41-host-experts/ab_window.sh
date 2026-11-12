@@ -173,6 +173,14 @@
 # file, none by default); an Lc2048 arm needs LCP_CHECK_C=2048 as before. The window log takes each P1 arm's
 # "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines; a P1 arm whose stats lines count a lease held at a pass
 # end, or (Qv) a host-verified expert-row that differs from the card's, is not measured.
+# QdN: decode passes on the cards (..._P1_DECODE_ROWS=N, 17 to N_Lc; every other arm states 0): a pure
+# decode pass of N rows or more (decode rows only, no draft, speculation or cut) arms the card path for its
+# routed layers as a prefill pass of the threshold's rows does, and takes the lent slots back as one does;
+# needs P1, refused beside Tb (a split step). A Qd arm is measured only with rank 0's "ds41 p1: decode
+# passes on the cards: every routed expert row of a pure decode pass of N to C rows" line at startup (any
+# other arm only without it), and at exit (qd_gate) only if every rank's "ds41 p1 stats, rank" line counts
+# its decode passes and some rank armed at least one ("decode passes armed A", A > 0): otherwise the switch
+# never acted (a batch below N) and the arm is set aside as unmeasured. Not yet measured on the cards.
 #
 # Coordinated actual Ar1280+Ag1024 caps additionally need SELFTEST_AR_AG_SHARED=<r4d_selftest>:
 # fresh all-four-card ds41_ar_ag_shared_exact pointer/lifetime/mixed replay receipt. It supplements
@@ -471,6 +479,13 @@ lcp_check() {   # name
     log "arm $name: P1, but the card path's line does not state layer passes of ${ARM_QM:-320} to ${ARM_LC} rows ($(grep -m1 'ds41 p1: card experts on' "$OUT/$name.server.log")); not measured"
     return 1
   fi
+  # QdN: rank 0's decode line at startup, in a Qd arm only (qd_gate).
+  local qd_why
+  if declare -F qd_gate >/dev/null && ! qd_why=$(qd_gate "$OUT/$name.server.log" "${ARM_QD:-}" "${ARM_LC:-}" start); then
+    log "arm $name: $qd_why; not measured"
+    return 1
+  fi
+  [[ -n "${ARM_QD:-}" ]] && grep -m1 -E 'ds41 p1: decode passes on the cards' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # QlK: rank 0's "ds41 p1: lent ring: K of the ring's" line at startup, in a Ql arm only.
   local lend_lines
   lend_lines=$(grep -c 'ds41 p1: lent ring: ' "$OUT/$name.server.log")
@@ -769,6 +784,36 @@ lend_exit_gate() {
 }
 
 # Qsp must be active on every rank and reduce actual wave work, rather than only enable a switch.
+# QdN (RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS): at start rank 0's "ds41 p1: decode passes on the cards: every
+# routed expert row of a pure decode pass of N to C rows" line in a Qd arm (none in any other); at exit every
+# rank's stats line with its decode counts, and some rank's armed passes above 0 (the switch acted). Arguments:
+# the log, the arm's N (empty: no Qd part), its chunk, start/exit. 0 when the arm may be measured; else 1, the
+# reason on stdout.
+qd_gate() {   # log, Qd threshold, chunk, start/exit
+  local f=$1 qd=$2 lc=$3 stage=${4:-start} n armed=0 ranks=0 a line
+  n=$(grep -c 'ds41 p1: decode passes on the cards' "$f")
+  if [[ -z "$qd" ]]; then
+    if (( n > 0 )); then echo "no Qd part, but the server arms decode passes for the card path (the knob set for the window?)"; return 1; fi
+    if [[ "$stage" == exit ]] && grep -qE 'ds41 p1 stats, rank [0-9]+: .*decode passes armed [1-9]' "$f"; then
+      echo "no Qd part, but a rank armed decode passes"; return 1
+    fi
+    return 0
+  fi
+  if ! grep -q "ds41 p1: decode passes on the cards: every routed expert row of a pure decode pass of $qd to $lc rows" "$f"; then
+    echo "Qd$qd, but the server log has no 'ds41 p1: decode passes on the cards: ... of $qd to $lc rows' line ($(grep -m1 -E 'ds41 p1: decode passes|P1_DECODE_ROWS' "$f"))"; return 1
+  fi
+  [[ "$stage" == exit ]] || return 0
+  while IFS= read -r line; do
+    ranks=$((ranks + 1))
+    a=$(sed -nE 's/.*; decode passes armed ([0-9]+), rows ([0-9]+) .*/\1/p' <<< "$line")
+    if [[ -z "$a" ]]; then echo "Qd$qd, but a 'ds41 p1 stats, rank' line without its decode counts ($line)"; return 1; fi
+    armed=$((armed + a))
+  done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$f")
+  (( ranks > 0 )) || { echo "Qd$qd, but no 'ds41 p1 stats, rank' line at exit"; return 1; }
+  (( armed > 0 )) || { echo "Qd$qd, but no rank armed a decode pass (every decode step below $qd rows?): the switch never acted"; return 1; }
+  return 0
+}
+
 qsp_gate() {   # log, requested switch, start/exit
   local f=$1 on=$2 stage=${3:-start} rank count line spans rows full fallbacks
   if [[ -z "$on" ]]; then
@@ -1403,6 +1448,12 @@ EOF2
       log "arm $name: P1, but $p1_bad; not measured (results kept as $name.unmeasured.json)"
       [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
     fi
+  fi
+  # QdN at exit: some rank armed a decode pass (qd_gate).
+  local qd_exit_why
+  if declare -F qd_gate >/dev/null && ! qd_exit_why=$(qd_gate "$OUT/$name.server.log" "${ARM_QD:-}" "${ARM_LC:-}" exit); then
+    log "arm $name: $qd_exit_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   # Pmr with a drafting Ds part (DSpark's 2+ row verify passes) at shutdown: the predictor's
   # multi-row line, and some rank's "by pass size" line with a "2 rows:" entry that planned units;
@@ -2972,7 +3023,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   axr=""   # AxrN: the worker's passes up to N rows (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)
@@ -3167,12 +3218,13 @@ for a in $ARMS; do
                else log "arm $a: $p: a chunk is a multiple of 16 in 64..4096; the arm is skipped"; skip=1; fi ;;
       P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
       Qsp)     qsp=1 ;;                                                 # each P1 wave's covering sorted-slot SwiGLU span
-      Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*|Qe[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold / lent arena slots
+      Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*|Qe[0-9]*|Qd[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold / lent arena slots / decode passes
                qn=${p:2}
                case ${p:0:2} in
                  Qw) qk=WAVE qlo=1 qhi=16 ;; Qi) qk=INFLIGHT qlo=1 qhi=64 ;; Qr) qk=READY qlo=1 qhi=32 ;;
                  Qa) qk=AHEAD qlo=0 qhi=64 ;; Qm) qk=MIN_ROWS qlo=17 qhi=4096 ;; Ql) qk=LEND qlo=1 qhi=64 ;;
-                 Qh) qk=GRACE_MS qlo=0 qhi=60000 ;; Qe) qk=LEND_ARENA qlo=1 qhi=64 ;; *) qk=VERIFY qlo=0 qhi=4096 ;;
+                 Qh) qk=GRACE_MS qlo=0 qhi=60000 ;; Qe) qk=LEND_ARENA qlo=1 qhi=64 ;; Qd) qk=DECODE_ROWS qlo=17 qhi=4096 ;;
+                 *) qk=VERIFY qlo=0 qhi=4096 ;;
                esac
                if [[ $qn =~ ^[0-9]+$ ]] && (( 10#$qn >= qlo && 10#$qn <= qhi )); then
                  q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_$qk=$((10#$qn)))
@@ -3180,6 +3232,7 @@ for a in $ARMS; do
                  [[ $qk == LEND ]] && ql=$((10#$qn))
                  [[ $qk == GRACE_MS ]] && qg=$((10#$qn))
                  [[ $qk == LEND_ARENA ]] && qe=$((10#$qn))
+                 [[ $qk == DECODE_ROWS ]] && qd=$((10#$qn))
                else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
       Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
       Lh[0-9]*)                                                        # the lent slots follow live decode routing (..._P1_LEND_HEAT=S; needs Qe)
@@ -3694,14 +3747,20 @@ for a in $ARMS; do
     env+=(RADIANCE_EXPERIMENTAL_DS41_P1=1 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0 "${q1[@]}")
+          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0
+          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0 "${q1[@]}")
     [[ -n "$qg" && -z "$ql$qe" ]] && { log "arm $a: Qh$qg sets the lent slots' grace, which needs a QlK or QeK part; the arm is skipped"; skip=1; }
+    # QdN: decode passes of N rows or more on the cards; a pass is at most the chunk, and a split step (Tb) launches
+    # a layer's expert ops once a micro-batch (the engine refuses both).
+    [[ -n "$qd" && -n "$lc" ]] && (( qd > lc )) && { log "arm $a: Qd$qd is above the chunk Lc$lc (no decode pass could arm); the arm is skipped"; skip=1; }
+    [[ -n "$qd" && -n "$tb" ]] && { log "arm $a: Qd$qd with Tb (a split decode step: the engine refuses it); the arm is skipped"; skip=1; }
   else
     (( ${#q1[@]} )) && { log "arm $a: the Q parts (${q1[*]}) need P1; the arm is skipped"; skip=1; }
     env+=(RADIANCE_EXPERIMENTAL_DS41_P1=0 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0)
+          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0
+          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0)
   fi
   # LhS (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT): the lent slots follow live decode routing, in an arm that lends
   # the arena (QeK, so P1 and Lc too). Every arm states the switch (0 without the part) and its two tunables
@@ -3865,7 +3924,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp ARM_LH=$lh
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QSP=$qsp ARM_LH=$lh
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr
   # Ax / AxN / Axv / AxvN / Ax0 / AxfN (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS, core/place/aux_expert_worker.h): the
   # extra card appended last to the window's mask of the four rank cards (ranks 0-3 stay the XTs), the worker on it

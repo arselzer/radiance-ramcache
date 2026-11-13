@@ -1059,9 +1059,11 @@ sb_check() {
 sb_client() {
   local name=$1 receipt=$2
   local k=${SB_CLIENT_N:-8}
-  log "arm $name: Sb: batch_client.py on the first $k prompts of $receipt, $k at a time"
+  # Arm names run to ~300 characters; the files get a short stable name (sha1 of the arm), logged beside it.
+  local short; short=sb-$(printf %s "$name" | sha1sum | cut -c1-12)
+  log "arm $name: Sb: batch_client.py on the first $k prompts of $receipt, $k at a time (files $short.batch_client*.jsonl)"
   env ${ARM_TIMEOUT:+AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT} python3 -I "$SB_TOOLS/batch_client.py" --receipt --first "$k" \
-    "$receipt" "$OUT/$name.batch_client.jsonl" --prompts-out "$OUT/$name.batch_client.prompts.jsonl" --url "http://127.0.0.1:$PORT" --concurrency "$k" \
+    "$receipt" "$OUT/$short.batch_client.jsonl" --prompts-out "$OUT/$short.batch_client.prompts.jsonl" --url "http://127.0.0.1:$PORT" --concurrency "$k" \
     ${ARM_TIMEOUT:+--timeout $ARM_TIMEOUT} >>"$OUT/window.log" 2>&1
   log "arm $name: Sb: batch_client exit $?"
 }

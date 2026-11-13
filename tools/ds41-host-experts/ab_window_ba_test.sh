@@ -337,5 +337,45 @@ got=$(cat "$d/armx.batch_client.prompts.jsonl" 2>/dev/null)
 [[ $got == *'"--receipt", "--first", "8", "'"$T"'/rec.json", "'"$d"'/armx.batch_client.jsonl"'* && $got == *'"--concurrency", "8"'* &&
    $got == *'"--url", "http://127.0.0.1:18089"'* && $got == *'"--timeout", "1800"'* ]] &&
   ok "sb_client: the first 8 of the receipt, 8 at a time, into <arm>.batch_client.jsonl" || bad "sb_client: $got"
+# ---- 6. leftover servers (window H28): a fabricated /proc (PROC_ROOT) whose pids' executables are the run's binary,
+# another radiance under the build root, a radiance elsewhere and a shell; kill, ss, sleep and curl stubbed.
+P=$T/proc6; R=$T/root6; mkdir -p "$R/run" "$R/other" "$T/elsewhere"
+for f in "$R/run/radiance" "$R/other/radiance" "$T/elsewhere/radiance" "$R/run/bash"; do echo x > "$f"; done
+mkproc() { mkdir -p "$P/$1"; ln -s "$2" "$P/$1/exe"; printf '%s\0--port\0018089\0' "$2" > "$P/$1/cmdline"; }
+mkproc 101 "$R/run/radiance"; mkproc 102 "$R/other/radiance"; mkproc 103 "$T/elsewhere/radiance"; mkproc 104 "$R/run/bash"
+mkdir -p "$P/105"; ln -s "$R/run/radiance (deleted)" "$P/105/exe"
+six() {   # what to run after the functions are loaded; prints the stubs' calls
+  ( set +u
+    PROC_ROOT=$P LEFTOVER_ROOT=$R/ BIN=$R/run/radiance PORT=18089 OUT=$T/out6 REAP_WAIT_S=2 NAME=qfn URL=http://qfn SERVER_PID=
+    mkdir -p "$OUT"
+    log() { echo "LOG: $*"; }
+    kill() { echo "KILL $*"; [[ $1 == -0 ]] && return 1; return 0; }
+    sleep() { :; }; wait() { :; }; power_restore() { :; }; aux_tenant_cleanup() { :; }
+    ss() { [[ -n "${SS_PID:-}" ]] && echo "LISTEN 0 128 127.0.0.1:18089 0.0.0.0:* users:((\"radiance\",pid=$SS_PID,fd=9))"; }
+    eval "$(sed -n '/^bin_pids() {/,/^}/p; /^port_pids() {/,/^}/p; /^reap_pids() {/,/^}/p; /^stop_server() {/,/^}/p; /^restore() {/,/^}/p' "$W")"
+    eval "$1" ) 2>&1
+}
+got=$(six 'bin_pids exact "$BIN"' | sort | tr '\n' ' ')
+[[ $got == "101 105 " ]] && ok "bin_pids exact: the run's binary, a deleted one too" || bad "bin_pids exact: $got"
+got=$(six 'bin_pids under "$LEFTOVER_ROOT"' | sort | tr '\n' ' ')
+[[ $got == "101 102 105 " ]] && ok "bin_pids under the root: every radiance there, not the shell, not one elsewhere" || bad "bin_pids under: $got"
+got=$(SS_PID=777 six 'stop_server')
+[[ $got == *"KILL -INT 101"* && $got == *"KILL -INT 105"* && $got == *"KILL -INT 777"* && $got != *"-INT 102"* &&
+   $got == *"LOG: after the arm's server stopped: leftover process 101"* ]] &&
+  ok "stop_server: the run binary's leftovers and the port's listener signalled and logged, others not" || bad "stop_server: $got"
+got=$(six 'kill() { echo "KILL $*"; return 0; }; reap_pids test 101')
+[[ $got == *"KILL -INT 101"* && $got == *"still up after 2s: 101; SIGKILL"* && $got == *"KILL -KILL 101"* ]] &&
+  ok "reap_pids: SIGKILL after REAP_WAIT_S" || bad "reap_pids: $got"
+got=$(six 'DOCKER=(echo); curl() { return 0; }; restore')
+[[ $got == *"LOG: before qfn restarts: leftover process 102"* && $got == *"KILL -INT 101"* && $got != *"-INT 103"* && $got != *"-INT 104"* ]] &&
+  ok "restore: every radiance under the build root reaped before the container starts" || bad "restore: $got"
+before=${got%%restoring qfn*}
+[[ $before == *"leftover process 102"* ]] && ok "restore: the reaping comes before 'restoring'" || bad "restore order"
+# (4): a port that already answers before the arm's server starts.
+armfn=$(sed -n '/^arm() {   # name/,/^}/p' "$W")
+got=$( ( set +u; OUT=$T/out6; PORT=18089; log() { echo "LOG: $*"; }; curl() { return 0; }; port_pids() { echo 4242; }
+         env() { echo "STARTED"; }; ARMS=x; eval "$armfn"; arm early X=1; echo "rc $?" ) 2>&1)
+[[ $got == *"port 18089 already answers before its server starts (pids: 4242 ); not measured"* && $got == *"rc 1"* && $got != *STARTED* ]] &&
+  ok "arm(): a port already answering refuses the arm before any start" || bad "arm() early port: $got"
 (( fail == 0 )) && echo "PASS ab_window_ba_test" || echo "FAIL ab_window_ba_test (loop output: $T/loop.txt)"
 exit $fail

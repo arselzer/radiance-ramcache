@@ -24,8 +24,8 @@
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
-# --dry-run prints the environment and the command and starts nothing. Otherwise the server runs in the foreground
-# beside a memory guard that stops it (SIGINT) if MemAvailable falls below MEMGUARD_MIB (3072; 0 turns it off), as the
+# --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
+# same pid), beside a memory guard that stops it (SIGINT) if MemAvailable falls below MEMGUARD_MIB (3072; 0 off), as the
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
@@ -233,20 +233,18 @@ if (( DRY )); then
   printf 'cmd'; printf ' %q' "$BIN" "${ARGS[@]}"; echo
   exit 0
 fi
-env "${ENV[@]}" "$BIN" "${ARGS[@]}" &
-PID=$!
-trap 'kill -INT "$PID" 2>/dev/null' INT TERM
+# The memory guard is its own background process watching this pid, which `exec` then hands to the server: the
+# process a caller starts and signals is radiance itself (a SIGINT reaches it, and nothing of it outlives a SIGKILL).
 GUARD=${MEMGUARD_MIB:-3072}
+LPID=$$
 if (( GUARD > 0 )); then
-  ( while kill -0 "$PID" 2>/dev/null; do
+  ( while kill -0 "$LPID" 2>/dev/null; do
       avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
       if (( avail < GUARD )); then
         echo "serve-batch.sh: MemAvailable ${avail} MiB below ${GUARD} MiB; stopping the server" >&2
-        kill -INT "$PID"; break
+        kill -INT "$LPID"; break
       fi
       sleep 1
-    done ) &
+    done ) < /dev/null &
 fi
-wait "$PID"; rc=$?
-if (( rc > 128 )) && kill -0 "$PID" 2>/dev/null; then wait "$PID"; rc=$?; fi   # a signal: wait for its shutdown
-exit $rc
+exec env "${ENV[@]}" "$BIN" "${ARGS[@]}"

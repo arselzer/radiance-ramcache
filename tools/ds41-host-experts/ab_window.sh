@@ -268,14 +268,52 @@ idle_for() {   # seconds of continuous idleness required, give up after $2 secon
 }
 
 SERVER_PID=
+# Leftover servers (window H28, 13 Nov: an Sb arm's radiance outlived the serve-batch.sh shell the harness killed,
+# kept the port, the four cards and 235 GB, answered the next arms, and kept QFN from starting). bin_pids: the pids
+# whose executable (PROC_ROOT, /proc) is the file named (`exact PATH`) or a `radiance` under a directory
+# (`under DIR`); port_pids: the pids listening on a TCP port (ss); reap_pids: SIGINT, up to REAP_WAIT_S (30) s, then
+# SIGKILL, each logged with its executable and command line.
+bin_pids() {   # exact PATH | under DIR
+  local mode=$1 want=$2 d exe
+  [[ $mode == exact ]] && want=$(readlink -f "$want" 2>/dev/null || echo "$want")
+  for d in "${PROC_ROOT:-/proc}"/[0-9]*; do
+    exe=$(readlink "$d/exe" 2>/dev/null) || continue
+    exe=${exe% (deleted)}
+    if [[ $mode == exact && $exe == "$want" ]] || [[ $mode == under && $exe == "${want%/}"/* && ${exe##*/} == radiance ]]; then
+      echo "${d##*/}"
+    fi
+  done
+}
+port_pids() {   # port
+  ss -Hltnp "sport = :$1" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
+}
+reap_pids() {   # why, pid...
+  local why=$1 p t=0 alive; shift
+  (( $# )) || return 0
+  for p in "$@"; do
+    log "$why: leftover process $p ($(readlink "${PROC_ROOT:-/proc}/$p/exe" 2>/dev/null): $(tr '\0' ' ' < "${PROC_ROOT:-/proc}/$p/cmdline" 2>/dev/null | cut -c1-200)); SIGINT"
+    kill -INT "$p" 2>/dev/null
+  done
+  while :; do
+    alive=""; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive+=" $p"; done
+    [[ -z "$alive" ]] && break
+    if (( t >= ${REAP_WAIT_S:-30} )); then log "$why: still up after ${t}s:$alive; SIGKILL"; kill -KILL $alive 2>/dev/null; break; fi
+    sleep 1; t=$((t + 1))
+  done
+}
 stop_server() {
-  [[ -n "$SERVER_PID" ]] || { aux_tenant_cleanup; return 0; }
-  kill -INT "$SERVER_PID" 2>/dev/null
-  local t=0
-  while kill -0 "$SERVER_PID" 2>/dev/null && (( t < 180 )); do sleep 1; t=$((t + 1)); done
-  if kill -0 "$SERVER_PID" 2>/dev/null; then log "server $SERVER_PID still up after ${t}s; SIGKILL"; kill -KILL "$SERVER_PID"; fi
-  wait "$SERVER_PID" 2>/dev/null
-  SERVER_PID=
+  if [[ -n "$SERVER_PID" ]]; then
+    kill -INT "$SERVER_PID" 2>/dev/null
+    local t=0
+    while kill -0 "$SERVER_PID" 2>/dev/null && (( t < 180 )); do sleep 1; t=$((t + 1)); done
+    if kill -0 "$SERVER_PID" 2>/dev/null; then log "server $SERVER_PID still up after ${t}s; SIGKILL"; kill -KILL "$SERVER_PID"; fi
+    wait "$SERVER_PID" 2>/dev/null
+    SERVER_PID=
+  fi
+  # Nothing of this window's binary, and nothing on the arm's port, may outlive the arm.
+  local left; left=$( { bin_pids exact "$BIN"; port_pids "$PORT"; } | sort -u)
+  # shellcheck disable=SC2086
+  [[ -n "$left" ]] && reap_pids "after the arm's server stopped" $left
   aux_tenant_cleanup
 }
 # AxF's simulated tenants (work/aux-dyn/SPEC.md §8.4): this harness's own helper processes only, stopped with the
@@ -351,6 +389,10 @@ restore() {
   RESTORED=1
   stop_server
   power_restore
+  # Whatever radiance of ours is still up (LEFTOVER_ROOT), so QFN can always get the cards.
+  local left; left=$(bin_pids under "${LEFTOVER_ROOT:-/home/as/ds41-claude-build/}")
+  # shellcheck disable=SC2086
+  [[ -n "$left" ]] && reap_pids "before $NAME restarts" $left
   log "restoring $NAME"
   local t=0 state
   while :; do
@@ -1027,6 +1069,12 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   local name=$1; shift
   local n=${ARM_N:-${AB_REQUESTS:-8}}; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
   log "arm $name: $*"
+  # A port that answers before this arm's server starts is another server's (a leftover): "serving" would
+  # measure it, so the arm is not run.
+  if curl -s -m 3 "http://127.0.0.1:$PORT/stats" >/dev/null 2>&1; then
+    log "arm $name: port $PORT already answers before its server starts (pids: $(port_pids "$PORT" | tr '\n' ' ')); not measured"
+    return 1
+  fi
   # AxF (work/aux-dyn/SPEC.md §8.4): the first simulated tenant takes its memory on the extra card before the server
   # starts (the server then starts released), and holds it until 20 s after "serving" (aux_tenant_phases).
   local tenant1="" tenant_helper=""

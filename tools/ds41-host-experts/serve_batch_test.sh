@@ -97,5 +97,33 @@ grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0' <<< "$d0h" && [[ $d0h == *
 "$SB" --model "$T/none.rad" --silu-table S > /dev/null 2>&1 && bad "a missing container accepted" ||
   ok "a missing container refused before any start"
 
+# ---- 4. a real start (a stub server): serve-batch.sh becomes the server (exec, the same pid), so the SIGINT a caller
+# sends the pid it started reaches the server, and nothing is left behind (window H28's orphan).
+cat > "$T/stub-radiance" <<'EOS'
+#!/usr/bin/env python3
+import os, signal, sys, time
+d = os.environ["STUB_DIR"]
+open(os.path.join(d, "pid"), "w").write("%d\n" % os.getpid())
+def stop(sig, frame):
+    open(os.path.join(d, "signal"), "w").write("%d\n" % sig)
+    sys.exit(0)
+signal.signal(signal.SIGINT, stop)
+while True:
+    time.sleep(0.1)
+EOS
+chmod +x "$T/stub-radiance"; echo model > "$T/model.rad"; echo silu > "$T/silu.bin"
+STUB_DIR=$T RADIANCE_BIN=$T/stub-radiance "$SB" --model "$T/model.rad" --silu-table "$T/silu.bin" > "$T/live.log" 2>&1 &
+lp=$!
+for _ in $(seq 100); do [[ -s "$T/pid" ]] && break; sleep 0.1; done
+[[ "$(cat "$T/pid" 2>/dev/null)" == "$lp" ]] && ok "the server runs as the launcher's own pid ($lp)" ||
+  bad "the server's pid $(cat "$T/pid" 2>/dev/null) is not the launcher's $lp"
+kill -INT "$lp"
+for _ in $(seq 50); do kill -0 "$lp" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$lp" 2>/dev/null; then bad "a SIGINT to the launcher's pid did not stop the server"; kill -KILL "$lp"
+else ok "a SIGINT to the launcher's pid stops the server (signal $(cat "$T/signal" 2>/dev/null))"; fi
+wait "$lp" 2>/dev/null
+left=$(pgrep -f "$T/stub-radiance" | tr '\n' ' ')
+[[ -z "$left" ]] && ok "nothing of the server left" || { bad "left behind: $left"; kill -KILL $left 2>/dev/null; }
+
 (( fail == 0 )) && echo "serve_batch_test: all passed"
 exit $fail

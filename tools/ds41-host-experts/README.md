@@ -88,12 +88,19 @@ template). Put the text prompts share in `system`: the prefix cache prefills it 
 tools/ds41-host-experts/batch_client.py questions.jsonl answers.jsonl --concurrency 256 --max-tokens 128
 ```
 
-**Expected throughput** (whole batch, client wall time, four cards, replies byte-identical to the base engine's;
-measured on a private NL-to-SQL set, prompts of about 1K tokens over a few shared schemas, 128-token replies; a run
-on a public BIRD set is pending): 256 questions 911 s -> 294 s with hybrid decode (329 s without), decode about 192
-tok/s (150 without); 128 questions 539 s -> 199 s (without hybrid decode; hybrid at 128 streams is not yet measured).
-Each is against the first configuration measured at its size (table below). Prefill ran at about 380 tok/s of
-computed (not cached) prompt tokens, measured without hybrid decode.
+**Expected throughput** (whole batch, client wall time, four cards, hybrid decode at 60% and `--max-seq-len 4096`,
+replies byte-identical to the base engine's; window ab-20261113T123110Z):
+
+| Job | Plain engine | Preset | Decode, all streams |
+|---|---:|---:|---:|
+| 256 BIRD Mini-Dev questions (public; 11 SQLite databases; replies <= 512 tokens) | 1,025 s | 185 s | 157 tok/s |
+| 256 text-to-SQL questions over shared schemas (private set, ~1K-token prompts, 128-token replies) | 911 s | 284 s | 195 tok/s |
+| 128 of the same at 128 streams | 539 s | 158 s | 131 tok/s |
+| 512 longer questions of the same kind at 512 streams (`--streams 512`) | - | 734 s | 252 tok/s |
+
+The BIRD replies score 59.6% execution accuracy against BIRD's reference results on the real databases, the same
+with and without the optimizations (they are byte-identical). Prefill runs at about 380 tok/s of computed (not
+cached) prompt tokens; with short replies it is about half of a job.
 
 **Host memory must not run out.** An arm that exhausted the box's RAM at 256 streams took the kernel down (an amdgpu
 bug on the out-of-memory path). The RAM budget (`RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1`, on in the preset) sizes
@@ -118,6 +125,7 @@ plus 3.2 KB a token), so the cards hold 256 sequences. Every row below has repli
 | the same with `Ba4096` | 169 s | - |
 | card-path decode `Qd64` and `Bs` with the fifth card | 171 s | 117.8 |
 | four cards only: card-path decode `Qd64`, `Bs`, `--checkpoint-slots 128` (ab-20261112T210213Z) | 199 s | 107.9 |
+| + hybrid decode `Qy60` and `--max-seq-len 4096` (ab-20261113T123110Z) | 158 s | 130.5 |
 | the same with replies up to 512 tokens instead of 128 | 208 s | 98.1 |
 
 | 256 streams, 256 prompts | wall | decode-only tok/s | prefill |

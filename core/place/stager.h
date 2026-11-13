@@ -535,6 +535,8 @@ public:
     int  launched(rad_op h, RadStream s, const RadArgs* a, int (*launch)(const RadArgs*, RadStream)) override;
     int  after_op(rad_op h, RadStream s) override;
     int  end_pass(RadStream s) override;
+    /* An armed card-path pass (p1_armed_: a prefill pass, or a decode pass under ..._P1_DECODE_ROWS). */
+    bool card_pass() const override { return p1_armed_; }
     /* ---- prefill Phase 1 (card_expert_stager.h): RADIANCE_EXPERIMENTAL_DS41_P1=1 beside LCP ----------
      * p1_on: this rank took it (p1_init); p1_stats_line: kLogStats's line for the shutdown. */
     bool p1_on() const { return p1_ && p1_->on(); }

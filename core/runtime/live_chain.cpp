@@ -149,19 +149,25 @@ LiveChain::~LiveChain() {
 void LiveChain::init(int rank, const Program* prog) {
     rank_ = rank;
     prog_ = prog;
-    mode_ = every_ = 0;
+    mode_ = every_ = pf_every_ = 0;
+    pick_ = LiveTracePick();
     if (const char* m = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP"); m && *m)
         mode_ = std::clamp(std::atoi(m), 0, 2);
     if (const char* t = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE"); t && *t)
         every_ = std::max(0, std::atoi(t));
+    if (const char* t = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL"); t && *t)
+        pf_every_ = std::max(0, std::atoi(t));
+    pick_ = LiveTracePick(every_, pf_every_);
     if (!on()) return;
     if (!live_supported() || rad_dev_chain_enabled()) {
         if (rank_ == 0)
-            RAD_WARN("live chain: %s; RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP / _TRACE are off",
+            RAD_WARN("live chain: %s; RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP / _TRACE / "
+                     "_TRACE_PREFILL are off",
                      !live_supported() ? "the device backend has no live issue path"
                                        : "launches chain (rad_dev_chain_enabled), and a chained "
                                          "kernel's wait counts chained blocks only");
-        mode_ = every_ = 0;
+        mode_ = every_ = pf_every_ = 0;
+        pick_ = LiveTracePick();
         return;
     }
     const char* o = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT");
@@ -172,20 +178,41 @@ void LiveChain::init(int rank, const Program* prog) {
     tag_base_ = (contexts.fetch_add(1, std::memory_order_relaxed) + 1) << 40;
     tag_n_ = 0;
     q_.reset();
-    if (every_ > 0 && rank_ == 0) rows_.resize(2048);
+    if (pick_.on() && rank_ == 0) rows_.resize(2048);
     if (rank_ == 0) {
         const char* what = mode_ == 1   ? "independent dispatches overlap in decode passes"
                            : mode_ == 2 ? "independent dispatches overlap in every pass issued live"
                                         : "overlap off, the check only counts";
-        const std::string trace =
-            every_ > 0 ? fmt("; one trunk decode pass in %d on rank 0 traced into %s.ops.csv and "
-                             "%s.stamps.csv", every_, prefix_.c_str(), prefix_.c_str())
-                       : std::string();
+        std::string trace =
+            every_ > 0 ? fmt("; one trunk decode pass in %d on rank 0 traced", every_) : std::string();
+        if (pf_every_ > 0)
+            trace += fmt("; one armed card-path prefill pass in %d on rank 0 traced", pf_every_);
+        if (pick_.on())
+            trace += fmt(" into %s.ops.csv and %s.stamps.csv", prefix_.c_str(), prefix_.c_str());
         RAD_INFO("live chain: %s%s", what, trace.c_str());
     }
 }
 
-void LiveChain::pass_begin(const RadBatch* b) {
+/* ================================================================== which passes are traced */
+
+const char* live_trace_kind_name(int kind) {
+    return kind == kLiveTraceDecode ? "decode" : kind == kLiveTracePrefill ? "prefill" : "none";
+}
+
+int LiveTracePick::candidate(const RadBatch* b, int rank, bool card_pass) {
+    if (!b || rank != 0 || b->draft_pass != 0) return kLiveTraceNone;
+    if (b->phase == RAD_PHASE_DECODE) return kLiveTraceDecode;
+    return card_pass ? kLiveTracePrefill : kLiveTraceNone;
+}
+
+int LiveTracePick::next(const RadBatch* b, int rank, bool card_pass) {
+    const int c = candidate(b, rank, card_pass);
+    if (c == kLiveTraceDecode && every_ > 0 && ++decode_seen_ % (uint64_t)every_ == 0) return c;
+    if (c == kLiveTracePrefill && pf_every_ > 0 && ++pf_seen_ % (uint64_t)pf_every_ == 0) return c;
+    return kLiveTraceNone;
+}
+
+void LiveChain::pass_begin(const RadBatch* b, bool card_pass) {
     /* Chaining is decided before any Ctx exists (engine bring-up); checked again per pass anyway,
      * since a chained kernel's own missing bit would read here as one this path cleared. */
     overlap_pass_ = traced_ = false;
@@ -197,11 +224,13 @@ void LiveChain::pass_begin(const RadBatch* b) {
     overlap_pass_ = mode_ == 2 || (mode_ == 1 && decode);
     if (overlap_pass_) ++st_.overlap_passes;
     traced_ = false;
-    if (every_ > 0 && rank_ == 0 && decode && b->draft_pass == 0 &&
-        ++decode_seen_ % (uint64_t)every_ == 0) {
+    pass_kind_ = pick_.next(b, rank_, card_pass);
+    if (pass_kind_ != kLiveTraceNone) {
         traced_ = true;
+        pass_rows_ = b->n_tok;
         ++trace_id_;
         ++st_.traced;
+        if (pass_kind_ == kLiveTracePrefill) ++st_.traced_prefill;
         n_rows_ = 0;
         pass_tag0_ = tag_base_ | (tag_n_ + 1);
         live_stamp(true, trace_id_, (prefix_ + ".stamps.csv").c_str());
@@ -262,7 +291,7 @@ void LiveChain::write_trace() {
         std::fseek(ops_out_, 0, SEEK_END);
         if (std::ftell(ops_out_) == 0)
             std::fputs("pass,seq,layer,op,label,kernel,lane,queue,idx,packets,unordered,would,why,"
-                       "clash,foreign,deps,reads,writes\n", ops_out_);
+                       "clash,foreign,deps,reads,writes,kind,rows\n", ops_out_);
     }
     const Program& P = *prog_;
     std::string line;
@@ -338,7 +367,7 @@ void LiveChain::write_trace() {
         csv_field(&line, reads);
         line += ',';
         csv_field(&line, writes);
-        line += '\n';
+        line += fmt(",%s,%lld\n", live_trace_kind_name(pass_kind_), (long long)pass_rows_);
         std::fputs(line.c_str(), ops_out_);
     }
     std::fflush(ops_out_);
@@ -368,7 +397,9 @@ std::string LiveChain::report() const {
                  (double)s.decode_launches / (double)s.decode_passes,
                  (double)s.decode_free / (double)s.decode_passes,
                  (double)s.decode_unordered / (double)s.decode_passes);
-    if (s.traced) r += fmt("; %llu passes traced into %s.ops.csv", (unsigned long long)s.traced, prefix_.c_str());
+    if (s.traced)
+        r += fmt("; %llu passes traced (%llu prefill) into %s.ops.csv", (unsigned long long)s.traced,
+                 (unsigned long long)s.traced_prefill, prefix_.c_str());
     return r;
 }
 

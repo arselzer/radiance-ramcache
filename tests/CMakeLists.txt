@@ -529,6 +529,10 @@ set_tests_properties(ab_window_vp_test PROPERTIES LABELS "unit;fast" TIMEOUT ${R
 add_test(NAME ab_window_n128_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_n128_test.sh)
 set_tests_properties(ab_window_n128_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# ab_window.sh's SlN part (--max-seq-len N): the startup-line gate on synthetic logs and the arm loop's parse.
+add_test(NAME ab_window_sl_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_sl_test.sh)
+set_tests_properties(ab_window_sl_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 # ab_window.sh's P1 parts (P1, QmN, QlK, QhMS): the server-log gate on synthetic logs and the arm loop with
 # every action stubbed. No card, no server, no model.
 add_test(NAME ab_window_p1_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_p1_test.sh)

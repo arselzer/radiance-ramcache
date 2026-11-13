@@ -64,6 +64,24 @@ expert cache (184 GiB instead of 205), and the experts that no longer fit are re
 chunk: rank 0 read 447 GB and waited 196 s on the drive. With 128 slots it read 52 GB and waited 1.2 s, and prefill
 fell from 341 to 177 s. At 128 streams the cache was nearly big enough already (171 -> 172 s).
 
+`--max-model-len` sizes these batch jobs' KV pool (the VRAM split keeps one `--max-model-len` sequence's
+cache), so a pool for N sequences sets it to N times a share; it was also each sequence's bound, and the step
+batch's block tables are N rows of it: the startup report's `step staging` grew with N x `--max-model-len`, about
+16 B a row-token (288 MiB at N128 L147456, 1.13 GiB at N256 L294912, 1.50 GiB at N256 L393216, 5.50 GiB at N512
+L720896, which left the experts nothing: "startup stopped: out of memory", ab-20261112T215554Z). `--max-seq-len N`
+(arm part `SlN`) separates the two: a request whose prompt plus output passes N is refused as one past
+`--max-model-len` is without it, and what is sized for one sequence's worst case takes N padded to cover the step's
+host bounds (`seq_len_bound`: N on the 1024-token grid plus `--max-num-batched-tokens`, two speculative windows and
+4096): the block tables and step staging, the KV tiers' restore chain, the rotary tables and the plugins'
+per-sequence widths (`RadBuildCtx::max_ctx`), the server's context and the snapshot store's session. The KV pool's
+floor and ceiling, the prefix cache, KV streaming and the RAM budget's per-sequence share keep `--max-model-len`. It
+is capacity only: every host bound a step derives (the context bound, the block-table pitch, the plugins' live
+widths) is what it is at `--max-model-len` for a sequence of at most N tokens, so replies do not change. Startup
+says `max seq len: N tokens a sequence (--max-seq-len N); ... sized for B tokens ...` and the step batch's line
+`... rows of B tokens`; without the flag nothing changes. It does not combine with `--kv-resident`. Predicted at
+N512 L720896 Lc2048 with `Sl4096`: rows of 10,370 tokens, step staging about 81 MiB instead of 5.50 GiB (not yet
+measured on the cards).
+
 ## What runs where
 
 - `core/place/host_expert_pool.*`: one process-wide pool of CPU workers, shared by the four rank

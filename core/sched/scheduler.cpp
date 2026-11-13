@@ -1167,8 +1167,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      "they stay on the %lld-token resume grid", rg, why.c_str(), (long long)G);
         }
     }
-    /* The builder's bound, not a second derivation: the block tables were sized for it. */
-    ctx_limit_ = builder_.max_ctx();
+    /* The builder's bound, not a second derivation: the block tables were sized for it (for at
+     * least it, under --max-seq-len, whose limit this is). */
+    ctx_limit_ = builder_.seq_limit();
     /* The pool's own bound on one sequence, searched once (can_ever_fit is monotonic in the
      * length): add_locked refuses a prompt past it. */
     pool_tokens_ = -1;

@@ -232,12 +232,15 @@ struct CheckpointSlots {
  * shared head's (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD under RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET). */
 /* RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET: the session length the auto snapshot store is sized for. `session`
  * (..._RAM_BUDGET_SESSION_TOKENS) when given; else each sequence's share of --max-model-len, at least 4096
- * tokens; never more than --max-model-len. A lone agent session keeps its whole context's snapshots; a
- * batch of short prompts in a pool sized for all of them gets few. */
-inline int64_t ram_budget_session_ctx(int64_t model_len, int64_t max_seqs, int64_t session) {
+ * tokens; never more than one sequence, `seq_len` (--max-seq-len) when given, else --max-model-len. A
+ * lone agent session keeps its whole context's snapshots; a batch of short prompts in a pool sized for
+ * all of them gets few. The share is the pool's (--max-model-len); only the cap is per sequence. */
+inline int64_t ram_budget_session_ctx(int64_t model_len, int64_t max_seqs, int64_t session,
+                                      int64_t seq_len = 0) {
     const int64_t share = model_len / (max_seqs > 0 ? max_seqs : 1);
     const int64_t want = session > 0 ? session : (share > 4096 ? share : 4096);
-    return want < model_len ? want : model_len;
+    const int64_t cap = seq_len > 0 && seq_len < model_len ? seq_len : model_len;
+    return want < cap ? want : cap;
 }
 int64_t checkpoint_slots_want(const CheckpointPolicy& policy, int64_t max_seqs, int64_t ctx,
                               int64_t interval, int64_t extra_per_seq = 0);

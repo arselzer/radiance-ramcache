@@ -3686,6 +3686,13 @@ TEST(the_ram_budget_session_follows_each_sequences_share) {
     CHECK_EQ(ram_budget_session_ctx(147456, 128, 1200), 1200ll);
     CHECK_EQ(ram_budget_session_ctx(32768, 1, 100000), 32768ll);
     CHECK_EQ(ram_budget_session_ctx(32768, 0, 0), 32768ll);
+    /* --max-seq-len caps a session (one sequence); the share stays the pool's. */
+    CHECK_EQ(ram_budget_session_ctx(32768, 1, 0, 8192), 8192ll);
+    CHECK_EQ(ram_budget_session_ctx(720896, 512, 0, 4096), 4096ll);
+    CHECK_EQ(ram_budget_session_ctx(720896, 512, 0, 2048), 2048ll);
+    CHECK_EQ(ram_budget_session_ctx(147456, 128, 1200, 4096), 1200ll);
+    CHECK_EQ(ram_budget_session_ctx(32768, 1, 0, 0), 32768ll);        /* no flag: as before */
+    CHECK_EQ(ram_budget_session_ctx(32768, 1, 0, 65536), 32768ll);    /* never past the pool's */
 }
 
 /* --checkpoint-slots auto: the policy's share plus one for each sequence, held to the share of

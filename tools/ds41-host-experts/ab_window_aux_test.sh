@@ -695,9 +695,12 @@ done
 # ---- 8. a Kld arm's aux gates (kld_finish -> aux_kld_check), every action stubbed: the records are compared only
 # when the worker demonstrably ran (its "on:" values, every rank's jobs, no launch failure, the clients unchanged)
 KF=$(sed -n '/^kld_finish() {/,/^}/p' "$W")
+# seqlen_server_gate (SlN), the real one: none of these arms has an Sl part or a "max seq len:" line.
+SLG=$(sed -n '/^seqlen_server_gate() {/,/^}/p' "$W")
+[[ -n "$SLG" ]] || bad "no seqlen_server_gate in $W"
 [[ -n "$KF" ]] || bad "no kld_finish in $W"
 kld() {   # name, ARM_AX, ARM_AXV, ARM_AXF, server log, KLD_REF ("" none), a command during the run ("" none)
-  ( set +u; log() { echo "LOG: $*"; }; eval "$FUNCS"; eval "$KF"
+  ( set +u; log() { echo "LOG: $*"; }; eval "$FUNCS"; eval "$KF"; eval "$SLG"; ARM_SL= ARM_CTX=
     kill() { return 1; }; wait() { return 0; }; python3() { echo "COMPARED $*"; return 0; }
     n128_server_gate() { return 0; }; xt_check() { return 0; }; lcp_check() { return 0; }
     vp_server_gate() { return 0; }; qsp_gate() { return 0; }

@@ -8,7 +8,7 @@ trap 'rm -rf "$T"' EXIT
 fail=0
 ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
-for fn in serving_cards serving_cards_ok ar_rows_parse ar_rows_server_gate ar_rows_server_check ar_rows_receipt_ok ar_rows_check ar_rows_gate xt_check kld_finish; do
+for fn in serving_cards serving_cards_ok ar_rows_parse ar_rows_server_gate ar_rows_server_check ar_rows_receipt_ok ar_rows_check ar_rows_gate xt_check seqlen_server_gate kld_finish; do
   eval "$(sed -n "/^$fn() {/,/^}/p" "$W")"
   declare -F "$fn" >/dev/null || { bad "missing $fn"; exit 1; }
 done
@@ -61,6 +61,12 @@ kld_finish on >/dev/null && ok 'KLD accepts actual cap before comparison' || bad
 [[ -s $T/compares ]] || bad 'KLD did not reach comparison'
 SERVER_PID=999999 KLD_REF=
 kld_finish on >/dev/null && bad 'Ar became KLD reference' || ok 'Ar cannot become KLD reference'
+# kld_finish's SlN gate (seqlen_server_gate, the real one): a server that capped its sequences without an Sl part.
+cp "$OUT/on.server.log" "$T/on.keep"
+echo 'I max seq len: 4096 tokens a sequence (--max-seq-len 4096); block tables, step staging and rotary tables are sized for 4096 tokens a sequence; the KV pool stays --max-model-len 512' >>"$OUT/on.server.log"
+SERVER_PID=999999 KLD_REF=$T/reference ARM_SL=
+kld_finish on >/dev/null && bad 'KLD accepted a sequence cap without Sl' || ok 'KLD rejects a sequence cap without Sl'
+cp "$T/on.keep" "$OUT/on.server.log"
 
 H=$T/home
 mkdir -p "$H/kernels"

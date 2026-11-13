@@ -3376,7 +3376,8 @@ int Engine::run_server() {
     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
     if (cfg_.max_n <= 0)
         decide("--max-n", std::to_string(o.max_n), "the larger of 8 and --max-num-seqs");
-    o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
+    /* What a request may reach: --max-seq-len under it, which the scheduler refuses past. */
+    o.max_ctx  = seq_len_limit(cfg_, cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train);
     o.model_path = cfg_.model;
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.reasoning_effort_map = cfg_.reasoning_effort_map;

@@ -893,6 +893,12 @@ struct Config {
     int64_t preempt_wait_ms = 5000;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
+    /* --max-seq-len N: the longest sequence (prompt plus output) one request may reach, when that
+     * is less than --max-model-len. 0 (the default) is --max-model-len. --max-model-len stays the
+     * pool's bound (the KV floor and ceiling, the prefix cache, the RAM budget's share); only what
+     * is sized for one sequence's worst case takes this: admission, the step batch's block tables,
+     * the rotary tables and the plugins' per-sequence widths (seq_len_limit, seq_len_bound). */
+    int64_t max_seq_len = 0;
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the
      * model card's extension past its trained context, no reconvert); "none" takes a checkpoint's
      * YaRN off; empty serves what the checkpoint says. Engine::apply_rope_scaling. */
@@ -1299,6 +1305,37 @@ inline bool draft_placement_modes_conflict(const Config& cfg) {
     const bool standard_manual = cfg.draft_expert_placement == "host" ||
                                  cfg.draft_expert_placement_given;
     return bank_manual && standard_manual;
+}
+
+/* --max-seq-len against the pool's bound `model_len` (--max-model-len, or the trained context):
+ * the longest sequence a request may reach. Without the flag, or with one at or past the pool's
+ * bound, it is `model_len`, as before the flag. */
+inline int64_t seq_len_limit(const Config& c, int64_t model_len) {
+    return c.max_seq_len > 0 && (model_len <= 0 || c.max_seq_len < model_len) ? c.max_seq_len
+                                                                               : model_len;
+}
+
+/* The bound the per-sequence worst cases are sized for under --max-seq-len: the step batch's
+ * block-table rows (BatchBuilder::max_ctx), the rotary tables and the plugins' widths
+ * (RadBuildCtx::max_ctx) and the KV tiers' restore chain. It is the limit with room for every
+ * host bound a step derives from it, so each is what it is at --max-model-len: the context bound
+ * rounded to its 1024-token grid (BatchBuilder's bound_bucket, whose bucket of any length up to
+ * the limit is at most the limit's), plus a step's tokens and two speculative windows (the
+ * block-table pitch's and the plugins' live widths' reach), plus 4096 tokens for the pitch's grid
+ * and a block of the widest group. Capacity only: no admitted sequence reaches it. Without the
+ * flag it is `model_len`. */
+inline int64_t seq_len_bound(const Config& c, int64_t model_len) {
+    const int64_t lim = seq_len_limit(c, model_len);
+    if (lim == model_len) return model_len;
+    int64_t q = 1024;
+    if (lim > 64) {
+        const int lg = 63 - __builtin_clzll((unsigned long long)lim);
+        if (((int64_t)1 << (lg - 5)) > q) q = (int64_t)1 << (lg - 5);
+    }
+    const int64_t bucket = (lim + q - 1) / q * q;
+    const int64_t spec = 2 * (64 + 1);   /* two windows of RAD_SCHED_MAX_SPEC (sched/draft.h) */
+    const int64_t want = bucket + (c.max_tok > 0 ? c.max_tok : 0) + spec + 4096;
+    return model_len > 0 && want > model_len ? model_len : want;
 }
 
 }  /* namespace rad */

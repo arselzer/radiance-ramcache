@@ -355,6 +355,41 @@ TEST(the_sizes_and_counts_reach_the_fields_they_name) {
     CHECK_EQ(big.max_ctx, 4294967296ll);
 }
 
+/* --max-seq-len: one sequence's bound below the pool's --max-model-len; 0, the default, is
+ * --max-model-len, so a launch line without it sizes and admits exactly as before. */
+TEST(max_seq_len_caps_a_sequence_and_defaults_to_the_pool) {
+    Config d;
+    CHECK_EQ(parse({ "--max-model-len", "720896" }, &d), RAD_OK);
+    CHECK_EQ(d.max_seq_len, 0ll);
+    CHECK_EQ(seq_len_limit(d, d.max_ctx), 720896ll);
+    CHECK_EQ(seq_len_bound(d, d.max_ctx), 720896ll);
+
+    Config c;
+    CHECK_EQ(parse({ "--max-model-len", "720896", "--max-seq-len", "4096",
+                     "--max-num-batched-tokens", "2048" }, &c), RAD_OK);
+    CHECK_EQ(c.max_seq_len, 4096ll);
+    CHECK_EQ(seq_len_limit(c, c.max_ctx), 4096ll);
+    /* The limit on its 1024-token grid, a step's tokens, two speculative windows, 4096. */
+    CHECK_EQ(seq_len_bound(c, c.max_ctx), 4096ll + 2048 + 130 + 4096);
+    /* Never past the pool's bound, and at or past it the flag is no cap. */
+    CHECK_EQ(seq_len_bound(c, 8192), 8192ll);
+    CHECK_EQ(seq_len_limit(c, 4096), 4096ll);
+    CHECK_EQ(seq_len_bound(c, 4096), 4096ll);
+    CHECK_EQ(seq_len_limit(c, 2048), 2048ll);
+    /* Above 32K the grid widens with the length (BatchBuilder's bound_bucket). */
+    Config w = c;
+    w.max_seq_len = 40000;   /* grid 1024 below 65536 */
+    CHECK_EQ(seq_len_bound(w, w.max_ctx), 40960ll + 2048 + 130 + 4096);
+    w.max_seq_len = 70000;   /* grid 2048 */
+    CHECK_EQ(seq_len_bound(w, w.max_ctx), 71680ll + 2048 + 130 + 4096);
+
+    Config n;
+    CHECK_EQ(parse({ "--max-seq-len", "-1" }, &n), RAD_E_INVAL);
+    Config z;
+    CHECK_EQ(parse({ "--max-seq-len", "0" }, &z), RAD_OK);
+    CHECK_EQ(z.max_seq_len, 0ll);
+}
+
 TEST(the_paths_and_names_reach_their_fields) {
     Config c;
     CHECK_EQ(parse({ "--radiance-home", "/rh",
@@ -567,7 +602,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
-        { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
+        { "--max-model-len", { "4096" } }, { "--max-seq-len", { "2048" } },
+        { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
         { "--kv-resident", { "65536" } },

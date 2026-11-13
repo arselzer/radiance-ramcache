@@ -84,6 +84,10 @@ static const Flag g_flags[] = {
                                         "(default 5000) falls back on the next step" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
+    { "--max-seq-len",        "N",      "the longest sequence (prompt plus output) a request may\n"
+                                        "reach, below --max-model-len, which still sizes the KV\n"
+                                        "pool; block tables and step staging are sized for N.\n"
+                                        "0 (default) is --max-model-len" },
     { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"
                                         "keys, no reconvert (docs/YARN.md); none: off" },
 
@@ -607,6 +611,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
+        else if (S("--max-seq-len"))           { if (!num(0, INT32_MAX, &c->max_seq_len)) return RAD_E_INVAL; }
         else if (S("--rope-scaling")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             /* Checked here so a typo is refused rather than served with the trained rotary. */
@@ -1438,6 +1443,8 @@ const ShowRow kShow[] = {
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
           return c.max_ctx ? num(c.max_ctx) : std::string("0 (the model's training context)"); } },
+    { "--max-seq-len",        [](const Config& c) {
+          return c.max_seq_len ? num(c.max_seq_len) : std::string("0 (--max-model-len)"); } },
     { "--rope-scaling",       [](const Config& c) { return or_none(c.rope_scaling, "the checkpoint's own"); } },
     { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },

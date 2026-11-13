@@ -6144,6 +6144,77 @@ TEST(a_sequence_stops_at_the_context_whatever_max_tokens_says) {
     CHECK(f.sch.find(big)->output.capacity() <= (size_t)(170 + RAD_SCHED_MAX_SPEC));
 }
 
+/* --max-seq-len bounds a sequence as --max-model-len does without it: the same stop, the same
+ * refusals, with the pool's bound left far above. */
+TEST(max_seq_len_stops_and_refuses_a_sequence_as_the_context_does) {
+    Fixture f;
+    f.build();
+    f.cfg.max_ctx = 8192;            /* the pool's bound */
+    f.cfg.max_seq_len = 170;         /* one sequence's */
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(160, /*max_tokens=*/0);        /* unlimited */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    for (int guard = 0; guard < 32 && f.sch.find(a)->state == ReqState::Running; ++guard) {
+        CHECK_OK(f.sch.set_draft(a, draft, 4));
+        REQUIRE(f.sch.step() != nullptr);
+        const StepEntry& e = f.sch.plan().e[0];
+        CHECK(e.ctx_len + e.n_tokens <= 170);
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& x) { return x.n_spec; }));
+    }
+    const Request* ra = f.sch.find(a);
+    CHECK_EQ((int)ra->state, (int)ReqState::Finished);
+    CHECK_EQ(ra->finish_reason, std::string("length"));
+    CHECK_EQ((int)(ra->prompt.size() + ra->output.size()), 170);
+
+    uint64_t full = f.submit(170, 8);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(full)->state, (int)ReqState::Failed);
+    uint64_t big = f.submit(8, 2147483647);
+    CHECK(f.sch.find(big)->output.capacity() <= (size_t)(170 + RAD_SCHED_MAX_SPEC));
+}
+
+/* The step staging (block tables for max_seqs rows) scales with --max-seq-len, not with the pool's
+ * --max-model-len: a batch job's pool of 512 x 1408 tokens no longer sizes every row for all of it. */
+TEST(max_seq_len_sizes_the_step_staging_not_the_pool) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096, /*windowed=*/false,
+            /*linear=*/false);
+    Config c = f.cfg;
+    c.n_spec = 0;
+    const auto bytes = [&](int64_t pool, int64_t seq) {
+        Config x = c;
+        x.max_ctx = pool;
+        x.max_seq_len = seq;
+        return BatchBuilder::device_bytes(f.prog, x, f.kv.geom);
+    };
+    const int64_t pool_a = 1 << 20, pool_b = 1 << 21;
+    /* Without the flag, or with one at or past the pool's bound, nothing changes. */
+    CHECK_EQ(bytes(pool_a, 0), bytes(pool_a, pool_a));
+    CHECK_EQ(bytes(pool_a, 0), bytes(pool_a, pool_b));
+    /* With it, the pool's bound does not size the staging at all ... */
+    CHECK_EQ(bytes(pool_a, 4096), bytes(pool_b, 4096));
+    /* ... and N does: 32 rows of 16-token blocks, 4 bytes an entry, at seq_len_bound. */
+    const int64_t full = bytes(pool_a, 0), at4k = bytes(pool_a, 4096), at8k = bytes(pool_a, 8192);
+    CHECK(at4k < at8k);
+    CHECK(at8k < full);
+    const int64_t per_token_row = 32 * 4 / 16;          /* rows x bytes / block_size */
+    const int64_t d = at8k - at4k;                      /* 4096 more tokens a row */
+    CHECK(d >= 4096 * per_token_row - 512 && d <= 4096 * per_token_row + 512);
+    /* The pool's bound against N's: the table term is (pool - bound(N)) x rows x 4 / 16 smaller. */
+    const int64_t saved = full - at4k;
+    Config c4 = c;
+    c4.max_seq_len = 4096;
+    CHECK_EQ(seq_len_bound(c4, pool_a), 4096ll + 512 + 130 + 4096);
+    const int64_t want = (pool_a - seq_len_bound(c4, pool_a)) * per_token_row;
+    CHECK(saved >= want - 512 && saved <= want + 512);
+    printf("    staging: pool %lld tokens %lld B; --max-seq-len 4096 %lld B; 8192 %lld B\n",
+           (long long)pool_a, (long long)full, (long long)at4k, (long long)at8k);
+}
+
 /* The cache's reserve is measured against what is held, not what is backed. An elastic pool that
  * has handed its unused top back to the card reads almost no free blocks however little is held,
  * and trimming against that would drain the whole cache after every request. */

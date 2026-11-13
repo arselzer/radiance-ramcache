@@ -619,6 +619,24 @@ n128_server_gate() {   # server log, Fn128 flag, active ranks (4 here); explanat
   return 0
 }
 
+# SlN (--max-seq-len N): the server's startup line "max seq len: N tokens a sequence (--max-seq-len N);"
+# in an Sl arm whose N is below its --max-model-len; an Sl arm at or past it, and every arm without
+# the part, must have no such line (a radiance without the flag refuses the arm at startup).
+seqlen_server_gate() {   # server log, Sl's N (empty without the part), the arm's --max-model-len
+  local f=$1 want=$2 ctx=$3
+  if [[ -n "$want" ]] && (( 10#$want < 10#$ctx )); then
+    if ! grep -qE "max seq len: $want tokens a sequence \(--max-seq-len $want\); block tables, step staging and rotary tables are sized for [0-9]+ tokens a sequence; the KV pool stays --max-model-len $ctx\b" "$f"; then
+      echo "Sl$want, but the server log has no 'max seq len: $want tokens a sequence (--max-seq-len $want); ... --max-model-len $ctx' line ($(grep -m1 -E 'max seq len|max-seq-len' "$f"))"
+      return 1
+    fi
+  elif grep -qF 'max seq len: ' "$f"; then
+    if [[ -n "$want" ]]; then echo "Sl$want is at or past --max-model-len $ctx, but the server caps its sequences"
+    else echo "no Sl part, but the server caps its sequences"; fi
+    return 1
+  fi
+  return 0
+}
+
 n128_arm_gate() {   # library, conservative work-row bound; receipt is set by the device oracle
   local lib=$1 rows=$2
   if [[ "${N128_OK:-}" != 1 ]]; then
@@ -679,6 +697,11 @@ kld_finish() {   # name; the run is SERVER_PID
     return 1
   fi
   [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  local sl_why
+  if ! sl_why=$(seqlen_server_gate "$OUT/$name.server.log" "${ARM_SL:-}" "${ARM_CTX:-512}"); then
+    log "arm $name: $sl_why; not measured"
+    return 1
+  fi
   xt_check "$name" || return 1
   lcp_check "$name" || return 1
   # The aux expert worker: an arm with an Ax part is gated as arm() and aux_arm_exit gate a serving one
@@ -1433,6 +1456,13 @@ EOF2
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
     return 1
   fi
+  local sl_why
+  if ! sl_why=$(seqlen_server_gate "$OUT/$name.server.log" "${ARM_SL:-}" "${ARM_CTX:-512}"); then
+    log "arm $name: $sl_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
+  [[ -n "${ARM_SL:-}" ]] && grep -m2 -E 'max seq len: |step batch: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   if [[ -n "${ARM_DME:-}" ]] && {
        ! grep -qE "DSpark matched early costs: k=${ARM_DME} n=[1-9][0-9]* " "$OUT/$name.server.log" ||
@@ -2926,7 +2956,11 @@ for a in $ARMS; do
 # knob off; Pf a prefill chunk runs in a step of its own and the decode rows of concurrent requests
 # run together (RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE); NK --max-num-seqs K, CK the arm's requests
 # sent K at a time (AB_CONCURRENCY), LK --max-model-len K (the KV pool backs about one sequence of K
-# tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); Tb a decode step of two or
+# tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); SlN --max-seq-len N (one
+# request's prompt plus output at most N tokens, refused past it as past LK; the block tables, step staging
+# and rotary tables sized for N rather than for LK, which still sizes the KV pool: the VRAM they took goes
+# to resident experts; exact, capacity only; 64 or more and at most LK; measured only with the server's
+# "max seq len: N tokens a sequence" line below LK and none without the part); Tb a decode step of two or
 # more sequences issued as two micro-batches, each layer's MoE gather of one behind the other's card
 # work (RADIANCE_EXPERIMENTAL_SCHED_TBO; a radiance and deepseek41 from claude/ds41-tbo); Ba / BaN whole
 # prompts waiting together admitted into one prefill-only step of at most 256 / N (32-256, or up to the
@@ -3081,7 +3115,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   axr=""   # AxrN: the worker's passes up to N rows (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)
@@ -3251,6 +3285,11 @@ for a in $ARMS; do
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
       L[0-9]*) ARGS+=(--max-model-len "${p#L}"); arm_ctx=${p#L} ;;    # this arm's --max-model-len (KV for N sequences)
+      Sl[0-9]*)                                                        # one sequence's bound below L (--max-seq-len N)
+               if [[ -n "$sl" ]]; then log "arm $a: duplicate Sl part; the arm is skipped"; skip=1; fi
+               sl=${p#Sl}
+               if [[ $sl =~ ^[0-9]{1,9}$ ]] && (( 10#$sl >= 64 )); then sl=$((10#$sl)); ARGS+=(--max-seq-len "$sl")
+               else log "arm $a: $p: a sequence bound is a whole number of tokens, at least 64; the arm is skipped"; skip=1; fi ;;
       Ov)      env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1) ;;    # independent dispatches overlap, decode passes
       Ov2)     env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=2) ;;    # ... in every pass issued live
       Xwp)     ARGS+=(--weight-prefetch off) ;;                        # no weight reads beside the collectives (core/config.cpp; exact)
@@ -4001,6 +4040,8 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
         log "arm $a: U$upart needs a whole --max-model-len, not '$arm_ctx'; the arm is skipped"; skip=1
       elif (( 10#$arm_ctx < umct )); then
         log "arm $a: U$upart's longest request needs $umct tokens of context (its receipt's max_context_tokens), more than the arm's --max-model-len $((10#$arm_ctx)); the arm is skipped"; skip=1
+      elif [[ -n "$sl" ]] && (( sl < umct )); then
+        log "arm $a: U$upart's longest request needs $umct tokens of context (its receipt's max_context_tokens), more than the arm's Sl$sl (--max-seq-len); the arm is skipped"; skip=1
       fi
       if [[ -z "${AB_REQUEST_TIMEOUT_S:-}" ]]; then
         urate=25; [[ -n "$lc" ]] && urate=100
@@ -4014,7 +4055,10 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
   ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QSP=$qsp ARM_LH=$lh
-  ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr
+  ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx
+  if [[ -n "$sl" && $arm_ctx =~ ^[0-9]{1,9}$ ]] && (( sl > 10#$arm_ctx )); then
+    log "arm $a: Sl$sl is past the arm's --max-model-len $((10#$arm_ctx)) (the server refuses it); the arm is skipped"; skip=1
+  fi
   # Ax / AxN / Axv / AxvN / Ax0 / AxfN (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS, core/place/aux_expert_worker.h): the
   # extra card appended last to the window's mask of the four rank cards (ranks 0-3 stay the XTs), the worker on it
   # with the arm's cap (Ax0: the card visible, the worker off). Every arm states the six switches (the worker off

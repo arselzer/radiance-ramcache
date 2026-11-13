@@ -6,7 +6,8 @@ serve_batch_test.sh).
       WORDS: an arm's launch, one word a line (ab_window.sh launch_words: the environment assignments, the binary,
       its flags). Prints the serve-batch.sh arguments for it, one a line: --model, --silu-table, --streams,
       --ctx-per-stream (--max-model-len / --max-num-seqs, which must divide), --port, --served-name,
-      --radiance-home, --shared-head, and --profile, --mirror, --reserve-mib where the launch has them. Exit 1
+      --radiance-home, --shared-head, --hybrid (..._P1_HYBRID: QyP's P, 0 or unset off; a held share, Qyf, is
+      refused), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
       with the reason when a value is missing or does not fit.
   serve_batch_match.py compare WORDS DRYRUN [FLAG ...]
       DRYRUN: serve-batch.sh --dry-run's output. Each side resolved as the server sees it (every variable at its
@@ -20,6 +21,8 @@ NOVAL = {"--weights-disk-tier", "--deterministic", "--no-prefix-cache"}
 SILU = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU"
 SHEAD = "RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD"
 RESERVE = "RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB"
+HYBRID = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID"
+ADAPT = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT"
 
 
 def resolve(words):
@@ -86,6 +89,11 @@ def params(words):
         out += ["--mirror", flags["--expert-plane-mirror"]]
     if env.get(RESERVE):
         out += ["--reserve-mib", env[RESERVE]]
+    if env.get(ADAPT):
+        raise ValueError("%s=%s (Qyf: a held hybrid share), which serve-batch.sh does not set" % (ADAPT, env[ADAPT]))
+    out += ["--hybrid", env.get(HYBRID) or "0"]
+    if flags.get("--max-seq-len"):
+        out += ["--max-seq-len", flags["--max-seq-len"]]
     return out
 
 

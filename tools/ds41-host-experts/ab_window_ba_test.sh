@@ -262,10 +262,11 @@ fi
 # ---- 5. Sb (the server through serve-batch.sh) and Xnp (no --expert-profile): the arm loop, every action stubbed
 # but sb_check, which runs serve-batch.sh --dry-run against the arm's launch (launch_words); arm()'s Sb launch
 # and batch_client.py run with a stub binary and a stub client.
-B256=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs
+B256=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60
 SB=$B256-Sb SBNP=$B256-Sb-Xnp SBXQ=$B256-Sb-Xqprof SBRES=${B256/-mA-/-mA20480-}-Sb SB64=${B256/Pch32/Pch64}-Sb
 SBRD=${B256/Rd13/Rd12}-Sb SBNOMA=${B256/-mA-/-}-Sb SBL=${B256/L294912/L294913}-Sb SBPCS=${B256/Pcs128/Pcs64}-Sb
-SBBOTH=$B256-Sb-Xnp-Xqprof SBQD=${B256/-Qd64/}-Sb
+SBBOTH=$B256-Sb-Xnp-Xqprof SBQD=${B256%-Qy60}; SBQD=${SBQD/-Qd64/}-Sb SBOFF=${B256%-Qy60}-Sb SBQYF=${B256/Qy60/Qyf60}-Sb
+SBSL=${B256/L294912/L294912-Sl4096}-Sb
 mkdir -p "$T/profiles"; echo '{}' > "$T/profiles/prof.json"
 (
   set +u
@@ -288,12 +289,12 @@ mkdir -p "$T/profiles"; echo '{}' > "$T/profiles/prof.json"
   eval "$(sed -n '/^launch_words() {/,/^}/p' "$W")"
   eval "$(sed -n '/^sb_check() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
-  ARMS="$SB $SBNP $SBXQ $SBRES $SB64 $SBRD $SBNOMA $SBL $SBPCS $SBBOTH $SBQD"
+  ARMS="$SB $SBNP $SBXQ $SBRES $SB64 $SBRD $SBNOMA $SBL $SBPCS $SBBOTH $SBQD $SBOFF $SBQYF $SBSL"
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"
 ) > "$T/sbloop.txt" 2>&1
-for a in "$SB" "$SBNP" "$SBXQ" "$SBRES" "$SB64"; do
+for a in "$SB" "$SBNP" "$SBXQ" "$SBRES" "$SB64" "$SBOFF" "$SBSL"; do
   if grep -qx "ARM $a" "$T/sbloop.txt"; then ok "Sb: launched: ...${a#$B256}"
   else bad "Sb: ...${a#$B256} not launched: $(grep -m2 -F "arm $a:" "$T/sbloop.txt")"; fi
 done
@@ -307,6 +308,7 @@ sbskip "$SBL" "is not a whole number of tokens" "L294913 over N256"
 sbskip "$SBPCS" "flag --checkpoint-slots" "Pcs64"
 sbskip "$SBBOTH" "Xnp and an Xq profile together" "Xnp with Xq"
 sbskip "$SBQD" "env RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS" "no Qd64"
+sbskip "$SBQYF" "Qyf: a held hybrid share" "Qyf60 (a held share)"
 args=$(cat "$T/sbout/$SB.sb.args" 2>/dev/null | tr '\n' ' ')
 [[ $args == *"--streams 256 --ctx-per-stream 1152 "* && $args == *"--served-name ds41-native-smoke"* && $args == *"--profile /stub/sealed.json"* &&
    $args == *"--mirror $T"* && $args == *"--radiance-home $H"* && $args == *"--shared-head 32"* && $args != *--reserve-mib* ]] &&
@@ -315,6 +317,9 @@ args=$(tr '\n' ' ' < "$T/sbout/$SBNP.sb.args" 2>/dev/null)
 [[ -n $args && $args != *--profile* ]] && ok "Sb Xnp: no --profile" || bad "Sb Xnp: $args"
 tr '\n' ' ' < "$T/sbout/$SBRES.sb.args" 2>/dev/null | grep -q -- '--reserve-mib 20480'  && ok "Sb mA20480: --reserve-mib 20480" || bad "Sb mA20480"
 tr '\n' ' ' < "$T/sbout/$SB64.sb.args" 2>/dev/null | grep -q -- '--shared-head 64'  && ok "Sb Pch64: --shared-head 64" || bad "Sb Pch64"
+tr '\n' ' ' < "$T/sbout/$SB.sb.args" 2>/dev/null | grep -q -- '--hybrid 60 ' && ok "Sb Qy60: --hybrid 60" || bad "Sb Qy60"
+tr '\n' ' ' < "$T/sbout/$SBOFF.sb.args" 2>/dev/null | grep -q -- '--hybrid 0 ' && ok "Sb without Qy: --hybrid 0" || bad "Sb without Qy"
+tr '\n' ' ' < "$T/sbout/$SBSL.sb.args" 2>/dev/null | grep -q -- '--max-seq-len 4096' && ok "Sb Sl4096: --max-seq-len 4096" || bad "Sb Sl4096"
 # arm()'s Sb branch: the launch through serve-batch.sh (a stub binary that records its environment and arguments,
 # and answers like a server), then batch_client.py after the requests (a stub client).
 armfn=$(sed -n '/^arm() {   # name/,/^}/p' "$W")

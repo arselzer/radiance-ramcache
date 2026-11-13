@@ -4,7 +4,7 @@
 # The environment and flags are the window harness's for the arm (ab_window.sh, 12 November)
 #
 #   all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-
-#   P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Xqagent3
+#   P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60-Xqagent3
 #
 # taken from its stubbed dry run, with each variable resolved to its last assignment and each flag to its last value
 # (the harness passes a few twice; the server keeps the last). What differs, on purpose:
@@ -13,12 +13,15 @@
 #   - the placement profile: the arm's (agent3) holds private captures and is not shipped. --profile names yours;
 #     without it the server ranks experts by the container's own activation profile (unmeasured for batches).
 #   - the plane mirror (R, Rd13) only with --mirror; the measured arm had one on a second drive.
+#   - hybrid decode (Qy60, RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=60, the share adapting) is the default: exact and +28%
+#     decode at 256 streams (window ab-20261113T014719Z); --hybrid 0 turns it off (the arm without Qy).
+#   - --max-seq-len N (SlN) only when given.
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
 # Usage: serve-batch.sh --model MODEL.rad --silu-table FILE [--streams 256] [--port 8000] [--reserve-mib N]
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
-#                       [--radiance-home DIR] [--dry-run]
+#                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the server runs in the foreground
@@ -26,7 +29,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR=""
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN=""
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -40,6 +43,8 @@ while (( $# )); do
     --shared-head) SHEAD=${2:?}; shift ;;
     --radiance-home) HOME_DIR=${2:?}; shift ;;
     --served-name) NAME=${2:?}; shift ;;
+    --hybrid) HYBRID=${2:?}; shift ;;
+    --max-seq-len) SEQLEN=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -52,6 +57,8 @@ num() { [[ $2 =~ ^[0-9]+$ ]] && (( 10#$2 >= $3 )) || die "$1 takes a whole numbe
 [[ -n "$SILU" ]] || die "--silu-table FILE is required: the card's silu table (ds41_mxfp4_device_check LIBR4D.so swiglu FILE)"
 num --streams "$STREAMS" 1; num --port "$PORT" 1; num --ctx-per-stream "$CTX" 1; num --shared-head "$SHEAD" 0
 [[ -z "$RESERVE" ]] || num --reserve-mib "$RESERVE" 1024
+num --hybrid "$HYBRID" 0; (( 10#$HYBRID <= 400 )) || die "--hybrid takes 0 (off) or a share of 1-400 percent, not '$HYBRID'"
+[[ -z "$SEQLEN" ]] || num --max-seq-len "$SEQLEN" 64
 STREAMS=$((10#$STREAMS)) CTX=$((10#$CTX))
 if (( ! DRY )); then
   [[ -f "$MODEL" ]] || die "no model container at $MODEL"
@@ -61,7 +68,7 @@ if (( ! DRY )); then
 fi
 BIN=${RADIANCE_BIN:-$(command -v radiance || echo build/bin/radiance)}
 
-# The arm's environment (131 assignments). The empty ones are set empty, as the harness sets them, so that a value
+# The arm's environment (133 assignments). The empty ones are set empty, as the harness sets them, so that a value
 # in the caller's environment cannot change the configuration.
 ENV=(
   RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40
@@ -147,6 +154,8 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS=
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64
   RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=64
+  RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$((10#$HYBRID))   # QyP: hybrid decode, the CPU's share P%; 0 off
+  RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT=            # empty: the share adapts (Qy, not Qyf)
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=0
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS=
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT=
@@ -215,6 +224,7 @@ ARGS=(
 )
 [[ -n "$HOME_DIR" ]] && ARGS=(--radiance-home "$HOME_DIR" "${ARGS[@]}")
 [[ -n "$PROFILE" ]] && ARGS+=(--expert-profile "$PROFILE")
+[[ -n "$SEQLEN" ]] && ARGS+=(--max-seq-len $((10#$SEQLEN)))
 [[ -n "$MIRROR" ]] && ARGS+=(--expert-plane-mirror "$MIRROR" --expert-plane-mirror-decode-share 0.13)
 ARGS+=("${EXTRA[@]}")
 

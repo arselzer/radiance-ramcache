@@ -12,7 +12,7 @@ the switches and every measurement. Below the line is upstream's README, unchang
 
 **Batch jobs** (hundreds of short prompts at once): see "Batch jobs: quickstart" in
 [tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md#batch-jobs-quickstart) for the one-command
-launcher (`serve-batch.sh`), a client and the measured throughput (256 questions in 329 s on four cards).
+launcher (`serve-batch.sh`), a client and the measured throughput (256 questions in 294 s on four cards).
 
 **Checkpoint precision:** the model used for these results preserves the official 1017 release's
 MXFP4 expert codes/scales, but uses ISTA IQ4_NL Engram tables and BF16/F32 conversions of other

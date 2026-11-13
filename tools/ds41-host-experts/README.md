@@ -54,7 +54,7 @@ tools/ds41-host-experts/serve-batch.sh --model /models/ds41.rad --silu-table sil
   --streams 256 --port 8000 [--profile decode-profile.json] [--mirror DIR] [--reserve-mib 10240]
 ```
 
-`serve-batch.sh` sets exactly the measured arm's 131 environment variables and flags (checked against the window
+`serve-batch.sh` sets exactly the measured arm's 133 environment variables and flags (checked against the window
 harness by `serve_batch_test.sh`; `--dry-run` prints them). In a window, an arm's `Sb` part starts its server through
 the launcher (skipped unless `serve-batch.sh --dry-run` gives the arm's whole launch, `serve_batch_match.py`; the
 scripts from `SB_TOOLS`, default the harness's directory) and afterwards sends the receipt's first 8 prompts through
@@ -73,6 +73,11 @@ scripts from `SB_TOOLS`, default the harness's directory) and afterwards sends t
   (the measured arm had one; optional).
 - `--shared-head` (32): the shared-head floor (`RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD`). 32 is the pending default;
   the rows below were measured with 64.
+- `--hybrid` (60): hybrid decode (`RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=60`, part `Qy60`): the CPU takes a share of
+  each card-path decode pass's RAM-cached experts, adapting it to keep within 60% of the card's link time. Exact, and
+  +28% decode at 256 streams (window ab-20261113T014719Z); `--hybrid 0` turns it off.
+- `--max-seq-len N` (off): one sequence's bound below the KV pool (part `SlN`); 4096 is the candidate for batches of
+  short prompts, not yet measured.
 
 **Send a batch.** `batch_client.py` reads a JSONL of `{"prompt": ..., "system": ...}` lines and sends them N at a
 time to the server's `/v1/completions`, framed in token ids as the measured runs framed them (DeepSeek's non-thinking
@@ -85,9 +90,10 @@ tools/ds41-host-experts/batch_client.py questions.jsonl answers.jsonl --concurre
 
 **Expected throughput** (whole batch, client wall time, four cards, replies byte-identical to the base engine's;
 measured on a private NL-to-SQL set, prompts of about 1K tokens over a few shared schemas, 128-token replies; a run
-on a public BIRD set is pending): 128 questions 539 s -> 199 s, 256 questions 911 s -> 329 s, against the first
-configurations measured at each size (table below). At 256 streams decode runs at about 150 tok/s and prefill at
-about 380 tok/s of computed (not cached) prompt tokens.
+on a public BIRD set is pending): 256 questions 911 s -> 294 s with hybrid decode (329 s without), decode about 192
+tok/s (150 without); 128 questions 539 s -> 199 s (without hybrid decode; hybrid at 128 streams is not yet measured).
+Each is against the first configuration measured at its size (table below). Prefill ran at about 380 tok/s of
+computed (not cached) prompt tokens, measured without hybrid decode.
 
 **Host memory must not run out.** An arm that exhausted the box's RAM at 256 streams took the kernel down (an amdgpu
 bug on the out-of-memory path). The RAM budget (`RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1`, on in the preset) sizes

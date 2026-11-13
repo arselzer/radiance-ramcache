@@ -19,7 +19,7 @@ fail=0
 ok()  { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
 
-ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Xqprof
+ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60-Xqprof
 mkdir -p "$T/home/kernels" "$T/mirror" "$T/profiles"; echo "{}" > "$T/profiles/prof.json"
 echo "not a library" > "$T/home/kernels/libr4d.so"
 echo '{}' > "$T/prompts.json"
@@ -80,7 +80,16 @@ else ok "the defaults: no reserve variable, no --expert-profile, no mirror"; fi
 grep -qx 'env RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=32' <<< "$d0" && ok "the shared-head floor's default: 32" ||
   bad "the shared-head default"
 
+dh=$("$SB" --model M --silu-table S --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=60' <<< "$dh" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT=' <<< "$dh" &&
+  ok "hybrid decode by default: Qy60, the share adapting" || bad "the hybrid default"
+d0h=$("$SB" --model M --silu-table S --hybrid 0 --max-seq-len 4096 --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0' <<< "$d0h" && [[ $d0h == *"--max-seq-len 4096"* ]] &&
+  ok "--hybrid 0: off (an arm without Qy); --max-seq-len 4096: SlN's flag" || bad "--hybrid 0 / --max-seq-len"
+[[ $dh != *--max-seq-len* ]] && ok "no --max-seq-len by default" || bad "a --max-seq-len by default"
+
 # ---- 3. refusals
+"$SB" --model M --silu-table S --hybrid 401 --dry-run > /dev/null 2>&1 && bad "--hybrid 401 accepted" || ok "--hybrid above 400 refused"
 "$SB" --model M --dry-run > /dev/null 2>&1 && bad "no --silu-table accepted" || ok "no --silu-table refused"
 "$SB" --silu-table S --dry-run > /dev/null 2>&1 && bad "no --model accepted" || ok "no --model refused"
 "$SB" --model M --silu-table S --reserve-mib 512 --dry-run > /dev/null 2>&1 && bad "a 512 MiB reserve accepted" ||

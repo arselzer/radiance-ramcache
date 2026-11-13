@@ -649,6 +649,7 @@ private:
     friend struct EpCountsHostProbe;
     friend struct AuxStagerProbe;
     friend struct P1HybridProbe;
+    friend struct P1HybridLevelProbe;
     using Layer = StagedLayer;
     std::vector<Layer>   layers_;      /* the routed layers with file-tier units, in first-op order */
     std::vector<int32_t> first_of_;    /* by op: the layer whose first op it is, or -1 */
@@ -874,6 +875,16 @@ private:
      * it was recorded; the submit time; the share. p1_hyb_pick chooses (fills p1_hyb_to_, by want_ index),
      * p1_hyb_take borrows and submits, p1_hyb_done counts a layer at its gather (hx_finish). */
     bool     p1_hyb_pass_ = false, p1_hyb_split_ = false, p1_hyb_rec_ = false;
+    /* Whether this pass runs at the activation arena's full plan (p1_arena_full_; true without the lent
+     * arena, whose one plan is the full one): its buffers' addresses are that level's. */
+    bool     pass_full_level_ = true;
+    /* Whether layer li of this pass may split (p1_hyb_pass_, the pool, the layer's gate_up operands known, and
+     * known at this pass's arena level: hx_fetch reads the rows and the sorted order from those addresses before
+     * this pass's gate_up is seen, and a pass at the other level has its buffers elsewhere). */
+    bool p1_hyb_layer_ok(int32_t li) const {
+        return p1_hyb_pass_ && hx_pool_ && !head_.configured() && li >= 0 && (size_t)li < hx_ops_.size() &&
+               hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x && hx_ops_[(size_t)li].x_full == pass_full_level_;
+    }
     int32_t  p1_hyb_li_ = -1;
     RadEvent p1_hyb_ev_ = nullptr;
     std::chrono::steady_clock::time_point p1_hyb_t_sub_{};
@@ -884,6 +895,7 @@ private:
     std::vector<int32_t> p1_hyb_cpu_;   /* this layer's units with the pool, aliased skipped */
     struct HybStats {
         uint64_t armed = 0, passes = 0, layers = 0, cpu_units = 0, card_units = 0, fell_back = 0, no_rows = 0;
+        uint64_t other_level = 0;   /* layers whose operands were last seen at the other arena level */
         uint64_t cpu_rows = 0, cpu_ns = 0, wait_ns = 0, late = 0, late_wait_ns = 0, early = 0;
         double   pred_cpu_ns = 0, pred_card_ns = 0;
     } p1_hyb_st_;
@@ -1025,6 +1037,9 @@ private:
         int64_t     x_ld = 0;
         const void* sorted = nullptr;
         const void* off = nullptr;
+        /* The arena level the pass that last set x .. off ran at (pass_full_level_): the activation arena's
+         * buffers sit elsewhere at the lent arena's smaller level than at the full plan. */
+        bool        x_full = true;
     };
     static constexpr int kHxUnits = 96;
     /* Sorted rows a pass can have: ep_rows_ tokens at top_k 6. */

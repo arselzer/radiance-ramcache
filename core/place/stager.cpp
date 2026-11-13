@@ -797,6 +797,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
     /* ..._P1_HYBRID (p1_hybrid.h): an armed decode pass may give each layer's cheapest RAM-cache units to the
      * CPU pool; every other pass, and every pass with the switch off, as before. */
     p1_hyb_pass_ = p1_armed_ && p1_decode_pass_ && p1_tun_.hybrid > 0 && p1_hyb_ev_ != nullptr;
+    pass_full_level_ = !p1_arena_full_ || p1_arena_full_();
     p1_hyb_split_ = false;
     p1_hyb_li_ = -1;
     p1_hyb_rec_ = false;
@@ -927,9 +928,12 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     /* ..._P1_HYBRID: a card-path layer of an armed decode pass may give RAM-cache units to the pool, which
      * needs the layer's rows and sorted order with the counts, as the CPU path's (hx_fetch). A layer whose
      * gate_up was never seen (no addresses yet) stays the card's whole. */
-    const bool hyb = p1 && p1_hyb_pass_ && hx_pool_ && !head_.configured() && (size_t)li < hx_ops_.size() &&
-                     hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x;
-    if (p1 && p1_hyb_pass_ && !hyb) ++p1_hyb_st_.no_rows;
+    const bool hyb = p1 && p1_hyb_layer_ok(li);
+    if (p1 && p1_hyb_pass_ && !hyb) {
+        const bool other = (size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].x &&
+                           hx_ops_[(size_t)li].x_full != pass_full_level_;
+        ++(other ? p1_hyb_st_.other_level : p1_hyb_st_.no_rows);
+    }
     /* Never seen at its gate_up (the first pass): nothing to fetch the rows from yet, so the CPU's
      * part waits for the gate_up's operands (hx_deferred) and the card gets aliases for all. */
     const bool defer = !p1 && !hx && hx_defer_ok_ && hx_pool_ && !head_.configured() &&
@@ -4395,6 +4399,7 @@ int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t)
             o.x_ld = x_ld;
             o.sorted = so.data;
             o.off = of.data;
+            o.x_full = pass_full_level_;
             RAD_TRY(hx_fetch(li, s));
             RAD_TRY(rad_event_record(counts_ev_, s));
         }
@@ -4411,6 +4416,7 @@ int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t)
         o.x_ld = x_ld;
         o.sorted = so.data;
         o.off = of.data;
+        o.x_full = pass_full_level_;
     }
     return RAD_OK;
 }
@@ -5840,12 +5846,12 @@ std::string FileStager::p1_stats_line() const {
         const HybStats& h = p1_hyb_st_;
         const double per = h.armed ? 1e-9 / (double)h.armed : 0;
         line += fmt("; hybrid: passes split %llu of %llu armed, layers %llu, units CPU %llu / card %llu (fell back %llu, "
-                    "layers without rows %llu), CPU rows %llu, CPU %.3f s (%.4f s a pass) against issue %.4f s a pass, "
+                    "layers without rows %llu, rows at the other arena level %llu), CPU rows %llu, CPU %.3f s (%.4f s a pass) against issue %.4f s a pass, "
                     "predicted CPU %.3f s / card %.3f s, gather wait %.3f s, late layers %llu (wait %.3f s), early layers "
                     "%llu, share %.1f%% (lowest %.1f%%)",
                     (unsigned long long)h.passes, (unsigned long long)h.armed, (unsigned long long)h.layers,
                     (unsigned long long)h.cpu_units, (unsigned long long)h.card_units, (unsigned long long)h.fell_back,
-                    (unsigned long long)h.no_rows, (unsigned long long)h.cpu_rows, (double)h.cpu_ns * 1e-9,
+                    (unsigned long long)h.no_rows, (unsigned long long)h.other_level, (unsigned long long)h.cpu_rows, (double)h.cpu_ns * 1e-9,
                     (double)h.cpu_ns * per, (double)p1_dec_ns_ * per, h.pred_cpu_ns * 1e-9, h.pred_card_ns * 1e-9,
                     (double)h.wait_ns * 1e-9, (unsigned long long)h.late, (double)h.late_wait_ns * 1e-9,
                     (unsigned long long)h.early, 100.0 * p1_hyb_share_.share(), 100.0 * p1_hyb_share_.min_seen());

@@ -14,7 +14,15 @@
  *    ring), every live sorted slot ends byte-identical to the all-CPU reference, the CPU and card sets partition
  *    the selected units, the borrows come in the layer's order with the admission's touch, the pool's
  *    reservation is given back in full, and a fixed-order weighted combine over each token's top-k rows (the
- *    gather's shape) is bit-identical to the base's whatever the split. */
+ *    gather's shape) is bit-identical to the base's whatever the split;
+ *  - the H31 failure (window ab-20261113T072152Z, N128 and BIRD N256 arms with Qy60): the first armed decode pass
+ *    after prefill chunks at the activation arena's full plan read the rows and the sorted order from the full
+ *    plan's addresses while it ran at the lent arena's smaller level ("expert 92 has 0 rows in the sorted order
+ *    and 4 in its count", then "gate_up reads rows other than the ones the pool was given"). A layer now splits
+ *    only when its gate_up operands were last seen at this pass's level (p1_hyb_layer_ok): the pass sequence
+ *    full-level prefill -> small-level decode declines (counted), its gate_up records the small level's addresses,
+ *    the next decode pass splits; back at the full level it declines again; and the live check that failed on the
+ *    card refuses the moved operands as it did there. */
 #include "rad_test.h"
 
 #include "rad_internal.h"
@@ -533,6 +541,105 @@ struct P1HybridProbe {
 };
 
 }  // namespace rad
+
+namespace rad {
+/* The arena-level gate on hx_capture's records, as start_ep_routed asks it. */
+struct P1HybridLevelProbe {
+    FileStager fs;
+    int32_t sorted_buf[2][16 * 6] = {}, off_buf[2][128] = {};
+    uint16_t x_buf[2][16] = {};   /* addresses only: nothing reads them */
+    void setup() {
+        StagedLayer L;
+        L.layer = 0;
+        L.first_op = 1;
+        L.last_op = 3;
+        fs.layers_ = { L };
+        FileStager::HxOps o;
+        o.gu = 1;
+        o.n_expert = 96;
+        o.top_k = 6;
+        fs.hx_ops_ = { o };
+        fs.ep_rows_ = 2048;
+        fs.routed_ = true;
+        fs.hx_pool_ = pool();
+        fs.p1_hyb_pass_ = true;
+    }
+    ~P1HybridLevelProbe() { fs.hx_pool_ = nullptr; }
+    /* One pass's gate_up operands (`which` buffer set: 0 the full plan's, 1 the small level's), as hx_capture sees
+     * them; `live` makes it the check on a layer whose CPU rows the pool has. */
+    int capture(int which, int rows) {
+        fs.pass_tok_ = rows;
+        RadTensor t[5] = {};
+        t[0].data = x_buf[which];
+        t[0].dtype = RAD_BF16;
+        t[0].rank = 2;
+        t[0].shape[0] = rows;
+        t[0].shape[1] = 5120;
+        t[0].stride[0] = 5120;
+        t[0].stride[1] = 1;
+        t[2].data = sorted_buf[which];
+        t[2].dtype = RAD_I32;
+        t[2].rank = 1;
+        t[2].shape[0] = rows * 6;
+        t[3].data = off_buf[which];
+        t[3].dtype = RAD_I32;
+        t[3].rank = 1;
+        t[3].shape[0] = 97;
+        t[4].rank = 2;
+        t[4].shape[0] = rows * 6;
+        t[4].shape[1] = 5120;
+        return fs.hx_capture(0, nullptr, t, 5);
+    }
+    void run() {
+        setup();
+        /* A prefill chunk at the full plan records the full plan's addresses. */
+        fs.pass_full_level_ = true;
+        REQUIRE_OK(capture(0, 16));
+        CHECK(fs.hx_ops_[0].x_full);
+        CHECK(fs.p1_hyb_layer_ok(0));            /* another full-level pass could split */
+        /* The first armed decode pass runs at the small level: it must not split (its rows are elsewhere). */
+        fs.pass_full_level_ = false;
+        CHECK(!fs.p1_hyb_layer_ok(0));
+        /* What happened on the card without the gate: the pool given the full plan's rows, the gate_up reading the
+         * small level's: the live check refuses it. */
+        fs.hx_li_ = 0;
+        fs.hx_stage_ = 2;
+        CHECK(capture(1, 8) < 0);
+        fs.hx_li_ = -1;
+        fs.hx_stage_ = 0;
+        /* With the gate: the declining pass's gate_up records the small level's addresses; the next decode pass
+         * at that level splits, and the live check passes on them. */
+        REQUIRE_OK(capture(1, 8));
+        CHECK(!fs.hx_ops_[0].x_full);
+        CHECK(fs.hx_ops_[0].x == (const void*)x_buf[1]);
+        CHECK(fs.p1_hyb_layer_ok(0));
+        fs.hx_li_ = 0;
+        fs.hx_stage_ = 2;
+        REQUIRE_OK(capture(1, 8));
+        CHECK(fs.hx_confirmed_);
+        fs.hx_li_ = -1;
+        fs.hx_stage_ = 0;
+        fs.hx_confirmed_ = false;
+        /* Back at the full plan (a later prompt's chunk): declined until a full-level pass records its own. */
+        fs.pass_full_level_ = true;
+        CHECK(!fs.p1_hyb_layer_ok(0));
+        REQUIRE_OK(capture(0, 16));
+        CHECK(fs.p1_hyb_layer_ok(0));
+        /* No pass to split, no pool, or a layer never seen: never. */
+        fs.p1_hyb_pass_ = false;
+        CHECK(!fs.p1_hyb_layer_ok(0));
+        fs.p1_hyb_pass_ = true;
+        fs.hx_ops_[0].x = nullptr;
+        CHECK(!fs.p1_hyb_layer_ok(0));
+    }
+};
+}  // namespace rad
+
+TEST(a_layer_splits_only_on_operands_seen_at_its_passes_arena_level) {
+    if (!pool()) SKIP("no AVX2 or no CPU pool");
+    rad::P1HybridLevelProbe p;
+    p.run();
+}
 
 TEST(a_hybrid_layer_leaves_every_row_and_the_combine_as_the_base_at_every_share) {
     if (!pool()) SKIP("no AVX2 or no CPU pool");

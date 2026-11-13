@@ -2127,7 +2127,12 @@ decode pass gives some of its RAM-cache units to the pool, which computes them w
   path's own submit: the layer's rows and sorted order ride the counts' wait (`hx_fetch`), the jobs take expert e's
   live slots of `[off[e], off[e + 1])` and refuse a count that differs from the scatter's, the gate_up's operands
   are checked against the rows the pool was given (`hx_capture`), and the pool's rows are copied over the down
-  projection's at the gather's operands (`hx_finish`), behind the layer's waves on the same stream.
+  projection's at the gather's operands (`hx_finish`), behind the layer's waves on the same stream. The rows are
+  fetched from the addresses the layer's gate_up last read, so a layer splits only when that was at this pass's
+  activation-arena level (the lent arena's smaller level or the full plan; their buffers sit apart): the first
+  armed decode pass after full-plan prefill chunks runs whole on the card and records the small level's
+  addresses (counted as "rows at the other arena level"). Without that gate window H31's N128 and BIRD N256 arms
+  failed at their first decode step (a sorted order that disagreed with the counts).
 - **Exact.** The gather reads each sorted slot's row and weighs a token's top-k rows in its own fixed order; which
   side wrote a slot never reaches it. Every slot's bytes are the same either way: the P1 twin's rows are the
   decode band's at every M up to 4096 (device check `p1`), the pool's are bit-exact with the decode band (the CPU
@@ -2141,7 +2146,7 @@ decode pass gives some of its RAM-cache units to the pool, which computes them w
 Rank 0 says `ds41 p1: hybrid decode on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P; pool X GB/s, link Y GB/s, the
 share adapts ... | held ...)` at startup; each rank's `ds41 p1 stats, rank` line adds `CPU pool N` to its touched
 experts and `hybrid: passes split S of A armed, layers L, units CPU C / card R (fell back F, layers without rows
-W), CPU rows N, CPU T s (t s a pass) against issue I s a pass, predicted CPU / card, gather wait G s, late layers
+W, rows at the other arena level O), CPU rows N, CPU T s (t s a pass) against issue I s a pass, predicted CPU / card, gather wait G s, late layers
 K (wait s), early layers E, share X% (lowest Y%)` (the CPU's time runs from the submit to the gather's wait, an
 upper bound for an early layer). A `Qy` arm is measured only with the startup line naming its share and mode and,
 at exit, some rank's S above 0; it needs `P1` and `Qd`, and is skipped beside `Sg`, `Ds`, `Ax` (not `Ax0`), `Qv`

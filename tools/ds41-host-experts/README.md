@@ -2129,9 +2129,9 @@ decode pass gives some of its RAM-cache units to the pool, which computes them w
   are checked against the rows the pool was given (`hx_capture`), and the pool's rows are copied over the down
   projection's at the gather's operands (`hx_finish`), behind the layer's waves on the same stream. The rows are
   fetched from the addresses the layer's gate_up last read, so a layer splits only when that was at this pass's
-  activation-arena level (the lent arena's smaller level or the full plan; their buffers sit apart): the first
-  armed decode pass after full-plan prefill chunks runs whole on the card and records the small level's
-  addresses (counted as "rows at the other arena level"). Without that gate window H31's N128 and BIRD N256 arms
+  activation-arena level (`Ctx::level()`: the full plan or one of the lent arena's smaller levels, 256 and 1024
+  rows in H31; their buffers sit apart): the first armed decode pass after prefill chunks at another level runs
+  whole on the card and records its level's addresses (counted as "rows at the other arena level"). Without that gate window H31's N128 and BIRD N256 arms
   failed at their first decode step (a sorted order that disagreed with the counts).
 - **Exact.** The gather reads each sorted slot's row and weighs a token's top-k rows in its own fixed order; which
   side wrote a slot never reaches it. Every slot's bytes are the same either way: the P1 twin's rows are the

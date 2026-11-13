@@ -20,8 +20,8 @@
  *    plan's addresses while it ran at the lent arena's smaller level ("expert 92 has 0 rows in the sorted order
  *    and 4 in its count", then "gate_up reads rows other than the ones the pool was given"). A layer now splits
  *    only when its gate_up operands were last seen at this pass's level (p1_hyb_layer_ok): the pass sequence
- *    full-level prefill -> small-level decode declines (counted), its gate_up records the small level's addresses,
- *    the next decode pass splits; back at the full level it declines again; and the live check that failed on the
+ *    full-plan prefill -> 256-row-level decode declines (counted), its gate_up records that level's addresses,
+ *    the next decode pass splits; at the 1024-row level and back at the full plan it declines again; and the live check that failed on the
  *    card refuses the moved operands as it did there. */
 #include "rad_test.h"
 
@@ -593,12 +593,12 @@ struct P1HybridLevelProbe {
     void run() {
         setup();
         /* A prefill chunk at the full plan records the full plan's addresses. */
-        fs.pass_full_level_ = true;
+        fs.pass_level_ = 0;
         REQUIRE_OK(capture(0, 16));
-        CHECK(fs.hx_ops_[0].x_full);
+        CHECK_EQ(fs.hx_ops_[0].x_level, 0);
         CHECK(fs.p1_hyb_layer_ok(0));            /* another full-level pass could split */
         /* The first armed decode pass runs at the small level: it must not split (its rows are elsewhere). */
-        fs.pass_full_level_ = false;
+        fs.pass_level_ = 2;
         CHECK(!fs.p1_hyb_layer_ok(0));
         /* What happened on the card without the gate: the pool given the full plan's rows, the gate_up reading the
          * small level's: the live check refuses it. */
@@ -610,7 +610,7 @@ struct P1HybridLevelProbe {
         /* With the gate: the declining pass's gate_up records the small level's addresses; the next decode pass
          * at that level splits, and the live check passes on them. */
         REQUIRE_OK(capture(1, 8));
-        CHECK(!fs.hx_ops_[0].x_full);
+        CHECK_EQ(fs.hx_ops_[0].x_level, 2);
         CHECK(fs.hx_ops_[0].x == (const void*)x_buf[1]);
         CHECK(fs.p1_hyb_layer_ok(0));
         fs.hx_li_ = 0;
@@ -620,8 +620,11 @@ struct P1HybridLevelProbe {
         fs.hx_li_ = -1;
         fs.hx_stage_ = 0;
         fs.hx_confirmed_ = false;
+        /* Another smaller level (the 1024-row one, a short chunk): not the 256-row level's addresses either. */
+        fs.pass_level_ = 1;
+        CHECK(!fs.p1_hyb_layer_ok(0));
         /* Back at the full plan (a later prompt's chunk): declined until a full-level pass records its own. */
-        fs.pass_full_level_ = true;
+        fs.pass_level_ = 0;
         CHECK(!fs.p1_hyb_layer_ok(0));
         REQUIRE_OK(capture(0, 16));
         CHECK(fs.p1_hyb_layer_ok(0));

@@ -540,6 +540,9 @@ public:
     /* ---- prefill Phase 1 (card_expert_stager.h): RADIANCE_EXPERIMENTAL_DS41_P1=1 beside LCP ----------
      * p1_on: this rank took it (p1_init); p1_stats_line: kLogStats's line for the shutdown. */
     bool p1_on() const { return p1_ && p1_->on(); }
+    /* The activation arena's level of the step about to be issued (Ctx::level(); the engine's), read at each
+     * pass's begin: hybrid decode splits a layer only on gate_up operands seen at the same level. */
+    void set_arena_level(std::function<int()> f) { arena_level_fn_ = std::move(f); }
     std::string p1_stats_line() const;
     /* Whether pass `b` is armed for the card path at the threshold `min_rows` (..._P1_MIN_ROWS): a pure
      * prefill pass (no decode row, no draft or speculation) of at least min_rows and at most
@@ -875,15 +878,16 @@ private:
      * it was recorded; the submit time; the share. p1_hyb_pick chooses (fills p1_hyb_to_, by want_ index),
      * p1_hyb_take borrows and submits, p1_hyb_done counts a layer at its gather (hx_finish). */
     bool     p1_hyb_pass_ = false, p1_hyb_split_ = false, p1_hyb_rec_ = false;
-    /* Whether this pass runs at the activation arena's full plan (p1_arena_full_; true without the lent
-     * arena, whose one plan is the full one): its buffers' addresses are that level's. */
-    bool     pass_full_level_ = true;
+    /* The activation arena's level this pass runs at (Ctx::level() through arena_level_fn_, which the engine
+     * sets; 0, the full plan, without it): its buffers' addresses are that level's. */
+    int      pass_level_ = 0;
+    std::function<int()> arena_level_fn_;
     /* Whether layer li of this pass may split (p1_hyb_pass_, the pool, the layer's gate_up operands known, and
      * known at this pass's arena level: hx_fetch reads the rows and the sorted order from those addresses before
      * this pass's gate_up is seen, and a pass at the other level has its buffers elsewhere). */
     bool p1_hyb_layer_ok(int32_t li) const {
         return p1_hyb_pass_ && hx_pool_ && !head_.configured() && li >= 0 && (size_t)li < hx_ops_.size() &&
-               hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x && hx_ops_[(size_t)li].x_full == pass_full_level_;
+               hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x && hx_ops_[(size_t)li].x_level == pass_level_;
     }
     int32_t  p1_hyb_li_ = -1;
     RadEvent p1_hyb_ev_ = nullptr;
@@ -1037,9 +1041,9 @@ private:
         int64_t     x_ld = 0;
         const void* sorted = nullptr;
         const void* off = nullptr;
-        /* The arena level the pass that last set x .. off ran at (pass_full_level_): the activation arena's
-         * buffers sit elsewhere at the lent arena's smaller level than at the full plan. */
-        bool        x_full = true;
+        /* The activation arena's level the pass that last set x .. off ran at (pass_level_): each level
+         * (the full plan, and with the lent arena the smaller steps' levels) places the buffers apart. */
+        int         x_level = 0;
     };
     static constexpr int kHxUnits = 96;
     /* Sorted rows a pass can have: ep_rows_ tokens at top_k 6. */

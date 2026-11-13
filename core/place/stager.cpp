@@ -797,7 +797,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
     /* ..._P1_HYBRID (p1_hybrid.h): an armed decode pass may give each layer's cheapest RAM-cache units to the
      * CPU pool; every other pass, and every pass with the switch off, as before. */
     p1_hyb_pass_ = p1_armed_ && p1_decode_pass_ && p1_tun_.hybrid > 0 && p1_hyb_ev_ != nullptr;
-    pass_full_level_ = !p1_arena_full_ || p1_arena_full_();
+    pass_level_ = arena_level_fn_ ? arena_level_fn_() : 0;
     p1_hyb_split_ = false;
     p1_hyb_li_ = -1;
     p1_hyb_rec_ = false;
@@ -931,7 +931,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     const bool hyb = p1 && p1_hyb_layer_ok(li);
     if (p1 && p1_hyb_pass_ && !hyb) {
         const bool other = (size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].x &&
-                           hx_ops_[(size_t)li].x_full != pass_full_level_;
+                           hx_ops_[(size_t)li].x_level != pass_level_;
         ++(other ? p1_hyb_st_.other_level : p1_hyb_st_.no_rows);
     }
     /* Never seen at its gate_up (the first pass): nothing to fetch the rows from yet, so the CPU's
@@ -4399,7 +4399,7 @@ int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t)
             o.x_ld = x_ld;
             o.sorted = so.data;
             o.off = of.data;
-            o.x_full = pass_full_level_;
+            o.x_level = pass_level_;
             RAD_TRY(hx_fetch(li, s));
             RAD_TRY(rad_event_record(counts_ev_, s));
         }
@@ -4416,7 +4416,7 @@ int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t)
         o.x_ld = x_ld;
         o.sorted = so.data;
         o.off = of.data;
-        o.x_full = pass_full_level_;
+        o.x_level = pass_level_;
     }
     return RAD_OK;
 }

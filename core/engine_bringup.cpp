@@ -4602,6 +4602,11 @@ int Engine::start() {
         } else if (r->fstager.enabled()) {
             r->ctx.set_stager(&r->fstager);
         }
+        /* The step's arena level for the file stager (its buffers' addresses differ by level). */
+        {
+            Ctx* const rctx = &r->ctx;
+            r->fstager.set_arena_level([rctx] { return rctx->level(); });
+        }
 
     }
     /* Runtime LoRA: the startup adapters, copied into their slots now that every rank's pools

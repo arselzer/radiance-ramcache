@@ -2005,9 +2005,48 @@ micro-batch, and the card path takes a layer's rows in one launch) and above the
 `ds41 p1: decode passes on the cards: every routed expert row of a pure decode pass of N to C rows ...` at
 startup, and each rank's `ds41 p1 stats, rank` line adds `decode passes armed A, rows R (at most M a pass),
 issue S s; decode passes of 17 to N-1 rows on the CPU path B` (armed decode passes print no chunk line). A
-`QdN` arm is measured only with the startup line and, at exit, some rank's A above 0. A hybrid (card path for
-a layer's units with many rows, CPU for the rest) is not built: the two paths own a layer's non-resident units
-whole (marks and waves on one side, aliases and the CPU rows' copy at the gather on the other).
+`QdN` arm is measured only with the startup line and, at exit, some rank's A above 0.
+
+Hybrid decode (`RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P`, 0 off, the default; 1-400; the window's parts `QyP` and
+`QyfP`; `core/place/p1_hybrid.h`; not yet measured on the cards). An armed decode pass streams every non-resident
+routed expert over the link (~29 GB a card a step at 256 streams, ~24 GB/s, the PCIe 4.0 x16 limit), while the
+CPU pool is idle and part of the host's RAM bandwidth is spare. Under the switch each card-path layer of an armed
+decode pass gives some of its RAM-cache units to the pool, which computes them while the ring streams the rest:
+- **Which.** Only RAM-cache hits (a drive miss stays on the ring: its planes are read and packed for it), fewest
+  rows first, while `(pool backlog + their cost) / pool rate <= P% x (bytes left to the ring) / link rate`, with
+  the pool's own cost model (`HostExpertPool::cost_rows`, `cpu_bytes_per_ns`, `link_bytes_per_ns`; the backlog is
+  every rank's, reservations included). The share adapts per rank (`..._P1_HYBRID_ADAPT`, 1 by default; 0 holds
+  it at P, part `Qyf`): a layer whose pool was done before the issuing thread reached the gather grows it by 5%
+  (up to P), one whose card had finished the layer's waves and waited for the pool's rows (an event behind the
+  waves, queried once the rows are in) shrinks it by 20% (down to 1%), anything else holds it.
+- **How.** A CPU unit is borrowed from the cache with the admission's touch, in the layer's order, as the ring's
+  `add_ram` would borrow it (one the cache no longer gives goes to the ring, counted), published skipped
+  (`kMarkSkip`) like every other non-resident unit and put in no wave, and handed to the pool through the CPU
+  path's own submit: the layer's rows and sorted order ride the counts' wait (`hx_fetch`), the jobs take expert e's
+  live slots of `[off[e], off[e + 1])` and refuse a count that differs from the scatter's, the gate_up's operands
+  are checked against the rows the pool was given (`hx_capture`), and the pool's rows are copied over the down
+  projection's at the gather's operands (`hx_finish`), behind the layer's waves on the same stream.
+- **Exact.** The gather reads each sorted slot's row and weighs a token's top-k rows in its own fixed order; which
+  side wrote a slot never reaches it. Every slot's bytes are the same either way: the P1 twin's rows are the
+  decode band's at every M up to 4096 (device check `p1`), the pool's are bit-exact with the decode band (the CPU
+  path below the threshold; `host_experts_test`, few and many rows 1-64). No card kernel writes a CPU unit's slots
+  (the twin's skip: no rows, no bytes; its zero-fill is the other ranks' tail `[off[96], T)`). Residency: the
+  same touches in the same order; only the background inserts that wait for an idle pool may land later.
+- **Not covered.** Prefill passes never split. Refused at startup without `..._P1_DECODE_ROWS`, beside the host
+  verify (`..._P1_VERIFY`), `..._HOST_EXPERTS_POLICY=verify` (both compare card rows the CPU's units do not
+  have), speculation, a drafter and the aux expert worker (`..._AUX_EXPERTS`); `Tb` is refused by `Qd` already.
+
+Rank 0 says `ds41 p1: hybrid decode on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P; pool X GB/s, link Y GB/s, the
+share adapts ... | held ...)` at startup; each rank's `ds41 p1 stats, rank` line adds `CPU pool N` to its touched
+experts and `hybrid: passes split S of A armed, layers L, units CPU C / card R (fell back F, layers without rows
+W), CPU rows N, CPU T s (t s a pass) against issue I s a pass, predicted CPU / card, gather wait G s, late layers
+K (wait s), early layers E, share X% (lowest Y%)` (the CPU's time runs from the submit to the gather's wait, an
+upper bound for an early layer). A `Qy` arm is measured only with the startup line naming its share and mode and,
+at exit, some rank's S above 0; it needs `P1` and `Qd`, and is skipped beside `Sg`, `Ds`, `Ax` (not `Ax0`), `Qv`
+and the verify policy. Host tests: `p1_hybrid_test` (the split, the share, the tunables; a hybrid layer through
+the stager with real packed experts and the pool: every live slot and a fixed-order combine byte-identical to the
+all-CPU rows at every share, drive units and a refused borrow on the ring, the borrows in order, the reservation
+given back) and `ab_window_p1_test` section 6.
 
 ## Adaptive residency: the lent slab, the heat over every lent slot, the read-back audit
 

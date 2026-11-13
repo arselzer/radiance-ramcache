@@ -181,6 +181,14 @@
 # other arm only without it), and at exit (qd_gate) only if every rank's "ds41 p1 stats, rank" line counts
 # its decode passes and some rank armed at least one ("decode passes armed A", A > 0): otherwise the switch
 # never acted (a batch below N) and the arm is set aside as unmeasured. Not yet measured on the cards.
+# QyP / QyfP: hybrid decode (..._P1_HYBRID=P, 1-400; every other arm states 0 and ..._P1_HYBRID_ADAPT empty): in a
+# decode pass the Qd part arms, each routed layer gives the CPU pool its RAM-cache units with the fewest rows while
+# the pool's predicted time stays within P% of the card's link time for the rest (core/place/p1_hybrid.h); Qyf holds
+# the share at P (..._P1_HYBRID_ADAPT=0), Qy lets it adapt. Needs P1 and Qd; skipped beside Sg (speculation), Ds
+# (a drafter), Ax (the aux expert worker; Ax0 is fine), Qv (the host verify) and the verify policy. A Qy arm is
+# measured only with rank 0's "ds41 p1: hybrid decode on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P;" line
+# naming its share mode (any other arm only without one), and at exit (qy_gate) only if every rank's stats line
+# counts its hybrid passes and some rank split one ("hybrid: passes split S", S > 0). Not yet measured on the cards.
 #
 # Coordinated actual Ar1280+Ag1024 caps additionally need SELFTEST_AR_AG_SHARED=<r4d_selftest>:
 # fresh all-four-card ds41_ar_ag_shared_exact pointer/lifetime/mixed replay receipt. It supplements
@@ -486,6 +494,13 @@ lcp_check() {   # name
     return 1
   fi
   [[ -n "${ARM_QD:-}" ]] && grep -m1 -E 'ds41 p1: decode passes on the cards' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # QyP / QyfP: rank 0's hybrid line at startup, in a Qy arm only (qy_gate).
+  local qy_why
+  if declare -F qy_gate >/dev/null && ! qy_why=$(qy_gate "$OUT/$name.server.log" "${ARM_QY:-}" "${ARM_QYF:-}" start); then
+    log "arm $name: $qy_why; not measured"
+    return 1
+  fi
+  [[ -n "${ARM_QY:-}" ]] && grep -m1 -E 'ds41 p1: hybrid decode on' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # QlK: rank 0's "ds41 p1: lent ring: K of the ring's" line at startup, in a Ql arm only.
   local lend_lines
   lend_lines=$(grep -c 'ds41 p1: lent ring: ' "$OUT/$name.server.log")
@@ -811,6 +826,42 @@ qd_gate() {   # log, Qd threshold, chunk, start/exit
   done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$f")
   (( ranks > 0 )) || { echo "Qd$qd, but no 'ds41 p1 stats, rank' line at exit"; return 1; }
   (( armed > 0 )) || { echo "Qd$qd, but no rank armed a decode pass (every decode step below $qd rows?): the switch never acted"; return 1; }
+  return 0
+}
+
+# QyP / QyfP (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID): at start rank 0's "ds41 p1: hybrid decode on: ...
+# (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P;" line naming the share mode (held for Qyf, adapting for Qy) in a Qy arm,
+# none in any other; at exit every rank's stats line with its hybrid counts and some rank's split passes above 0
+# (the switch acted). Arguments: the log, the arm's P (empty: no Qy part), its Qyf flag, start/exit. 0 when the arm
+# may be measured; else 1, the reason on stdout.
+qy_gate() {   # log, Qy share, Qyf (non-empty: held), start/exit
+  local f=$1 qy=$2 qyf=$3 stage=${4:-start} n split=0 ranks=0 a line
+  n=$(grep -c 'ds41 p1: hybrid decode on' "$f")
+  if [[ -z "$qy" ]]; then
+    if (( n > 0 )); then echo "no Qy part, but the server splits decode passes (the knob set for the window?)"; return 1; fi
+    if [[ "$stage" == exit ]] && grep -qE 'ds41 p1 stats, rank [0-9]+: .*; hybrid: passes split [1-9]' "$f"; then
+      echo "no Qy part, but a rank split decode passes"; return 1
+    fi
+    return 0
+  fi
+  if ! grep -q "ds41 p1: hybrid decode on: .*(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$qy;" "$f"; then
+    echo "Qy$qy, but the server log has no 'ds41 p1: hybrid decode on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$qy;' line ($(grep -m1 -E 'ds41 p1: hybrid|P1_HYBRID' "$f"))"; return 1
+  fi
+  if [[ -n "$qyf" ]] && ! grep -q 'ds41 p1: hybrid decode on: .*the share held (..._P1_HYBRID_ADAPT=0)' "$f"; then
+    echo "Qyf$qy, but the hybrid line does not hold the share"; return 1
+  fi
+  if [[ -z "$qyf" ]] && ! grep -q 'ds41 p1: hybrid decode on: .*the share adapts per rank' "$f"; then
+    echo "Qy$qy, but the hybrid line does not adapt the share"; return 1
+  fi
+  [[ "$stage" == exit ]] || return 0
+  while IFS= read -r line; do
+    ranks=$((ranks + 1))
+    a=$(sed -nE 's/.*; hybrid: passes split ([0-9]+) of ([0-9]+) armed.*/\1/p' <<< "$line")
+    if [[ -z "$a" ]]; then echo "Qy$qy, but a 'ds41 p1 stats, rank' line without its hybrid counts ($line)"; return 1; fi
+    split=$((split + a))
+  done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$f")
+  (( ranks > 0 )) || { echo "Qy$qy, but no 'ds41 p1 stats, rank' line at exit"; return 1; }
+  (( split > 0 )) || { echo "Qy$qy, but no rank split a decode pass (no RAM-cache unit fit the share?): the switch never acted"; return 1; }
   return 0
 }
 
@@ -1454,6 +1505,12 @@ EOF2
   local qd_exit_why
   if declare -F qd_gate >/dev/null && ! qd_exit_why=$(qd_gate "$OUT/$name.server.log" "${ARM_QD:-}" "${ARM_LC:-}" exit); then
     log "arm $name: $qd_exit_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  # QyP / QyfP at exit: some rank split a decode pass (qy_gate).
+  local qy_exit_why
+  if declare -F qy_gate >/dev/null && ! qy_exit_why=$(qy_gate "$OUT/$name.server.log" "${ARM_QY:-}" "${ARM_QYF:-}" exit); then
+    log "arm $name: $qy_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   # Pmr with a drafting Ds part (DSpark's 2+ row verify passes) at shutdown: the predictor's
@@ -3024,7 +3081,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   axr=""   # AxrN: the worker's passes up to N rows (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)
@@ -3235,8 +3292,16 @@ for a in $ARMS; do
                  [[ $qk == GRACE_MS ]] && qg=$((10#$qn))
                  [[ $qk == LEND_ARENA ]] && qe=$((10#$qn))
                  [[ $qk == DECODE_ROWS ]] && qd=$((10#$qn))
+                 [[ $qk == VERIFY ]] && qv=$((10#$qn))
                else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
       Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
+      Qy[0-9]*|Qyf[0-9]*)                                              # hybrid decode: the CPU's share P% (Qyf: held)
+               if [[ $p == Qyf* ]]; then qyf=1; qn=${p#Qyf}; else qn=${p#Qy}; fi
+               if [[ -n "$qy" ]]; then log "arm $a: two Qy parts; the arm is skipped"; skip=1
+               elif [[ $qn =~ ^[0-9]+$ ]] && (( 10#$qn >= 1 && 10#$qn <= 400 )); then
+                 qy=$((10#$qn)); q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$qy)
+                 [[ -n "$qyf" ]] && q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT=0)
+               else log "arm $a: $p: Qy takes 1-400 (percent); the arm is skipped"; skip=1; fi ;;
       Lh[0-9]*)                                                        # the lent slots follow live decode routing (..._P1_LEND_HEAT=S; needs Qe)
                if [[ -n "$lh" ]]; then log "arm $a: duplicate Lh part; the arm is skipped"; skip=1; fi
                if [[ ${p#Lh} =~ ^[0-9]+$ ]] && (( 10#${p#Lh} >= 1 && 10#${p#Lh} <= 8 )); then lh=$((10#${p#Lh}))
@@ -3760,19 +3825,31 @@ for a in $ARMS; do
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
           RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0 "${q1[@]}")
+          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0
+          RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT= "${q1[@]}")
     [[ -n "$qg" && -z "$ql$qe" ]] && { log "arm $a: Qh$qg sets the lent slots' grace, which needs a QlK or QeK part; the arm is skipped"; skip=1; }
     # QdN: decode passes of N rows or more on the cards; a pass is at most the chunk, and a split step (Tb) launches
     # a layer's expert ops once a micro-batch (the engine refuses both).
     [[ -n "$qd" && -n "$lc" ]] && (( qd > lc )) && { log "arm $a: Qd$qd is above the chunk Lc$lc (no decode pass could arm); the arm is skipped"; skip=1; }
     [[ -n "$qd" && -n "$tb" ]] && { log "arm $a: Qd$qd with Tb (a split decode step: the engine refuses it); the arm is skipped"; skip=1; }
+    # QyP: hybrid decode splits the decode passes Qd arms; the engine refuses it beside speculation, a drafter, the
+    # aux expert worker, the host verify and the verify policy.
+    if [[ -n "$qy" ]]; then
+      [[ -z "$qd" ]] && { log "arm $a: Qy$qy splits the decode passes a Qd part arms, and there is none; the arm is skipped"; skip=1; }
+      [[ -n "$sg" && "$sg" != 0 ]] && { log "arm $a: Qy$qy beside Sg$sg (speculation: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ -n "$ds" ]] && { log "arm $a: Qy$qy beside $ds (a drafter: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ -n "$ax" && "$ax" != 0 ]] && { log "arm $a: Qy$qy beside the aux expert worker (Ax: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ -n "$qv" && "$qv" != 0 ]] && { log "arm $a: Qy$qy beside Qv$qv (the host verify: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ "$pol" == verify ]] && { log "arm $a: Qy$qy beside the verify policy (the engine refuses it); the arm is skipped"; skip=1; }
+    fi
   else
     (( ${#q1[@]} )) && { log "arm $a: the Q parts (${q1[*]}) need P1; the arm is skipped"; skip=1; }
     env+=(RADIANCE_EXPERIMENTAL_DS41_P1=0 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
           RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0)
+          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0
+          RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT=)
   fi
   # LhS (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT): the lent slots follow live decode routing, in an arm that lends
   # the arena (QeK, so P1 and Lc too). Every arm states the switch (0 without the part) and its two tunables
@@ -3936,7 +4013,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QSP=$qsp ARM_LH=$lh
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QSP=$qsp ARM_LH=$lh
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr
   # Ax / AxN / Axv / AxvN / Ax0 / AxfN (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS, core/place/aux_expert_worker.h): the
   # extra card appended last to the window's mask of the four rank cards (ranks 0-3 stay the XTs), the worker on it

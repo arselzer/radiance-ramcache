@@ -333,10 +333,11 @@ open(sys.argv[sys.argv.index("--prompts-out") + 1], "w").write(json.dumps(sys.ar
 EOS
 ( OUT=$d PORT=18089 SB_TOOLS=$d/tools ARM_TIMEOUT=1800; log() { echo "LOG: $*" >> "$d/log"; }
   eval "$(sed -n '/^sb_client() {/,/^}/p' "$W")"; sb_client armx "$T/rec.json" ) > /dev/null 2>&1
-got=$(cat "$d/armx.batch_client.prompts.jsonl" 2>/dev/null)
-[[ $got == *'"--receipt", "--first", "8", "'"$T"'/rec.json", "'"$d"'/armx.batch_client.jsonl"'* && $got == *'"--concurrency", "8"'* &&
+sbh=$(printf %s armx | sha1sum | cut -c1-12)
+got=$(cat "$d/sb-$sbh.batch_client.prompts.jsonl" 2>/dev/null)
+[[ $got == *'"--receipt", "--first", "8", "'"$T"'/rec.json", "'"$d"'/sb-'"$sbh"'.batch_client.jsonl"'* && $got == *'"--concurrency", "8"'* &&
    $got == *'"--url", "http://127.0.0.1:18089"'* && $got == *'"--timeout", "1800"'* ]] &&
-  ok "sb_client: the first 8 of the receipt, 8 at a time, into <arm>.batch_client.jsonl" || bad "sb_client: $got"
+  ok "sb_client: the first 8 of the receipt, 8 at a time, into sb-<sha1 of the arm>.batch_client.jsonl" || bad "sb_client: $got"
 # ---- 6. leftover servers (window H28): a fabricated /proc (PROC_ROOT) whose pids' executables are the run's binary,
 # another radiance under the build root, a radiance elsewhere and a shell; kill, ss, sleep and curl stubbed.
 P=$T/proc6; R=$T/root6; mkdir -p "$R/run" "$R/other" "$T/elsewhere"

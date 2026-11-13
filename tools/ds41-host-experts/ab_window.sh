@@ -222,6 +222,7 @@ ARMS=${ARMS-"base verify greedy"}
 HX_THREADS=${HX_THREADS:-16}
 VERIFY_REQUESTS=${VERIFY_REQUESTS:-3}
 HERE=$(cd "$(dirname "$0")" && pwd)
+SB_TOOLS=${SB_TOOLS:-$HERE}   # Sb arms: serve-batch.sh, serve_batch_match.py, batch_client.py
 R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
 MIRROR=${MIRROR:-}   # the checkpoint's model-*.safetensors for R arms; no default
@@ -968,6 +969,60 @@ ram_budget_gate() {
   return 0
 }
 
+# An arm's server launch, word by word into LAUNCH: its environment assignments (arm()'s arguments after the name,
+# then the three every arm sets), the binary and its flags. arm() runs `env "${LAUNCH[@]}"`; Sb (sb_check) holds
+# serve-batch.sh to the same words.
+launch_words() {
+  local prof=(--expert-profile "${ARM_PROFILE:-$PROFILE}")
+  [[ -n "${ARM_NOPROF:-}" ]] && prof=()   # Xnp: the container's own activation profile
+  LAUNCH=("$@" RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS=1 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1
+      RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1
+    "$BIN" --radiance-home "${ARM_HOME:-$RHOME}" --kernels libr4d,libref --model "$MODEL"
+      --served-model-name ds41-native-smoke --tp 4 --tp-wire exact --placement expert_tiered
+      --weights-disk-tier --expert-ram-cache-total-mib ${CACHE_MIB:-81920} --host-pool-mib ${HOST_POOL_MIB:-4096}
+      --host-headroom-mib 8192 --gpu-headroom-mib 256 --embedding-placement vram
+      --vision-tower-placement vram --ngram-placement disk --max-model-len 512
+      --max-num-batched-tokens 16 --max-num-seqs ${MAX_SEQS:-1} --kv-cache-dtype bf16
+      --num-speculative-tokens 0 --spec-ngram 0 ${ARM_NOPC---no-prefix-cache} --deterministic
+      --host 127.0.0.1 --port $PORT "${prof[@]}" ${EXTRA_ARGS:-} "${ARGS[@]}")
+}
+# Sb (serve-batch.sh, the batch preset): the arm's launch (launch_words, from arm()'s arguments after the name)
+# turned into serve-batch.sh's arguments (serve_batch_match.py params) and held to it: serve-batch.sh --dry-run with
+# them must give the same environment, binary and flags, each at its last value, or the arm cannot be expressed.
+# SB_TOOLS (this script's directory): serve-batch.sh, serve_batch_match.py and batch_client.py. Sets SB_ARGS, or
+# SB_WHY and returns 1.
+sb_check() {
+  local name=$1; shift
+  SB_ARGS=() SB_WHY=""
+  local f t=$OUT/$name.sb
+  for f in serve-batch.sh serve_batch_match.py batch_client.py; do
+    [[ -f "$SB_TOOLS/$f" ]] || { SB_WHY="no $SB_TOOLS/$f (SB_TOOLS)"; return 1; }
+  done
+  launch_words "$@"
+  printf '%s\n' "${LAUNCH[@]}" > "$t.words"
+  if ! python3 -I "$SB_TOOLS/serve_batch_match.py" params "$t.words" > "$t.args" 2>&1; then
+    SB_WHY="serve-batch.sh cannot take this launch: $(head -1 "$t.args")"; return 1
+  fi
+  mapfile -t SB_ARGS < "$t.args"
+  if ! RADIANCE_BIN="$BIN" bash "$SB_TOOLS/serve-batch.sh" "${SB_ARGS[@]}" --dry-run > "$t.dry" 2>&1; then
+    SB_WHY="serve-batch.sh --dry-run refused: $(tail -1 "$t.dry")"; return 1
+  fi
+  if ! python3 -I "$SB_TOOLS/serve_batch_match.py" compare "$t.words" "$t.dry" > "$t.cmp" 2>&1; then
+    SB_WHY="serve-batch.sh does not express the arm: $(head -3 "$t.cmp" | tr '\n' ';')"; return 1
+  fi
+  return 0
+}
+# Sb: after the timed requests, on the same server, batch_client.py sends the first SB_CLIENT_N (8) of the arm's
+# prompts SB_CLIENT_N at a time; its replies go to $OUT/<arm>.batch_client.jsonl, beside ab_requests.py's.
+sb_client() {
+  local name=$1 receipt=$2
+  local k=${SB_CLIENT_N:-8}
+  log "arm $name: Sb: batch_client.py on the first $k prompts of $receipt, $k at a time"
+  env ${ARM_TIMEOUT:+AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT} python3 -I "$SB_TOOLS/batch_client.py" --receipt --first "$k" \
+    "$receipt" "$OUT/$name.batch_client.jsonl" --prompts-out "$OUT/$name.batch_client.prompts.jsonl" --url "http://127.0.0.1:$PORT" --concurrency "$k" \
+    ${ARM_TIMEOUT:+--timeout $ARM_TIMEOUT} >>"$OUT/window.log" 2>&1
+  log "arm $name: Sb: batch_client exit $?"
+}
 arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (default 81920)
   local name=$1; shift
   local n=${ARM_N:-${AB_REQUESTS:-8}}; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
@@ -987,16 +1042,15 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       AUX_TENANT_FAIL+=" the first tenant got no room ($(tail -1 "$OUT/$name.tenant1.log" 2>/dev/null));"
     log "arm $name: AxF: the first tenant (pid $tenant1): $(grep -m1 'aux_tenant: room after' "$OUT/$name.tenant1.log" 2>/dev/null)"
   fi
-  env "$@" RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS=1 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1 \
-      RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1 \
-    "$BIN" --radiance-home "${ARM_HOME:-$RHOME}" --kernels libr4d,libref --model "$MODEL" \
-      --served-model-name ds41-native-smoke --tp 4 --tp-wire exact --placement expert_tiered \
-      --weights-disk-tier --expert-ram-cache-total-mib ${CACHE_MIB:-81920} --host-pool-mib ${HOST_POOL_MIB:-4096} \
-      --host-headroom-mib 8192 --gpu-headroom-mib 256 --embedding-placement vram \
-      --vision-tower-placement vram --ngram-placement disk --max-model-len 512 \
-      --max-num-batched-tokens 16 --max-num-seqs ${MAX_SEQS:-1} --kv-cache-dtype bf16 \
-      --num-speculative-tokens 0 --spec-ngram 0 ${ARM_NOPC---no-prefix-cache} --deterministic \
-      --host 127.0.0.1 --port $PORT --expert-profile "${ARM_PROFILE:-$PROFILE}" ${EXTRA_ARGS:-} "${ARGS[@]}" >"$OUT/$name.server.log" 2>&1 &
+  if [[ -n "${ARM_SB:-}" ]]; then
+    # Sb: the server through serve-batch.sh, given what this launch has (sb_check: the same environment and flags).
+    sb_check "$name" "$@" || { log "arm $name: Sb: $SB_WHY; not measured"; aux_tenant_cleanup; return 1; }
+    log "arm $name: Sb: RADIANCE_BIN=$BIN $SB_TOOLS/serve-batch.sh ${SB_ARGS[*]}"
+    env RADIANCE_BIN="$BIN" bash "$SB_TOOLS/serve-batch.sh" "${SB_ARGS[@]}" >"$OUT/$name.server.log" 2>&1 &
+  else
+    launch_words "$@"
+    env "${LAUNCH[@]}" >"$OUT/$name.server.log" 2>&1 &
+  fi
   SERVER_PID=$!
   # Memory guard: stops this server (never anything else) if the host runs short.
   ( while kill -0 "$SERVER_PID" 2>/dev/null; do
@@ -1410,6 +1464,7 @@ EOF2
     python3 -I "$HERE/ab_requests.py" "${before_args[@]}" "${ARM_PROMPTS:-$PROMPTS}" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
   rc=$?
   log "arm $name: requests exit $rc"
+  [[ -n "${ARM_SB:-}" && "$rc" == 0 ]] && sb_client "$name" "${ARM_PROMPTS:-$PROMPTS}"
   if [[ -n "$toggler" ]]; then
     kill "$toggler" 2>/dev/null; wait "$toggler" 2>/dev/null
     log "arm $name: AxT: $(wc -l < "$OUT/$name.aux-toggles" 2>/dev/null || echo 0) control-file writes over the requests"
@@ -3120,7 +3175,7 @@ for a in $ARMS; do
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   axr=""   # AxrN: the worker's passes up to N rows (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
-  ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= ARM_PROFILE= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
+  ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= ARM_PROFILE= ARM_SB= ARM_NOPROF= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
   f5="" ARM_BEFORE_PROMPTS= ARM_BEFORE_N= ARM_BEFORE_CONC= ARM_OBS_CONC=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   fn128=""
@@ -3293,6 +3348,8 @@ for a in $ARMS; do
       Ov)      env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1) ;;    # independent dispatches overlap, decode passes
       Ov2)     env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=2) ;;    # ... in every pass issued live
       Xwp)     ARGS+=(--weight-prefetch off) ;;                        # no weight reads beside the collectives (core/config.cpp; exact)
+      Sb)      ARM_SB=1 ;;                                            # the server through serve-batch.sh (sb_check), and batch_client.py after the requests
+      Xnp)     ARM_NOPROF=1 ;;                                        # no --expert-profile: the container's own activation profile
       Xq?*)    ARM_PROFILE=${EXTRA_PROFILES:-/home/as/ds41-claude-build/work/extra-profiles}/${p#Xq}.json   # this arm's --expert-profile
                [[ -f "$ARM_PROFILE" ]] || { log "arm $a: $p: no profile $ARM_PROFILE; the arm is skipped"; skip=1; } ;;
       Ct|Ct[0-9]*)
@@ -4184,18 +4241,23 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
         RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_MBPS=${axo:+${AUX_ONLINE_MBPS:-}}
         RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_CHECK=${axo:+${AUX_ONLINE_CHECK:-}}
         RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_DRY=${axod})
+  if [[ -n "$ARM_NOPROF" && -n "$ARM_PROFILE" ]]; then log "arm $a: Xnp and an Xq profile together; the arm is skipped"; skip=1; fi
   [[ -n "$skip" ]] && continue
   # The extra card's clients at the arm's start (it is shared): only allowed tenants, and room for the cap.
   if [[ -n "$ax" ]] && ! aux_clients_gate "$a" "$ax"; then continue; fi
   [[ "$ax" == 0 ]] && ARM_AX0_USED=$(cat "${AUX_DRM:-/nonexistent}/mem_info_vram_used" 2>/dev/null)
-  [[ -n "$power" ]] && power_set "$power"
+  arm_env=()
   case $pol in
-    base) arm "$a" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0 "${env[@]}" ;;
+    base) arm_env=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0 "${env[@]}") ;;
     verify|greedy|all)
-      arm "$a" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$threads RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU \
-          RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=$pol "${env[@]}" ;;
-    *) log "unknown arm $a" ;;
+      arm_env=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$threads RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU
+               RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=$pol "${env[@]}") ;;
+    *) log "unknown arm $a"; continue ;;
   esac
+  # Sb: serve-batch.sh must express the whole launch (sb_check), or the arm is skipped before anything starts.
+  if [[ -n "$ARM_SB" ]] && ! sb_check "$a" "${arm_env[@]}"; then log "arm $a: Sb: $SB_WHY; the arm is skipped"; continue; fi
+  [[ -n "$power" ]] && power_set "$power"
+  arm "$a" "${arm_env[@]}"
   power_restore
 done
 [[ -n "$ARMS" ]] && python3 -I "$HERE/ab_requests.py" --compare "$OUT" $ARMS | tee -a "$OUT/window.log"

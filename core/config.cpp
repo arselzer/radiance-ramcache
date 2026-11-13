@@ -210,7 +210,8 @@ static const Flag g_flags[] = {
     "                                    total, in pinned host memory. Default `auto`: what\n"
     "                                    --checkpoint-policy keeps for a --max-model-len session, plus\n"
     "                                    one, for each of --max-num-seqs, within an eighth of host\n"
-    "                                    memory. N fixes the total; 0 keeps none" },
+    "                                    memory (under RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET, for at\n"
+    "                                    most 32 sequences). N fixes the total; 0 keeps none" },
     { "--no-prefix-cache",    nullptr,  "disable prefix caching" },
     { "--prefix-resume",      "MODE",   "where a prefix hit resumes: exact (default) only where\n"
     "                                    an idle server's cold prefill of the prompt starts a\n"

@@ -10,6 +10,10 @@ checks by comparing replies, prefill hashes and logits. [RAMCACHE.md](RAMCACHE.m
 adds; [tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md) has the configuration,
 the switches and every measurement. Below the line is upstream's README, unchanged.
 
+**Batch jobs** (hundreds of short prompts at once): see "Batch jobs: quickstart" in
+[tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md#batch-jobs-quickstart) for the one-command
+launcher (`serve-batch.sh`), a client and the measured throughput (256 questions in 329 s on four cards).
+
 **Checkpoint precision:** the model used for these results preserves the official 1017 release's
 MXFP4 expert codes/scales, but uses ISTA IQ4_NL Engram tables and BF16/F32 conversions of other
 official neural weights. It is a hybrid, not an entirely untouched official-precision checkpoint.

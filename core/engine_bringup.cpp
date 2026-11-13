@@ -3729,6 +3729,9 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
                  (long long)model_len, (long long)(pol->held(ctx, interval) + 1 + extra), pol->name(),
                  extra ? ", one of them a shared head's (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD)" : "");
     }
+    /* Under the RAM budget, at most kRamBudgetCheckpointSeqs sequences' worth (core/mem/prefix.h);
+     * the same count as before up to that many. */
+    const int64_t store_seqs = ram_budget_on_ ? ram_budget_checkpoint_seqs(cfg_.max_seqs) : cfg_.max_seqs;
 
     int64_t still = cfg_.prefix_cache_mib * ((int64_t)1 << 20);
     for (const auto& r : ranks_) still += arena_host_bytes(r->program);
@@ -3737,7 +3740,7 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
      * with the model's own state -- any hybrid's linear layers, any KV encoding's mirror -- since
      * it is measured from this rank's slot and the host's own spare memory. */
     const int64_t floor_slots =
-        std::min<int64_t>(checkpoint_slots_want(*pol, cfg_.max_seqs, ctx, interval, extra),
+        std::min<int64_t>(checkpoint_slots_want(*pol, store_seqs, ctx, interval, extra),
                           kCheckpointSlotsFloor);
     const int64_t floor_bytes =
         slot > INT64_MAX / std::max<int64_t>(floor_slots, 1) ? INT64_MAX : floor_slots * slot;
@@ -3822,15 +3825,19 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
                  "MiB; sized by --checkpoint-slots auto", sm);
     }
 
-    const CheckpointSlots c = checkpoint_slots_auto(*pol, cfg_.max_seqs, ctx, interval, slot,
+    const CheckpointSlots c = checkpoint_slots_auto(*pol, store_seqs, ctx, interval, slot,
                                                     share, room, extra);
     cfg_.checkpoint_slots = c.slots;
 
-    const std::string need =
+    std::string need =
         fmt("%lld a sequence for --max-num-seqs %lld: %s keeps %lld for a %lld-token session at "
             "a %lld-token interval, and one more for a running turn", (long long)c.per_seq,
             (long long)cfg_.max_seqs, pol->name(), (long long)(c.per_seq - 1), (long long)ctx,
             (long long)interval);
+    if (store_seqs < cfg_.max_seqs)
+        need += fmt("; the ram budget sizes the store for %lld sequences' worth, not %lld "
+                    "(kRamBudgetCheckpointSeqs: a batch holds few snapshots at once; --checkpoint-slots N "
+                    "sets more)", (long long)store_seqs, (long long)cfg_.max_seqs);
     std::string bound;
     if (c.bound == CheckpointSlots::Bound::Share)
         bound = fmt("; %lld wanted, held to an eighth of host memory (%s); --checkpoint-slots N "

@@ -350,10 +350,10 @@ int BatchBuilder::init(Program& prog, const Config& cfg, const ChunkGeometry& ge
     /* Report both the reservation and the block-table share of it: tables are carved for the
      * worst step, but a step uploads only the rows it filled. */
     RAD_INFO("step batch: %s pinned staging ring + %s device slab a rank (%s of it block "
-             "tables), %d KV group(s), %d derived buffer(s)",
+             "tables, %lld rows of %lld tokens), %d KV group(s), %d derived buffer(s)",
              humanb(ring_.bytes).c_str(), humanb(set_.dev_bytes).c_str(),
-             humanb(set_.dev_bytes - set_.bt_base).c_str(), (int)prog.kv_groups.size(),
-             (int)derived_.size());
+             humanb(set_.dev_bytes - set_.bt_base).c_str(), (long long)max_seqs_,
+             (long long)max_ctx_, (int)prog.kv_groups.size(), (int)derived_.size());
     return RAD_OK;
 }
 
@@ -385,9 +385,13 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
     if (kvgeom_.g.size() != prog.kv_groups.size()) return RAD_E_INVAL;
 
     /* Block-table rows are sized by context, or by window for a window group (size_set). The +1
-     * block there is because a window is not block-aligned and can straddle one extra block. */
-    max_ctx_ = cfg.max_ctx > 0 ? cfg.max_ctx : prog.meta.n_ctx_train;
-    if (max_ctx_ <= 0) max_ctx_ = cfg.max_tok;
+     * block there is because a window is not block-aligned and can straddle one extra block.
+     * Under --max-seq-len the context is one sequence's (seq_len_bound), not the pool's
+     * --max-model-len: the rows are max_seqs of them. */
+    int64_t model_len = cfg.max_ctx > 0 ? cfg.max_ctx : prog.meta.n_ctx_train;
+    if (model_len <= 0) model_len = cfg.max_tok;
+    seq_limit_ = seq_len_limit(cfg, model_len);
+    max_ctx_ = seq_len_bound(cfg, model_len);
 
     /* Conv rolling window: width-1 entries of history plus the whole speculative window, so a
      * rejection reads back at the slot the last accepted token left (spec §10). Taken from the

@@ -259,5 +259,124 @@ else
     else bad "shared-head gate: Pch '$sh', $pub published, want $want ($(ls "$d"))"; fi
   done
 fi
+# ---- 5. Sb (the server through serve-batch.sh) and Xnp (no --expert-profile): the arm loop, every action stubbed
+# but sb_check, which runs serve-batch.sh --dry-run against the arm's launch (launch_words); arm()'s Sb launch
+# and batch_client.py run with a stub binary and a stub client.
+B256=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60
+SB=$B256-Sb SBNP=$B256-Sb-Xnp SBXQ=$B256-Sb-Xqprof SBRES=${B256/-mA-/-mA20480-}-Sb SB64=${B256/Pch32/Pch64}-Sb
+SBRD=${B256/Rd13/Rd12}-Sb SBNOMA=${B256/-mA-/-}-Sb SBL=${B256/L294912/L294913}-Sb SBPCS=${B256/Pcs128/Pcs64}-Sb
+SBBOTH=$B256-Sb-Xnp-Xqprof SBQD=${B256%-Qy60}; SBQD=${SBQD/-Qd64/}-Sb SBOFF=${B256%-Qy60}-Sb SBQYF=${B256/Qy60/Qyf60}-Sb
+SBSL=${B256/L294912/L294912-Sl4096}-Sb
+mkdir -p "$T/profiles"; echo '{}' > "$T/profiles/prof.json"
+(
+  set +u
+  log() { echo "LOG: $*"; }
+  power_set() { :; }; power_restore() { :; }
+  vpack_gate() { return 0; }
+  aux_clients_gate() { return 0; }
+  arm() { echo "ARM $1"; }
+  HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T PROMPTS=$T/prompts.json
+  BIN=/stub/radiance MODEL=/stub/model.rad PORT=18089 PROFILE=/stub/sealed.json EXTRA_PROFILES=$T/profiles
+  SB_TOOLS=$(cd "$(dirname "$W")" && pwd)
+  unset RADIANCE_TUNE
+  SUM=$(sha256sum "$H/kernels/libr4d.so" | cut -d' ' -f1); LIB=$H/kernels/libr4d.so
+  TALL_OK=1 TALL_WHY=test TALL_SUM=$SUM TALL_LIB=$LIB DK_OK=1 DK_WHY=test DK_SUM=$SUM DK_LIB=$LIB
+  RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=4096
+  BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=4096 P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
+  AUX_OK=1 AUX_LIB=$LIB AUX_SUM=$SUM AUX_UUID=GPU-00000000000000aa AUX_MIB=26000
+  OUT=$T/sbout; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
+  eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^launch_words() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^sb_check() {/,/^}/p' "$W")"
+  HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
+  ARMS="$SB $SBNP $SBXQ $SBRES $SB64 $SBRD $SBNOMA $SBL $SBPCS $SBBOTH $SBQD $SBOFF $SBQYF $SBSL"
+  s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
+  e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
+  eval "$(sed -n "${s},${e}p" "$W")"
+) > "$T/sbloop.txt" 2>&1
+for a in "$SB" "$SBNP" "$SBXQ" "$SBRES" "$SB64" "$SBOFF" "$SBSL"; do
+  if grep -qx "ARM $a" "$T/sbloop.txt"; then ok "Sb: launched: ...${a#$B256}"
+  else bad "Sb: ...${a#$B256} not launched: $(grep -m2 -F "arm $a:" "$T/sbloop.txt")"; fi
+done
+sbskip() {   # arm, the reason's text, what
+  if ! grep -qx "ARM $1" "$T/sbloop.txt" && grep -F "arm $1:" "$T/sbloop.txt" | grep -qF "$2"; then ok "Sb: skipped: $3"
+  else bad "Sb: $3 not skipped with '$2': $(grep -m2 -F "arm $1:" "$T/sbloop.txt")"; fi
+}
+sbskip "$SBRD" "flag --expert-plane-mirror-decode-share" "Rd12 (the launcher's share is 0.13)"
+sbskip "$SBNOMA" "env RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET" "no mA"
+sbskip "$SBL" "is not a whole number of tokens" "L294913 over N256"
+sbskip "$SBPCS" "flag --checkpoint-slots" "Pcs64"
+sbskip "$SBBOTH" "Xnp and an Xq profile together" "Xnp with Xq"
+sbskip "$SBQD" "env RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS" "no Qd64"
+sbskip "$SBQYF" "Qyf: a held hybrid share" "Qyf60 (a held share)"
+args=$(cat "$T/sbout/$SB.sb.args" 2>/dev/null | tr '\n' ' ')
+[[ $args == *"--streams 256 --ctx-per-stream 1152 "* && $args == *"--served-name ds41-native-smoke"* && $args == *"--profile /stub/sealed.json"* &&
+   $args == *"--mirror $T"* && $args == *"--radiance-home $H"* && $args == *"--shared-head 32"* && $args != *--reserve-mib* ]] &&
+  ok "Sb: the launcher's arguments for the measured arm" || bad "Sb: the launcher's arguments: $args"
+args=$(tr '\n' ' ' < "$T/sbout/$SBNP.sb.args" 2>/dev/null)
+[[ -n $args && $args != *--profile* ]] && ok "Sb Xnp: no --profile" || bad "Sb Xnp: $args"
+tr '\n' ' ' < "$T/sbout/$SBRES.sb.args" 2>/dev/null | grep -q -- '--reserve-mib 20480'  && ok "Sb mA20480: --reserve-mib 20480" || bad "Sb mA20480"
+tr '\n' ' ' < "$T/sbout/$SB64.sb.args" 2>/dev/null | grep -q -- '--shared-head 64'  && ok "Sb Pch64: --shared-head 64" || bad "Sb Pch64"
+tr '\n' ' ' < "$T/sbout/$SB.sb.args" 2>/dev/null | grep -q -- '--hybrid 60 ' && ok "Sb Qy60: --hybrid 60" || bad "Sb Qy60"
+tr '\n' ' ' < "$T/sbout/$SBOFF.sb.args" 2>/dev/null | grep -q -- '--hybrid 0 ' && ok "Sb without Qy: --hybrid 0" || bad "Sb without Qy"
+tr '\n' ' ' < "$T/sbout/$SBSL.sb.args" 2>/dev/null | grep -q -- '--max-seq-len 4096' && ok "Sb Sl4096: --max-seq-len 4096" || bad "Sb Sl4096"
+# arm()'s Sb branch: the launch through serve-batch.sh (a stub binary that records its environment and arguments,
+# and answers like a server), then batch_client.py after the requests (a stub client).
+armfn=$(sed -n '/^arm() {   # name/,/^}/p' "$W")
+if [[ $armfn == *'bash "$SB_TOOLS/serve-batch.sh" "${SB_ARGS[@]}"'* && $armfn == *'sb_client "$name"'* ]]; then
+  ok "arm(): an Sb arm starts serve-batch.sh and runs sb_client after its requests"
+else bad "arm(): no Sb launch or sb_client call"; fi
+d=$T/sbclient; mkdir -p "$d/tools"
+cat > "$d/tools/batch_client.py" <<'EOS'
+import json, sys
+open(sys.argv[sys.argv.index("--prompts-out") + 1], "w").write(json.dumps(sys.argv[1:]) + "\n")
+EOS
+( OUT=$d PORT=18089 SB_TOOLS=$d/tools ARM_TIMEOUT=1800; log() { echo "LOG: $*" >> "$d/log"; }
+  eval "$(sed -n '/^sb_client() {/,/^}/p' "$W")"; sb_client armx "$T/rec.json" ) > /dev/null 2>&1
+sbh=$(printf %s armx | sha1sum | cut -c1-12)
+got=$(cat "$d/sb-$sbh.batch_client.prompts.jsonl" 2>/dev/null)
+[[ $got == *'"--receipt", "--first", "8", "'"$T"'/rec.json", "'"$d"'/sb-'"$sbh"'.batch_client.jsonl"'* && $got == *'"--concurrency", "8"'* &&
+   $got == *'"--url", "http://127.0.0.1:18089"'* && $got == *'"--timeout", "1800"'* ]] &&
+  ok "sb_client: the first 8 of the receipt, 8 at a time, into sb-<sha1 of the arm>.batch_client.jsonl" || bad "sb_client: $got"
+# ---- 6. leftover servers (window H28): a fabricated /proc (PROC_ROOT) whose pids' executables are the run's binary,
+# another radiance under the build root, a radiance elsewhere and a shell; kill, ss, sleep and curl stubbed.
+P=$T/proc6; R=$T/root6; mkdir -p "$R/run" "$R/other" "$T/elsewhere"
+for f in "$R/run/radiance" "$R/other/radiance" "$T/elsewhere/radiance" "$R/run/bash"; do echo x > "$f"; done
+mkproc() { mkdir -p "$P/$1"; ln -s "$2" "$P/$1/exe"; printf '%s\0--port\0018089\0' "$2" > "$P/$1/cmdline"; }
+mkproc 101 "$R/run/radiance"; mkproc 102 "$R/other/radiance"; mkproc 103 "$T/elsewhere/radiance"; mkproc 104 "$R/run/bash"
+mkdir -p "$P/105"; ln -s "$R/run/radiance (deleted)" "$P/105/exe"
+six() {   # what to run after the functions are loaded; prints the stubs' calls
+  ( set +u
+    PROC_ROOT=$P LEFTOVER_ROOT=$R/ BIN=$R/run/radiance PORT=18089 OUT=$T/out6 REAP_WAIT_S=2 NAME=qfn URL=http://qfn SERVER_PID=
+    mkdir -p "$OUT"
+    log() { echo "LOG: $*"; }
+    kill() { echo "KILL $*"; [[ $1 == -0 ]] && return 1; return 0; }
+    sleep() { :; }; wait() { :; }; power_restore() { :; }; aux_tenant_cleanup() { :; }
+    ss() { [[ -n "${SS_PID:-}" ]] && echo "LISTEN 0 128 127.0.0.1:18089 0.0.0.0:* users:((\"radiance\",pid=$SS_PID,fd=9))"; }
+    eval "$(sed -n '/^bin_pids() {/,/^}/p; /^port_pids() {/,/^}/p; /^reap_pids() {/,/^}/p; /^stop_server() {/,/^}/p; /^restore() {/,/^}/p' "$W")"
+    eval "$1" ) 2>&1
+}
+got=$(six 'bin_pids exact "$BIN"' | sort | tr '\n' ' ')
+[[ $got == "101 105 " ]] && ok "bin_pids exact: the run's binary, a deleted one too" || bad "bin_pids exact: $got"
+got=$(six 'bin_pids under "$LEFTOVER_ROOT"' | sort | tr '\n' ' ')
+[[ $got == "101 102 105 " ]] && ok "bin_pids under the root: every radiance there, not the shell, not one elsewhere" || bad "bin_pids under: $got"
+got=$(SS_PID=777 six 'stop_server')
+[[ $got == *"KILL -INT 101"* && $got == *"KILL -INT 105"* && $got == *"KILL -INT 777"* && $got != *"-INT 102"* &&
+   $got == *"LOG: after the arm's server stopped: leftover process 101"* ]] &&
+  ok "stop_server: the run binary's leftovers and the port's listener signalled and logged, others not" || bad "stop_server: $got"
+got=$(six 'kill() { echo "KILL $*"; return 0; }; reap_pids test 101')
+[[ $got == *"KILL -INT 101"* && $got == *"still up after 2s: 101; SIGKILL"* && $got == *"KILL -KILL 101"* ]] &&
+  ok "reap_pids: SIGKILL after REAP_WAIT_S" || bad "reap_pids: $got"
+got=$(six 'DOCKER=(echo); curl() { return 0; }; restore')
+[[ $got == *"LOG: before qfn restarts: leftover process 102"* && $got == *"KILL -INT 101"* && $got != *"-INT 103"* && $got != *"-INT 104"* ]] &&
+  ok "restore: every radiance under the build root reaped before the container starts" || bad "restore: $got"
+before=${got%%restoring qfn*}
+[[ $before == *"leftover process 102"* ]] && ok "restore: the reaping comes before 'restoring'" || bad "restore order"
+# (4): a port that already answers before the arm's server starts.
+armfn=$(sed -n '/^arm() {   # name/,/^}/p' "$W")
+got=$( ( set +u; OUT=$T/out6; PORT=18089; log() { echo "LOG: $*"; }; curl() { return 0; }; port_pids() { echo 4242; }
+         env() { echo "STARTED"; }; ARMS=x; eval "$armfn"; arm early X=1; echo "rc $?" ) 2>&1)
+[[ $got == *"port 18089 already answers before its server starts (pids: 4242 ); not measured"* && $got == *"rc 1"* && $got != *STARTED* ]] &&
+  ok "arm(): a port already answering refuses the arm before any start" || bad "arm() early port: $got"
 (( fail == 0 )) && echo "PASS ab_window_ba_test" || echo "FAIL ab_window_ba_test (loop output: $T/loop.txt)"
 exit $fail

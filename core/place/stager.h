@@ -89,6 +89,7 @@
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
 #include "card_expert_stager.h"
+#include "p1_hybrid.h"
 #include "hx_fetch_list.h"
 #include "hx_side_store.h"
 #include "readahead.h"
@@ -534,9 +535,14 @@ public:
     int  launched(rad_op h, RadStream s, const RadArgs* a, int (*launch)(const RadArgs*, RadStream)) override;
     int  after_op(rad_op h, RadStream s) override;
     int  end_pass(RadStream s) override;
+    /* An armed card-path pass (p1_armed_: a prefill pass, or a decode pass under ..._P1_DECODE_ROWS). */
+    bool card_pass() const override { return p1_armed_; }
     /* ---- prefill Phase 1 (card_expert_stager.h): RADIANCE_EXPERIMENTAL_DS41_P1=1 beside LCP ----------
      * p1_on: this rank took it (p1_init); p1_stats_line: kLogStats's line for the shutdown. */
     bool p1_on() const { return p1_ && p1_->on(); }
+    /* The activation arena's level of the step about to be issued (Ctx::level(); the engine's), read at each
+     * pass's begin: hybrid decode splits a layer only on gate_up operands seen at the same level. */
+    void set_arena_level(std::function<int()> f) { arena_level_fn_ = std::move(f); }
     std::string p1_stats_line() const;
     /* Whether pass `b` is armed for the card path at the threshold `min_rows` (..._P1_MIN_ROWS): a pure
      * prefill pass (no decode row, no draft or speculation) of at least min_rows and at most
@@ -645,6 +651,8 @@ public:
 private:
     friend struct EpCountsHostProbe;
     friend struct AuxStagerProbe;
+    friend struct P1HybridProbe;
+    friend struct P1HybridLevelProbe;
     using Layer = StagedLayer;
     std::vector<Layer>   layers_;      /* the routed layers with file-tier units, in first-op order */
     std::vector<int32_t> first_of_;    /* by op: the layer whose first op it is, or -1 */
@@ -855,7 +863,9 @@ private:
      * ..._MISSES of at least p1_cpu_rows). */
     int64_t hx_miss_need(int32_t li) const { return p1_armed_ ? layer_rows(li) : pass_tok_; }
     uint64_t p1_cpu_layers_ = 0;         /* this armed pass's routed layers on the CPU path (below the threshold) */
-    int  p1_layer(int32_t li, RadStream s);
+    /* `hyb`: this layer may give RAM-cache units to the CPU pool (hybrid decode, p1_hybrid.h; its rows
+     * and sorted order were fetched with the counts). */
+    int  p1_layer(int32_t li, RadStream s, bool hyb = false);
     /* ..._P1_DECODE_ROWS (p1_decode_pass_arms): the threshold as p1_init read it (0 off); this pass armed as a
      * decode pass; and the shutdown counts (p1_stats_line): decode passes armed, their rows, the tallest, their
      * issue time from begin_pass to end_pass; and the pure decode passes of 17 rows or more below the
@@ -863,6 +873,40 @@ private:
     int64_t  p1_decode_rows_ = 0;
     bool     p1_decode_pass_ = false;
     uint64_t p1_dec_passes_ = 0, p1_dec_rows_ = 0, p1_dec_max_ = 0, p1_dec_ns_ = 0, p1_dec_below_ = 0;
+    /* ..._P1_HYBRID (p1_hybrid.h; 0 off: none of this acts): this pass is an armed decode pass that may split;
+     * the layer whose CPU units are with the pool (-1 none); the event behind its waves (after_op) and whether
+     * it was recorded; the submit time; the share. p1_hyb_pick chooses (fills p1_hyb_to_, by want_ index),
+     * p1_hyb_take borrows and submits, p1_hyb_done counts a layer at its gather (hx_finish). */
+    bool     p1_hyb_pass_ = false, p1_hyb_split_ = false, p1_hyb_rec_ = false;
+    /* The activation arena's level this pass runs at (Ctx::level() through arena_level_fn_, which the engine
+     * sets; 0, the full plan, without it): its buffers' addresses are that level's. */
+    int      pass_level_ = 0;
+    std::function<int()> arena_level_fn_;
+    /* Whether layer li of this pass may split (p1_hyb_pass_, the pool, the layer's gate_up operands known, and
+     * known at this pass's arena level: hx_fetch reads the rows and the sorted order from those addresses before
+     * this pass's gate_up is seen, and a pass at the other level has its buffers elsewhere). */
+    bool p1_hyb_layer_ok(int32_t li) const {
+        return p1_hyb_pass_ && hx_pool_ && !head_.configured() && li >= 0 && (size_t)li < hx_ops_.size() &&
+               hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x && hx_ops_[(size_t)li].x_level == pass_level_;
+    }
+    int32_t  p1_hyb_li_ = -1;
+    RadEvent p1_hyb_ev_ = nullptr;
+    std::chrono::steady_clock::time_point p1_hyb_t_sub_{};
+    p1hyb::Share p1_hyb_share_;
+    std::vector<p1hyb::Cand> p1_hyb_cand_;
+    std::vector<uint8_t> p1_hyb_to_;
+    std::vector<int> p1_hyb_order_;
+    std::vector<int32_t> p1_hyb_cpu_;   /* this layer's units with the pool, aliased skipped */
+    struct HybStats {
+        uint64_t armed = 0, passes = 0, layers = 0, cpu_units = 0, card_units = 0, fell_back = 0, no_rows = 0;
+        uint64_t other_level = 0;   /* layers whose operands were last seen at the other arena level */
+        uint64_t cpu_rows = 0, cpu_ns = 0, wait_ns = 0, late = 0, late_wait_ns = 0, early = 0;
+        double   pred_cpu_ns = 0, pred_card_ns = 0;
+    } p1_hyb_st_;
+    int  p1_hyb_pick(int32_t li);
+    bool p1_hyb_borrow(int32_t u, int rows, bool admit);
+    int  p1_hyb_submit(int32_t li);
+    void p1_hyb_done(bool early, uint64_t waited_ns);
     bool p1_admits(int32_t li, int32_t e) const;
     /* ..._P1_VERIFY=N: after a layer's waves, N of its RAM-cache units' expert-rows recomputed by the
      * CPU pool from the cache's bytes (borrowed again, read-only) and compared with the card's down
@@ -997,6 +1041,9 @@ private:
         int64_t     x_ld = 0;
         const void* sorted = nullptr;
         const void* off = nullptr;
+        /* The activation arena's level the pass that last set x .. off ran at (pass_level_): each level
+         * (the full plan, and with the lent arena the smaller steps' levels) places the buffers apart. */
+        int         x_level = 0;
     };
     static constexpr int kHxUnits = 96;
     /* Sorted rows a pass can have: ep_rows_ tokens at top_k 6. */

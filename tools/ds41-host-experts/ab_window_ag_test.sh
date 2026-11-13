@@ -8,7 +8,7 @@ trap 'rm -rf "$T"' EXIT
 fail=0
 ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
-for fn in serving_cards serving_cards_ok ag_rows_parse ag_rows_server_gate ag_rows_server_check ag_rows_receipt_ok ag_rows_check ag_rows_gate xt_check kld_finish; do
+for fn in serving_cards serving_cards_ok ag_rows_parse ag_rows_server_gate ag_rows_server_check ag_rows_receipt_ok ag_rows_check ag_rows_gate xt_check seqlen_server_gate kld_finish; do
   eval "$(sed -n "/^$fn() {/,/^}/p" "$W")"
   declare -F "$fn" >/dev/null || { bad "missing $fn"; exit 1; }
 done

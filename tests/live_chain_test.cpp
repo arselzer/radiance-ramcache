@@ -15,6 +15,7 @@
 
 #include "device/device.h"
 #include "runtime/live_chain.h"
+#include "runtime/stager.h"
 
 #include <cstdlib>
 #include <map>
@@ -408,6 +409,123 @@ TEST(the_switches_off_mean_nothing_runs) {
     b.phase = RAD_PHASE_DECODE;
     c.pass_begin(&b);
     CHECK(!c.checking());
+    c.pass_end();
+    CHECK(c.report().empty());
+}
+
+/* ---- which passes the trace takes (CHAIN_TRACE / CHAIN_TRACE_PREFILL) */
+
+namespace {
+RadBatch pass_of(int phase, int64_t rows, int draft = 0) {
+    RadBatch b{};
+    b.phase = phase;
+    b.n_tok = rows;
+    b.draft_pass = draft;
+    return b;
+}
+}  // namespace
+
+TEST(the_prefill_trace_takes_armed_card_path_prefill_passes_only) {
+    using rad::LiveTracePick;
+    const RadBatch pf = pass_of(RAD_PHASE_PREFILL, 1420), mx = pass_of(RAD_PHASE_MIXED, 900),
+                   dec = pass_of(RAD_PHASE_DECODE, 256), draft = pass_of(RAD_PHASE_PREFILL, 1420, 1);
+    CHECK_EQ(LiveTracePick::candidate(&pf, 0, true), (int)rad::kLiveTracePrefill);
+    CHECK_EQ(LiveTracePick::candidate(&mx, 0, true), (int)rad::kLiveTracePrefill);
+    /* Not armed: the CPU path's prefill is not the card split. */
+    CHECK_EQ(LiveTracePick::candidate(&pf, 0, false), (int)rad::kLiveTraceNone);
+    /* A decode pass stays the decode trace's, armed (..._P1_DECODE_ROWS) or not. */
+    CHECK_EQ(LiveTracePick::candidate(&dec, 0, true), (int)rad::kLiveTraceDecode);
+    CHECK_EQ(LiveTracePick::candidate(&dec, 0, false), (int)rad::kLiveTraceDecode);
+    /* Rank 0's trunk passes only. */
+    CHECK_EQ(LiveTracePick::candidate(&pf, 1, true), (int)rad::kLiveTraceNone);
+    CHECK_EQ(LiveTracePick::candidate(&draft, 0, true), (int)rad::kLiveTraceNone);
+    CHECK_EQ(LiveTracePick::candidate(nullptr, 0, true), (int)rad::kLiveTraceNone);
+}
+
+TEST(each_kind_counts_its_own_candidates) {
+    using rad::LiveTracePick;
+    const RadBatch pf = pass_of(RAD_PHASE_PREFILL, 2048), dec = pass_of(RAD_PHASE_DECODE, 256);
+    /* Prefill only (the decode trace off): every 3rd armed prefill pass, decode passes never. */
+    LiveTracePick p(0, 3);
+    CHECK(p.on());
+    std::vector<int> got;
+    for (int i = 0; i < 7; ++i) {
+        got.push_back(p.next(&pf, 0, true));
+        got.push_back(p.next(&dec, 0, true));
+        CHECK_EQ(p.next(&pf, 0, false), (int)rad::kLiveTraceNone);   /* unarmed: not counted */
+    }
+    int n_pf = 0, n_dec = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] == rad::kLiveTracePrefill) {
+            ++n_pf;
+            CHECK(i % 2 == 0);
+        }
+        if (got[i] == rad::kLiveTraceDecode) ++n_dec;
+    }
+    CHECK_EQ(n_pf, 2);   /* the 3rd and 6th of 7 */
+    CHECK_EQ(n_dec, 0);
+    CHECK_EQ(p.seen(rad::kLiveTracePrefill), 7u);
+    CHECK_EQ(p.seen(rad::kLiveTraceDecode), 0u);
+    /* Both: the decode count is the one CHAIN_TRACE alone gives, whatever prefill passes run. */
+    LiveTracePick both(2, 1), alone(2, 0);
+    for (int i = 0; i < 6; ++i) {
+        CHECK_EQ(both.next(&dec, 0, false), alone.next(&dec, 0, false));
+        CHECK_EQ(both.next(&pf, 0, true), (int)rad::kLiveTracePrefill);
+        CHECK_EQ(alone.next(&pf, 0, true), (int)rad::kLiveTraceNone);
+    }
+    /* Off. */
+    LiveTracePick off(0, 0);
+    CHECK(!off.on());
+    CHECK_EQ(off.next(&pf, 0, true), (int)rad::kLiveTraceNone);
+    CHECK_EQ(off.next(&dec, 0, true), (int)rad::kLiveTraceNone);
+    CHECK(std::string(rad::live_trace_kind_name(rad::kLiveTracePrefill)) == "prefill");
+    CHECK(std::string(rad::live_trace_kind_name(rad::kLiveTraceDecode)) == "decode");
+}
+
+namespace {
+struct FakeStager final : rad::OpStager {
+    bool arms = false, card = false;
+    bool begin_pass(const RadBatch*) override { return arms; }
+    int before_op(rad_op, RadStream, bool* r) override { *r = false; return RAD_OK; }
+    int end_pass(RadStream) override { return RAD_OK; }
+    bool card_pass() const override { return card; }
+};
+}  // namespace
+
+TEST(the_stager_chain_says_card_pass_only_for_a_stager_that_armed) {
+    FakeStager a, b;
+    rad::StagerChain c;
+    c.set(&a, &b);
+    const RadBatch pf = pass_of(RAD_PHASE_PREFILL, 1024);
+    CHECK(!c.card_pass());
+    b.card = true;             /* b would say so, but did not arm this pass */
+    a.arms = true;
+    CHECK(c.begin_pass(&pf));
+    CHECK(!c.card_pass());
+    c.end_pass(nullptr);
+    b.arms = true;
+    CHECK(c.begin_pass(&pf));
+    CHECK(c.card_pass());
+    c.end_pass(nullptr);
+    CHECK(!c.card_pass());     /* after the pass */
+    rad::OpStager& base = a;   /* the default: no card path */
+    a.card = false;
+    CHECK(!base.card_pass());
+}
+
+TEST(the_prefill_switch_alone_stays_off_without_a_live_path) {
+    if (rad::live_supported()) SKIP("the active backend has a live issue path");
+    unsetenv("RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP");
+    unsetenv("RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE");
+    setenv("RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL", "1", 1);
+    rad::LiveChain c;
+    c.init(0, nullptr);
+    unsetenv("RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL");
+    CHECK(!c.on());
+    const RadBatch pf = pass_of(RAD_PHASE_PREFILL, 1420);
+    c.pass_begin(&pf, true);
+    CHECK(!c.checking());
+    CHECK(!c.tracing());
     c.pass_end();
     CHECK(c.report().empty());
 }

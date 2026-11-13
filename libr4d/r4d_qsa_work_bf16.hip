@@ -29,8 +29,11 @@ namespace {
 
 constexpr int kThreads = 128;
 /* The sequence loop's bound, checked by the launcher against the real count from cu_seqlens. Not a
- * row constraint on the declared seqs (rad-convert declares 256, which must still resolve). */
-constexpr int kMaxSeq  = 256;
+ * row constraint on the declared seqs (rad-convert declares 256, which must still resolve). Nothing
+ * is sized by it: every workgroup scans cu for its owner, so it only bounds that scan. It was 256,
+ * which refused a 512-sequence decode step (--max-num-seqs 512 with --max-seq-len); a step of at
+ * most 256 sequences scans and writes exactly as before. */
+constexpr int kMaxSeq  = 4096;
 
 /* A gather that moves element bits and computes nothing, so one body serves any element width: E is
  * uint16_t for bf16 and uint32_t for f32 (the plane the staging copy feeds decides). */

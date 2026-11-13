@@ -181,6 +181,14 @@
 # other arm only without it), and at exit (qd_gate) only if every rank's "ds41 p1 stats, rank" line counts
 # its decode passes and some rank armed at least one ("decode passes armed A", A > 0): otherwise the switch
 # never acted (a batch below N) and the arm is set aside as unmeasured. Not yet measured on the cards.
+# QyP / QyfP: hybrid decode (..._P1_HYBRID=P, 1-400; every other arm states 0 and ..._P1_HYBRID_ADAPT empty): in a
+# decode pass the Qd part arms, each routed layer gives the CPU pool its RAM-cache units with the fewest rows while
+# the pool's predicted time stays within P% of the card's link time for the rest (core/place/p1_hybrid.h); Qyf holds
+# the share at P (..._P1_HYBRID_ADAPT=0), Qy lets it adapt. Needs P1 and Qd; skipped beside Sg (speculation), Ds
+# (a drafter), Ax (the aux expert worker; Ax0 is fine), Qv (the host verify) and the verify policy. A Qy arm is
+# measured only with rank 0's "ds41 p1: hybrid decode on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P;" line
+# naming its share mode (any other arm only without one), and at exit (qy_gate) only if every rank's stats line
+# counts its hybrid passes and some rank split one ("hybrid: passes split S", S > 0). Not yet measured on the cards.
 #
 # Coordinated actual Ar1280+Ag1024 caps additionally need SELFTEST_AR_AG_SHARED=<r4d_selftest>:
 # fresh all-four-card ds41_ar_ag_shared_exact pointer/lifetime/mixed replay receipt. It supplements
@@ -214,6 +222,7 @@ ARMS=${ARMS-"base verify greedy"}
 HX_THREADS=${HX_THREADS:-16}
 VERIFY_REQUESTS=${VERIFY_REQUESTS:-3}
 HERE=$(cd "$(dirname "$0")" && pwd)
+SB_TOOLS=${SB_TOOLS:-$HERE}   # Sb arms: serve-batch.sh, serve_batch_match.py, batch_client.py
 R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
 MIRROR=${MIRROR:-}   # the checkpoint's model-*.safetensors for R arms; no default
@@ -259,14 +268,52 @@ idle_for() {   # seconds of continuous idleness required, give up after $2 secon
 }
 
 SERVER_PID=
+# Leftover servers (window H28, 13 Nov: an Sb arm's radiance outlived the serve-batch.sh shell the harness killed,
+# kept the port, the four cards and 235 GB, answered the next arms, and kept QFN from starting). bin_pids: the pids
+# whose executable (PROC_ROOT, /proc) is the file named (`exact PATH`) or a `radiance` under a directory
+# (`under DIR`); port_pids: the pids listening on a TCP port (ss); reap_pids: SIGINT, up to REAP_WAIT_S (30) s, then
+# SIGKILL, each logged with its executable and command line.
+bin_pids() {   # exact PATH | under DIR
+  local mode=$1 want=$2 d exe
+  [[ $mode == exact ]] && want=$(readlink -f "$want" 2>/dev/null || echo "$want")
+  for d in "${PROC_ROOT:-/proc}"/[0-9]*; do
+    exe=$(readlink "$d/exe" 2>/dev/null) || continue
+    exe=${exe% (deleted)}
+    if [[ $mode == exact && $exe == "$want" ]] || [[ $mode == under && $exe == "${want%/}"/* && ${exe##*/} == radiance ]]; then
+      echo "${d##*/}"
+    fi
+  done
+}
+port_pids() {   # port
+  ss -Hltnp "sport = :$1" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
+}
+reap_pids() {   # why, pid...
+  local why=$1 p t=0 alive; shift
+  (( $# )) || return 0
+  for p in "$@"; do
+    log "$why: leftover process $p ($(readlink "${PROC_ROOT:-/proc}/$p/exe" 2>/dev/null): $(tr '\0' ' ' < "${PROC_ROOT:-/proc}/$p/cmdline" 2>/dev/null | cut -c1-200)); SIGINT"
+    kill -INT "$p" 2>/dev/null
+  done
+  while :; do
+    alive=""; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive+=" $p"; done
+    [[ -z "$alive" ]] && break
+    if (( t >= ${REAP_WAIT_S:-30} )); then log "$why: still up after ${t}s:$alive; SIGKILL"; kill -KILL $alive 2>/dev/null; break; fi
+    sleep 1; t=$((t + 1))
+  done
+}
 stop_server() {
-  [[ -n "$SERVER_PID" ]] || { aux_tenant_cleanup; return 0; }
-  kill -INT "$SERVER_PID" 2>/dev/null
-  local t=0
-  while kill -0 "$SERVER_PID" 2>/dev/null && (( t < 180 )); do sleep 1; t=$((t + 1)); done
-  if kill -0 "$SERVER_PID" 2>/dev/null; then log "server $SERVER_PID still up after ${t}s; SIGKILL"; kill -KILL "$SERVER_PID"; fi
-  wait "$SERVER_PID" 2>/dev/null
-  SERVER_PID=
+  if [[ -n "$SERVER_PID" ]]; then
+    kill -INT "$SERVER_PID" 2>/dev/null
+    local t=0
+    while kill -0 "$SERVER_PID" 2>/dev/null && (( t < 180 )); do sleep 1; t=$((t + 1)); done
+    if kill -0 "$SERVER_PID" 2>/dev/null; then log "server $SERVER_PID still up after ${t}s; SIGKILL"; kill -KILL "$SERVER_PID"; fi
+    wait "$SERVER_PID" 2>/dev/null
+    SERVER_PID=
+  fi
+  # Nothing of this window's binary, and nothing on the arm's port, may outlive the arm.
+  local left; left=$( { bin_pids exact "$BIN"; port_pids "$PORT"; } | sort -u)
+  # shellcheck disable=SC2086
+  [[ -n "$left" ]] && reap_pids "after the arm's server stopped" $left
   aux_tenant_cleanup
 }
 # AxF's simulated tenants (work/aux-dyn/SPEC.md §8.4): this harness's own helper processes only, stopped with the
@@ -342,6 +389,10 @@ restore() {
   RESTORED=1
   stop_server
   power_restore
+  # Whatever radiance of ours is still up (LEFTOVER_ROOT), so QFN can always get the cards.
+  local left; left=$(bin_pids under "${LEFTOVER_ROOT:-/home/as/ds41-claude-build/}")
+  # shellcheck disable=SC2086
+  [[ -n "$left" ]] && reap_pids "before $NAME restarts" $left
   log "restoring $NAME"
   local t=0 state
   while :; do
@@ -486,6 +537,13 @@ lcp_check() {   # name
     return 1
   fi
   [[ -n "${ARM_QD:-}" ]] && grep -m1 -E 'ds41 p1: decode passes on the cards' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # QyP / QyfP: rank 0's hybrid line at startup, in a Qy arm only (qy_gate).
+  local qy_why
+  if declare -F qy_gate >/dev/null && ! qy_why=$(qy_gate "$OUT/$name.server.log" "${ARM_QY:-}" "${ARM_QYF:-}" start); then
+    log "arm $name: $qy_why; not measured"
+    return 1
+  fi
+  [[ -n "${ARM_QY:-}" ]] && grep -m1 -E 'ds41 p1: hybrid decode on' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # QlK: rank 0's "ds41 p1: lent ring: K of the ring's" line at startup, in a Ql arm only.
   local lend_lines
   lend_lines=$(grep -c 'ds41 p1: lent ring: ' "$OUT/$name.server.log")
@@ -604,6 +662,24 @@ n128_server_gate() {   # server log, Fn128 flag, active ranks (4 here); explanat
   return 0
 }
 
+# SlN (--max-seq-len N): the server's startup line "max seq len: N tokens a sequence (--max-seq-len N);"
+# in an Sl arm whose N is below its --max-model-len; an Sl arm at or past it, and every arm without
+# the part, must have no such line (a radiance without the flag refuses the arm at startup).
+seqlen_server_gate() {   # server log, Sl's N (empty without the part), the arm's --max-model-len
+  local f=$1 want=$2 ctx=$3
+  if [[ -n "$want" ]] && (( 10#$want < 10#$ctx )); then
+    if ! grep -qE "max seq len: $want tokens a sequence \(--max-seq-len $want\); block tables, step staging and rotary tables are sized for [0-9]+ tokens a sequence; the KV pool stays --max-model-len $ctx\b" "$f"; then
+      echo "Sl$want, but the server log has no 'max seq len: $want tokens a sequence (--max-seq-len $want); ... --max-model-len $ctx' line ($(grep -m1 -E 'max seq len|max-seq-len' "$f"))"
+      return 1
+    fi
+  elif grep -qF 'max seq len: ' "$f"; then
+    if [[ -n "$want" ]]; then echo "Sl$want is at or past --max-model-len $ctx, but the server caps its sequences"
+    else echo "no Sl part, but the server caps its sequences"; fi
+    return 1
+  fi
+  return 0
+}
+
 n128_arm_gate() {   # library, conservative work-row bound; receipt is set by the device oracle
   local lib=$1 rows=$2
   if [[ "${N128_OK:-}" != 1 ]]; then
@@ -664,6 +740,11 @@ kld_finish() {   # name; the run is SERVER_PID
     return 1
   fi
   [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  local sl_why
+  if ! sl_why=$(seqlen_server_gate "$OUT/$name.server.log" "${ARM_SL:-}" "${ARM_CTX:-512}"); then
+    log "arm $name: $sl_why; not measured"
+    return 1
+  fi
   xt_check "$name" || return 1
   lcp_check "$name" || return 1
   # The aux expert worker: an arm with an Ax part is gated as arm() and aux_arm_exit gate a serving one
@@ -814,6 +895,42 @@ qd_gate() {   # log, Qd threshold, chunk, start/exit
   return 0
 }
 
+# QyP / QyfP (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID): at start rank 0's "ds41 p1: hybrid decode on: ...
+# (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P;" line naming the share mode (held for Qyf, adapting for Qy) in a Qy arm,
+# none in any other; at exit every rank's stats line with its hybrid counts and some rank's split passes above 0
+# (the switch acted). Arguments: the log, the arm's P (empty: no Qy part), its Qyf flag, start/exit. 0 when the arm
+# may be measured; else 1, the reason on stdout.
+qy_gate() {   # log, Qy share, Qyf (non-empty: held), start/exit
+  local f=$1 qy=$2 qyf=$3 stage=${4:-start} n split=0 ranks=0 a line
+  n=$(grep -c 'ds41 p1: hybrid decode on' "$f")
+  if [[ -z "$qy" ]]; then
+    if (( n > 0 )); then echo "no Qy part, but the server splits decode passes (the knob set for the window?)"; return 1; fi
+    if [[ "$stage" == exit ]] && grep -qE 'ds41 p1 stats, rank [0-9]+: .*; hybrid: passes split [1-9]' "$f"; then
+      echo "no Qy part, but a rank split decode passes"; return 1
+    fi
+    return 0
+  fi
+  if ! grep -q "ds41 p1: hybrid decode on: .*(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$qy;" "$f"; then
+    echo "Qy$qy, but the server log has no 'ds41 p1: hybrid decode on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$qy;' line ($(grep -m1 -E 'ds41 p1: hybrid|P1_HYBRID' "$f"))"; return 1
+  fi
+  if [[ -n "$qyf" ]] && ! grep -q 'ds41 p1: hybrid decode on: .*the share held (..._P1_HYBRID_ADAPT=0)' "$f"; then
+    echo "Qyf$qy, but the hybrid line does not hold the share"; return 1
+  fi
+  if [[ -z "$qyf" ]] && ! grep -q 'ds41 p1: hybrid decode on: .*the share adapts per rank' "$f"; then
+    echo "Qy$qy, but the hybrid line does not adapt the share"; return 1
+  fi
+  [[ "$stage" == exit ]] || return 0
+  while IFS= read -r line; do
+    ranks=$((ranks + 1))
+    a=$(sed -nE 's/.*; hybrid: passes split ([0-9]+) of ([0-9]+) armed.*/\1/p' <<< "$line")
+    if [[ -z "$a" ]]; then echo "Qy$qy, but a 'ds41 p1 stats, rank' line without its hybrid counts ($line)"; return 1; fi
+    split=$((split + a))
+  done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$f")
+  (( ranks > 0 )) || { echo "Qy$qy, but no 'ds41 p1 stats, rank' line at exit"; return 1; }
+  (( split > 0 )) || { echo "Qy$qy, but no rank split a decode pass (no RAM-cache unit fit the share?): the switch never acted"; return 1; }
+  return 0
+}
+
 qsp_gate() {   # log, requested switch, start/exit
   local f=$1 on=$2 stage=${3:-start} rank count line spans rows full fallbacks
   if [[ -z "$on" ]]; then
@@ -894,10 +1011,72 @@ ram_budget_gate() {
   return 0
 }
 
+# An arm's server launch, word by word into LAUNCH: its environment assignments (arm()'s arguments after the name,
+# then the three every arm sets), the binary and its flags. arm() runs `env "${LAUNCH[@]}"`; Sb (sb_check) holds
+# serve-batch.sh to the same words.
+launch_words() {
+  local prof=(--expert-profile "${ARM_PROFILE:-$PROFILE}")
+  [[ -n "${ARM_NOPROF:-}" ]] && prof=()   # Xnp: the container's own activation profile
+  LAUNCH=("$@" RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS=1 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1
+      RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1
+    "$BIN" --radiance-home "${ARM_HOME:-$RHOME}" --kernels libr4d,libref --model "$MODEL"
+      --served-model-name ds41-native-smoke --tp 4 --tp-wire exact --placement expert_tiered
+      --weights-disk-tier --expert-ram-cache-total-mib ${CACHE_MIB:-81920} --host-pool-mib ${HOST_POOL_MIB:-4096}
+      --host-headroom-mib 8192 --gpu-headroom-mib 256 --embedding-placement vram
+      --vision-tower-placement vram --ngram-placement disk --max-model-len 512
+      --max-num-batched-tokens 16 --max-num-seqs ${MAX_SEQS:-1} --kv-cache-dtype bf16
+      --num-speculative-tokens 0 --spec-ngram 0 ${ARM_NOPC---no-prefix-cache} --deterministic
+      --host 127.0.0.1 --port $PORT "${prof[@]}" ${EXTRA_ARGS:-} "${ARGS[@]}")
+}
+# Sb (serve-batch.sh, the batch preset): the arm's launch (launch_words, from arm()'s arguments after the name)
+# turned into serve-batch.sh's arguments (serve_batch_match.py params) and held to it: serve-batch.sh --dry-run with
+# them must give the same environment, binary and flags, each at its last value, or the arm cannot be expressed.
+# SB_TOOLS (this script's directory): serve-batch.sh, serve_batch_match.py and batch_client.py. Sets SB_ARGS, or
+# SB_WHY and returns 1.
+sb_check() {
+  local name=$1; shift
+  SB_ARGS=() SB_WHY=""
+  local f t=$OUT/$name.sb
+  for f in serve-batch.sh serve_batch_match.py batch_client.py; do
+    [[ -f "$SB_TOOLS/$f" ]] || { SB_WHY="no $SB_TOOLS/$f (SB_TOOLS)"; return 1; }
+  done
+  launch_words "$@"
+  printf '%s\n' "${LAUNCH[@]}" > "$t.words"
+  if ! python3 -I "$SB_TOOLS/serve_batch_match.py" params "$t.words" > "$t.args" 2>&1; then
+    SB_WHY="serve-batch.sh cannot take this launch: $(head -1 "$t.args")"; return 1
+  fi
+  mapfile -t SB_ARGS < "$t.args"
+  if ! RADIANCE_BIN="$BIN" bash "$SB_TOOLS/serve-batch.sh" "${SB_ARGS[@]}" --dry-run > "$t.dry" 2>&1; then
+    SB_WHY="serve-batch.sh --dry-run refused: $(tail -1 "$t.dry")"; return 1
+  fi
+  if ! python3 -I "$SB_TOOLS/serve_batch_match.py" compare "$t.words" "$t.dry" > "$t.cmp" 2>&1; then
+    SB_WHY="serve-batch.sh does not express the arm: $(head -3 "$t.cmp" | tr '\n' ';')"; return 1
+  fi
+  return 0
+}
+# Sb: after the timed requests, on the same server, batch_client.py sends the first SB_CLIENT_N (8) of the arm's
+# prompts SB_CLIENT_N at a time; its replies go to $OUT/<arm>.batch_client.jsonl, beside ab_requests.py's.
+sb_client() {
+  local name=$1 receipt=$2
+  local k=${SB_CLIENT_N:-8}
+  # Arm names run to ~300 characters; the files get a short stable name (sha1 of the arm), logged beside it.
+  local short; short=sb-$(printf %s "$name" | sha1sum | cut -c1-12)
+  log "arm $name: Sb: batch_client.py on the first $k prompts of $receipt, $k at a time (files $short.batch_client*.jsonl)"
+  env ${ARM_TIMEOUT:+AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT} python3 -I "$SB_TOOLS/batch_client.py" --receipt --first "$k" \
+    "$receipt" "$OUT/$short.batch_client.jsonl" --prompts-out "$OUT/$short.batch_client.prompts.jsonl" --url "http://127.0.0.1:$PORT" --concurrency "$k" \
+    ${ARM_TIMEOUT:+--timeout $ARM_TIMEOUT} >>"$OUT/window.log" 2>&1
+  log "arm $name: Sb: batch_client exit $?"
+}
 arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (default 81920)
   local name=$1; shift
   local n=${ARM_N:-${AB_REQUESTS:-8}}; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
   log "arm $name: $*"
+  # A port that answers before this arm's server starts is another server's (a leftover): "serving" would
+  # measure it, so the arm is not run.
+  if curl -s -m 3 "http://127.0.0.1:$PORT/stats" >/dev/null 2>&1; then
+    log "arm $name: port $PORT already answers before its server starts (pids: $(port_pids "$PORT" | tr '\n' ' ')); not measured"
+    return 1
+  fi
   # AxF (work/aux-dyn/SPEC.md §8.4): the first simulated tenant takes its memory on the extra card before the server
   # starts (the server then starts released), and holds it until 20 s after "serving" (aux_tenant_phases).
   local tenant1="" tenant_helper=""
@@ -913,16 +1092,15 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       AUX_TENANT_FAIL+=" the first tenant got no room ($(tail -1 "$OUT/$name.tenant1.log" 2>/dev/null));"
     log "arm $name: AxF: the first tenant (pid $tenant1): $(grep -m1 'aux_tenant: room after' "$OUT/$name.tenant1.log" 2>/dev/null)"
   fi
-  env "$@" RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS=1 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1 \
-      RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1 \
-    "$BIN" --radiance-home "${ARM_HOME:-$RHOME}" --kernels libr4d,libref --model "$MODEL" \
-      --served-model-name ds41-native-smoke --tp 4 --tp-wire exact --placement expert_tiered \
-      --weights-disk-tier --expert-ram-cache-total-mib ${CACHE_MIB:-81920} --host-pool-mib ${HOST_POOL_MIB:-4096} \
-      --host-headroom-mib 8192 --gpu-headroom-mib 256 --embedding-placement vram \
-      --vision-tower-placement vram --ngram-placement disk --max-model-len 512 \
-      --max-num-batched-tokens 16 --max-num-seqs ${MAX_SEQS:-1} --kv-cache-dtype bf16 \
-      --num-speculative-tokens 0 --spec-ngram 0 ${ARM_NOPC---no-prefix-cache} --deterministic \
-      --host 127.0.0.1 --port $PORT --expert-profile "${ARM_PROFILE:-$PROFILE}" ${EXTRA_ARGS:-} "${ARGS[@]}" >"$OUT/$name.server.log" 2>&1 &
+  if [[ -n "${ARM_SB:-}" ]]; then
+    # Sb: the server through serve-batch.sh, given what this launch has (sb_check: the same environment and flags).
+    sb_check "$name" "$@" || { log "arm $name: Sb: $SB_WHY; not measured"; aux_tenant_cleanup; return 1; }
+    log "arm $name: Sb: RADIANCE_BIN=$BIN $SB_TOOLS/serve-batch.sh ${SB_ARGS[*]}"
+    env RADIANCE_BIN="$BIN" bash "$SB_TOOLS/serve-batch.sh" "${SB_ARGS[@]}" >"$OUT/$name.server.log" 2>&1 &
+  else
+    launch_words "$@"
+    env "${LAUNCH[@]}" >"$OUT/$name.server.log" 2>&1 &
+  fi
   SERVER_PID=$!
   # Memory guard: stops this server (never anything else) if the host runs short.
   ( while kill -0 "$SERVER_PID" 2>/dev/null; do
@@ -1336,6 +1514,7 @@ EOF2
     python3 -I "$HERE/ab_requests.py" "${before_args[@]}" "${ARM_PROMPTS:-$PROMPTS}" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
   rc=$?
   log "arm $name: requests exit $rc"
+  [[ -n "${ARM_SB:-}" && "$rc" == 0 ]] && sb_client "$name" "${ARM_PROMPTS:-$PROMPTS}"
   if [[ -n "$toggler" ]]; then
     kill "$toggler" 2>/dev/null; wait "$toggler" 2>/dev/null
     log "arm $name: AxT: $(wc -l < "$OUT/$name.aux-toggles" 2>/dev/null || echo 0) control-file writes over the requests"
@@ -1382,6 +1561,13 @@ EOF2
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
     return 1
   fi
+  local sl_why
+  if ! sl_why=$(seqlen_server_gate "$OUT/$name.server.log" "${ARM_SL:-}" "${ARM_CTX:-512}"); then
+    log "arm $name: $sl_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
+  [[ -n "${ARM_SL:-}" ]] && grep -m2 -E 'max seq len: |step batch: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   if [[ -n "${ARM_DME:-}" ]] && {
        ! grep -qE "DSpark matched early costs: k=${ARM_DME} n=[1-9][0-9]* " "$OUT/$name.server.log" ||
@@ -1454,6 +1640,12 @@ EOF2
   local qd_exit_why
   if declare -F qd_gate >/dev/null && ! qd_exit_why=$(qd_gate "$OUT/$name.server.log" "${ARM_QD:-}" "${ARM_LC:-}" exit); then
     log "arm $name: $qd_exit_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  # QyP / QyfP at exit: some rank split a decode pass (qy_gate).
+  local qy_exit_why
+  if declare -F qy_gate >/dev/null && ! qy_exit_why=$(qy_gate "$OUT/$name.server.log" "${ARM_QY:-}" "${ARM_QYF:-}" exit); then
+    log "arm $name: $qy_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   # Pmr with a drafting Ds part (DSpark's 2+ row verify passes) at shutdown: the predictor's
@@ -2869,7 +3061,11 @@ for a in $ARMS; do
 # knob off; Pf a prefill chunk runs in a step of its own and the decode rows of concurrent requests
 # run together (RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE); NK --max-num-seqs K, CK the arm's requests
 # sent K at a time (AB_CONCURRENCY), LK --max-model-len K (the KV pool backs about one sequence of K
-# tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); Tb a decode step of two or
+# tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); SlN --max-seq-len N (one
+# request's prompt plus output at most N tokens, refused past it as past LK; the block tables, step staging
+# and rotary tables sized for N rather than for LK, which still sizes the KV pool: the VRAM they took goes
+# to resident experts; exact, capacity only; 64 or more and at most LK; measured only with the server's
+# "max seq len: N tokens a sequence" line below LK and none without the part); Tb a decode step of two or
 # more sequences issued as two micro-batches, each layer's MoE gather of one behind the other's card
 # work (RADIANCE_EXPERIMENTAL_SCHED_TBO; a radiance and deepseek41 from claude/ds41-tbo); Ba / BaN whole
 # prompts waiting together admitted into one prefill-only step of at most 256 / N (32-256, or up to the
@@ -2913,7 +3109,11 @@ for a in $ARMS; do
 # pass in N (16) on rank 0: every launch with its dependences into chain-<arm>.ops.csv and every
 # kernel's card times into chain-<arm>.stamps.csv (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE; read them
 # with chain_report.py; without Ov it is the dump-only arm: what the check would free, nothing
-# changed); rN a repeat (ignored).
+# changed); Ctp / CtpN trace one armed card-path prefill pass in N (4) on rank 0 into the same files
+# (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL; needs P1; beside Ct or alone; ops rows carry the
+# pass's kind and rows; chain_report.py PREFIX --split gives the step's card time by kernel class:
+# routed experts, dense GEMMs, attention, indexer, collectives, the rest, copies, idle; exact, it only
+# reads timestamps, but not a timing arm); rN a repeat (ignored).
 # Ss a step of one sequence that its own token can end has its tokens read back before the next
 # step is planned, and nothing runs behind one that ended its request: no forward pass after a
 # reply's end-of-generation token, which the reply (and the next request) otherwise waits out,
@@ -3024,12 +3224,13 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl=""
+  ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   axr=""   # AxrN: the worker's passes up to N rows (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
-  ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= ARM_PROFILE= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
+  ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= ARM_PROFILE= ARM_SB= ARM_NOPROF= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
   f5="" ARM_BEFORE_PROMPTS= ARM_BEFORE_N= ARM_BEFORE_CONC= ARM_OBS_CONC=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   fn128=""
@@ -3194,11 +3395,26 @@ for a in $ARMS; do
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
       L[0-9]*) ARGS+=(--max-model-len "${p#L}"); arm_ctx=${p#L} ;;    # this arm's --max-model-len (KV for N sequences)
+      Sl[0-9]*)                                                        # one sequence's bound below L (--max-seq-len N)
+               if [[ -n "$sl" ]]; then log "arm $a: duplicate Sl part; the arm is skipped"; skip=1; fi
+               sl=${p#Sl}
+               if [[ $sl =~ ^[0-9]{1,9}$ ]] && (( 10#$sl >= 64 )); then sl=$((10#$sl)); ARGS+=(--max-seq-len "$sl")
+               else log "arm $a: $p: a sequence bound is a whole number of tokens, at least 64; the arm is skipped"; skip=1; fi ;;
       Ov)      env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1) ;;    # independent dispatches overlap, decode passes
       Ov2)     env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=2) ;;    # ... in every pass issued live
       Xwp)     ARGS+=(--weight-prefetch off) ;;                        # no weight reads beside the collectives (core/config.cpp; exact)
+      Sb)      ARM_SB=1 ;;                                            # the server through serve-batch.sh (sb_check), and batch_client.py after the requests
+      Xnp)     ARM_NOPROF=1 ;;                                        # no --expert-profile: the container's own activation profile
       Xq?*)    ARM_PROFILE=${EXTRA_PROFILES:-/home/as/ds41-claude-build/work/extra-profiles}/${p#Xq}.json   # this arm's --expert-profile
                [[ -f "$ARM_PROFILE" ]] || { log "arm $a: $p: no profile $ARM_PROFILE; the arm is skipped"; skip=1; } ;;
+      Ctp|Ctp[0-9]*)                                                   # one armed card-path prefill pass in N traced
+               ctp=${p#Ctp}; ctp=${ctp:-4}
+               if [[ ! $ctp =~ ^[0-9]+$ ]] || (( 10#$ctp < 1 )); then
+                 log "arm $a: $p: CtpN takes a positive N; the arm is skipped"; skip=1
+               else
+                 env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL=$((10#$ctp))
+                       RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT=$(cd "$OUT" && pwd)/chain-$a)
+               fi ;;
       Ct|Ct[0-9]*)
                ct=${p#Ct}
                env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE=${ct:-16}
@@ -3235,8 +3451,16 @@ for a in $ARMS; do
                  [[ $qk == GRACE_MS ]] && qg=$((10#$qn))
                  [[ $qk == LEND_ARENA ]] && qe=$((10#$qn))
                  [[ $qk == DECODE_ROWS ]] && qd=$((10#$qn))
+                 [[ $qk == VERIFY ]] && qv=$((10#$qn))
                else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
       Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
+      Qy[0-9]*|Qyf[0-9]*)                                              # hybrid decode: the CPU's share P% (Qyf: held)
+               if [[ $p == Qyf* ]]; then qyf=1; qn=${p#Qyf}; else qn=${p#Qy}; fi
+               if [[ -n "$qy" ]]; then log "arm $a: two Qy parts; the arm is skipped"; skip=1
+               elif [[ $qn =~ ^[0-9]+$ ]] && (( 10#$qn >= 1 && 10#$qn <= 400 )); then
+                 qy=$((10#$qn)); q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$qy)
+                 [[ -n "$qyf" ]] && q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT=0)
+               else log "arm $a: $p: Qy takes 1-400 (percent); the arm is skipped"; skip=1; fi ;;
       Lh[0-9]*)                                                        # the lent slots follow live decode routing (..._P1_LEND_HEAT=S; needs Qe)
                if [[ -n "$lh" ]]; then log "arm $a: duplicate Lh part; the arm is skipped"; skip=1; fi
                if [[ ${p#Lh} =~ ^[0-9]+$ ]] && (( 10#${p#Lh} >= 1 && 10#${p#Lh} <= 8 )); then lh=$((10#${p#Lh}))
@@ -3760,19 +3984,32 @@ for a in $ARMS; do
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
           RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0 "${q1[@]}")
+          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0
+          RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT= "${q1[@]}")
     [[ -n "$qg" && -z "$ql$qe" ]] && { log "arm $a: Qh$qg sets the lent slots' grace, which needs a QlK or QeK part; the arm is skipped"; skip=1; }
     # QdN: decode passes of N rows or more on the cards; a pass is at most the chunk, and a split step (Tb) launches
     # a layer's expert ops once a micro-batch (the engine refuses both).
     [[ -n "$qd" && -n "$lc" ]] && (( qd > lc )) && { log "arm $a: Qd$qd is above the chunk Lc$lc (no decode pass could arm); the arm is skipped"; skip=1; }
     [[ -n "$qd" && -n "$tb" ]] && { log "arm $a: Qd$qd with Tb (a split decode step: the engine refuses it); the arm is skipped"; skip=1; }
+    # QyP: hybrid decode splits the decode passes Qd arms; the engine refuses it beside speculation, a drafter, the
+    # aux expert worker, the host verify and the verify policy.
+    if [[ -n "$qy" ]]; then
+      [[ -z "$qd" ]] && { log "arm $a: Qy$qy splits the decode passes a Qd part arms, and there is none; the arm is skipped"; skip=1; }
+      [[ -n "$sg" && "$sg" != 0 ]] && { log "arm $a: Qy$qy beside Sg$sg (speculation: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ -n "$ds" ]] && { log "arm $a: Qy$qy beside $ds (a drafter: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ -n "$ax" && "$ax" != 0 ]] && { log "arm $a: Qy$qy beside the aux expert worker (Ax: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ -n "$qv" && "$qv" != 0 ]] && { log "arm $a: Qy$qy beside Qv$qv (the host verify: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ "$pol" == verify ]] && { log "arm $a: Qy$qy beside the verify policy (the engine refuses it); the arm is skipped"; skip=1; }
+    fi
   else
     (( ${#q1[@]} )) && { log "arm $a: the Q parts (${q1[*]}) need P1; the arm is skipped"; skip=1; }
+    [[ -n "$ctp" ]] && { log "arm $a: Ctp$ctp traces armed card-path prefill passes, which need P1; the arm is skipped"; skip=1; }
     env+=(RADIANCE_EXPERIMENTAL_DS41_P1=0 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
           RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0)
+          RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0
+          RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT=)
   fi
   # LhS (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT): the lent slots follow live decode routing, in an arm that lends
   # the arena (QeK, so P1 and Lc too). Every arm states the switch (0 without the part) and its two tunables
@@ -3924,6 +4161,8 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
         log "arm $a: U$upart needs a whole --max-model-len, not '$arm_ctx'; the arm is skipped"; skip=1
       elif (( 10#$arm_ctx < umct )); then
         log "arm $a: U$upart's longest request needs $umct tokens of context (its receipt's max_context_tokens), more than the arm's --max-model-len $((10#$arm_ctx)); the arm is skipped"; skip=1
+      elif [[ -n "$sl" ]] && (( sl < umct )); then
+        log "arm $a: U$upart's longest request needs $umct tokens of context (its receipt's max_context_tokens), more than the arm's Sl$sl (--max-seq-len); the arm is skipped"; skip=1
       fi
       if [[ -z "${AB_REQUEST_TIMEOUT_S:-}" ]]; then
         urate=25; [[ -n "$lc" ]] && urate=100
@@ -3936,8 +4175,11 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QSP=$qsp ARM_LH=$lh
-  ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QSP=$qsp ARM_LH=$lh
+  ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx
+  if [[ -n "$sl" && $arm_ctx =~ ^[0-9]{1,9}$ ]] && (( sl > 10#$arm_ctx )); then
+    log "arm $a: Sl$sl is past the arm's --max-model-len $((10#$arm_ctx)) (the server refuses it); the arm is skipped"; skip=1
+  fi
   # Ax / AxN / Axv / AxvN / Ax0 / AxfN (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS, core/place/aux_expert_worker.h): the
   # extra card appended last to the window's mask of the four rank cards (ranks 0-3 stay the XTs), the worker on it
   # with the arm's cap (Ax0: the card visible, the worker off). Every arm states the six switches (the worker off
@@ -4063,18 +4305,23 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
         RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_MBPS=${axo:+${AUX_ONLINE_MBPS:-}}
         RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_CHECK=${axo:+${AUX_ONLINE_CHECK:-}}
         RADIANCE_EXPERIMENTAL_DS41_AUX_ONLINE_DRY=${axod})
+  if [[ -n "$ARM_NOPROF" && -n "$ARM_PROFILE" ]]; then log "arm $a: Xnp and an Xq profile together; the arm is skipped"; skip=1; fi
   [[ -n "$skip" ]] && continue
   # The extra card's clients at the arm's start (it is shared): only allowed tenants, and room for the cap.
   if [[ -n "$ax" ]] && ! aux_clients_gate "$a" "$ax"; then continue; fi
   [[ "$ax" == 0 ]] && ARM_AX0_USED=$(cat "${AUX_DRM:-/nonexistent}/mem_info_vram_used" 2>/dev/null)
-  [[ -n "$power" ]] && power_set "$power"
+  arm_env=()
   case $pol in
-    base) arm "$a" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0 "${env[@]}" ;;
+    base) arm_env=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0 "${env[@]}") ;;
     verify|greedy|all)
-      arm "$a" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$threads RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU \
-          RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=$pol "${env[@]}" ;;
-    *) log "unknown arm $a" ;;
+      arm_env=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$threads RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU
+               RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=$pol "${env[@]}") ;;
+    *) log "unknown arm $a"; continue ;;
   esac
+  # Sb: serve-batch.sh must express the whole launch (sb_check), or the arm is skipped before anything starts.
+  if [[ -n "$ARM_SB" ]] && ! sb_check "$a" "${arm_env[@]}"; then log "arm $a: Sb: $SB_WHY; the arm is skipped"; continue; fi
+  [[ -n "$power" ]] && power_set "$power"
+  arm "$a" "${arm_env[@]}"
   power_restore
 done
 [[ -n "$ARMS" ]] && python3 -I "$HERE/ab_requests.py" --compare "$OUT" $ARMS | tee -a "$OUT/window.log"

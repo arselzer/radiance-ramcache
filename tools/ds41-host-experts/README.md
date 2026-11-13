@@ -21,6 +21,92 @@ On the loop's eight held-out prompts (64 tokens, greedy, TP4) the path takes dec
 about 17 tok/s and the time to first token summed over the prompts from 64.0 to about 15.5 s. Every
 step was measured as an A/B window; the log is `/home/as/ds41-decode-review-20261028/NIGHT-LOG.md`.
 
+## Batch jobs: quickstart
+
+Many short prompts at once (for example a few hundred questions over a few shared schemas), answered by
+DeepSeek-V4.1-Flash on four cards with the measured best four-card batch configuration.
+
+**Hardware assumed.** Four 16 GB RDNA4 cards (RX 9070 XT, gfx1201) at TP4, a 24-core EPYC (7443, 48 threads: the
+preset runs 40 CPU expert threads), 256 GB of RAM and the model container on NVMe. Less RAM still runs: the RAM budget
+sizes the expert cache to what the host has, and the experts that do not fit are read from the drive, which is slower
+(unmeasured below 256 GB for batches). Fewer streams need less of everything; a smaller CPU needs fewer expert threads,
+which the preset does not change (pass a different `RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS` only knowingly). No fifth
+card is used; hide any other card with `ROCR_VISIBLE_DEVICES`.
+
+**Build.** Build radiance with HIP as in the top-level README ("Build from source"); the `deepseek41` plugin and
+`libr4d` must come from the same build. Build the card check (`make -C tools/ds41-host-experts mxfp4-check`, needs
+`hipcc`) and capture the SiLU table on one of your cards once per `libr4d` build:
+
+```
+HIP_VISIBLE_DEVICES=0 tools/ds41-host-experts/ds41_mxfp4_device_check build/radiance_home/kernels/libr4d.so \
+  swiglu silu_table_gfx1201.bin     # captures the card's silu(g) for every bf16 gate, then proves swiglu against the host
+```
+
+The measured runs also passed the window harness's card checks on their `libr4d` before the arms ran (`ab_window.sh`
+`DEVICE_CHECKS`: swiglu, lcp, p1, bal, the vpack check and the `gemm_nt_f32bf16` selftest); a new build should pass
+them too before its replies are taken as exact.
+
+**Serve.**
+
+```
+export RADIANCE_HOME=$PWD/build/radiance_home
+tools/ds41-host-experts/serve-batch.sh --model /models/ds41.rad --silu-table silu_table_gfx1201.bin \
+  --streams 256 --port 8000 [--profile decode-profile.json] [--mirror DIR] [--reserve-mib 10240]
+```
+
+`serve-batch.sh` sets exactly the measured arm's 133 environment variables and flags (checked against the window
+harness by `serve_batch_test.sh`; `--dry-run` prints them). In a window, an arm's `Sb` part starts its server through
+the launcher (skipped unless `serve-batch.sh --dry-run` gives the arm's whole launch, `serve_batch_match.py`; the
+scripts from `SB_TOOLS`, default the harness's directory) and afterwards sends the receipt's first 8 prompts through
+`batch_client.py` 8 at a time (`<arm>.batch_client.jsonl`); `Xnp` drops `--expert-profile`. The choices left to you:
+
+- `--streams`: concurrent sequences, 256 (default) or 128 were measured. Send that many requests at once.
+- `--ctx-per-stream` (1152): tokens a stream needs, prompt plus reply. The KV pool (`--max-model-len`) is streams x
+  this: 294,912 at 256 streams, 147,456 at 128, as measured with prompts of about 1K tokens and 128-token replies.
+  Raise it for longer prompts (KV is small: about 6.5 MiB a sequence a card plus 3.2 KB a token).
+- `--reserve-mib`: host RAM the budget keeps free (10,240 when not given; at least 1024).
+- `--profile`: the placement profile (`--expert-profile`). The measured arm used one blended from captures of the
+  same prompt families, which is not shipped; profiles are bound to the container they were recorded on. Without
+  one the server ranks experts by the container's own activation profile (not measured for batches). To make one,
+  serve representative prompts with `-- --expert-stats capture.json` and blend it with `profile_blend.py` (below).
+- `--mirror`: a second copy of the checkpoint's `model-*.safetensors` on another drive, read for part of the misses
+  (the measured arm had one; optional).
+- `--shared-head` (32): the shared-head floor (`RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD`). 32 is the pending default;
+  the rows below were measured with 64.
+- `--hybrid` (60): hybrid decode (`RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=60`, part `Qy60`): the CPU takes a share of
+  each card-path decode pass's RAM-cached experts, adapting it to keep within 60% of the card's link time. Exact, and
+  +28% decode at 256 streams (window ab-20261113T014719Z); `--hybrid 0` turns it off.
+- `--max-seq-len N` (off): one sequence's bound below the KV pool (part `SlN`); 4096 is the candidate for batches of
+  short prompts, not yet measured.
+
+**Send a batch.** `batch_client.py` reads a JSONL of `{"prompt": ..., "system": ...}` lines and sends them N at a
+time to the server's `/v1/completions`, framed in token ids as the measured runs framed them (DeepSeek's non-thinking
+chat form, greedy); `--chat` uses the OpenAI `/v1/chat/completions` endpoint instead (needs a container with a chat
+template). Put the text prompts share in `system`: the prefix cache prefills it once.
+
+```
+tools/ds41-host-experts/batch_client.py questions.jsonl answers.jsonl --concurrency 256 --max-tokens 128
+```
+
+**Expected throughput** (whole batch, client wall time, four cards, hybrid decode at 60% and `--max-seq-len 4096`,
+replies byte-identical to the base engine's; window ab-20261113T123110Z):
+
+| Job | Plain engine | Preset | Decode, all streams |
+|---|---:|---:|---:|
+| 256 BIRD Mini-Dev questions (public; 11 SQLite databases; replies <= 512 tokens) | 1,025 s | 185 s | 157 tok/s |
+| 256 text-to-SQL questions over shared schemas (private set, ~1K-token prompts, 128-token replies) | 911 s | 284 s | 195 tok/s |
+| 128 of the same at 128 streams | 539 s | 158 s | 131 tok/s |
+| 512 longer questions of the same kind at 512 streams (`--streams 512`) | - | 734 s | 252 tok/s |
+
+The BIRD replies score 59.6% execution accuracy against BIRD's reference results on the real databases, the same
+with and without the optimizations (they are byte-identical). Prefill runs at about 380 tok/s of computed (not
+cached) prompt tokens; with short replies it is about half of a job.
+
+**Host memory must not run out.** An arm that exhausted the box's RAM at 256 streams took the kernel down (an amdgpu
+bug on the out-of-memory path). The RAM budget (`RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1`, on in the preset) sizes
+the expert cache from what startup leaves and holds its growth above the reserve; `serve-batch.sh` also stops the
+server if MemAvailable falls below 3 GiB (`MEMGUARD_MIB`). Do not run other large jobs beside it.
+
 ## Batch jobs: 128 and 256 concurrent streams (measured 12 November)
 
 A batch of short prompts that share long heads (128 or 256 NL-to-SQL questions over a few schemas, sent at once, one
@@ -39,6 +125,7 @@ plus 3.2 KB a token), so the cards hold 256 sequences. Every row below has repli
 | the same with `Ba4096` | 169 s | - |
 | card-path decode `Qd64` and `Bs` with the fifth card | 171 s | 117.8 |
 | four cards only: card-path decode `Qd64`, `Bs`, `--checkpoint-slots 128` (ab-20261112T210213Z) | 199 s | 107.9 |
+| + hybrid decode `Qy60` and `--max-seq-len 4096` (ab-20261113T123110Z) | 158 s | 130.5 |
 | the same with replies up to 512 tokens instead of 128 | 208 s | 98.1 |
 
 | 256 streams, 256 prompts | wall | decode-only tok/s | prefill |
@@ -59,17 +146,37 @@ and batch admission at 2048. With a fifth card and up to 128 streams, add `RADIA
 the passes the worker would). Size host memory first: an arm that exhausted the box's RAM at 256 streams took the
 kernel down (an amdgpu bug on the OOM path); the RAM budget keeps that margin.
 
-The snapshot store's automatic size is 4 slots a sequence: at 256 streams 1,024 slots of 22.59 MiB, 23 GiB pinned,
+The snapshot store's automatic size was 4 slots a sequence: at 256 streams 1,024 slots of 22.59 MiB, 23 GiB pinned,
 of which a batch of shared-head prompts used 36 (11 at 128 streams). Under the RAM budget that memory comes out of the
 expert cache (184 GiB instead of 205), and the experts that no longer fit are read from the drive on every card-path
 chunk: rank 0 read 447 GB and waited 196 s on the drive. With 128 slots it read 52 GB and waited 1.2 s, and prefill
-fell from 341 to 177 s. At 128 streams the cache was nearly big enough already (171 -> 172 s).
+fell from 341 to 177 s. At 128 streams the cache was nearly big enough already (171 -> 172 s). Under the RAM budget the automatic size is now
+32 sequences' worth at most (min(4 x streams, 128) here, the measured `--checkpoint-slots 128`; up to 32 streams
+unchanged; host-tested, not yet in a GPU window); `--checkpoint-slots N` still sets it.
 
 Shared-head floor 32 instead of 64 (ab-20261112T224535Z): the prompts' common opening is 57-62 tokens and about a sixth of
 them share nothing deeper, so at a 64-token floor no keep point was set for them and each recomputed from the start
 (`hit_cuts.no_snapshot` 46 at 256 streams). At 32: 4 such prompts, 6.8% fewer prefill tokens computed, prefill hashes of
 all 256 prompts identical; 365 against 371 s at 256 streams and 187 against 199 s at 128 (all arms with `Kh`, which
 itself costs about 45 s of prefill at 256 streams).
+
+`--max-model-len` sizes these batch jobs' KV pool (the VRAM split keeps one `--max-model-len` sequence's
+cache), so a pool for N sequences sets it to N times a share; it was also each sequence's bound, and the step
+batch's block tables are N rows of it: the startup report's `step staging` grew with N x `--max-model-len`, about
+16 B a row-token (288 MiB at N128 L147456, 1.13 GiB at N256 L294912, 1.50 GiB at N256 L393216, 5.50 GiB at N512
+L720896, which left the experts nothing: "startup stopped: out of memory", ab-20261112T215554Z). `--max-seq-len N`
+(arm part `SlN`) separates the two: a request whose prompt plus output passes N is refused as one past
+`--max-model-len` is without it, and what is sized for one sequence's worst case takes N padded to cover the step's
+host bounds (`seq_len_bound`: N on the 1024-token grid plus `--max-num-batched-tokens`, two speculative windows and
+4096): the block tables and step staging, the KV tiers' restore chain, the rotary tables and the plugins'
+per-sequence widths (`RadBuildCtx::max_ctx`), the server's context and the snapshot store's session. The KV pool's
+floor and ceiling, the prefix cache, KV streaming and the RAM budget's per-sequence share keep `--max-model-len`. It
+is capacity only: every host bound a step derives (the context bound, the block-table pitch, the plugins' live
+widths) is what it is at `--max-model-len` for a sequence of at most N tokens, so replies do not change. Startup
+says `max seq len: N tokens a sequence (--max-seq-len N); ... sized for B tokens ...` and the step batch's line
+`... rows of B tokens`; without the flag nothing changes. It does not combine with `--kv-resident`. Predicted at
+N512 L720896 Lc2048 with `Sl4096`: rows of 10,370 tokens, step staging about 81 MiB instead of 5.50 GiB (not yet
+measured on the cards).
 
 ## What runs where
 
@@ -1575,7 +1682,10 @@ largest other item is the prefix cache's pinned snapshot store (641 slots of 22.
 N128 with the window's `--max-model-len 147456`); in this mode `--checkpoint-slots auto` sizes it for
 sessions of `..._RAM_BUDGET_SESSION_TOKENS` (default min(--max-model-len, max(--max-model-len / --max-num-seqs, 4096)): a lone agent session keeps its full context, a batch of short prompts few) instead, plus one
 slot a sequence under `RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD` (startup line `ram budget: the
-snapshot store is sized for N-token sessions`); fewer slots mean fewer resume points, never other
+snapshot store is sized for N-token sessions`), and for at most 32 sequences' worth
+(`kRamBudgetCheckpointSeqs`, `core/mem/prefix.h`: min(4 x `--max-num-seqs`, 128) slots for a batch of short
+shared-head prompts; unchanged up to 32 sequences; the `checkpoint slots: auto` line says when it applies; an explicit
+`--checkpoint-slots N` wins); fewer slots mean fewer resume points, never other
 bytes. Arm part
 `mA` (or `mAN`, a reserve of N MiB, at least 1024), beside `mN` for the cap; an `mA` arm is measured
 only with both `ram budget: on` and `may hold` lines in its server log, a plain arm only with neither
@@ -1989,9 +2099,53 @@ micro-batch, and the card path takes a layer's rows in one launch) and above the
 `ds41 p1: decode passes on the cards: every routed expert row of a pure decode pass of N to C rows ...` at
 startup, and each rank's `ds41 p1 stats, rank` line adds `decode passes armed A, rows R (at most M a pass),
 issue S s; decode passes of 17 to N-1 rows on the CPU path B` (armed decode passes print no chunk line). A
-`QdN` arm is measured only with the startup line and, at exit, some rank's A above 0. A hybrid (card path for
-a layer's units with many rows, CPU for the rest) is not built: the two paths own a layer's non-resident units
-whole (marks and waves on one side, aliases and the CPU rows' copy at the gather on the other).
+`QdN` arm is measured only with the startup line and, at exit, some rank's A above 0.
+
+Hybrid decode (`RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P`, 0 off, the default; 1-400; the window's parts `QyP` and
+`QyfP`; `core/place/p1_hybrid.h`; not yet measured on the cards). An armed decode pass streams every non-resident
+routed expert over the link (~29 GB a card a step at 256 streams, ~24 GB/s, the PCIe 4.0 x16 limit), while the
+CPU pool is idle and part of the host's RAM bandwidth is spare. Under the switch each card-path layer of an armed
+decode pass gives some of its RAM-cache units to the pool, which computes them while the ring streams the rest:
+- **Which.** Only RAM-cache hits (a drive miss stays on the ring: its planes are read and packed for it), fewest
+  rows first, while `(pool backlog + their cost) / pool rate <= P% x (bytes left to the ring) / link rate`, with
+  the pool's own cost model (`HostExpertPool::cost_rows`, `cpu_bytes_per_ns`, `link_bytes_per_ns`; the backlog is
+  every rank's, reservations included). The share adapts per rank (`..._P1_HYBRID_ADAPT`, 1 by default; 0 holds
+  it at P, part `Qyf`): a layer whose pool was done before the issuing thread reached the gather grows it by 5%
+  (up to P), one whose card had finished the layer's waves and waited for the pool's rows (an event behind the
+  waves, queried once the rows are in) shrinks it by 20% (down to 1%), anything else holds it.
+- **How.** A CPU unit is borrowed from the cache with the admission's touch, in the layer's order, as the ring's
+  `add_ram` would borrow it (one the cache no longer gives goes to the ring, counted), published skipped
+  (`kMarkSkip`) like every other non-resident unit and put in no wave, and handed to the pool through the CPU
+  path's own submit: the layer's rows and sorted order ride the counts' wait (`hx_fetch`), the jobs take expert e's
+  live slots of `[off[e], off[e + 1])` and refuse a count that differs from the scatter's, the gate_up's operands
+  are checked against the rows the pool was given (`hx_capture`), and the pool's rows are copied over the down
+  projection's at the gather's operands (`hx_finish`), behind the layer's waves on the same stream. The rows are
+  fetched from the addresses the layer's gate_up last read, so a layer splits only when that was at this pass's
+  activation-arena level (`Ctx::level()`: the full plan or one of the lent arena's smaller levels, 256 and 1024
+  rows in H31; their buffers sit apart): the first armed decode pass after prefill chunks at another level runs
+  whole on the card and records its level's addresses (counted as "rows at the other arena level"). Without that gate window H31's N128 and BIRD N256 arms
+  failed at their first decode step (a sorted order that disagreed with the counts).
+- **Exact.** The gather reads each sorted slot's row and weighs a token's top-k rows in its own fixed order; which
+  side wrote a slot never reaches it. Every slot's bytes are the same either way: the P1 twin's rows are the
+  decode band's at every M up to 4096 (device check `p1`), the pool's are bit-exact with the decode band (the CPU
+  path below the threshold; `host_experts_test`, few and many rows 1-64). No card kernel writes a CPU unit's slots
+  (the twin's skip: no rows, no bytes; its zero-fill is the other ranks' tail `[off[96], T)`). Residency: the
+  same touches in the same order; only the background inserts that wait for an idle pool may land later.
+- **Not covered.** Prefill passes never split. Refused at startup without `..._P1_DECODE_ROWS`, beside the host
+  verify (`..._P1_VERIFY`), `..._HOST_EXPERTS_POLICY=verify` (both compare card rows the CPU's units do not
+  have), speculation, a drafter and the aux expert worker (`..._AUX_EXPERTS`); `Tb` is refused by `Qd` already.
+
+Rank 0 says `ds41 p1: hybrid decode on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P; pool X GB/s, link Y GB/s, the
+share adapts ... | held ...)` at startup; each rank's `ds41 p1 stats, rank` line adds `CPU pool N` to its touched
+experts and `hybrid: passes split S of A armed, layers L, units CPU C / card R (fell back F, layers without rows
+W, rows at the other arena level O), CPU rows N, CPU T s (t s a pass) against issue I s a pass, predicted CPU / card, gather wait G s, late layers
+K (wait s), early layers E, share X% (lowest Y%)` (the CPU's time runs from the submit to the gather's wait, an
+upper bound for an early layer). A `Qy` arm is measured only with the startup line naming its share and mode and,
+at exit, some rank's S above 0; it needs `P1` and `Qd`, and is skipped beside `Sg`, `Ds`, `Ax` (not `Ax0`), `Qv`
+and the verify policy. Host tests: `p1_hybrid_test` (the split, the share, the tunables; a hybrid layer through
+the stager with real packed experts and the pool: every live slot and a fixed-order combine byte-identical to the
+all-CPU rows at every share, drive units and a refused borrow on the ring, the borrows in order, the reservation
+given back) and `ab_window_p1_test` section 6.
 
 ## Adaptive residency: the lent slab, the heat over every lent slot, the read-back audit
 

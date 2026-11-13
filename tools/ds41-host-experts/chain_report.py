@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""chain_report.py PREFIX [--layer N] [--top K]: the card's per-layer dispatch chain from a chain
-trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE, arm part Ct; core/runtime/live_chain.h).
+"""chain_report.py PREFIX [--layer N] [--top K] [--split]: the card's per-layer dispatch chain from a
+chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE, arm part Ct; core/runtime/live_chain.h).
 
 PREFIX.ops.csv has one line per device launch of every traced pass (rank 0): its layer, op,
 kernel, queue and packet indices, whether its first dispatch went without the barrier bit
@@ -20,8 +20,17 @@ one queue whose second launch is short and reads nothing but what the first wrot
 positions (`epilogue`), and GEMVs that read the same input (`shared input`, which needs each
 segment's split count kept, since a wider N picks another split and changes the bits).
 
---layer N prints every launch of layer N in the first complete traced pass. --selftest runs on
-synthetic files. Standard library only.
+--layer N prints every launch of layer N in the first complete traced pass.
+
+--split prints, per kind of traced pass (decode; prefill: an armed card-path prefill pass,
+RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL, arm part Ctp), where the pass's card time goes: its
+wall on card 0 (first kernel start to last end), the kernels' summed and union time per class
+(routed experts: every moe_gemm launch and every kernel the stager launched itself whose name is
+the MXFP4 twin's; MoE glue; dense GEMMs; attention and KV stores; the indexer; collectives; norms,
+mHC, rope and the rest; other kernels no launch owns: copies, fills, table patches) and the idle
+time no kernel covers (ring waits, counts syncs, host gaps), each as a median over the traced
+passes and per pass row; then the costliest kernels. Files without the kind column are decode
+traces. --selftest runs on synthetic files. Standard library only.
 """
 import csv
 import os
@@ -43,6 +52,8 @@ def load(prefix):
                       "clash", "foreign"):
                 r[k] = int(r[k])
             r["pass"] = int(r["pass"])
+            r["kind"] = r.get("kind") or "decode"
+            r["rows"] = int(r.get("rows") or 0)
             r["deps_l"] = parse_deps(r["deps"])
             r["reads_l"] = [x for x in r["reads"].split("|") if x]
             r["writes_l"] = [x for x in r["writes"].split("|") if x]
@@ -229,7 +240,91 @@ def fusion_candidates(seg):
     return out
 
 
-def report(prefix, layer=None, top=12):
+# --split: a launch's class from its op, a kernel no launch owns from its name.
+CLASSES = ("routed experts", "moe glue", "dense gemm", "attention", "indexer", "collectives",
+           "norms+misc", "other kernels")
+ROUTED_KERNELS = ("mx_vp2", "mx_gemv", "mx_tiled", "moe_gemm", "mxfp4")
+
+
+def op_class(op):
+    if op.startswith("moe_gemm"):
+        return "routed experts"
+    if op.startswith(("moe_", "swiglu", "router", "sigmoid_scatter")):
+        return "moe glue"
+    if op.startswith(("gemm", "logits")):
+        return "dense gemm"
+    if op.startswith(("attn", "kv_")):
+        return "attention"
+    if op.startswith("index_"):
+        return "indexer"
+    if op.startswith(("all_reduce", "all_gather")):
+        return "collectives"
+    return "norms+misc"
+
+
+def kernel_class(kernel):
+    return "routed experts" if any(k in kernel for k in ROUTED_KERNELS) else "other kernels"
+
+
+def split(ops, stamps, foreign, top=12):
+    """Per traced pass: wall, per-class summed and union kernel time, idle; medians by kind."""
+    med = statistics.median
+    per_kind = defaultdict(list)
+    kern = defaultdict(lambda: defaultdict(lambda: [0, 0]))
+    for p, rows in sorted(ops.items()):
+        kind = rows[0]["kind"]
+        n_rows = rows[0]["rows"]
+        iv_all, by = [], defaultdict(list)
+        for r in rows:
+            if r["t"] is None:
+                continue
+            c = op_class(r["op"])
+            for x in r["t"][3]:
+                by[c].append((x[2], x[3]))
+                iv_all.append((x[2], x[3]))
+                k = kern[kind][(c, r["op"], x[0])]
+                k[0] += 1
+                k[1] += x[3] - x[2]
+        for (_, _, kname, _, start, end) in foreign.get(p, []):
+            c = kernel_class(kname)
+            by[c].append((start, end))
+            iv_all.append((start, end))
+            k = kern[kind][(c, "-", kname)]
+            k[0] += 1
+            k[1] += end - start
+        if not iv_all:
+            continue
+        wall = max(b for _, b in iv_all) - min(a for a, _ in iv_all)
+        busy = union(iv_all)
+        f = {"wall": wall, "busy": busy, "idle": wall - busy, "rows": n_rows,
+             "sum": {c: sum(b - a for a, b in by[c]) for c in CLASSES},
+             "union": {c: union(by[c]) for c in CLASSES}}
+        per_kind[kind].append(f)
+    for kind, fs in sorted(per_kind.items()):
+        rows_med = med(f["rows"] for f in fs)
+        wall = med(f["wall"] for f in fs)
+        print("\n%s passes: %d traced, median %d rows; wall on card 0 %.1f ms, kernels' union %.1f ms, "
+              "idle %.1f ms (%.0f%%)" % (kind, len(fs), rows_med, wall / 1e6, med(f["busy"] for f in fs) / 1e6,
+                                        med(f["idle"] for f in fs) / 1e6,
+                                        100.0 * med(f["idle"] for f in fs) / wall if wall else 0))
+        print("  %-16s %10s %10s %7s %10s" % ("class", "sum ms", "union ms", "% wall", "us a row"))
+        for c in CLASSES:
+            sm = med(f["sum"][c] for f in fs)
+            un = med(f["union"][c] for f in fs)
+            if sm == 0 and un == 0:
+                continue
+            print("  %-16s %10.1f %10.1f %6.1f%% %10.2f" % (
+                c, sm / 1e6, un / 1e6, 100.0 * un / wall if wall else 0,
+                un / 1e3 / rows_med if rows_med else 0))
+        n = len(fs)
+        ks = sorted(kern[kind].items(), key=lambda kv: -kv[1][1])[:top]
+        print("  costliest kernels (a pass, mean over %d):" % n)
+        for (c, op, kname), (cnt, t) in ks:
+            print("    %-16s %-28s %-48s x%-6.0f %9.2f ms" % (c, op[:28], kname[:48], cnt / n, t / n / 1e6))
+    return per_kind
+
+
+def report(prefix, layer=None, top=12, do_split=False):
     ops, stamps = load(prefix)
     foreign = attach_times(ops, stamps)
     by_kind = defaultdict(list)
@@ -238,8 +333,9 @@ def report(prefix, layer=None, top=12):
     for p in sorted(ops):
         rows = sorted(ops[p], key=lambda r: r["seq"])
         prepare(rows)
+        pk = rows[0]["kind"]
         for l, (seg, full) in sorted(stretches(rows).items()):
-            k = layer_kind(full)
+            k = layer_kind(full) if pk == "decode" else "%s %s" % (pk, layer_kind(full))
             f = analyse(seg, rows)
             by_kind[k].append(f)
             for c in fusion_candidates(seg):
@@ -249,6 +345,7 @@ def report(prefix, layer=None, top=12):
     print("%s: %d traced passes, %d launches, %d stamped kernels (%d not a launch's)" % (
         prefix, len(ops), sum(len(v) for v in ops.values()), len(stamps),
         sum(len(v) for v in foreign.values())))
+    per_kind = split(ops, stamps, foreign, top) if do_split else None
     med = statistics.median
     for k, fs in sorted(by_kind.items(), key=lambda kv: -len(kv[1])):
         print("\n%s layers (%d stretches to the routing-counts sync)" % (k, len(fs)))
@@ -291,6 +388,7 @@ def report(prefix, layer=None, top=12):
                 r["seq"], name(r)[:44], r["queue"], "U" if r["unordered"] else "O",
                 "w" if r["would"] else " ", (r["t"][0] - t0) / 1e3, (r["t"][1] - t0) / 1e3,
                 r["why"], r["deps"]))
+    return per_kind
 
 
 def selftest():
@@ -316,6 +414,52 @@ def selftest():
             t = start + dur * 1000 + 3000
             idx += 1
     report(pre, layer=4)
+
+    # The current format (kind, rows): the decode pass above again, and an armed prefill pass whose
+    # twin waves the stager launched itself (stamps no launch owns) and whose ring wait is a gap.
+    pre2 = os.path.join(d, "p")
+    with open(pre + ".ops.csv") as f:
+        old = f.read().splitlines()
+    with open(pre + ".stamps.csv") as f:
+        old_st = f.read().splitlines()
+    with open(pre2 + ".ops.csv", "w") as f, open(pre2 + ".stamps.csv", "w") as s:
+        f.write(old[0] + ",kind,rows\n")
+        for ln in old[1:]:
+            f.write(ln + ",decode,256\n")
+        s.write("\n".join(old_st) + "\n")
+        # (op, label, reads, writes, deps, dur_us, idle_before_us)
+        lay = [("gemm_nt_bf16f8", "blk.5.attn_q_a.weight", "xn", "qr", "", 100, 0),
+               ("attn_sparse_sink", "-", "q|kv:main@0", "o", "0r", 50, 0),
+               ("index_score", "blk.5.index_w.weight", "q", "sc", "", 40, 0),
+               ("moe_scatter", "-", "ids", "sorted", "", 10, 0),
+               ("moe_gemm_ggml_mxfp4", "blk.5.ffn_gate_up_exps.weight", "x|wtab", "gu", "3r", 300, 100),
+               ("swiglu_clamp", "-", "gu", "h", "4r", 20, 0),
+               ("moe_gemm_ggml_mxfp4", "blk.5.ffn_down_exps.weight", "h|wtab", "y", "5r", 150, 0),
+               ("all_reduce", "-", "y", "y", "6r", 30, 0)]
+        t, idx = 5000000, 900
+        for i, (op, lab, rd, wr, deps, dur, idle) in enumerate(lay):
+            t += idle * 1000
+            f.write("2,%d,5,%s,%s,k%d,0,3,%d,1,0,0,clash,-1,0,%s,%s,%s,prefill,1024\n" % (
+                i, op, lab, i, idx, deps, rd, wr))
+            s.write("2,3,%d,k%d,1,0,%d,%d\n" % (idx, i, t, t + dur * 1000))
+            t += dur * 1000
+            idx += 1
+        # The stager's second twin wave and a ring copy's kernel: no launch owns them.
+        s.write("2,3,%d,\"mx_vp2_kernel<2, 2, 5, 11>\",1,0,%d,%d\n" % (idx, t, t + 200000))
+        t += 200000
+        s.write("2,3,%d,r4d_copy_rows,1,0,%d,%d\n" % (idx + 1, t, t + 25000))
+    per_kind = report(pre2, do_split=True)
+    pf = per_kind["prefill"][0]
+    assert pf["rows"] == 1024, pf
+    assert pf["union"]["routed experts"] == 650000, pf["union"]
+    assert pf["union"]["dense gemm"] == 100000 and pf["union"]["attention"] == 50000
+    assert pf["union"]["indexer"] == 40000 and pf["union"]["collectives"] == 30000
+    assert pf["union"]["moe glue"] == 30000 and pf["union"]["other kernels"] == 25000
+    assert pf["idle"] == 100000 and pf["wall"] == 1025000, pf
+    assert per_kind["decode"][0]["rows"] == 256
+    assert op_class("moe_gemm_ggml_mxfp4_gemv_tall_p1") == "routed experts"
+    assert kernel_class("mx_vp2_kernel<2, 3, 3, 9>") == "routed experts"
+    assert kernel_class("r4d_fill_u32") == "other kernels"
     print("\nselftest ran")
 
 
@@ -335,7 +479,10 @@ def main():
         i = a.index("--top")
         top = int(a[i + 1])
         del a[i:i + 2]
-    report(a[0], layer, top)
+    do_split = "--split" in a
+    if do_split:
+        a.remove("--split")
+    report(a[0], layer, top, do_split)
 
 
 if __name__ == "__main__":

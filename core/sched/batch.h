@@ -165,6 +165,9 @@ public:
     /* Longest sequence a batch can describe, in tokens, as sized into the block-table rows at
      * init. A position at or past it cannot be addressed. */
     int64_t max_ctx() const { return max_ctx_; }
+    /* The longest sequence a request may reach (--max-seq-len, else max_ctx()): what admission
+     * and the context stop test against. At most max_ctx(), which seq_len_bound pads it to. */
+    int64_t seq_limit() const { return seq_limit_; }
 
     /* The consumer skip (consumer_skip.h), as the scheduler enabled it: a step whose only entry is
      * a prefill chunk carrying StepEntry::consumer_end gets RadBatch::consumer_full from the
@@ -350,7 +353,7 @@ private:
     KVGeom        kvgeom_{};
     std::vector<RankIO> ranks_;
 
-    int64_t max_tok_ = 0, max_seqs_ = 0, max_ctx_ = 0;
+    int64_t max_tok_ = 0, max_seqs_ = 0, max_ctx_ = 0, seq_limit_ = 0;
     /* The consumer skip: the shape, the target `cs_f_` holds the thresholds for (-1: none), and
      * the counters. */
     ConsumerShape cs_{};

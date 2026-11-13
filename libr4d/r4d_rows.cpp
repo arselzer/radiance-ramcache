@@ -8929,7 +8929,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 { "qsa_work_bf16", "qsa_work", "attn",
   "gather the blocks completing this step into the flat list qsa_block_key reads",
   "any declared sequence maximum -- the real count comes off cu_seqlens at issue and the launcher "
-  "refuses past 256 there; any token count, any ratio; "
+  "refuses past 4096 there; any token count, any ratio; "
   "`work` is a HOST bound and slots past the real count report page -1",
   "bf16 keys and a bf16 tail in, an i32 position, cu_seqlens and the block-key table; a bf16 "
   "staging plane out with an i32 page and first-token position a block",

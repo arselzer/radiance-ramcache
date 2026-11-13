@@ -23807,6 +23807,105 @@ static void moe_w4_rot(const Plugin& pl) {
  * Also checked: every operand the block-key kernel reads (page, first-token position, the `ratio`
  * staged rows per block) against its source, and -1 in the slots past the real count.
  */
+/* qsa_work over a decode step of many sequences, one token each, as a 512- or 1024-stream batch job
+ * steps (--max-num-seqs 512 with --max-seq-len): the launcher refused past 256 sequences. Each
+ * sequence's one token completes a block or not by its position; the slots are permuted. Checked
+ * against the host walk as qsa_work_case: page, first-token position, staged keys, the per-sequence
+ * complete-block count and -1 past the real count. f32 planes (the compressor's). */
+static void qsa_work_many_case(const Plugin& pl, int64_t seqs) {
+    const std::string what = "qsa_work_f32 over a decode step of " + std::to_string(seqs) + " sequences";
+    const RadKernelInfo* r = find(pl, "qsa_work_f32");
+    if (!r) { ok(what.c_str(), false, "row absent"); return; }
+    const int64_t n = 64, ratio = 2, ring = 2, btw = 128, slots = seqs + 3, NT = seqs;
+    std::vector<int32_t> cuh((size_t)seqs + 1), ph((size_t)NT), sxh((size_t)seqs);
+    for (int64_t s = 0; s <= seqs; ++s) cuh[(size_t)s] = (int32_t)s;
+    for (int64_t s = 0; s < seqs; ++s) {
+        ph[(size_t)s] = (int32_t)((s * 37 + 11) % 240);
+        sxh[(size_t)s] = (int32_t)((s * 7 + 2) % slots);
+    }
+    std::vector<float> kh((size_t)(NT * n)), th((size_t)(slots * ring * n));
+    for (int64_t t = 0; t < NT; ++t)
+        for (int64_t d = 0; d < n; ++d) kh[(size_t)(t * n + d)] = (float)(t * 1000 + d) + 0.25f;
+    for (int64_t sl = 0; sl < slots; ++sl)
+        for (int64_t row = 0; row < ring; ++row)
+            for (int64_t d = 0; d < n; ++d)
+                th[(size_t)((sl * ring + row) * n + d)] = -(float)(sl * 10000 + row * 1000 + d) - 0.5f;
+    std::vector<int32_t> bth((size_t)(seqs * btw));
+    for (int64_t s = 0; s < seqs; ++s)
+        for (int64_t b = 0; b < btw; ++b) bth[(size_t)(s * btw + b)] = (int32_t)((s * 211 + b * 13 + 5) % 65536);
+    struct Wk { int64_t s, b; };
+    std::vector<Wk> want;
+    for (int64_t s = 0; s < seqs; ++s) {
+        const int64_t p = ph[(size_t)s];
+        if ((p + 1) % ratio == 0) want.push_back({ s, p / ratio });
+    }
+    const int64_t W_ = (NT + ratio - 1) / ratio + seqs;
+    void* d_k  = dalloc(kh.size() * 4);
+    void* d_p  = dalloc(ph.size() * 4);
+    void* d_cu = dalloc(cuh.size() * 4);
+    void* d_tl = dalloc(th.size() * 4);
+    void* d_sx = dalloc(sxh.size() * 4);
+    void* d_bt = dalloc(bth.size() * 4);
+    void* d_st = dalloc((size_t)(W_ * ratio * n) * 4);
+    void* d_pg = dalloc((size_t)W_ * 4);
+    void* d_bp = dalloc((size_t)W_ * 4);
+    void* d_nc = dalloc((size_t)seqs * 4);
+    st_memcpy(d_k,  kh.data(),  kh.size() * 4,  hipMemcpyHostToDevice);
+    st_memcpy(d_p,  ph.data(),  ph.size() * 4,  hipMemcpyHostToDevice);
+    st_memcpy(d_cu, cuh.data(), cuh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_tl, th.data(),  th.size() * 4,  hipMemcpyHostToDevice);
+    st_memcpy(d_sx, sxh.data(), sxh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_bt, bth.data(), bth.size() * 4, hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = {
+        T(d_k,  RAD_F32, { NT, n }),
+        T(d_p,  RAD_I32, { NT }),
+        T(d_cu, RAD_I32, { seqs + 1 }),
+        T(d_tl, RAD_F32, { slots, 1, ring, n }),
+        T(d_sx, RAD_I32, { seqs, 1 }),
+        T(d_bt, RAD_I32, { seqs, btw }),
+        T(nullptr, RAD_I32, { 3, NT }),
+        T(d_st, RAD_F32, { W_ * ratio, n }),
+        T(d_pg, RAD_I32, { W_ }),
+        T(d_bp, RAD_I32, { W_ }),
+        T(d_nc, RAD_I32, { seqs }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", NT), PI("n", n), PI("ratio", ratio), PI("ring", ring), PI("seqs", seqs),
+        PI("work", W_), PS("dtype", "f32"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    const int rc = r->launch(&a, nullptr);
+    st_stream_sync(nullptr);
+    if (rc != RAD_OK) { ok(what.c_str(), false, "launch rc=" + std::to_string(rc)); dfree_all(); return; }
+    std::vector<float> gs((size_t)(W_ * ratio * n));
+    std::vector<int32_t> gp((size_t)W_), gb((size_t)W_), gnc((size_t)seqs);
+    st_memcpy(gs.data(), d_st, gs.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(gp.data(), d_pg, gp.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(gb.data(), d_bp, gb.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(gnc.data(), d_nc, gnc.size() * 4, hipMemcpyDeviceToHost);
+    long bad = 0;
+    for (int64_t s = 0; s < seqs; ++s)
+        if (gnc[(size_t)s] != (ph[(size_t)s] + 1) / ratio) ++bad;
+    for (int64_t w = 0; w < W_; ++w) {
+        if (w >= (int64_t)want.size()) { if (gp[(size_t)w] != -1) ++bad; continue; }
+        const int64_t s = want[(size_t)w].s, b = want[(size_t)w].b, p0 = ph[(size_t)s];
+        if (gp[(size_t)w] != bth[(size_t)(s * btw + b)]) ++bad;
+        if (gb[(size_t)w] != (int32_t)(b * ratio)) ++bad;
+        for (int64_t i = 0; i < ratio; ++i) {
+            const int64_t q = b * ratio + i;
+            const float* src = q >= p0 ? kh.data() + (size_t)((s + (q - p0)) * n)
+                                       : th.data() + (size_t)((sxh[(size_t)s] * ring + (q % ring)) * n);
+            if (std::memcmp(gs.data() + (size_t)((w * ratio + i) * n), src, (size_t)n * 4)) ++bad;
+        }
+    }
+    ok(what.c_str(), bad == 0 && !want.empty(),
+       std::to_string(want.size()) + " blocks, " + std::to_string(bad) + " mismatches");
+    dfree_all();
+}
+
 static void qsa_work_case(const Plugin& pl) {
     const char* what = "qsa_work vs a host walk of a mixed prefill/decode batch";
     const RadKernelInfo* r = find(pl, "qsa_work_bf16");
@@ -32340,6 +32439,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("qsa_work_bf16")) {
         if (!g_case) std::printf("\nthe QSA work list, against a host walk of the batch\n");
         qsa_work_case(pl);
+    }
+    if (sel("qsa_work_f32")) {
+        if (!g_case) std::printf("\nthe QSA work list over 512 and 1024 decode rows, against a host walk\n");
+        qsa_work_many_case(pl, 512);
+        qsa_work_many_case(pl, 1024);
     }
 
     if (sel("qsa_tail_store_bf16")) {

@@ -1003,7 +1003,9 @@ int Engine::apply_rope_scaling() {
     }
 
     const RopeResolved r = rope_resolve(meta_kv_k_, meta_kv_v_, "");
-    const long long want = cfg_.max_ctx > 0 ? (long long)cfg_.max_ctx : (long long)meta_.n_ctx_train;
+    /* The positions a sequence reaches: --max-seq-len's, when it is below --max-model-len. */
+    const long long want = (long long)seq_len_limit(
+        cfg_, cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train);
     if (r.type == "yarn" && r.factor > 1.0) {
         const long long reach = (long long)(r.orig * r.factor);
         RAD_INFO("rope: YaRN factor %g over %lld trained positions -- the rotary reaches %lld; "
@@ -1048,7 +1050,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.world_size = cfg_.tp;
     bc.max_tok    = max_tok;
     bc.max_seqs   = cfg_.max_seqs;
-    bc.max_ctx    = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
+    /* One sequence's bound (rotary tables, block-table widths): --max-model-len, or under
+     * --max-seq-len its padded bound (seq_len_bound), never the pool's. */
+    bc.max_ctx    = seq_len_bound(cfg_, cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train);
     bc.max_spec   = cfg_.n_spec;
     bc.draft_tree = draft_tree_ ? 1 : 0;
     bc.tp_wire_lossy = cfg_.tp_wire_exact ? 0 : 1;
@@ -2005,7 +2009,8 @@ int Engine::plan() {
                     entry += p->bytes_per_block * (bs / p->block_size);
                     ng += (int)(bs / p->block_size);
                 }
-                const int64_t tier = TierExec::device_bytes(entry, ng, TierExec::sizes(entry, ctx, bs));
+                const int64_t tier = TierExec::device_bytes(
+                    entry, ng, TierExec::sizes(entry, seq_len_bound(cfg_, ctx), bs));
                 f.staging += tier;
                 lazy += tier;
             }
@@ -3730,8 +3735,10 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
      * 14 GiB at 128 sequences, for ~1K-token prompts), and one more a sequence for a shared head
      * under RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD. Fewer slots only mean fewer resume points
      * (more recompute), never other bytes. Off, ctx is --max-model-len and extra 0, as before. */
-    const int64_t ctx = ram_budget_on_ ? ram_budget_session_ctx(model_len, cfg_.max_seqs, ram_session_tokens_)
-                                       : model_len;
+    /* A session is one sequence, so --max-seq-len caps it; the share stays the pool's. */
+    const int64_t seq_len = seq_len_limit(cfg_, model_len);
+    const int64_t ctx = ram_budget_on_ ? ram_budget_session_ctx(model_len, cfg_.max_seqs, ram_session_tokens_, seq_len)
+                                       : seq_len;
     int64_t extra = 0;
     if (ram_budget_on_) {
         const char* sh = std::getenv("RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD");
@@ -3743,6 +3750,9 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
                  (long long)model_len, (long long)(pol->held(ctx, interval) + 1 + extra), pol->name(),
                  extra ? ", one of them a shared head's (RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD)" : "");
     }
+    /* Under the RAM budget, at most kRamBudgetCheckpointSeqs sequences' worth (core/mem/prefix.h);
+     * the same count as before up to that many. */
+    const int64_t store_seqs = ram_budget_on_ ? ram_budget_checkpoint_seqs(cfg_.max_seqs) : cfg_.max_seqs;
 
     int64_t still = cfg_.prefix_cache_mib * ((int64_t)1 << 20);
     for (const auto& r : ranks_) still += arena_host_bytes(r->program);
@@ -3751,7 +3761,7 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
      * with the model's own state -- any hybrid's linear layers, any KV encoding's mirror -- since
      * it is measured from this rank's slot and the host's own spare memory. */
     const int64_t floor_slots =
-        std::min<int64_t>(checkpoint_slots_want(*pol, cfg_.max_seqs, ctx, interval, extra),
+        std::min<int64_t>(checkpoint_slots_want(*pol, store_seqs, ctx, interval, extra),
                           kCheckpointSlotsFloor);
     const int64_t floor_bytes =
         slot > INT64_MAX / std::max<int64_t>(floor_slots, 1) ? INT64_MAX : floor_slots * slot;
@@ -3836,15 +3846,19 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
                  "MiB; sized by --checkpoint-slots auto", sm);
     }
 
-    const CheckpointSlots c = checkpoint_slots_auto(*pol, cfg_.max_seqs, ctx, interval, slot,
+    const CheckpointSlots c = checkpoint_slots_auto(*pol, store_seqs, ctx, interval, slot,
                                                     share, room, extra);
     cfg_.checkpoint_slots = c.slots;
 
-    const std::string need =
+    std::string need =
         fmt("%lld a sequence for --max-num-seqs %lld: %s keeps %lld for a %lld-token session at "
             "a %lld-token interval, and one more for a running turn", (long long)c.per_seq,
             (long long)cfg_.max_seqs, pol->name(), (long long)(c.per_seq - 1), (long long)ctx,
             (long long)interval);
+    if (store_seqs < cfg_.max_seqs)
+        need += fmt("; the ram budget sizes the store for %lld sequences' worth, not %lld "
+                    "(kRamBudgetCheckpointSeqs: a batch holds few snapshots at once; --checkpoint-slots N "
+                    "sets more)", (long long)store_seqs, (long long)cfg_.max_seqs);
     std::string bound;
     if (c.bound == CheckpointSlots::Bound::Share)
         bound = fmt("; %lld wanted, held to an eighth of host memory (%s); --checkpoint-slots N "
@@ -4111,7 +4125,7 @@ int Engine::configure_kv() {
                  * is prefilled again once VRAM gives it up, which on a card whose experts do not
                  * fit is right after the turn. */
                 const int64_t held = T.arena().capacity() * tc.block_tokens;
-                const int64_t ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train;
+                const int64_t ctx = seq_len_limit(cfg_, cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train);
                 if (layout.rep_bytes > 0 && ranks_.size() > 1) {
                     /* What the slot would be with every rank's copy of the replicated groups. */
                     const int64_t each = slot_bytes + layout.rep_bytes * (int64_t)(ranks_.size() - 1);
@@ -4146,7 +4160,7 @@ int Engine::configure_kv() {
                  * few milliseconds behind it. A restore is a whole chain up to the longest
                  * context. TierExec::sizes holds the arithmetic, which the VRAM budget uses. */
                 const TierExec::Sizes tz = TierExec::sizes(
-                    entry_bytes, cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train,
+                    entry_bytes, seq_len_bound(cfg_, cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train),
                     ranks_[0]->prefix.block_size());
                 const int max_batch = tz.max_batch;
                 const int64_t max_copy = tz.max_copy, max_chain = tz.max_chain;
@@ -4213,7 +4227,7 @@ int Engine::configure_kv() {
      * reference rather than the pool's capacity, so the comparison would be about the wrong
      * number. */
     {
-        const int64_t want = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
+        const int64_t want = seq_len_limit(cfg_, cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train);
         const KVManager& kv = ranks_[0]->kv;
         for (int32_t g = 0; g < kv.n_groups(); ++g) {
             const KVGroupPlan* p = kv.plan(g);
@@ -4308,6 +4322,34 @@ int Engine::start() {
     if (cfg_.max_ctx == 0)
         decide("--max-model-len", std::to_string(meta_.n_ctx_train),
                "the model's training context (--max-model-len 0)");
+    /* --max-seq-len: one sequence's bound below the pool's. Everything sized for one sequence's
+     * worst case takes it (seq_len_limit / seq_len_bound); the pool keeps --max-model-len. */
+    if (cfg_.max_seq_len > 0) {
+        const int64_t model_len = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
+        if (model_len > 0 && cfg_.max_seq_len > model_len) {
+            RAD_ERR("--max-seq-len %lld is past --max-model-len %lld: a sequence cannot be longer "
+                    "than the pool's bound; lower --max-seq-len or raise --max-model-len",
+                    (long long)cfg_.max_seq_len, (long long)model_len);
+            return RAD_E_INVAL;
+        }
+        /* A streamed group's resolve is declared for max_seqs x the plugin's context in blocks
+         * (kv_resolve_declare), the pool's depth, which a per-sequence bound would cut short. */
+        if (cfg_.kv_resident > 0) {
+            RAD_ERR("--max-seq-len does not combine with --kv-resident: KV streaming addresses the "
+                    "pool by one sequence's bound");
+            return RAD_E_INVAL;
+        }
+        const int64_t lim = seq_len_limit(cfg_, model_len);
+        if (lim < model_len)
+            RAD_INFO("max seq len: %lld tokens a sequence (--max-seq-len %lld); block tables, step "
+                     "staging and rotary tables are sized for %lld tokens a sequence; the KV pool "
+                     "stays --max-model-len %lld",
+                     (long long)lim, (long long)cfg_.max_seq_len,
+                     (long long)seq_len_bound(cfg_, model_len), (long long)model_len);
+        decide("--max-seq-len", std::to_string(lim),
+               lim < model_len ? "one sequence's bound; --max-model-len sizes the KV pool"
+                               : "the same as --max-model-len: no cap");
+    }
     RAD_TRY(load_vocab());
     /* Check kernel libraries' device code against the cards the ranks use, not device 0. */
     rad_tools_registry().set_code_device(devs[0]);
@@ -4581,6 +4623,11 @@ int Engine::start() {
         } else if (r->fstager.enabled()) {
             r->ctx.set_stager(&r->fstager);
         }
+        /* The step's arena level for the file stager (its buffers' addresses differ by level). */
+        {
+            Ctx* const rctx = &r->ctx;
+            r->fstager.set_arena_level([rctx] { return rctx->level(); });
+        }
 
     }
     /* Runtime LoRA: the startup adapters, copied into their slots now that every rank's pools
@@ -4640,7 +4687,7 @@ int Engine::start() {
             const int64_t t = p.n_blocks * p.block_size;
             if (tokens == 0 || t < tokens) tokens = t;
         }
-        const int64_t mlen = cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train;
+        const int64_t mlen = seq_len_limit(cfg_, cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train);
         const int64_t lent = lending_ ? ranks_[0]->mover.flex_capacity() : 0;
         if (bytes > 0)
             decide("kv cache",

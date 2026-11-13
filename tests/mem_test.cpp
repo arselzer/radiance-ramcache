@@ -3686,6 +3686,42 @@ TEST(the_ram_budget_session_follows_each_sequences_share) {
     CHECK_EQ(ram_budget_session_ctx(147456, 128, 1200), 1200ll);
     CHECK_EQ(ram_budget_session_ctx(32768, 1, 100000), 32768ll);
     CHECK_EQ(ram_budget_session_ctx(32768, 0, 0), 32768ll);
+    /* --max-seq-len caps a session (one sequence); the share stays the pool's. */
+    CHECK_EQ(ram_budget_session_ctx(32768, 1, 0, 8192), 8192ll);
+    CHECK_EQ(ram_budget_session_ctx(720896, 512, 0, 4096), 4096ll);
+    CHECK_EQ(ram_budget_session_ctx(720896, 512, 0, 2048), 2048ll);
+    CHECK_EQ(ram_budget_session_ctx(147456, 128, 1200, 4096), 1200ll);
+    CHECK_EQ(ram_budget_session_ctx(32768, 1, 0, 0), 32768ll);        /* no flag: as before */
+    CHECK_EQ(ram_budget_session_ctx(32768, 1, 0, 65536), 32768ll);    /* never past the pool's */
+}
+
+/* The RAM budget's store holds at most 32 sequences' ladders: 256 streams of short shared-head prompts in a
+ * 294,912-token pool get 128 slots (the measured --checkpoint-slots 128: 493 -> 329 s, the 1,024 slots of
+ * before pinned 23 GiB of the expert cache), 128 streams 128, and up to 32 sequences -- a lone 32K agent
+ * session among them -- the store is what it was. */
+TEST(the_ram_budget_store_holds_at_most_32_sequences) {
+    const GeometricBackoff g(2048);
+    const int64_t slot = (int64_t)(22.59 * (1 << 20)), lots = INT64_MAX;
+    auto store = [&](int64_t seqs, int64_t model_len) {
+        const int64_t ctx = ram_budget_session_ctx(model_len, seqs, 0);
+        return checkpoint_slots_auto(g, ram_budget_checkpoint_seqs(seqs), ctx, 2048, slot, lots, lots, 1);
+    };
+    CHECK_EQ(ram_budget_checkpoint_seqs(256), kRamBudgetCheckpointSeqs);
+    CHECK_EQ(ram_budget_checkpoint_seqs(32), 32ll);
+    CHECK_EQ(ram_budget_checkpoint_seqs(1), 1ll);
+    CHECK_EQ(ram_budget_checkpoint_seqs(0), 1ll);
+    CHECK_EQ(store(256, 294912).per_seq, 4ll);
+    CHECK_EQ(store(256, 294912).slots, 128ll);
+    CHECK_EQ(store(128, 147456).slots, 128ll);
+    CHECK_EQ(store(64, 294912).slots, 128ll);
+    CHECK_EQ(store(32, 147456).slots, 128ll);
+    for (int64_t n : { 1, 2, 4, 8, 16, 32 }) {   /* the old count: every sequence its ladder */
+        const int64_t ctx = ram_budget_session_ctx(32768, n, 0);
+        CHECK_EQ(checkpoint_slots_auto(g, ram_budget_checkpoint_seqs(n), ctx, 2048, slot, lots, lots, 1).slots,
+                 checkpoint_slots_auto(g, n, ctx, 2048, slot, lots, lots, 1).slots);
+    }
+    CHECK_EQ(store(8, 294912).slots, 8 * store(8, 294912).per_seq);
+    CHECK_EQ(store(1, 32768).slots, store(1, 32768).per_seq);
 }
 
 /* --checkpoint-slots auto: the policy's share plus one for each sequence, held to the share of

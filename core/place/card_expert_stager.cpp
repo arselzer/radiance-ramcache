@@ -52,6 +52,8 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kLendRestEnv, 0, ds41p1::kMaxLendRestMs, &r.lend_rest_ms },
         /* Decode passes on the cards: 0 off, else 17 to 4096 (below 17 the gemv rows, which honour no mark). */
         { ds41p1::kDecodeRowsEnv, 0, ds41p1::kTwinMaxRows, &r.decode_rows },
+        /* Hybrid decode: the CPU's share in percent, 0 off (p1_hybrid.h). */
+        { ds41p1::kHybridEnv, 0, ds41p1::kMaxHybridPct, &r.hybrid },
     };
     for (const K& k : ks) {
         const char* v = get(k.env);
@@ -92,6 +94,13 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         return false;
     }
     r.lend_audit = as == 1;
+    const char* ha = get(ds41p1::kHybridAdaptEnv);
+    const int hs = ha && *ha ? ds41p1::env_state(ha) : 1;
+    if (hs < 0) {
+        if (why) *why = std::string(ds41p1::kHybridAdaptEnv) + "=" + ha + ": 0 holds the share, 1 / unset / empty adapts it";
+        return false;
+    }
+    r.hybrid_adapt = hs == 1;
     *t = r;
     return true;
 }
